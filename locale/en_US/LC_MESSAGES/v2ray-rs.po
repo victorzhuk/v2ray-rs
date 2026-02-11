@@ -1,0 +1,232 @@
+# English translation for v2ray-rs.
+# Copyright (C) 2026
+# This file is distributed under the same license as the v2ray-rs package.
+#
+msgid ""
+msgstr ""
+"Project-Id-Version: v2ray-rs 0.1.0\n"
+"Report-Msgid-Bugs-To: \n"
+"POT-Creation-Date: 2026-02-10 00:00+0000\n"
+"PO-Revision-Date: 2026-02-10 00:00+0000\n"
+"Last-Translator: \n"
+"Language-Team: English\n"
+"Language: en_US\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "V2Ray Manager"
+msgstr "V2Ray Manager"
+
+msgid "Subscriptions"
+msgstr "Subscriptions"
+
+msgid "Routing Rules"
+msgstr "Routing Rules"
+
+msgid "Logs"
+msgstr "Logs"
+
+msgid "Settings"
+msgstr "Settings"
+
+msgid "Connect"
+msgstr "Connect"
+
+msgid "Disconnect"
+msgstr "Disconnect"
+
+msgid "Connected"
+msgstr "Connected"
+
+msgid "Disconnected"
+msgstr "Disconnected"
+
+msgid "Connecting..."
+msgstr "Connecting..."
+
+msgid "Disconnecting..."
+msgstr "Disconnecting..."
+
+msgid "Add Subscription"
+msgstr "Add Subscription"
+
+msgid "Delete Subscription"
+msgstr "Delete Subscription"
+
+msgid "Are you sure you want to delete this subscription?"
+msgstr "Are you sure you want to delete this subscription?"
+
+msgid "No Subscriptions"
+msgstr "No Subscriptions"
+
+msgid "Add a subscription to get started"
+msgstr "Add a subscription to get started"
+
+msgid "Name"
+msgstr "Name"
+
+msgid "URL"
+msgstr "URL"
+
+msgid "Cancel"
+msgstr "Cancel"
+
+msgid "Add"
+msgstr "Add"
+
+msgid "Delete"
+msgstr "Delete"
+
+msgid "Save"
+msgstr "Save"
+
+msgid "Add Rule"
+msgstr "Add Rule"
+
+msgid "Edit Rule"
+msgstr "Edit Rule"
+
+msgid "No Routing Rules"
+msgstr "No Routing Rules"
+
+msgid "Add rules to control traffic routing"
+msgstr "Add rules to control traffic routing"
+
+msgid "Rules are evaluated top to bottom"
+msgstr "Rules are evaluated top to bottom"
+
+msgid "Rule Type"
+msgstr "Rule Type"
+
+msgid "Match Value"
+msgstr "Match Value"
+
+msgid "Action"
+msgstr "Action"
+
+msgid "GeoIP Country Code"
+msgstr "GeoIP Country Code"
+
+msgid "GeoSite Category"
+msgstr "GeoSite Category"
+
+msgid "Domain Pattern"
+msgstr "Domain Pattern"
+
+msgid "IP CIDR"
+msgstr "IP CIDR"
+
+msgid "Proxy"
+msgstr "Proxy"
+
+msgid "Direct"
+msgstr "Direct"
+
+msgid "Block"
+msgstr "Block"
+
+msgid "Presets"
+msgstr "Presets"
+
+msgid "Add common routing rules"
+msgstr "Add common routing rules"
+
+msgid "Clear logs"
+msgstr "Clear logs"
+
+msgid "Process Not Running"
+msgstr "Process Not Running"
+
+msgid "Start the proxy to see logs"
+msgstr "Start the proxy to see logs"
+
+msgid "Backend"
+msgstr "Backend"
+
+msgid "Select proxy backend"
+msgstr "Select proxy backend"
+
+msgid "Proxy Ports"
+msgstr "Proxy Ports"
+
+msgid "SOCKS5 Port"
+msgstr "SOCKS5 Port"
+
+msgid "HTTP Port"
+msgstr "HTTP Port"
+
+msgid "Auto-update subscriptions"
+msgstr "Auto-update subscriptions"
+
+msgid "Update interval (hours)"
+msgstr "Update interval (hours)"
+
+msgid "Interface"
+msgstr "Interface"
+
+msgid "Language"
+msgstr "Language"
+
+msgid "English"
+msgstr "English"
+
+msgid "Russian"
+msgstr "Russian"
+
+msgid "System Integration"
+msgstr "System Integration"
+
+msgid "Minimize to tray"
+msgstr "Minimize to tray"
+
+msgid "Enable notifications"
+msgstr "Enable notifications"
+
+msgid "No backend found"
+msgstr "No backend found"
+
+msgid "Install v2ray, xray, or sing-box"
+msgstr "Install v2ray, xray, or sing-box"
+
+msgid "Welcome to V2Ray Manager"
+msgstr "Welcome to V2Ray Manager"
+
+msgid "Select Backend"
+msgstr "Select Backend"
+
+msgid "Choose which proxy backend to use"
+msgstr "Choose which proxy backend to use"
+
+msgid "Import Subscription"
+msgstr "Import Subscription"
+
+msgid "Subscription URL"
+msgstr "Subscription URL"
+
+msgid "Next"
+msgstr "Next"
+
+msgid "Skip"
+msgstr "Skip"
+
+msgid "Import"
+msgstr "Import"
+
+msgid "Finish"
+msgstr "Finish"
+
+msgid "Setup Complete"
+msgstr "Setup Complete"
+
+msgid "Move up"
+msgstr "Move up"
+
+msgid "Move down"
+msgstr "Move down"
+
+msgid "Edit rule"
+msgstr "Edit rule"
+
+msgid "Delete rule"
+msgstr "Delete rule"

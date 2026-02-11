@@ -1,0 +1,21 @@
+[package]
+name = "v2ray-rs-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+uuid.workspace = true
+directories.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+ipnet.workspace = true
+tempfile = "3"
+reqwest = { workspace = true, features = ["blocking"], optional = true }
+
+[features]
+default = ["geodata-fetch"]
+geodata-fetch = ["dep:reqwest"]
+test-utils = []

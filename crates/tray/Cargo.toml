@@ -1,0 +1,13 @@
+[package]
+name = "v2ray-rs-tray"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+v2ray-rs-core = { path = "../core" }
+v2ray-rs-process = { path = "../process" }
+ksni = "0.3"
+notify-rust = "4"
+png = "0.17"
+tokio.workspace = true
+log.workspace = true

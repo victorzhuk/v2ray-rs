@@ -1,0 +1,13 @@
+[package]
+name = "v2ray-rs-process"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+v2ray-rs-core = { path = "../core" }
+tokio.workspace = true
+thiserror.workspace = true
+nix.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

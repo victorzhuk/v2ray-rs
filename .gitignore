@@ -1,0 +1,247 @@
+# Rust
+/target/
+Cargo.lock
+
+# Build artifacts
+*.o
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+
+# Backup files
+*~
+*.swp
+*.swo
+*.bak
+*.backup
+
+# IDE and Editor files
+.vscode/
+.idea/
+.zed/
+.claude/
+.cursor/
+.opencode/
+*.sublime-*
+*.iml
+*.code-workspace
+*.sln.iml
+*~
+.netrwhist
+*~
+\#*\#
+.\#*
+*~
+*.sublime-project
+*.sublime-workspace
+.*.kate-swp
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Linux
+.directory
+.Trash-*
+
+# Testing
+# (tempfile::TempDir creates directories that may persist)
+test-data/
+test-temp/
+tmp/
+
+# Documentation
+/docs/build/
+/docs/book/
+
+# Logs
+*.log
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Database (if any)
+*.db
+*.sqlite
+*.sqlite3
+
+# Configuration overrides (keep template files)
+settings.local.toml
+subscriptions.local.json
+routing.local.json
+
+# Compiled
+*.rlib
+*.rmeta
+
+# Cargo registry
+.cargo/registry
+
+# Cargo index
+.cargo/git
+
+# Cargo builds
+.cargo/bin
+.cargo/deps
+
+# Build incrementals
+/target/**/incremental/
+
+# Rust analyzer
+/rust-project.json
+/.rustfmt.toml
+
+# Code coverage
+tarpaulin-report.html
+cobertura.xml
+lcov.info
+*.profraw
+*.profdata
+
+# Debug files
+debug/
+perf.data
+perf.data.old
+
+# Backup and swap files
+*.orig
+*.rej
+*~
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Archive files
+*.tar
+*.tar.gz
+*.zip
+*.7z
+*.rar
+
+# Backup archives
+*.backup
+*.bak
+
+# Release artifacts
+*.deb
+*.rpm
+*.flatpak
+*.AppImage
+
+# Generated files
+generated/
+gen/
+
+# Geodata databases (large files, should be fetched)
+*.dat
+*.db
+!examples/**/*.db
+!examples/**/*.dat
+
+# Process PID files
+*.pid
+.pidfile
+
+# XDG data (test environments)
+.xdg-test/
+.xdg-cache-test/
+.xdg-config-test/
+.xdg-data-test/
+
+# Clippy cache
+.cargo-clippy/
+
+# Profiling
+flamegraph.svg
+perf.prof
+
+# Benchmark results
+bench_results/
+benchmark*.txt
+
+# Documentation overrides
+docs/build/
+site/
+
+# Locales
+locale/*.po~
+locale/*.mo~
+
+# Assets
+assets/cache/
+
+# Development
+dev/
+sandbox/
+playground/
+
+# CI/CD artifacts
+.github/artifacts/
+artifacts/
+
+# Git hooks (personal)
+.hooks/
+
+# Git patches
+*.patch
+*.diff
+
+# GPG
+*.asc
+*.sig
+
+# Makefile artifacts
+*.d
+*.dSYM/
+
+# Container related
+.dockerignore
+.docker/
+
+# Kubernetes
+*.k8s.yaml
+*.helm.yaml
+
+# Terraform
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Node modules (if any tooling uses it)
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Python (if any tooling uses it)
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+env/
+ENV/
+
+# Miscellaneous
+.DS_Store?
+ehthumbs.db
+Icon?
+nohup.out

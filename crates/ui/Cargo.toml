@@ -1,0 +1,17 @@
+[package]
+name = "v2ray-rs-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+v2ray-rs-core = { path = "../core" }
+v2ray-rs-process = { path = "../process" }
+v2ray-rs-subscription = { path = "../subscription" }
+v2ray-rs-tray = { path = "../tray" }
+relm4.workspace = true
+tokio.workspace = true
+log.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+gettext-rs.workspace = true
+ipnet.workspace = true
