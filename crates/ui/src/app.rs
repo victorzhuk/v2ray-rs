@@ -36,6 +36,7 @@ pub struct App {
     window: adw::ApplicationWindow,
     process_handle: Option<ProcessHandle>,
     process_state: ProcessState,
+    reconnect_pending: bool,
     connected: bool,
     button_sensitive: bool,
     has_active_nodes: bool,
@@ -246,6 +247,7 @@ impl SimpleComponent for App {
             window: root.clone(),
             process_handle: None,
             process_state: ProcessState::Stopped,
+            reconnect_pending: false,
             connected: false,
             button_sensitive: true,
             has_active_nodes,
@@ -286,7 +288,12 @@ impl SimpleComponent for App {
                 if let Err(e) = v2ray_rs_core::persistence::save_settings(&self.paths, &settings) {
                     log::error!("save settings: {e}");
                 }
+                let was_connected = self.process_handle.is_some();
                 self.settings = settings;
+                if was_connected {
+                    self.reconnect_pending = true;
+                    sender.input(AppMsg::Disconnect);
+                }
             }
             AppMsg::ActiveNodesChanged(has) => {
                 self.has_active_nodes = has;
@@ -430,6 +437,10 @@ impl SimpleComponent for App {
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                 }
                 self.apply_state(&state);
+                if matches!(state, ProcessState::Stopped) && self.reconnect_pending {
+                    self.reconnect_pending = false;
+                    sender.input(AppMsg::Connect);
+                }
             }
             AppMsg::ProcessLogLine(line) => {
                 self.logs_page.emit(LogsMsg::AppendLine(line));
@@ -501,6 +512,12 @@ fn install_app_icon() {
         let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
         if std::fs::create_dir_all(&icon_dir).is_ok() {
             let _ = std::fs::write(icon_dir.join("v2ray-rs.png"), APP_ICON_PNG);
+            let theme_dir = data_dir.join("icons/hicolor");
+            let _ = std::process::Command::new("gtk-update-icon-cache")
+                .arg("-f")
+                .arg("-t")
+                .arg(&theme_dir)
+                .spawn();
         }
     }
 }

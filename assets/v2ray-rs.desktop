@@ -7,3 +7,4 @@ Terminal=false
 Type=Application
 Categories=Network;Utility;
 Keywords=proxy;vpn;v2ray;xray;sing-box;
+StartupWMClass=com.github.v2ray-rs
