@@ -9,6 +9,11 @@ use crate::models::{
     ShadowsocksConfig, TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
+const GEOIP_RULESET_URL: &str =
+    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
+const GEOSITE_RULESET_URL: &str =
+    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
+
 pub struct SingboxGenerator;
 
 impl ConfigGenerator for SingboxGenerator {
@@ -58,7 +63,7 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
         .iter()
         .enumerate()
         .map(|(i, node)| {
-            let tag = outbound_tag(node, i);
+            let tag = super::common::outbound_tag(node, i);
             build_outbound(node, &tag)
         })
         .collect();
@@ -73,13 +78,6 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
     }));
 
     Value::Array(outbounds)
-}
-
-fn outbound_tag(node: &ProxyNode, index: usize) -> String {
-    match node.remark() {
-        Some(name) if !name.is_empty() => format!("proxy-{index}-{name}"),
-        _ => format!("proxy-{index}"),
-    }
 }
 
 fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
@@ -243,9 +241,7 @@ fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
             "type": "remote",
             "tag": format!("geoip-{tag}"),
             "format": "binary",
-            "url": format!(
-                "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-{tag}.srs"
-            ),
+            "url": format!("{GEOIP_RULESET_URL}/geoip-{tag}.srs"),
             "download_detour": "direct",
         }));
     }
@@ -254,9 +250,7 @@ fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
             "type": "remote",
             "tag": format!("geosite-{tag}"),
             "format": "binary",
-            "url": format!(
-                "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-{tag}.srs"
-            ),
+            "url": format!("{GEOSITE_RULESET_URL}/geosite-{tag}.srs"),
             "download_detour": "direct",
         }));
     }
@@ -303,59 +297,8 @@ fn build_route_rule(rule: &RoutingRule) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_fixtures::fixtures::*;
     use crate::models::*;
-
-    fn default_settings() -> AppSettings {
-        AppSettings::default()
-    }
-
-    fn vless_node() -> ProxyNode {
-        ProxyNode::Vless(VlessConfig {
-            address: "example.com".into(),
-            port: 443,
-            uuid: "test-uuid".into(),
-            encryption: Some("none".into()),
-            flow: None,
-            transport: TransportSettings::Ws(WsSettings {
-                path: "/ws".into(),
-                host: Some("example.com".into()),
-                headers: Default::default(),
-            }),
-            tls: Some(TlsSettings {
-                server_name: Some("example.com".into()),
-                alpn: vec!["h2".into()],
-                verify: true,
-                fingerprint: None,
-            }),
-            remark: Some("Test VLESS".into()),
-        })
-    }
-
-    fn ss_node() -> ProxyNode {
-        ProxyNode::Shadowsocks(ShadowsocksConfig {
-            address: "ss.example.com".into(),
-            port: 8388,
-            method: "aes-256-gcm".into(),
-            password: "secret".into(),
-            remark: Some("Test SS".into()),
-        })
-    }
-
-    fn trojan_node() -> ProxyNode {
-        ProxyNode::Trojan(TrojanConfig {
-            address: "trojan.example.com".into(),
-            port: 443,
-            password: "trojan-pass".into(),
-            transport: TransportSettings::Tcp,
-            tls: Some(TlsSettings {
-                server_name: Some("trojan.example.com".into()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
-            }),
-            remark: Some("Test Trojan".into()),
-        })
-    }
 
     #[test]
     fn test_singbox_error_on_empty() {

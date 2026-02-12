@@ -9,6 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.2.0] - 2026-02-12
+
+### Added
+- GTK4/Relm4 GUI application with libadwaita (`v2ray-rs-ui`)
+  - Main window with ViewSwitcher: Subscriptions, Routing, Logs, Settings
+  - Connect/Disconnect button with process state tracking
+  - Subscription management: add, rename, delete, toggle, reorder
+  - Node latency testing (TCP ping) with sort-by-latency
+  - Routing rule editor with drag-and-drop reordering and preset dialogs
+  - Settings editor for backend, ports, update intervals, language
+  - Process log viewer
+  - First-run onboarding wizard
+  - Toast notifications for status messages
+  - i18n support via gettext
+- System tray integration via ksni (`v2ray-rs-tray`)
+  - FreeDesktop symbolic icons (connected/disconnected/error)
+  - Connect/Disconnect toggle, status label, Open Main Window, Quit
+  - Desktop notifications on state changes
+- Workspace expanded to five crates: core, subscription, process, tray, ui
+- Arch Linux PKGBUILD packaging
+- Desktop entry file (`v2ray-rs.desktop`)
+- Shared config test fixtures (`config/test_fixtures.rs`)
+- Shared `outbound_tag()` helper (`config/common.rs`)
+- Bounded concurrent TCP pings via `Semaphore` (max 50)
+- PID reuse protection via `/proc/PID/cmdline` verification
+- Signal-aware exit classification (SIGINT/SIGTERM/SIGKILL vs real crashes)
+- Tracked log capture tasks with abort-on-stop
+
+### Changed
+- `geodata::needs_update()` accepts `Duration` instead of raw `u64`
+- `subscription::update::reconcile_nodes()` delegates to `reconcile_with_counts()`
+- Extracted `parse_url_transport()` and `parse_url_tls()` from duplicated parser code
+- HTTP user-agent now uses `CARGO_PKG_VERSION` instead of hardcoded `"v2ray-rs/0.1"`
+- Replaced 30+ `let _ = persist()` sites with `if let Err(e)` + `log::error!`
+- Replaced `Mutex::lock().unwrap()` with `if let Ok(guard)` in UI statics
+- Added `#[serde(skip_serializing_if = "Option::is_none")]` to all `Option<T>` proxy fields
+- Changed `SubscriptionNode::last_latency_ms` from `#[serde(skip)]` to `#[serde(skip_serializing, default)]`
+- Extracted named constants for timeouts, window size, channel capacity, retry limits, and ruleset URLs
+- sing-box config uses `rule_set` (remote binary `.srs`) instead of deprecated `geoip`/`geosite` databases
+
+### Fixed
+- Panic on `target.parent().unwrap()` in geodata download path
+- Potential UTF-8 panic in tray error message truncation
+- PID file `kill(pid, 0)` race condition on PID reuse
+- Untracked `tokio::spawn` tasks for log capture leaked on process stop
+- All signal exits (130/137/143) incorrectly counted toward crash threshold
+
+### Removed
+- Dead `status_bar.rs` module (127 lines, unused)
+- Duplicate `outbound_tag()` from `v2ray.rs` and `singbox.rs`
+- Duplicate test fixture functions from individual config test modules
+- Legacy PNG tray icons (replaced by symbolic SVGs)
+
 ## [0.1.0] - 2026-02-11
 
 ### Added
@@ -84,5 +137,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/victorzhuk/v2ray-rs/releases/tag/v0.1.0

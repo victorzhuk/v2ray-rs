@@ -421,7 +421,9 @@ fn build_routing_rule_row(
             if let Some(r) = rs.rules_mut().iter_mut().find(|r| r.id == id) {
                 r.enabled = !r.enabled;
             }
-            let _ = persistence::save_routing_rules(&ctx.paths, &rs);
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &rs) {
+                log::error!("save routing rules: {e}");
+            }
         });
     }
     row.add_suffix(&switch);
@@ -449,7 +451,9 @@ fn build_routing_rule_row(
         btn.connect_clicked(move |_| {
             pop.popdown();
             ctx.rule_set.borrow_mut().move_rule(idx, idx - 1);
-            let _ = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow());
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                log::error!("save routing rules: {e}");
+            }
             render_routing_rules(&ctx);
         });
         popover_box.append(&btn);
@@ -465,7 +469,9 @@ fn build_routing_rule_row(
         btn.connect_clicked(move |_| {
             pop.popdown();
             ctx.rule_set.borrow_mut().move_rule(idx, idx + 1);
-            let _ = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow());
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                log::error!("save routing rules: {e}");
+            }
             render_routing_rules(&ctx);
         });
         popover_box.append(&btn);
@@ -507,7 +513,9 @@ fn build_routing_rule_row(
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
             ctx.rule_set.borrow_mut().remove(&id);
-            let _ = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow());
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                log::error!("save routing rules: {e}");
+            }
             render_routing_rules(&ctx);
         });
     }
@@ -636,7 +644,9 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             } else {
                 rs.add(rule);
             }
-            let _ = persistence::save_routing_rules(&ctx.paths, &rs);
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &rs) {
+                log::error!("save routing rules: {e}");
+            }
         }
         render_routing_rules(&ctx);
     });
@@ -674,7 +684,9 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
         let p = preset.clone();
         apply_btn.connect_clicked(move |_| {
             ctx.rule_set.borrow_mut().apply_preset(&p);
-            let _ = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow());
+            if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                log::error!("save routing rules: {e}");
+            }
             render_routing_rules(&ctx);
         });
         row.add_suffix(&apply_btn);
@@ -701,7 +713,9 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             let p = preset.clone();
             apply_btn.connect_clicked(move |_| {
                 ctx.rule_set.borrow_mut().apply_preset(&p);
-                let _ = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow());
+                if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                    log::error!("save routing rules: {e}");
+                }
                 render_routing_rules(&ctx);
             });
             row.add_suffix(&apply_btn);
@@ -714,7 +728,9 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             let name = preset.name.clone();
             let pp = paths.clone();
             delete_btn.connect_clicked(move |_| {
-                let _ = persistence::delete_preset(&pp, &name);
+                if let Err(e) = persistence::delete_preset(&pp, &name) {
+                    log::error!("delete preset: {e}");
+                }
             });
             row.add_suffix(&delete_btn);
 
@@ -795,7 +811,9 @@ fn show_save_preset_dialog(rule_set: &RoutingRuleSet, paths: &AppPaths) {
         }
         let description = desc_entry.text().to_string();
         let preset = Preset::from_rules(name.trim(), description.trim(), &rules);
-        let _ = persistence::save_preset(&paths, &preset);
+        if let Err(e) = persistence::save_preset(&paths, &preset) {
+            log::error!("save preset: {e}");
+        }
     });
 
     dialog.present(gtk::Window::NONE);

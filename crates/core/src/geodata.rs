@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,8 @@ use thiserror::Error;
 
 use crate::models::BackendType;
 use crate::persistence::AppPaths;
+
+const GEODATA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Debug, Error)]
 pub enum GeodataError {
@@ -108,13 +111,13 @@ impl GeodataManager {
         Ok(())
     }
 
-    pub fn needs_update(&self, interval_secs: u64) -> bool {
+    pub fn needs_update(&self, interval: Duration) -> bool {
         match self.load_metadata() {
             Ok(Some(metadata)) => {
                 let elapsed = Utc::now()
                     .signed_duration_since(metadata.last_check)
                     .num_seconds();
-                elapsed >= interval_secs as i64
+                elapsed >= interval.as_secs() as i64
             }
             _ => true,
         }
@@ -152,9 +155,9 @@ impl GeodataManager {
 pub fn check_and_download(
     manager: &GeodataManager,
     backend: BackendType,
-    interval_secs: u64,
+    interval: Duration,
 ) -> Result<Option<GeodataMetadata>, GeodataError> {
-    if manager.has_geodata(backend) && !manager.needs_update(interval_secs) {
+    if manager.has_geodata(backend) && !manager.needs_update(interval) {
         return Ok(None);
     }
     download_geodata(manager, backend).map(Some)
@@ -167,7 +170,7 @@ pub fn download_geodata(
 ) -> Result<GeodataMetadata, GeodataError> {
     manager.ensure_dir()?;
     let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(GEODATA_DOWNLOAD_TIMEOUT)
         .build()
         .map_err(|e| GeodataError::Download {
             url: String::new(),
@@ -195,7 +198,12 @@ pub fn download_geodata(
             reason: e.to_string(),
         })?;
 
-        let dir = target.parent().unwrap();
+        let dir = target.parent().ok_or_else(|| {
+            GeodataError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "download target path has no parent",
+            ))
+        })?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         std::io::Write::write_all(&mut tmp, &bytes)?;
         tmp.persist(&target)
@@ -253,7 +261,7 @@ mod tests {
     #[test]
     fn test_needs_update_no_metadata() {
         let (_tmp, manager) = test_manager();
-        assert!(manager.needs_update(3600));
+        assert!(manager.needs_update(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -266,7 +274,7 @@ mod tests {
         };
         manager.save_metadata(&metadata).unwrap();
 
-        assert!(!manager.needs_update(3600));
+        assert!(!manager.needs_update(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -280,7 +288,7 @@ mod tests {
         };
         manager.save_metadata(&metadata).unwrap();
 
-        assert!(manager.needs_update(3600));
+        assert!(manager.needs_update(Duration::from_secs(3600)));
     }
 
     #[test]

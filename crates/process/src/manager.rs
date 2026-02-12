@@ -40,6 +40,7 @@ pub struct ProcessManager {
     config_path: PathBuf,
     crash_times: Vec<Instant>,
     auto_restart: bool,
+    log_handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl ProcessManager {
@@ -53,6 +54,7 @@ impl ProcessManager {
             config_path,
             crash_times: Vec::new(),
             auto_restart: true,
+            log_handles: Vec::new(),
         }
     }
 
@@ -159,11 +161,11 @@ impl ProcessManager {
         Ok(())
     }
 
-    fn capture_output(&self, child: &mut Child) {
+    fn capture_output(&mut self, child: &mut Child) {
         if let Some(stdout) = child.stdout.take() {
             let tx = self.state.sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
-            tokio::spawn(async move {
+            self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -173,13 +175,13 @@ impl ProcessManager {
                     }
                     let _ = tx.send(ProcessEvent::LogLine(log_line));
                 }
-            });
+            }));
         }
 
         if let Some(stderr) = child.stderr.take() {
             let tx = self.state.sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
-            tokio::spawn(async move {
+            self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
@@ -189,7 +191,7 @@ impl ProcessManager {
                     }
                     let _ = tx.send(ProcessEvent::LogLine(log_line));
                 }
-            });
+            }));
         }
     }
 
@@ -209,6 +211,10 @@ impl ProcessManager {
             child.wait().await.ok();
         }
 
+        for handle in self.log_handles.drain(..) {
+            handle.abort();
+        }
+
         self.child = None;
     }
 
@@ -218,18 +224,26 @@ impl ProcessManager {
             None => "process killed by signal".into(),
         };
 
-        self.crash_times.push(Instant::now());
-        self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
+        let is_signal_exit = exit_code.is_none() || matches!(exit_code, Some(130) | Some(137) | Some(143));
 
-        if self.crash_times.len() >= MAX_CRASHES {
-            let _ = self.state.transition(ProcessState::Error(
-                format!("{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"),
-            ));
-            return;
+        if !is_signal_exit {
+            self.crash_times.push(Instant::now());
+            self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
+
+            if self.crash_times.len() >= MAX_CRASHES {
+                let _ = self.state.transition(ProcessState::Error(
+                    format!("{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"),
+                ));
+                return;
+            }
         }
 
-        if !self.auto_restart {
-            let _ = self.state.transition(ProcessState::Error(msg));
+        if !self.auto_restart || is_signal_exit {
+            let _ = self.state.transition(if is_signal_exit {
+                ProcessState::Stopped
+            } else {
+                ProcessState::Error(msg)
+            });
             return;
         }
 

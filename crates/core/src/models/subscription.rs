@@ -26,7 +26,7 @@ pub enum SubscriptionSource {
 pub struct SubscriptionNode {
     pub node: ProxyNode,
     pub enabled: bool,
-    #[serde(skip)]
+    #[serde(skip_serializing, default)]
     pub last_latency_ms: Option<u64>,
 }
 

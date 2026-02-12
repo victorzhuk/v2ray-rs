@@ -152,21 +152,27 @@ impl Component for SubscriptionsPage {
             SubscriptionsMsg::ToggleSubscription(id) => {
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
                     sub.enabled = !sub.enabled;
-                    let _ = persistence::update_subscription(&self.paths, sub.clone());
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::ToggleNode(sub_id, idx) => {
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == sub_id) {
                     if let Some(node) = sub.nodes.get_mut(idx) {
                         node.enabled = !node.enabled;
-                        let _ = persistence::update_subscription(&self.paths, sub.clone());
+                        if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                            log::error!("update subscription: {e}");
+                        }
                     }
                 }
             }
             SubscriptionsMsg::RenameSubscription(id, new_name) => {
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
                     sub.name = new_name;
-                    let _ = persistence::update_subscription(&self.paths, sub.clone());
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::MoveSubscription(id, direction) => {
@@ -178,7 +184,9 @@ impl Component for SubscriptionsPage {
                     };
                     if new_pos != pos {
                         self.subscriptions.swap(pos, new_pos);
-                        let _ = persistence::save_subscriptions(&self.paths, &self.subscriptions);
+                        if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
+                            log::error!("save subscriptions: {e}");
+                        }
                     }
                 }
             }
@@ -191,18 +199,24 @@ impl Component for SubscriptionsPage {
                     };
                     if new_idx != idx {
                         sub.nodes.swap(idx, new_idx);
-                        let _ = persistence::update_subscription(&self.paths, sub.clone());
+                        if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                            log::error!("update subscription: {e}");
+                        }
                     }
                 }
             }
             SubscriptionsMsg::DeleteSubscription(id) => {
-                let _ = persistence::remove_subscription(&self.paths, &id);
+                if let Err(e) = persistence::remove_subscription(&self.paths, &id) {
+                    log::error!("remove subscription: {e}");
+                }
                 self.subscriptions.retain(|s| s.id != id);
             }
             SubscriptionsMsg::AddSubscription(name, url) => {
                 let sub = Subscription::new_from_url(name, url);
                 let id = sub.id;
-                let _ = persistence::add_subscription(&self.paths, sub.clone());
+                if let Err(e) = persistence::add_subscription(&self.paths, sub.clone()) {
+                    log::error!("add subscription: {e}");
+                }
                 self.subscriptions.push(sub);
                 sender.input(SubscriptionsMsg::UpdateSubscription(id));
             }
@@ -241,7 +255,9 @@ impl Component for SubscriptionsPage {
                         let lb = b.last_latency_ms.unwrap_or(u64::MAX);
                         la.cmp(&lb)
                     });
-                    let _ = persistence::update_subscription(&self.paths, sub.clone());
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::EnableAllNodes(id) => {
@@ -249,7 +265,9 @@ impl Component for SubscriptionsPage {
                     for node in &mut sub.nodes {
                         node.enabled = true;
                     }
-                    let _ = persistence::update_subscription(&self.paths, sub.clone());
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::DisableAllNodes(id) => {
@@ -257,14 +275,18 @@ impl Component for SubscriptionsPage {
                     for node in &mut sub.nodes {
                         node.enabled = false;
                     }
-                    let _ = persistence::update_subscription(&self.paths, sub.clone());
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::DragDropSubscription(from, to) => {
                 if from != to && from < self.subscriptions.len() && to < self.subscriptions.len() {
                     let sub = self.subscriptions.remove(from);
                     self.subscriptions.insert(to, sub);
-                    let _ = persistence::save_subscriptions(&self.paths, &self.subscriptions);
+                    if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
+                        log::error!("save subscriptions: {e}");
+                    }
                 }
             }
             SubscriptionsMsg::DragDropNode(sub_id, from, to) => {
@@ -272,7 +294,9 @@ impl Component for SubscriptionsPage {
                     if from != to && from < sub.nodes.len() && to < sub.nodes.len() {
                         let node = sub.nodes.remove(from);
                         sub.nodes.insert(to, node);
-                        let _ = persistence::update_subscription(&self.paths, sub.clone());
+                        if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                            log::error!("update subscription: {e}");
+                        }
                     }
                 }
             }
@@ -803,7 +827,12 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        format!("{}...", &s[..max])
+        let boundary = s.char_indices()
+            .map(|(i, _)| i)
+            .take_while(|&i| i <= max)
+            .last()
+            .unwrap_or(0);
+        format!("{}...", &s[..boundary])
     }
 }
 

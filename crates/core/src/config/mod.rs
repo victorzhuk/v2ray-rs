@@ -1,4 +1,7 @@
+mod common;
 mod singbox;
+#[cfg(test)]
+mod test_fixtures;
 pub(crate) mod v2ray;
 mod writer;
 mod xray;

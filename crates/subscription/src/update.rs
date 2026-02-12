@@ -8,6 +8,8 @@ use v2ray_rs_core::models::{ProxyNode, Subscription, SubscriptionNode, Subscript
 use crate::fetch::{fetch_from_file, fetch_with_client, FetchError};
 use crate::parser::parse_uri;
 
+const DEFAULT_MAX_RETRIES: u32 = 3;
+
 #[derive(Debug, Clone)]
 pub struct UpdateResult {
     pub added: usize,
@@ -27,6 +29,15 @@ pub fn reconcile_nodes(
     old_nodes: &[SubscriptionNode],
     new_parsed: Vec<ProxyNode>,
 ) -> Vec<SubscriptionNode> {
+    reconcile_with_counts(old_nodes, new_parsed).0
+}
+
+pub fn reconcile_with_counts(
+    old_nodes: &[SubscriptionNode],
+    new_parsed: Vec<ProxyNode>,
+) -> (Vec<SubscriptionNode>, UpdateResult) {
+    let mut added = 0;
+    let mut unchanged = 0;
     let mut result = Vec::new();
 
     for new_node in new_parsed {
@@ -37,6 +48,12 @@ pub fn reconcile_nodes(
                 && discriminant(old_node) == discriminant(&new_node)
         });
 
+        if matched.is_some() {
+            unchanged += 1;
+        } else {
+            added += 1;
+        }
+
         let enabled = matched.map(|m| m.enabled).unwrap_or(true);
         result.push(SubscriptionNode {
             node: new_node,
@@ -45,41 +62,15 @@ pub fn reconcile_nodes(
         });
     }
 
-    result
-}
-
-pub fn reconcile_with_counts(
-    old_nodes: &[SubscriptionNode],
-    new_parsed: Vec<ProxyNode>,
-) -> (Vec<SubscriptionNode>, UpdateResult) {
-    let mut added = 0;
-    let mut unchanged = 0;
-
-    let new_nodes = reconcile_nodes(old_nodes, new_parsed.clone());
-
-    for node in &new_nodes {
-        let was_present = old_nodes.iter().any(|old| {
-            old.node.address() == node.node.address()
-                && old.node.port() == node.node.port()
-                && discriminant(&old.node) == discriminant(&node.node)
-        });
-
-        if was_present {
-            unchanged += 1;
-        } else {
-            added += 1;
-        }
-    }
-
     let removed = old_nodes.len().saturating_sub(unchanged);
 
-    let result = UpdateResult {
+    let update_result = UpdateResult {
         added,
         removed,
         unchanged,
     };
 
-    (new_nodes, result)
+    (result, update_result)
 }
 
 pub async fn fetch_with_retry(
@@ -110,7 +101,7 @@ pub async fn update_subscription(
     subscription: &mut Subscription,
 ) -> Result<UpdateResult, FetchError> {
     let raw_content = match &subscription.source {
-        SubscriptionSource::Url { url } => fetch_with_retry(client, url, 3).await?,
+        SubscriptionSource::Url { url } => fetch_with_retry(client, url, DEFAULT_MAX_RETRIES).await?,
         SubscriptionSource::File { path } => fetch_from_file(path)?,
     };
 

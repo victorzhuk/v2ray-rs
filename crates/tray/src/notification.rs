@@ -1,6 +1,8 @@
 use notify_rust::{Notification, Timeout};
 use v2ray_rs_process::ProcessState;
 
+const NOTIFICATION_TIMEOUT_MS: u32 = 5000;
+
 #[derive(Clone)]
 pub struct Notifier {
     enabled: bool,
@@ -43,7 +45,7 @@ impl Notifier {
             .summary(summary)
             .body(body)
             .icon("network-vpn")
-            .timeout(Timeout::Milliseconds(5000))
+            .timeout(Timeout::Milliseconds(NOTIFICATION_TIMEOUT_MS))
             .show();
     }
 }

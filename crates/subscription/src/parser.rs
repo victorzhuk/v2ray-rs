@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use thiserror::Error;
-use v2ray_rs_core::models::ProxyNode;
+use v2ray_rs_core::models::{ProxyNode, TransportSettings, TlsSettings, WsSettings, GrpcSettings, H2Settings};
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -25,33 +27,8 @@ pub fn parse_uri(uri: &str) -> Result<ProxyNode, ParseError> {
     }
 }
 
-fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
-    use std::collections::HashMap;
-    use v2ray_rs_core::models::{VlessConfig, TransportSettings, TlsSettings, WsSettings, GrpcSettings, H2Settings};
-
-    let url = url::Url::parse(uri).map_err(|e| ParseError::InvalidFormat(e.to_string()))?;
-
-    let uuid = url.username().to_owned();
-    if uuid.is_empty() {
-        return Err(ParseError::InvalidFormat("missing UUID".into()));
-    }
-
-    let address = url
-        .host_str()
-        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
-        .to_owned();
-    let port = url
-        .port()
-        .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
-
-    let remark = percent_decode_fragment(url.fragment());
-
-    let params: HashMap<String, String> = url
-        .query_pairs()
-        .map(|(k, v)| (k.into_owned(), v.into_owned()))
-        .collect();
-
-    let transport = match params.get("type").map(|s| s.as_str()) {
+fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
+    match params.get("type").map(|s| s.as_str()) {
         Some("ws") => {
             let path = params.get("path").cloned().unwrap_or_default();
             let host = params.get("host").cloned();
@@ -77,9 +54,11 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
             TransportSettings::H2(H2Settings { host, path })
         }
         _ => TransportSettings::Tcp,
-    };
+    }
+}
 
-    let tls = match params.get("security").map(|s| s.as_str()) {
+fn parse_url_tls(params: &HashMap<String, String>) -> Option<TlsSettings> {
+    match params.get("security").map(|s| s.as_str()) {
         Some("tls") | Some("reality") => {
             let server_name = params.get("sni").cloned();
             let alpn = params
@@ -95,7 +74,36 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
             })
         }
         _ => None,
-    };
+    }
+}
+
+fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
+    use v2ray_rs_core::models::VlessConfig;
+
+    let url = url::Url::parse(uri).map_err(|e| ParseError::InvalidFormat(e.to_string()))?;
+
+    let uuid = url.username().to_owned();
+    if uuid.is_empty() {
+        return Err(ParseError::InvalidFormat("missing UUID".into()));
+    }
+
+    let address = url
+        .host_str()
+        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
+        .to_owned();
+    let port = url
+        .port()
+        .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
+
+    let remark = percent_decode_fragment(url.fragment());
+
+    let params: HashMap<String, String> = url
+        .query_pairs()
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+
+    let transport = parse_url_transport(&params);
+    let tls = parse_url_tls(&params);
 
     let flow = params.get("flow").cloned();
     let encryption = params.get("encryption").cloned();
@@ -246,8 +254,7 @@ fn parse_ss(uri: &str) -> Result<ProxyNode, ParseError> {
 }
 
 fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
-    use std::collections::HashMap;
-    use v2ray_rs_core::models::{TrojanConfig, TransportSettings, TlsSettings, WsSettings, GrpcSettings, H2Settings};
+    use v2ray_rs_core::models::TrojanConfig;
 
     let url = url::Url::parse(uri).map_err(|e| ParseError::InvalidFormat(e.to_string()))?;
 
@@ -271,57 +278,19 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    let transport = match params.get("type").map(|s| s.as_str()) {
-        Some("ws") => {
-            let path = params.get("path").cloned().unwrap_or_default();
-            let host = params.get("host").cloned();
-            TransportSettings::Ws(WsSettings {
-                path,
-                host,
-                headers: Default::default(),
-            })
-        }
-        Some("grpc") => {
-            let service_name = params.get("serviceName").cloned().unwrap_or_default();
-            TransportSettings::Grpc(GrpcSettings {
-                service_name,
-                multi_mode: false,
-            })
-        }
-        Some("h2") => {
-            let host = params
-                .get("host")
-                .map(|h| vec![h.clone()])
-                .unwrap_or_default();
-            let path = params.get("path").cloned().unwrap_or_default();
-            TransportSettings::H2(H2Settings { host, path })
-        }
-        _ => TransportSettings::Tcp,
-    };
-
-    let tls = match params.get("security").map(|s| s.as_str()) {
-        Some("tls") | Some("reality") => {
-            let server_name = params.get("sni").cloned();
-            let alpn = params
-                .get("alpn")
-                .map(|a| a.split(',').map(|s| s.to_owned()).collect())
-                .unwrap_or_default();
-            let fingerprint = params.get("fp").cloned();
+    let transport = parse_url_transport(&params);
+    let tls = parse_url_tls(&params).or_else(|| {
+        if port == 443 {
             Some(TlsSettings {
-                server_name,
-                alpn,
+                server_name: Some(address.clone()),
+                alpn: vec![],
                 verify: true,
-                fingerprint,
+                fingerprint: None,
             })
+        } else {
+            None
         }
-        None if port == 443 => Some(TlsSettings {
-            server_name: Some(address.clone()),
-            alpn: vec![],
-            verify: true,
-            fingerprint: None,
-        }),
-        _ => None,
-    };
+    });
 
     Ok(ProxyNode::Trojan(TrojanConfig {
         address,

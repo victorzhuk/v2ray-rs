@@ -160,7 +160,12 @@ impl AppTray {
         };
 
         let truncated = if msg.len() > 50 {
-            format!("Error: {}...", &msg[..47])
+            let boundary = msg.char_indices()
+                .map(|(i, _)| i)
+                .take_while(|&i| i <= 47)
+                .last()
+                .unwrap_or(0);
+            format!("Error: {}...", &msg[..boundary])
         } else {
             format!("Error: {msg}")
         };

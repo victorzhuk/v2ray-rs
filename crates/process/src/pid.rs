@@ -3,6 +3,17 @@ use std::path::PathBuf;
 use nix::sys::signal::{kill, Signal};
 use nix::unistd::Pid;
 
+fn is_backend_process(pid: u32) -> bool {
+    let cmdline_path = format!("/proc/{pid}/cmdline");
+    let Ok(raw) = fs::read(&cmdline_path) else {
+        return false;
+    };
+    let cmdline = String::from_utf8_lossy(&raw).to_lowercase();
+    cmdline.contains("v2ray")
+        || cmdline.contains("xray")
+        || cmdline.contains("sing-box")
+}
+
 pub struct PidFile {
     path: PathBuf,
 }
@@ -45,10 +56,13 @@ impl PidFile {
         };
 
         let nix_pid = Pid::from_raw(pid as i32);
-
         let process_exists = kill(nix_pid, None).is_ok();
 
         if process_exists {
+            if !is_backend_process(pid) {
+                self.remove()?;
+                return Ok(false);
+            }
             let _ = kill(nix_pid, Signal::SIGTERM);
             self.remove()?;
             Ok(true)

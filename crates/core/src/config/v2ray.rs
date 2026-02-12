@@ -61,7 +61,7 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
         .iter()
         .enumerate()
         .map(|(i, node)| {
-            let tag = outbound_tag(node, i);
+            let tag = super::common::outbound_tag(node, i);
             build_outbound(node, &tag)
         })
         .collect();
@@ -78,13 +78,6 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
     }));
 
     Value::Array(outbounds)
-}
-
-fn outbound_tag(node: &ProxyNode, index: usize) -> String {
-    match node.remark() {
-        Some(name) if !name.is_empty() => format!("proxy-{index}-{name}"),
-        _ => format!("proxy-{index}"),
-    }
 }
 
 fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
@@ -298,72 +291,8 @@ fn first_proxy_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::test_fixtures::fixtures::*;
     use crate::models::*;
-
-    fn default_settings() -> AppSettings {
-        AppSettings::default()
-    }
-
-    fn vless_node() -> ProxyNode {
-        ProxyNode::Vless(VlessConfig {
-            address: "example.com".into(),
-            port: 443,
-            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
-            encryption: Some("none".into()),
-            flow: None,
-            transport: TransportSettings::Ws(WsSettings {
-                path: "/ws".into(),
-                host: Some("example.com".into()),
-                headers: Default::default(),
-            }),
-            tls: Some(TlsSettings {
-                server_name: Some("example.com".into()),
-                alpn: vec!["h2".into()],
-                verify: true,
-                fingerprint: None,
-            }),
-            remark: Some("Test VLESS".into()),
-        })
-    }
-
-    fn vmess_node() -> ProxyNode {
-        ProxyNode::Vmess(VmessConfig {
-            address: "vmess.example.com".into(),
-            port: 8443,
-            uuid: "123e4567-e89b-12d3-a456-426614174000".into(),
-            alter_id: 0,
-            security: "auto".into(),
-            transport: TransportSettings::Tcp,
-            tls: None,
-            remark: Some("Test VMess".into()),
-        })
-    }
-
-    fn ss_node() -> ProxyNode {
-        ProxyNode::Shadowsocks(ShadowsocksConfig {
-            address: "ss.example.com".into(),
-            port: 8388,
-            method: "aes-256-gcm".into(),
-            password: "secret".into(),
-            remark: Some("Test SS".into()),
-        })
-    }
-
-    fn trojan_node() -> ProxyNode {
-        ProxyNode::Trojan(TrojanConfig {
-            address: "trojan.example.com".into(),
-            port: 443,
-            password: "trojan-pass".into(),
-            transport: TransportSettings::Tcp,
-            tls: Some(TlsSettings {
-                server_name: Some("trojan.example.com".into()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
-            }),
-            remark: Some("Test Trojan".into()),
-        })
-    }
 
     #[test]
     fn test_generate_returns_error_on_empty_nodes() {

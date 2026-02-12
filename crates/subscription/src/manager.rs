@@ -1,11 +1,9 @@
-use std::time::Duration;
-
 use thiserror::Error;
 use uuid::Uuid;
 use v2ray_rs_core::models::Subscription;
 use v2ray_rs_core::persistence::{self, AppPaths, PersistenceError};
 
-use crate::fetch::FetchError;
+use crate::fetch::{FetchError, CONNECT_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT};
 use crate::update::{self, UpdateResult};
 
 #[derive(Debug, Error)]
@@ -27,11 +25,11 @@ pub struct SubscriptionService {
 impl SubscriptionService {
     pub fn new(paths: AppPaths) -> Self {
         let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(60))
-            .user_agent("v2ray-rs/0.1")
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
+            .user_agent(USER_AGENT)
             .build()
-            .expect("failed to build HTTP client");
+            .expect("reqwest HTTP client build failed — is TLS available on this system?");
 
         Self { client, paths }
     }

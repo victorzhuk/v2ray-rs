@@ -43,15 +43,15 @@ pub struct VlessConfig {
     pub address: String,
     pub port: u16,
     pub uuid: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub encryption: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flow: Option<String>,
     #[serde(default)]
     pub transport: TransportSettings,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSettings>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
 }
 
@@ -66,9 +66,9 @@ pub struct VmessConfig {
     pub security: String,
     #[serde(default)]
     pub transport: TransportSettings,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSettings>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
 }
 
@@ -82,7 +82,7 @@ pub struct ShadowsocksConfig {
     pub port: u16,
     pub method: String,
     pub password: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
 }
 
@@ -93,9 +93,9 @@ pub struct TrojanConfig {
     pub password: String,
     #[serde(default)]
     pub transport: TransportSettings,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tls: Option<TlsSettings>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
 }
 
@@ -118,7 +118,7 @@ impl Default for TransportSettings {
 pub struct WsSettings {
     #[serde(default)]
     pub path: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
@@ -141,13 +141,13 @@ pub struct H2Settings {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TlsSettings {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_name: Option<String>,
     #[serde(default)]
     pub alpn: Vec<String>,
     #[serde(default = "default_true")]
     pub verify: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
 }
 

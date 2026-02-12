@@ -4,6 +4,10 @@ use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use thiserror::Error;
 
+pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION"));
+
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("network error: {0}")]
@@ -18,9 +22,9 @@ pub enum FetchError {
 
 pub async fn fetch_from_url(url: &str) -> Result<String, FetchError> {
     let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(60))
-        .user_agent("v2ray-rs/0.1")
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .user_agent(USER_AGENT)
         .build()
         .map_err(|e| FetchError::NetworkError(e.to_string()))?;
 

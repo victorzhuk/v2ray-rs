@@ -17,6 +17,10 @@ static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
 static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::new(None);
 
 const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/v2ray-rs.png");
+const DEFAULT_WINDOW_WIDTH: i32 = 900;
+const DEFAULT_WINDOW_HEIGHT: i32 = 650;
+const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const EVENT_CHANNEL_CAPACITY: usize = 16;
 
 use crate::logs::{LogsMsg, LogsPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
@@ -116,8 +120,8 @@ impl SimpleComponent for App {
 
     view! {
         adw::ApplicationWindow {
-            set_default_width: 900,
-            set_default_height: 650,
+            set_default_width: DEFAULT_WINDOW_WIDTH,
+            set_default_height: DEFAULT_WINDOW_HEIGHT,
             set_title: Some("V2Ray Manager"),
 
             connect_close_request[sender] => move |_| {
@@ -264,7 +268,9 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::OnboardingComplete(settings, subscription) => {
-                let _ = v2ray_rs_core::persistence::save_settings(&self.paths, &settings);
+                if let Err(e) = v2ray_rs_core::persistence::save_settings(&self.paths, &settings) {
+                    log::error!("save settings: {e}");
+                }
                 self.settings = settings;
                 self.show_wizard = false;
 
@@ -274,7 +280,9 @@ impl SimpleComponent for App {
             }
             AppMsg::SettingsChanged(settings) => {
                 crate::i18n::switch_language(settings.language);
-                let _ = v2ray_rs_core::persistence::save_settings(&self.paths, &settings);
+                if let Err(e) = v2ray_rs_core::persistence::save_settings(&self.paths, &settings) {
+                    log::error!("save settings: {e}");
+                }
                 self.settings = settings;
             }
             AppMsg::ActiveNodesChanged(has) => {
@@ -457,7 +465,7 @@ impl SimpleComponent for App {
 }
 
 fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
-    glib::timeout_add_local(Duration::from_millis(200), move || {
+    glib::timeout_add_local(TRAY_POLL_INTERVAL, move || {
         if let Ok(guard) = TRAY_HANDLE.lock() {
             if let Some(ref handle) = *guard {
                 while let Some(action) = handle.try_recv_action() {
@@ -497,16 +505,20 @@ pub fn run() {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let _rt_guard = rt.enter();
 
-    let (event_tx, event_rx) = broadcast::channel::<ProcessEvent>(16);
-    *TRAY_EVENT_TX.lock().unwrap() = Some(event_tx);
+    let (event_tx, event_rx) = broadcast::channel::<ProcessEvent>(EVENT_CHANNEL_CAPACITY);
+    if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
+        *guard = Some(event_tx);
+    }
 
     let tray_handle = rt.block_on(async {
         let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
         v2ray_rs_tray::TrayService::spawn(event_rx, notifier).await.ok()
     });
 
-    if let Some(handle) = tray_handle {
-        *TRAY_HANDLE.lock().unwrap() = Some(handle);
+    if let Some(handle) = tray_handle
+        && let Ok(mut guard) = TRAY_HANDLE.lock()
+    {
+        *guard = Some(handle);
     }
 
     install_app_icon();
