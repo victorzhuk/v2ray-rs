@@ -33,15 +33,6 @@
 yay -S v2ray-rs
 ```
 
-### Debian/Ubuntu (.deb)
-
-Download the latest `.deb` from [GitHub Releases](https://github.com/victorzhuk/v2ray-rs/releases):
-
-```bash
-sudo dpkg -i v2ray-rs_*.deb
-sudo apt-get install -f
-```
-
 ### From Source
 
 ```bash

@@ -144,13 +144,7 @@ impl ProcessManager {
     }
 
     async fn spawn_process(&mut self) -> Result<(), ProcessError> {
-        let mut child = Command::new(&self.binary_path)
-            .arg("run")
-            .arg("-c")
-            .arg(&self.config_path)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
+        let mut child = self.try_spawn().await?;
 
         if let Some(pid) = child.id() {
             self.pid_file.write(pid).ok();
@@ -159,6 +153,32 @@ impl ProcessManager {
         self.capture_output(&mut child);
         self.child = Some(child);
         Ok(())
+    }
+
+    // Retry on ETXTBSY which can occur on overlayfs (Docker containers)
+    // when a binary is written and immediately executed
+    async fn try_spawn(&self) -> Result<Child, std::io::Error> {
+        const MAX_RETRIES: u32 = 5;
+        for attempt in 0..MAX_RETRIES {
+            match Command::new(&self.binary_path)
+                .arg("run")
+                .arg("-c")
+                .arg(&self.config_path)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+            {
+                Ok(child) => return Ok(child),
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    if attempt == MAX_RETRIES - 1 {
+                        return Err(e);
+                    }
+                    sleep(Duration::from_millis(50)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
     }
 
     fn capture_output(&mut self, child: &mut Child) {

@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop GUI wrapper for v2ray/xray/sing-box CLI proxy tools. The app manages subscriptions, generates config files, handles process lifecycle, and provides geo-routing rules — all without implementing any protocol logic. The protocol work is delegated entirely to the system-installed CLI binaries.
 
-Planned UI: Relm4 (GTK4). Currently in early development — core data models, persistence, subscription parsing, and backend detection are implemented.
+UI: Relm4 (GTK4) with libadwaita. Five crates: core, subscription, process, tray, ui.
 
 ## Commands
 
@@ -64,7 +64,7 @@ Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle manageme
 
 - **`pid.rs`** — `PidFile` for writing/reading/removing PID files. `check_and_kill_orphaned()` detects stale processes from previous runs using `kill(pid, 0)` signal probe.
 
-- **`manager.rs`** — `ProcessManager` orchestrator. Spawns backend via `tokio::process::Command`, pipes stdout/stderr through async line readers into shared `Arc<Mutex<LogBuffer>>` + broadcast channel. Graceful stop (SIGTERM → 5s → SIGKILL). Crash recovery with 2s delay, max 3 crashes per minute before Error state. PID file lifecycle.
+- **`manager.rs`** — `ProcessManager` orchestrator. Spawns backend via `tokio::process::Command` with ETXTBSY retry (handles overlayfs race in containers), pipes stdout/stderr through async line readers into shared `Arc<Mutex<LogBuffer>>` + broadcast channel. Graceful stop (SIGTERM → 5s → SIGKILL). Crash recovery with 2s delay, max 3 crashes per minute before Error state. PID file lifecycle.
 
 ### `crates/tray` (`v2ray-rs-tray`)
 
@@ -111,6 +111,15 @@ AppSettings + ProxyNodes + RoutingRuleSet → config generation → JSON config 
 - **Tests use `tempfile::TempDir`**: Persistence tests create isolated temp directories via `AppPaths::from_paths()` (cfg(test) only constructor).
 - **Workspace dependencies**: All shared deps declared in root `Cargo.toml` `[workspace.dependencies]` and used via `.workspace = true`.
 - **Edition 2024**: Uses Rust edition 2024.
+
+## Versioning
+
+When bumping the version, update all three places:
+1. `Cargo.toml` — `[workspace.package] version`
+2. `pkg/archlinux/PKGBUILD` — `pkgver`
+3. `CHANGELOG.md` — new section + link refs at bottom
+
+Then run `cargo check` to regenerate `Cargo.lock`.
 
 ## OpenSpec
 

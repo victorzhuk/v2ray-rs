@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.3] - 2026-02-12
+
+### Fixed
+- CI test failure: ETXTBSY race on overlayfs (retry spawn on `ExecutableFileBusy`)
+- AUR publish failure: `github-actions-deploy-aur@v4` tag doesn't exist (pinned to `v4.1.1`)
+
+---
+
 ## [0.3.2] - 2026-02-12
 
 ### Fixed
@@ -175,7 +183,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.2.0...v0.3.0
