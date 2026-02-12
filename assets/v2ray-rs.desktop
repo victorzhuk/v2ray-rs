@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=V2Ray Manager
+Comment=Linux desktop GUI for v2ray/xray/sing-box proxy management
+Exec=v2ray-rs
+Icon=v2ray-rs
+Terminal=false
+Type=Application
+Categories=Network;Utility;
+Keywords=proxy;vpn;v2ray;xray;sing-box;

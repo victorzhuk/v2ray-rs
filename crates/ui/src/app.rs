@@ -16,6 +16,8 @@ use v2ray_rs_tray::{TrayAction, TrayHandle};
 static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
 static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::new(None);
 
+const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/v2ray-rs.png");
+
 use crate::logs::{LogsMsg, LogsPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
 use crate::wizard::OnboardingWizard;
@@ -472,6 +474,19 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
     });
 }
 
+fn install_app_icon() {
+    let data_dir = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")));
+
+    if let Some(data_dir) = data_dir {
+        let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
+        if std::fs::create_dir_all(&icon_dir).is_ok() {
+            let _ = std::fs::write(icon_dir.join("v2ray-rs.png"), APP_ICON_PNG);
+        }
+    }
+}
+
 pub fn run() {
     let paths = AppPaths::new().expect("failed to determine XDG directories");
 
@@ -494,20 +509,14 @@ pub fn run() {
         *TRAY_HANDLE.lock().unwrap() = Some(handle);
     }
 
+    install_app_icon();
+
     let app = adw::Application::builder()
         .application_id("com.github.v2ray-rs")
         .build();
 
     app.connect_startup(|_| {
-        if let Some(display) = gtk::gdk::Display::default() {
-            let icon_theme = gtk::IconTheme::for_display(&display);
-            let assets_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../assets")
-                .canonicalize()
-                .unwrap_or_else(|_| std::path::PathBuf::from("assets"));
-            icon_theme.add_search_path(&assets_dir);
-        }
-        gtk::Window::set_default_icon_name("icon");
+        gtk::Window::set_default_icon_name("v2ray-rs");
     });
 
     app.connect_activate(|app| {

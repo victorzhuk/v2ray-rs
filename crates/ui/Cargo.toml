@@ -15,3 +15,15 @@ uuid.workspace = true
 chrono.workspace = true
 gettext-rs.workspace = true
 ipnet.workspace = true
+
+[package.metadata.deb]
+name = "v2ray-rs"
+maintainer = "Victor Zhuk"
+depends = "libgtk-4-1, libadwaita-1-0"
+section = "net"
+assets = [
+    ["target/release/v2ray-rs-ui", "usr/bin/v2ray-rs", "755"],
+    ["assets/v2ray-rs.png", "usr/share/icons/hicolor/256x256/apps/v2ray-rs.png", "644"],
+    ["assets/v2ray-rs.desktop", "usr/share/applications/v2ray-rs.desktop", "644"],
+    ["LICENSE", "usr/share/doc/v2ray-rs/copyright", "644"],
+]

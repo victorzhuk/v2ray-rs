@@ -1,7 +1,7 @@
 use std::sync::mpsc;
 
 use ksni::menu::{MenuItem, StandardItem};
-use ksni::{Handle, Icon, Tray, TrayMethods};
+use ksni::{Handle, Tray, TrayMethods};
 use tokio::sync::broadcast;
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 
@@ -53,19 +53,11 @@ impl Tray for AppTray {
         "V2Ray Manager".into()
     }
 
-    fn icon_theme_path(&self) -> String {
-        String::new()
-    }
-
-    fn icon_name(&self) -> String {
-        String::new()
-    }
-
-    fn icon_pixmap(&self) -> Vec<Icon> {
+    fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         match &self.process_state {
-            ProcessState::Running => icons::connected(),
-            ProcessState::Error(_) => icons::error(),
-            _ => icons::disconnected(),
+            ProcessState::Running => icons::connected_pixmap(),
+            ProcessState::Error(_) => icons::error_pixmap(),
+            _ => icons::disconnected_pixmap(),
         }
     }
 
@@ -197,7 +189,6 @@ impl TrayService {
         notifier: Notifier,
     ) -> Result<TrayHandle, ksni::Error> {
         let (action_tx, action_rx) = mpsc::channel();
-        icons::install_icons();
 
         let tray = AppTray {
             process_state: ProcessState::Stopped,

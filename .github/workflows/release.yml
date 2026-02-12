@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -22,10 +23,21 @@ jobs:
       - name: Install GTK4 dependencies
         run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - name: Build release
-        run: cargo build --release
+        run: cargo build --release -p v2ray-rs-ui
+      - name: Install cargo-deb
+        run: cargo install cargo-deb
+      - name: Build .deb package
+        run: cargo deb -p v2ray-rs-ui --no-build
+      - name: Prepare release assets
+        run: |
+          cp target/release/v2ray-rs-ui target/release/v2ray-rs
+          cp pkg/archlinux/PKGBUILD target/release/PKGBUILD
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           generate_release_notes: true
           files: |
-            target/release/v2ray-rs-ui
+            target/release/v2ray-rs
+            target/debian/*.deb
+            target/release/PKGBUILD

@@ -8,6 +8,6 @@ v2ray-rs-core = { path = "../core" }
 v2ray-rs-process = { path = "../process" }
 ksni = "0.3"
 notify-rust = "4"
-png = "0.17"
+resvg.workspace = true
 tokio.workspace = true
 log.workspace = true

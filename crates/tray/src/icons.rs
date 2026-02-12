@@ -1,105 +1,50 @@
-use std::fs;
-use std::path::PathBuf;
-use std::sync::OnceLock;
-
 use ksni::Icon;
 
-const ICON_DISCONNECTED: &[u8] = include_bytes!("../icons/tray-disconnected.png");
-const ICON_CONNECTED: &[u8] = include_bytes!("../icons/tray-connected.png");
-const ICON_ERROR: &[u8] = include_bytes!("../icons/tray-error.png");
+const SVG_DISCONNECTED: &str = include_str!("../icons/v2ray-rs-disconnected-symbolic.svg");
+const SVG_CONNECTED: &str = include_str!("../icons/v2ray-rs-connected-symbolic.svg");
+const SVG_ERROR: &str = include_str!("../icons/v2ray-rs-error-symbolic.svg");
 
-const SVG_DISCONNECTED: &[u8] = include_bytes!("../icons/v2ray-rs-disconnected-symbolic.svg");
-const SVG_CONNECTED: &[u8] = include_bytes!("../icons/v2ray-rs-connected-symbolic.svg");
-const SVG_ERROR: &[u8] = include_bytes!("../icons/v2ray-rs-error-symbolic.svg");
+const ICON_SIZE: u32 = 22;
 
-static ICONS_INSTALLED: OnceLock<bool> = OnceLock::new();
+fn render_svg(svg_str: &str) -> Option<Icon> {
+    let svg = svg_str.replace("currentColor", "#DEDDDA");
 
-#[allow(dead_code)]
-pub const ICON_NAME_CONNECTED: &str = "v2ray-rs-connected-symbolic";
-#[allow(dead_code)]
-pub const ICON_NAME_DISCONNECTED: &str = "v2ray-rs-disconnected-symbolic";
-#[allow(dead_code)]
-pub const ICON_NAME_ERROR: &str = "v2ray-rs-error-symbolic";
+    let opts = resvg::usvg::Options::default();
+    let tree = resvg::usvg::Tree::from_str(&svg, &opts).ok()?;
 
-fn hicolor_status_dir() -> PathBuf {
-    let data_home = std::env::var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
-            PathBuf::from(home).join(".local/share")
-        });
-    data_home
-        .join("icons")
-        .join("hicolor")
-        .join("scalable")
-        .join("status")
-}
+    let size = resvg::tiny_skia::IntSize::from_wh(ICON_SIZE, ICON_SIZE)?;
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(size.width(), size.height())?;
 
-pub fn install_icons() {
-    ICONS_INSTALLED.get_or_init(|| {
-        let icons_dir = hicolor_status_dir();
-        if let Err(e) = fs::create_dir_all(&icons_dir) {
-            eprintln!("tray: create icon dir: {e}");
-            return false;
-        }
+    let sx = size.width() as f32 / tree.size().width();
+    let sy = size.height() as f32 / tree.size().height();
+    let transform = resvg::tiny_skia::Transform::from_scale(sx, sy);
 
-        for (name, data) in [
-            ("v2ray-rs-disconnected-symbolic.svg", SVG_DISCONNECTED),
-            ("v2ray-rs-connected-symbolic.svg", SVG_CONNECTED),
-            ("v2ray-rs-error-symbolic.svg", SVG_ERROR),
-        ] {
-            if let Err(e) = fs::write(icons_dir.join(name), data) {
-                eprintln!("tray: write {name}: {e}");
-            }
-        }
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
 
-        let hicolor_root = icons_dir
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent());
-        if let Some(root) = hicolor_root {
-            let _ = std::process::Command::new("gtk-update-icon-cache")
-                .arg("-f")
-                .arg("-t")
-                .arg(root)
-                .status();
-        }
-
-        true
-    });
-}
-
-pub fn disconnected() -> Vec<Icon> {
-    vec![png_to_icon(ICON_DISCONNECTED)]
-}
-
-pub fn connected() -> Vec<Icon> {
-    vec![png_to_icon(ICON_CONNECTED)]
-}
-
-pub fn error() -> Vec<Icon> {
-    vec![png_to_icon(ICON_ERROR)]
-}
-
-fn png_to_icon(png_data: &[u8]) -> Icon {
-    let mut decoder = png::Decoder::new(png_data);
-    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::ALPHA);
-    let mut reader = decoder.read_info().expect("valid png");
-    let mut buf = vec![0; reader.output_buffer_size()];
-    let info = reader.next_frame(&mut buf).expect("valid frame");
-    buf.truncate(info.buffer_size());
-
-    rgba_to_argb(&mut buf);
-
-    Icon {
-        width: info.width as i32,
-        height: info.height as i32,
-        data: buf,
+    let rgba = pixmap.data();
+    let mut argb = Vec::with_capacity(rgba.len());
+    for chunk in rgba.chunks_exact(4) {
+        argb.push(chunk[3]); // A
+        argb.push(chunk[0]); // R
+        argb.push(chunk[1]); // G
+        argb.push(chunk[2]); // B
     }
+
+    Some(Icon {
+        width: size.width() as i32,
+        height: size.height() as i32,
+        data: argb,
+    })
 }
 
-fn rgba_to_argb(data: &mut [u8]) {
-    for pixel in data.chunks_exact_mut(4) {
-        pixel.rotate_right(1);
-    }
+pub fn disconnected_pixmap() -> Vec<Icon> {
+    render_svg(SVG_DISCONNECTED).into_iter().collect()
+}
+
+pub fn connected_pixmap() -> Vec<Icon> {
+    render_svg(SVG_CONNECTED).into_iter().collect()
+}
+
+pub fn error_pixmap() -> Vec<Icon> {
+    render_svg(SVG_ERROR).into_iter().collect()
 }
