@@ -29,11 +29,7 @@ fn pid_path(dir: &TempDir) -> PathBuf {
 #[tokio::test]
 async fn start_and_stop() {
     let dir = setup_dir();
-    let binary = create_script(
-        &dir,
-        "backend",
-        "#!/bin/sh\nwhile true; do sleep 1; done\n",
-    );
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
     let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
@@ -50,11 +46,7 @@ async fn start_and_stop() {
 #[tokio::test]
 async fn restart_transitions() {
     let dir = setup_dir();
-    let binary = create_script(
-        &dir,
-        "backend",
-        "#!/bin/sh\nwhile true; do sleep 1; done\n",
-    );
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
     let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
@@ -98,11 +90,7 @@ async fn config_missing() {
 #[tokio::test]
 async fn pid_file_written_on_start() {
     let dir = setup_dir();
-    let binary = create_script(
-        &dir,
-        "backend",
-        "#!/bin/sh\nwhile true; do sleep 1; done\n",
-    );
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
     let pid = pid_path(&dir);
 
@@ -143,11 +131,7 @@ async fn log_capture() {
 #[tokio::test]
 async fn shutdown_disables_auto_restart() {
     let dir = setup_dir();
-    let binary = create_script(
-        &dir,
-        "backend",
-        "#!/bin/sh\nwhile true; do sleep 1; done\n",
-    );
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
     let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
@@ -173,11 +157,7 @@ async fn stop_when_already_stopped() {
 #[tokio::test]
 async fn crash_detection() {
     let dir = setup_dir();
-    let binary = create_script(
-        &dir,
-        "backend",
-        "#!/bin/sh\nexit 1\n",
-    );
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nexit 1\n");
     let config = create_config(&dir);
 
     let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));

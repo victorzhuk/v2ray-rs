@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{RuleAction, RuleMatch, RoutingRule};
+use super::{RoutingRule, RuleAction, RuleMatch};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Preset {
@@ -49,14 +49,12 @@ pub fn builtin_presets() -> Vec<Preset> {
         Preset {
             name: "RU Direct".into(),
             description: "Route Russian traffic directly".into(),
-            rules: vec![
-                PresetRule {
-                    match_condition: RuleMatch::GeoIp {
-                        country_code: "RU".into(),
-                    },
-                    action: RuleAction::Direct,
+            rules: vec![PresetRule {
+                match_condition: RuleMatch::GeoIp {
+                    country_code: "RU".into(),
                 },
-            ],
+                action: RuleAction::Direct,
+            }],
         },
         Preset {
             name: "CN Direct".into(),
@@ -97,15 +95,21 @@ pub fn builtin_presets() -> Vec<Preset> {
             description: "Route AI services through proxy".into(),
             rules: vec![
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "openai".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "openai".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "anthropic".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "anthropic".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "google".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "google".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
             ],
@@ -115,43 +119,63 @@ pub fn builtin_presets() -> Vec<Preset> {
             description: "Route social media through proxy".into(),
             rules: vec![
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "discord".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "discord".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "telegram".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "telegram".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "whatsapp".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "whatsapp".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "tiktok".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "tiktok".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "instagram".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "instagram".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "twitter".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "twitter".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "facebook".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "facebook".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "youtube".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "youtube".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "reddit".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "reddit".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::GeoSite { category: "github".into() },
+                    match_condition: RuleMatch::GeoSite {
+                        category: "github".into(),
+                    },
                     action: RuleAction::Proxy,
                 },
             ],
@@ -161,15 +185,21 @@ pub fn builtin_presets() -> Vec<Preset> {
             description: "Route local network traffic directly".into(),
             rules: vec![
                 PresetRule {
-                    match_condition: RuleMatch::IpCidr { cidr: "10.0.0.0/8".parse().unwrap() },
+                    match_condition: RuleMatch::IpCidr {
+                        cidr: "10.0.0.0/8".parse().unwrap(),
+                    },
                     action: RuleAction::Direct,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::IpCidr { cidr: "172.16.0.0/12".parse().unwrap() },
+                    match_condition: RuleMatch::IpCidr {
+                        cidr: "172.16.0.0/12".parse().unwrap(),
+                    },
                     action: RuleAction::Direct,
                 },
                 PresetRule {
-                    match_condition: RuleMatch::IpCidr { cidr: "192.168.0.0/16".parse().unwrap() },
+                    match_condition: RuleMatch::IpCidr {
+                        cidr: "192.168.0.0/16".parse().unwrap(),
+                    },
                     action: RuleAction::Direct,
                 },
             ],

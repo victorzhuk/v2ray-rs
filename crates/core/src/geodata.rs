@@ -54,7 +54,10 @@ impl GeodataManager {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&self.geodata_dir, std::fs::Permissions::from_mode(0o700))?;
+                std::fs::set_permissions(
+                    &self.geodata_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                )?;
             }
         }
         Ok(())
@@ -96,13 +99,12 @@ impl GeodataManager {
     pub fn save_metadata(&self, metadata: &GeodataMetadata) -> Result<(), GeodataError> {
         self.ensure_dir()?;
         let json = serde_json::to_string_pretty(metadata)?;
-        let dir = self
-            .metadata_path
-            .parent()
-            .ok_or_else(|| GeodataError::Io(std::io::Error::new(
+        let dir = self.metadata_path.parent().ok_or_else(|| {
+            GeodataError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "metadata path has no parent",
-            )))?;
+            ))
+        })?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(json.as_bytes())?;
         tmp.flush()?;
@@ -179,12 +181,13 @@ pub fn download_geodata(
 
     for dl in GeodataManager::download_urls(backend) {
         let target = manager.geodata_dir().join(&dl.filename);
-        let response = client.get(&dl.url).send().map_err(|e| {
-            GeodataError::Download {
+        let response = client
+            .get(&dl.url)
+            .send()
+            .map_err(|e| GeodataError::Download {
                 url: dl.url.clone(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
         if !response.status().is_success() {
             return Err(GeodataError::Download {

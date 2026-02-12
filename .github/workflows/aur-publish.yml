@@ -1,0 +1,22 @@
+name: AUR Publish
+
+on:
+  release:
+    types: [published]
+
+jobs:
+  aur:
+    name: Publish to AUR
+    runs-on: ubuntu-latest
+    if: "!github.event.release.prerelease"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v4
+        with:
+          pkgname: v2ray-rs
+          pkgbuild: pkg/archlinux/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          updpkgsums: true

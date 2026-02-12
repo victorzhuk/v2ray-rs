@@ -3,8 +3,8 @@ use base64::engine::general_purpose::STANDARD;
 use tempfile::TempDir;
 use v2ray_rs_core::models::{ProxyNode, Subscription};
 use v2ray_rs_core::persistence::{
-    add_subscription, get_subscription, load_subscriptions, remove_subscription,
-    update_subscription, AppPaths,
+    AppPaths, add_subscription, get_subscription, load_subscriptions, remove_subscription,
+    update_subscription,
 };
 use v2ray_rs_subscription::fetch::{decode_subscription_content, fetch_from_file};
 use v2ray_rs_subscription::parser::parse_subscription_uris;
@@ -15,8 +15,7 @@ fn test_subscription_full_lifecycle() {
     let tmp = TempDir::new().unwrap();
     let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
 
-    let vmess_json =
-        r#"{"add":"vmess.test.com","port":"443","id":"test-uuid","ps":"VMess Node"}"#;
+    let vmess_json = r#"{"add":"vmess.test.com","port":"443","id":"test-uuid","ps":"VMess Node"}"#;
     let vmess_uri = format!("vmess://{}", STANDARD.encode(vmess_json));
 
     let vless_uri = "vless://550e8400-e29b-41d4-a716-446655440000@vless.test.com:443#VLESS%20Node";
@@ -83,7 +82,11 @@ fn test_subscription_full_lifecycle() {
     let uris2 = decode_subscription_content(&raw_content2);
     let import_result2 = parse_subscription_uris(&uris2);
 
-    let parsed_nodes: Vec<ProxyNode> = import_result2.nodes.iter().map(|n| n.node.clone()).collect();
+    let parsed_nodes: Vec<ProxyNode> = import_result2
+        .nodes
+        .iter()
+        .map(|n| n.node.clone())
+        .collect();
 
     let (reconciled_nodes, update_result) = reconcile_with_counts(&sub.nodes, parsed_nodes);
 
@@ -106,8 +109,11 @@ fn test_subscription_full_lifecycle() {
     let uris3 = decode_subscription_content(&raw_content3);
     let import_result3 = parse_subscription_uris(&uris3);
 
-    let parsed_nodes3: Vec<ProxyNode> =
-        import_result3.nodes.iter().map(|n| n.node.clone()).collect();
+    let parsed_nodes3: Vec<ProxyNode> = import_result3
+        .nodes
+        .iter()
+        .map(|n| n.node.clone())
+        .collect();
 
     let (reconciled_nodes3, _) = reconcile_with_counts(&sub.nodes, parsed_nodes3);
 

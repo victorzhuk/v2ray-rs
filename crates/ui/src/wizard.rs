@@ -1,15 +1,15 @@
-use relm4::prelude::*;
-use relm4::adw;
 use adw::prelude::*;
+use relm4::adw;
+use relm4::prelude::*;
 
+use v2ray_rs_core::backend::{DetectedBackend, all_install_guidance, backend_name, detect_all};
 use v2ray_rs_core::models::{AppSettings, BackendConfig, BackendType};
-use v2ray_rs_core::backend::{backend_name, detect_all, all_install_guidance, DetectedBackend};
 use v2ray_rs_core::persistence::AppPaths;
 
 pub struct OnboardingWizard {
-    paths: AppPaths,
+    _paths: AppPaths,
     settings: AppSettings,
-    detected_backends: Vec<DetectedBackend>,
+    _detected_backends: Vec<DetectedBackend>,
     selected_backend: Option<(BackendType, std::path::PathBuf)>,
     current_page: usize,
     subscription_name: String,
@@ -234,13 +234,17 @@ impl SimpleComponent for OnboardingWizard {
         }
     }
 
-    fn init(paths: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
+    fn init(
+        paths: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
         let detected_backends = detect_all();
 
         let model = OnboardingWizard {
-            paths,
+            _paths: paths,
             settings: AppSettings::default(),
-            detected_backends: detected_backends.clone(),
+            _detected_backends: detected_backends.clone(),
             selected_backend: None,
             current_page: 0,
             subscription_name: String::new(),
@@ -253,7 +257,7 @@ impl SimpleComponent for OnboardingWizard {
             let status = adw::StatusPage::builder()
                 .icon_name("dialog-error-symbolic")
                 .title("No Backend Found")
-                .description(&all_install_guidance())
+                .description(all_install_guidance())
                 .build();
             widgets.backend_list_container.append(&status);
         } else {
@@ -263,12 +267,8 @@ impl SimpleComponent for OnboardingWizard {
 
             let mut first_check: Option<gtk::CheckButton> = None;
             for backend in &detected_backends {
-                let (row, check) = create_wizard_backend_row(
-                    backend,
-                    &None,
-                    sender.clone(),
-                    first_check.as_ref(),
-                );
+                let (row, check) =
+                    create_wizard_backend_row(backend, &None, sender.clone(), first_check.as_ref());
                 if first_check.is_none() {
                     first_check = Some(check);
                 }
@@ -324,7 +324,10 @@ impl SimpleComponent for OnboardingWizard {
                     None
                 };
 
-                let _ = sender.output(WizardOutput::Complete { settings, subscription });
+                let _ = sender.output(WizardOutput::Complete {
+                    settings,
+                    subscription,
+                });
             }
         }
     }
@@ -336,17 +339,24 @@ fn create_wizard_backend_row(
     sender: ComponentSender<OnboardingWizard>,
     group_btn: Option<&gtk::CheckButton>,
 ) -> (adw::ActionRow, gtk::CheckButton) {
-    let version_str = backend.version.as_ref()
+    let version_str = backend
+        .version
+        .as_ref()
         .map(|v| format!("({})", v))
         .unwrap_or_default();
 
     let row = adw::ActionRow::builder()
-        .title(&format!("{} {}", backend_name(backend.backend_type), version_str))
-        .subtitle(&backend.binary_path.display().to_string())
+        .title(format!(
+            "{} {}",
+            backend_name(backend.backend_type),
+            version_str
+        ))
+        .subtitle(backend.binary_path.display().to_string())
         .activatable(true)
         .build();
 
-    let is_selected = selected.as_ref()
+    let is_selected = selected
+        .as_ref()
         .map(|(bt, _)| *bt == backend.backend_type)
         .unwrap_or(false);
 

@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-02-12
+
+### Changed
+- CI/Release builds inside Arch Linux container (rolling glib >= 2.84 for GNOME 48)
+- Updated GitHub Actions: actions/checkout v4 -> v6
+- Bumped toml 0.8 -> 1, nix 0.29 -> 0.31, resvg 0.45 -> 0.47, reqwest 0.12 -> 0.13
+- Added --locked flag to release build
+- Removed .deb packaging from release workflow
+
+### Added
+- AUR publishing workflow (auto-publishes PKGBUILD on GitHub release)
+
+### Fixed
+- CI failure from cargo fmt violations
+- Release build failure (glib 2.84 not available on Ubuntu 24.04)
+- All clippy warnings (derivable_impls, collapsible_if, needless_borrows, manual_ok)
+
+---
+
 ## [0.2.0] - 2026-02-12
 
 ### Added
@@ -137,6 +156,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/victorzhuk/v2ray-rs/releases/tag/v0.1.0

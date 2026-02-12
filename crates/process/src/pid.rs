@@ -1,7 +1,7 @@
+use nix::sys::signal::{Signal, kill};
+use nix::unistd::Pid;
 use std::fs;
 use std::path::PathBuf;
-use nix::sys::signal::{kill, Signal};
-use nix::unistd::Pid;
 
 fn is_backend_process(pid: u32) -> bool {
     let cmdline_path = format!("/proc/{pid}/cmdline");
@@ -9,9 +9,7 @@ fn is_backend_process(pid: u32) -> bool {
         return false;
     };
     let cmdline = String::from_utf8_lossy(&raw).to_lowercase();
-    cmdline.contains("v2ray")
-        || cmdline.contains("xray")
-        || cmdline.contains("sing-box")
+    cmdline.contains("v2ray") || cmdline.contains("xray") || cmdline.contains("sing-box")
 }
 
 pub struct PidFile {
@@ -33,7 +31,9 @@ impl PidFile {
     pub fn read(&self) -> std::io::Result<Option<u32>> {
         match fs::read_to_string(&self.path) {
             Ok(content) => {
-                let pid = content.trim().parse::<u32>()
+                let pid = content
+                    .trim()
+                    .parse::<u32>()
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
                 Ok(Some(pid))
             }

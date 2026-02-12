@@ -1,7 +1,7 @@
 use adw::prelude::*;
+use ipnet::IpNet;
 use relm4::adw;
 use relm4::gtk;
-use ipnet::IpNet;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    builtin_presets, AppSettings, BackendConfig, Language,
-    Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
+    AppSettings, BackendConfig, Language, Preset, RoutingRule, RoutingRuleSet, RuleAction,
+    RuleMatch, builtin_presets,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -55,9 +55,7 @@ fn build_system_page(
 
     let s = state.borrow();
 
-    let interface_group = adw::PreferencesGroup::builder()
-        .title("Interface")
-        .build();
+    let interface_group = adw::PreferencesGroup::builder().title("Interface").build();
 
     let lang_row = adw::ComboRow::builder()
         .title("Language")
@@ -155,12 +153,12 @@ fn build_network_page(
                 .unwrap_or_default();
 
             let row = adw::ActionRow::builder()
-                .title(&format!(
+                .title(format!(
                     "{} {}",
                     backend_name(backend.backend_type),
                     version_str
                 ))
-                .subtitle(&backend.binary_path.display().to_string())
+                .subtitle(backend.binary_path.display().to_string())
                 .activatable(true)
                 .build();
 
@@ -306,9 +304,7 @@ fn build_routing_page(paths: &AppPaths) -> adw::PreferencesPage {
 
     let toolbar_group = adw::PreferencesGroup::new();
 
-    let toolbar_row = adw::ActionRow::builder()
-        .activatable(false)
-        .build();
+    let toolbar_row = adw::ActionRow::builder().activatable(false).build();
 
     let toolbar = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -405,7 +401,7 @@ fn build_routing_rule_row(
     ctx: &RenderCtx,
 ) -> adw::ActionRow {
     let row = adw::ActionRow::builder()
-        .title(&format_match(&rule.match_condition))
+        .title(format_match(&rule.match_condition))
         .subtitle(format_action(&rule.action))
         .build();
 
@@ -667,9 +663,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
         .spacing(12)
         .build();
 
-    let builtin_group = adw::PreferencesGroup::builder()
-        .title("Built-in")
-        .build();
+    let builtin_group = adw::PreferencesGroup::builder().title("Built-in").build();
     for preset in builtin_presets() {
         let row = adw::ActionRow::builder()
             .title(&preset.name)
@@ -696,9 +690,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
 
     let custom = persistence::load_custom_presets(paths).unwrap_or_default();
     if !custom.is_empty() {
-        let custom_group = adw::PreferencesGroup::builder()
-            .title("Custom")
-            .build();
+        let custom_group = adw::PreferencesGroup::builder().title("Custom").build();
         for preset in &custom {
             let row = adw::ActionRow::builder()
                 .title(&preset.name)
@@ -713,7 +705,8 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             let p = preset.clone();
             apply_btn.connect_clicked(move |_| {
                 ctx.rule_set.borrow_mut().apply_preset(&p);
-                if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
+                if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow())
+                {
                     log::error!("save routing rules: {e}");
                 }
                 render_routing_rules(&ctx);

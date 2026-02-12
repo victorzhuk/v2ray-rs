@@ -2,7 +2,7 @@ use uuid::Uuid;
 
 use crate::config::{ConfigError, ConfigWriter};
 use crate::models::{
-    AppSettings, ProxyNode, Preset, RuleAction, RuleMatch, RoutingRule, RoutingRuleSet,
+    AppSettings, Preset, ProxyNode, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
     ValidationError,
 };
 use crate::persistence::{self, AppPaths, PersistenceError};
@@ -32,10 +32,7 @@ impl RoutingManager {
         &self.rules
     }
 
-    pub fn add_rule(
-        &mut self,
-        rule: RoutingRule,
-    ) -> Result<(), RoutingManagerError> {
+    pub fn add_rule(&mut self, rule: RoutingRule) -> Result<(), RoutingManagerError> {
         self.rules.add_validated(rule)?;
         self.persist()?;
         Ok(())

@@ -1,5 +1,5 @@
 pkgname=v2ray-rs
-pkgver=0.1.0
+pkgver=0.3.0
 pkgrel=1
 pkgdesc="Linux desktop GUI for v2ray/xray/sing-box proxy management"
 arch=('x86_64')

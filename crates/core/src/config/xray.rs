@@ -30,29 +30,26 @@ fn patch_xray_outbounds(config: &mut Value, nodes: &[ProxyNode]) {
     };
 
     for (i, node) in nodes.iter().enumerate() {
-        if let ProxyNode::Vless(c) = node {
-            if let Some(outbound) = outbounds.get_mut(i) {
-                apply_xray_vless_extensions(outbound, c);
-            }
+        if let ProxyNode::Vless(c) = node
+            && let Some(outbound) = outbounds.get_mut(i)
+        {
+            apply_xray_vless_extensions(outbound, c);
         }
     }
 }
 
 fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
-    if let Some(ref flow) = c.flow {
-        if is_xtls_flow(flow) {
-            if let Some(users) = outbound["settings"]["vnext"][0]["users"].as_array_mut() {
-                if let Some(user) = users.first_mut() {
-                    user["flow"] = serde_json::json!(flow);
-                }
-            }
+    if let Some(ref flow) = c.flow
+        && is_xtls_flow(flow)
+    {
+        if let Some(users) = outbound["settings"]["vnext"][0]["users"].as_array_mut()
+            && let Some(user) = users.first_mut()
+        {
+            user["flow"] = serde_json::json!(flow);
+        }
 
-            if matches!(c.transport, TransportSettings::Tcp) {
-                if let Some(tls) = c.tls.as_ref() {
-                    let _ = tls;
-                    outbound["streamSettings"]["security"] = serde_json::json!("xtls");
-                }
-            }
+        if matches!(c.transport, TransportSettings::Tcp) && c.tls.is_some() {
+            outbound["streamSettings"]["security"] = serde_json::json!("xtls");
         }
     }
 }
@@ -128,12 +125,7 @@ mod tests {
     fn test_xray_non_xtls_unmodified() {
         let generator = XrayGenerator;
         let config = generator
-            .generate(
-                &[vless_without_xtls()],
-                &[],
-                &AppSettings::default(),
-                None,
-            )
+            .generate(&[vless_without_xtls()], &[], &AppSettings::default(), None)
             .unwrap();
 
         let outbound = &config["outbounds"][0];

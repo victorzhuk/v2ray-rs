@@ -1,6 +1,6 @@
-use relm4::prelude::*;
-use relm4::adw;
 use adw::prelude::*;
+use relm4::adw;
+use relm4::prelude::*;
 
 pub struct LogsPage {
     running: bool,
@@ -72,11 +72,13 @@ impl SimpleComponent for LogsPage {
         }
     }
 
-    fn init(_init: Self::Init, root: Self::Root, _sender: ComponentSender<Self>) -> ComponentParts<Self> {
+    fn init(
+        _init: Self::Init,
+        root: Self::Root,
+        _sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
         let log_buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
-        let text_view = gtk::TextView::builder()
-            .buffer(&log_buffer)
-            .build();
+        let text_view = gtk::TextView::builder().buffer(&log_buffer).build();
 
         let model = LogsPage {
             running: false,

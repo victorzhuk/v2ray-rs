@@ -160,7 +160,8 @@ impl AppTray {
         };
 
         let truncated = if msg.len() > 50 {
-            let boundary = msg.char_indices()
+            let boundary = msg
+                .char_indices()
                 .map(|(i, _)| i)
                 .take_while(|&i| i <= 47)
                 .last()

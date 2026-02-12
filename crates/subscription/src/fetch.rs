@@ -31,10 +31,7 @@ pub async fn fetch_from_url(url: &str) -> Result<String, FetchError> {
     fetch_with_client(&client, url).await
 }
 
-pub async fn fetch_with_client(
-    client: &reqwest::Client,
-    url: &str,
-) -> Result<String, FetchError> {
+pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
     let response = client.get(url).send().await.map_err(|e| {
         if e.is_timeout() {
             FetchError::Timeout
@@ -134,16 +131,20 @@ mod tests {
         assert_eq!(result, content);
     }
 
-
     #[test]
     fn test_fetch_decode_parse_integration() {
         use crate::parser::parse_subscription_uris;
         use v2ray_rs_core::models::ProxyNode;
 
-        let vmess_json = r#"{"add":"vmess.example.com","port":"443","id":"vmess-uuid","ps":"VMess Node"}"#;
-        let vmess_uri = format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(vmess_json));
+        let vmess_json =
+            r#"{"add":"vmess.example.com","port":"443","id":"vmess-uuid","ps":"VMess Node"}"#;
+        let vmess_uri = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(vmess_json)
+        );
 
-        let ss_userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:secret");
+        let ss_userinfo =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("aes-256-gcm:secret");
         let ss_uri = format!("ss://{}@ss.example.com:8388#SS%20Node", ss_userinfo);
 
         let content = format!(
@@ -164,14 +165,16 @@ mod tests {
         assert_eq!(import_result.nodes.len(), 4);
         assert_eq!(import_result.errors.len(), 0);
 
-        let protocols: Vec<_> = import_result.nodes.iter().map(|n| {
-            match &n.node {
+        let protocols: Vec<_> = import_result
+            .nodes
+            .iter()
+            .map(|n| match &n.node {
                 ProxyNode::Vless(_) => "vless",
                 ProxyNode::Vmess(_) => "vmess",
                 ProxyNode::Shadowsocks(_) => "ss",
                 ProxyNode::Trojan(_) => "trojan",
-            }
-        }).collect();
+            })
+            .collect();
 
         assert!(protocols.contains(&"vless"));
         assert!(protocols.contains(&"vmess"));

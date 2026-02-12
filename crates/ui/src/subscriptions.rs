@@ -33,7 +33,6 @@ pub enum SubscriptionsOutput {
 
 #[derive(Debug)]
 pub enum SubscriptionsMsg {
-    Refresh,
     ToggleSubscription(Uuid),
     ToggleNode(Uuid, usize),
     DeleteSubscription(Uuid),
@@ -128,7 +127,14 @@ impl Component for SubscriptionsPage {
             locked: false,
         };
 
-        render_list(&model.subscriptions, &list_container, &sender, &HashSet::new(), &HashSet::new(), false);
+        render_list(
+            &model.subscriptions,
+            &list_container,
+            &sender,
+            &HashSet::new(),
+            &HashSet::new(),
+            false,
+        );
 
         if settings.auto_update_subscriptions {
             sender.input(SubscriptionsMsg::CheckAutoUpdate);
@@ -145,10 +151,6 @@ impl Component for SubscriptionsPage {
         };
 
         match msg {
-            SubscriptionsMsg::Refresh => {
-                self.subscriptions =
-                    persistence::load_subscriptions(&self.paths).unwrap_or_default();
-            }
             SubscriptionsMsg::ToggleSubscription(id) => {
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
                     sub.enabled = !sub.enabled;
@@ -158,12 +160,12 @@ impl Component for SubscriptionsPage {
                 }
             }
             SubscriptionsMsg::ToggleNode(sub_id, idx) => {
-                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == sub_id) {
-                    if let Some(node) = sub.nodes.get_mut(idx) {
-                        node.enabled = !node.enabled;
-                        if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
-                            log::error!("update subscription: {e}");
-                        }
+                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == sub_id)
+                    && let Some(node) = sub.nodes.get_mut(idx)
+                {
+                    node.enabled = !node.enabled;
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
                     }
                 }
             }
@@ -184,7 +186,9 @@ impl Component for SubscriptionsPage {
                     };
                     if new_pos != pos {
                         self.subscriptions.swap(pos, new_pos);
-                        if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
+                        if let Err(e) =
+                            persistence::save_subscriptions(&self.paths, &self.subscriptions)
+                        {
                             log::error!("save subscriptions: {e}");
                         }
                     }
@@ -224,9 +228,7 @@ impl Component for SubscriptionsPage {
                 let svc = self.service.clone();
                 sender.oneshot_command(async move {
                     match svc.refresh(id).await {
-                        Ok((sub, result)) => {
-                            SubscriptionsCmdOutput::RefreshDone(id, sub, result)
-                        }
+                        Ok((sub, result)) => SubscriptionsCmdOutput::RefreshDone(id, sub, result),
                         Err(e) => SubscriptionsCmdOutput::RefreshFailed(id, e.to_string()),
                     }
                 });
@@ -284,19 +286,23 @@ impl Component for SubscriptionsPage {
                 if from != to && from < self.subscriptions.len() && to < self.subscriptions.len() {
                     let sub = self.subscriptions.remove(from);
                     self.subscriptions.insert(to, sub);
-                    if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
+                    if let Err(e) =
+                        persistence::save_subscriptions(&self.paths, &self.subscriptions)
+                    {
                         log::error!("save subscriptions: {e}");
                     }
                 }
             }
             SubscriptionsMsg::DragDropNode(sub_id, from, to) => {
-                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == sub_id) {
-                    if from != to && from < sub.nodes.len() && to < sub.nodes.len() {
-                        let node = sub.nodes.remove(from);
-                        sub.nodes.insert(to, node);
-                        if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
-                            log::error!("update subscription: {e}");
-                        }
+                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == sub_id)
+                    && from != to
+                    && from < sub.nodes.len()
+                    && to < sub.nodes.len()
+                {
+                    let node = sub.nodes.remove(from);
+                    sub.nodes.insert(to, node);
+                    if let Err(e) = persistence::update_subscription(&self.paths, sub.clone()) {
+                        log::error!("update subscription: {e}");
                     }
                 }
             }
@@ -319,7 +325,14 @@ impl Component for SubscriptionsPage {
         }
         emit_active_nodes(&self.subscriptions, &sender);
         let expanded = capture_expanded(&self.list_container);
-        render_list(&self.subscriptions, &self.list_container, &sender, &expanded, &self.testing_latency, self.locked);
+        render_list(
+            &self.subscriptions,
+            &self.list_container,
+            &sender,
+            &expanded,
+            &self.testing_latency,
+            self.locked,
+        );
     }
 
     fn update_cmd(
@@ -335,7 +348,9 @@ impl Component for SubscriptionsPage {
                 }
                 log::info!(
                     "updated subscription {id}: +{} -{} ={}",
-                    result.added, result.removed, result.unchanged
+                    result.added,
+                    result.removed,
+                    result.unchanged
                 );
             }
             SubscriptionsCmdOutput::LatencyResult(id, results) => {
@@ -357,7 +372,9 @@ impl Component for SubscriptionsPage {
                         match result {
                             Ok(r) => log::info!(
                                 "auto-updated {id}: +{} -{} ={}",
-                                r.added, r.removed, r.unchanged
+                                r.added,
+                                r.removed,
+                                r.unchanged
                             ),
                             Err(e) => log::warn!("auto-update {id} failed: {e}"),
                         }
@@ -368,7 +385,14 @@ impl Component for SubscriptionsPage {
         let has_active = self.subscriptions.iter().any(|s| s.has_enabled_nodes());
         let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
         let expanded = capture_expanded(&self.list_container);
-        render_list(&self.subscriptions, &self.list_container, &sender, &expanded, &self.testing_latency, self.locked);
+        render_list(
+            &self.subscriptions,
+            &self.list_container,
+            &sender,
+            &expanded,
+            &self.testing_latency,
+            self.locked,
+        );
     }
 }
 
@@ -376,12 +400,12 @@ fn capture_expanded(container: &gtk::ListBox) -> HashSet<Uuid> {
     let mut set = HashSet::new();
     let mut child = container.first_child();
     while let Some(ref widget) = child {
-        if let Some(expander) = widget.downcast_ref::<adw::ExpanderRow>() {
-            if expander.is_expanded() {
-                let name = expander.widget_name();
-                if let Ok(id) = Uuid::parse_str(&name) {
-                    set.insert(id);
-                }
+        if let Some(expander) = widget.downcast_ref::<adw::ExpanderRow>()
+            && expander.is_expanded()
+        {
+            let name = expander.widget_name();
+            if let Ok(id) = Uuid::parse_str(&name) {
+                set.insert(id);
             }
         }
         child = widget.next_sibling();
@@ -417,7 +441,8 @@ fn render_list(
     }
 
     for (idx, sub) in subs.iter().enumerate() {
-        let expander = build_subscription_group(sub, idx, sender, expanded_subs, testing_latency, locked);
+        let expander =
+            build_subscription_group(sub, idx, sender, expanded_subs, testing_latency, locked);
         container.append(&expander);
     }
 }
@@ -442,7 +467,7 @@ fn build_subscription_group(
 
     let expander = adw::ExpanderRow::builder()
         .title(&sub.name)
-        .subtitle(&format!(
+        .subtitle(format!(
             "{} | {} nodes | {}",
             source_text,
             sub.nodes.len(),
@@ -469,7 +494,9 @@ fn build_subscription_group(
         {
             let idx = sub_idx;
             drag_source.connect_prepare(move |_src, _x, _y| {
-                Some(gdk::ContentProvider::for_value(&format!("sub_{idx}").to_value()))
+                Some(gdk::ContentProvider::for_value(
+                    &format!("sub_{idx}").to_value(),
+                ))
             });
         }
         handle.add_controller(drag_source);
@@ -479,13 +506,12 @@ fn build_subscription_group(
             let target_idx = sub_idx;
             let s = sender.clone();
             drop_target.connect_drop(move |_target, value, _x, _y| {
-                if let Ok(val) = value.get::<String>() {
-                    if let Some(from_str) = val.strip_prefix("sub_") {
-                        if let Ok(from_idx) = from_str.parse::<usize>() {
-                            s.input(SubscriptionsMsg::DragDropSubscription(from_idx, target_idx));
-                            return true;
-                        }
-                    }
+                if let Ok(val) = value.get::<String>()
+                    && let Some(from_str) = val.strip_prefix("sub_")
+                    && let Ok(from_idx) = from_str.parse::<usize>()
+                {
+                    s.input(SubscriptionsMsg::DragDropSubscription(from_idx, target_idx));
+                    return true;
                 }
                 false
             });
@@ -598,7 +624,11 @@ fn build_subscription_group(
     let has_latency = sub.nodes.iter().any(|n| n.last_latency_ms.is_some());
 
     let test_latency_btn = gtk::Button::builder()
-        .label(if is_testing { "Testing..." } else { "Test Latency" })
+        .label(if is_testing {
+            "Testing..."
+        } else {
+            "Test Latency"
+        })
         .has_frame(false)
         .sensitive(!is_testing)
         .build();
@@ -719,7 +749,9 @@ fn build_node_row(
             let id = sub_id;
             let source_idx = idx;
             drag_source.connect_prepare(move |_src, _x, _y| {
-                Some(gdk::ContentProvider::for_value(&format!("node_{id}_{source_idx}").to_value()))
+                Some(gdk::ContentProvider::for_value(
+                    &format!("node_{id}_{source_idx}").to_value(),
+                ))
             });
         }
         node_handle.add_controller(drag_source);
@@ -730,14 +762,15 @@ fn build_node_row(
             let target_idx = idx;
             let s = sender.clone();
             drop_target.connect_drop(move |_target, value, _x, _y| {
-                if let Ok(val) = value.get::<String>() {
-                    let prefix = format!("node_{target_id}_");
-                    if let Some(from_str) = val.strip_prefix(&prefix) {
-                        if let Ok(from_idx) = from_str.parse::<usize>() {
-                            s.input(SubscriptionsMsg::DragDropNode(target_id, from_idx, target_idx));
-                            return true;
-                        }
-                    }
+                let prefix = format!("node_{target_id}_");
+                if let Ok(val) = value.get::<String>()
+                    && let Some(from_str) = val.strip_prefix(&prefix)
+                    && let Ok(from_idx) = from_str.parse::<usize>()
+                {
+                    s.input(SubscriptionsMsg::DragDropNode(
+                        target_id, from_idx, target_idx,
+                    ));
+                    return true;
                 }
                 false
             });
@@ -755,7 +788,7 @@ fn build_node_row(
 
     if let Some(ms) = node.last_latency_ms {
         let latency_label = gtk::Label::builder()
-            .label(&format!("{ms}ms"))
+            .label(format!("{ms}ms"))
             .valign(gtk::Align::Center)
             .build();
         latency_label.add_css_class("caption");
@@ -827,7 +860,8 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
     } else {
-        let boundary = s.char_indices()
+        let boundary = s
+            .char_indices()
             .map(|(i, _)| i)
             .take_while(|&i| i <= max)
             .last()
@@ -917,7 +951,10 @@ fn show_rename_dialog(id: Uuid, current_name: &str, sender: ComponentSender<Subs
         if response == "rename" {
             let new_name = name_entry.text().to_string();
             if !new_name.trim().is_empty() {
-                sender.input(SubscriptionsMsg::RenameSubscription(id, new_name.trim().into()));
+                sender.input(SubscriptionsMsg::RenameSubscription(
+                    id,
+                    new_name.trim().into(),
+                ));
             }
         }
     });

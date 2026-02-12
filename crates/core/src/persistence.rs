@@ -103,7 +103,8 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), PersistenceError> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(data)?;
     tmp.flush()?;
-    tmp.persist(path).map_err(|e| PersistenceError::Io(e.error))?;
+    tmp.persist(path)
+        .map_err(|e| PersistenceError::Io(e.error))?;
     Ok(())
 }
 
@@ -329,7 +330,10 @@ mod tests {
     #[test]
     fn test_subscriptions_save_load_roundtrip() {
         let (_tmp, paths) = test_paths();
-        let subs = vec![Subscription::new_from_url("Test Sub", "https://example.com/sub")];
+        let subs = vec![Subscription::new_from_url(
+            "Test Sub",
+            "https://example.com/sub",
+        )];
 
         save_subscriptions(&paths, &subs).unwrap();
         let loaded = load_subscriptions(&paths).unwrap();

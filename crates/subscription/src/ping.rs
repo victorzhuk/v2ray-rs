@@ -39,7 +39,10 @@ pub async fn ping_nodes(nodes: &[SubscriptionNode]) -> Vec<Option<u64>> {
             let permit = Arc::clone(&semaphore);
             tokio::spawn(async move {
                 let _permit = permit.acquire().await.ok()?;
-                tcp_ping(&addr, port).await.ok().map(|d| d.as_millis() as u64)
+                tcp_ping(&addr, port)
+                    .await
+                    .ok()
+                    .map(|d| d.as_millis() as u64)
             })
         })
         .collect();

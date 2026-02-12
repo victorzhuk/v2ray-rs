@@ -5,7 +5,7 @@ use chrono::Utc;
 use uuid::Uuid;
 use v2ray_rs_core::models::{ProxyNode, Subscription, SubscriptionNode, SubscriptionSource};
 
-use crate::fetch::{fetch_from_file, fetch_with_client, FetchError};
+use crate::fetch::{FetchError, fetch_from_file, fetch_with_client};
 use crate::parser::parse_uri;
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
@@ -19,10 +19,21 @@ pub struct UpdateResult {
 
 #[derive(Debug, Clone)]
 pub enum UpdateEvent {
-    Started { subscription_id: Uuid },
-    Success { subscription_id: Uuid, result: UpdateResult },
-    Failed { subscription_id: Uuid, error: String },
-    Retrying { subscription_id: Uuid, attempt: u32 },
+    Started {
+        subscription_id: Uuid,
+    },
+    Success {
+        subscription_id: Uuid,
+        result: UpdateResult,
+    },
+    Failed {
+        subscription_id: Uuid,
+        error: String,
+    },
+    Retrying {
+        subscription_id: Uuid,
+        attempt: u32,
+    },
 }
 
 pub fn reconcile_nodes(
@@ -101,7 +112,9 @@ pub async fn update_subscription(
     subscription: &mut Subscription,
 ) -> Result<UpdateResult, FetchError> {
     let raw_content = match &subscription.source {
-        SubscriptionSource::Url { url } => fetch_with_retry(client, url, DEFAULT_MAX_RETRIES).await?,
+        SubscriptionSource::Url { url } => {
+            fetch_with_retry(client, url, DEFAULT_MAX_RETRIES).await?
+        }
         SubscriptionSource::File { path } => fetch_from_file(path)?,
     };
 
@@ -125,7 +138,7 @@ pub async fn update_subscription(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use v2ray_rs_core::models::{ShadowsocksConfig, VlessConfig, VmessConfig, TransportSettings};
+    use v2ray_rs_core::models::{ShadowsocksConfig, TransportSettings, VlessConfig, VmessConfig};
 
     fn vless_node(addr: &str, port: u16) -> ProxyNode {
         ProxyNode::Vless(VlessConfig {
@@ -203,12 +216,12 @@ mod tests {
             SubscriptionNode {
                 node: vless_node("a.com", 443),
                 enabled: true,
-            last_latency_ms: None,
+                last_latency_ms: None,
             },
             SubscriptionNode {
                 node: vless_node("b.com", 443),
                 enabled: true,
-            last_latency_ms: None,
+                last_latency_ms: None,
             },
         ];
 
@@ -270,19 +283,16 @@ mod tests {
             SubscriptionNode {
                 node: vless_node("a.com", 443),
                 enabled: true,
-            last_latency_ms: None,
+                last_latency_ms: None,
             },
             SubscriptionNode {
                 node: vmess_node("b.com", 8443),
                 enabled: false,
-            last_latency_ms: None,
+                last_latency_ms: None,
             },
         ];
 
-        let new_parsed = vec![
-            vless_node("a.com", 443),
-            ss_node("c.com", 8388),
-        ];
+        let new_parsed = vec![vless_node("a.com", 443), ss_node("c.com", 8388)];
 
         let (_nodes, result) = reconcile_with_counts(&old, new_parsed);
 

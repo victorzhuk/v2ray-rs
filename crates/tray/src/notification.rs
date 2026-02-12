@@ -30,10 +30,7 @@ impl Notifier {
                 self.send("Proxy Error", msg);
             }
             ProcessState::Stopped if matches!(from, ProcessState::Running) => {
-                self.send(
-                    "Proxy Disconnected",
-                    "Backend process stopped unexpectedly",
-                );
+                self.send("Proxy Disconnected", "Backend process stopped unexpectedly");
             }
             _ => {}
         }

@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::config::{generator_for, ConfigError};
+use crate::config::{ConfigError, generator_for};
 use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule};
 use crate::persistence::AppPaths;
 
@@ -27,7 +27,10 @@ impl ConfigWriter {
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Self {
         let geodata_dir = dir.join("geodata");
-        Self { output_dir: dir, geodata_dir }
+        Self {
+            output_dir: dir,
+            geodata_dir,
+        }
     }
 
     pub fn output_path(&self, backend: BackendType) -> PathBuf {
@@ -68,8 +71,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(data)?;
     tmp.flush()?;
-    tmp.persist(path)
-        .map_err(|e| ConfigError::Io(e.error))?;
+    tmp.persist(path).map_err(|e| ConfigError::Io(e.error))?;
     Ok(())
 }
 
@@ -224,10 +226,7 @@ mod tests {
     #[test]
     fn test_config_writer_new_uses_user_override() {
         let dir = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(
-            dir.path().join("config"),
-            dir.path().join("data"),
-        );
+        let paths = AppPaths::from_paths(dir.path().join("config"), dir.path().join("data"));
         let mut settings = AppSettings::default();
         settings.backend.config_output_dir = Some(PathBuf::from("/custom/path"));
 
@@ -241,10 +240,7 @@ mod tests {
     #[test]
     fn test_config_writer_new_uses_default_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(
-            dir.path().join("config"),
-            dir.path().join("data"),
-        );
+        let paths = AppPaths::from_paths(dir.path().join("config"), dir.path().join("data"));
         let settings = AppSettings::default();
 
         let writer = ConfigWriter::new(&settings, &paths);

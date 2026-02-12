@@ -99,19 +99,14 @@ pub struct TrojanConfig {
     pub remark: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TransportSettings {
+    #[default]
     Tcp,
     Ws(WsSettings),
     Grpc(GrpcSettings),
     H2(H2Settings),
-}
-
-impl Default for TransportSettings {
-    fn default() -> Self {
-        Self::Tcp
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

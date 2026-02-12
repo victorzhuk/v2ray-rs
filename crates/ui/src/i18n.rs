@@ -1,6 +1,6 @@
-use gettextrs::{gettext, setlocale, LocaleCategory, bindtextdomain, textdomain};
-use v2ray_rs_core::models::Language;
+use gettextrs::{LocaleCategory, bindtextdomain, gettext, setlocale, textdomain};
 use std::path::Path;
+use v2ray_rs_core::models::Language;
 
 const DOMAIN: &str = "v2ray-rs";
 

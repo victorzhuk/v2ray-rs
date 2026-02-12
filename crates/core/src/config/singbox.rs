@@ -1,16 +1,15 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, GrpcSettings, H2Settings, ProxyNode, RuleAction, RuleMatch, RoutingRule,
+    AppSettings, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
     ShadowsocksConfig, TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
-const GEOIP_RULESET_URL: &str =
-    "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
+const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
 const GEOSITE_RULESET_URL: &str =
     "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
 
@@ -303,7 +302,11 @@ mod tests {
     #[test]
     fn test_singbox_error_on_empty() {
         let generator = SingboxGenerator;
-        assert!(generator.generate(&[], &[], &default_settings(), None).is_err());
+        assert!(
+            generator
+                .generate(&[], &[], &default_settings(), None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -415,7 +418,12 @@ mod tests {
         assert_eq!(rule_sets[0]["type"], "remote");
         assert_eq!(rule_sets[0]["tag"], "geoip-ru");
         assert_eq!(rule_sets[0]["format"], "binary");
-        assert!(rule_sets[0]["url"].as_str().unwrap().contains("geoip-ru.srs"));
+        assert!(
+            rule_sets[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("geoip-ru.srs")
+        );
         assert_eq!(rule_sets[0]["download_detour"], "direct");
     }
 
@@ -443,7 +451,9 @@ mod tests {
     fn test_singbox_multiple_nodes() {
         let generator = SingboxGenerator;
         let nodes = vec![vless_node(), ss_node(), trojan_node()];
-        let config = generator.generate(&nodes, &[], &default_settings(), None).unwrap();
+        let config = generator
+            .generate(&nodes, &[], &default_settings(), None)
+            .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
         // 3 proxy + direct + block = 5
@@ -493,7 +503,9 @@ mod tests {
             enabled: true,
         }];
 
-        let config = generator.generate(&nodes, &rules, &default_settings(), None).unwrap();
+        let config = generator
+            .generate(&nodes, &rules, &default_settings(), None)
+            .unwrap();
         let json_str = serde_json::to_string_pretty(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
     }

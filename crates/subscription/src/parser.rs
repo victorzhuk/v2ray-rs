@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use thiserror::Error;
-use v2ray_rs_core::models::{ProxyNode, TransportSettings, TlsSettings, WsSettings, GrpcSettings, H2Settings};
+use v2ray_rs_core::models::{
+    GrpcSettings, H2Settings, ProxyNode, TlsSettings, TransportSettings, WsSettings,
+};
 
 #[derive(Debug, Error)]
 pub enum ParseError {
@@ -12,11 +14,7 @@ pub enum ParseError {
 }
 
 pub fn parse_uri(uri: &str) -> Result<ProxyNode, ParseError> {
-    let scheme = uri
-        .split("://")
-        .next()
-        .unwrap_or("")
-        .to_lowercase();
+    let scheme = uri.split("://").next().unwrap_or("").to_lowercase();
 
     match scheme.as_str() {
         "vless" => parse_vless(uri),
@@ -123,7 +121,9 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
 fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use v2ray_rs_core::models::{VmessConfig, TransportSettings, TlsSettings, WsSettings, GrpcSettings, H2Settings};
+    use v2ray_rs_core::models::{
+        GrpcSettings, H2Settings, TlsSettings, TransportSettings, VmessConfig, WsSettings,
+    };
 
     let encoded = uri
         .strip_prefix("vmess://")
@@ -198,10 +198,7 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
         port,
         uuid,
         alter_id: json["aid"].as_u64().unwrap_or(0) as u32,
-        security: json["scy"]
-            .as_str()
-            .unwrap_or("auto")
-            .to_owned(),
+        security: json["scy"].as_str().unwrap_or("auto").to_owned(),
         transport,
         tls,
         remark,
@@ -337,7 +334,6 @@ fn percent_decode_fragment(fragment: Option<&str>) -> Option<String> {
             .unwrap_or_else(|| f.to_owned())
     })
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -606,7 +602,10 @@ mod tests {
     fn test_parse_uri_dispatches_correctly() {
         let vless_uri = "vless://uuid@host:443";
         let vmess_json = r#"{"add":"host","port":"443","id":"uuid"}"#;
-        let vmess_uri = format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(vmess_json));
+        let vmess_uri = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(vmess_json)
+        );
         let ss_userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("method:pass");
         let ss_uri = format!("ss://{}@host:8388", ss_userinfo);
         let trojan_uri = "trojan://pass@host:443";
@@ -620,7 +619,10 @@ mod tests {
     #[test]
     fn test_parse_subscription_uris_partial_success() {
         let vmess_json = r#"{"add":"example.com","port":"443","id":"uuid"}"#;
-        let vmess_uri = format!("vmess://{}", base64::engine::general_purpose::STANDARD.encode(vmess_json));
+        let vmess_uri = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(vmess_json)
+        );
 
         let uris = vec![
             "vless://uuid@host:443".to_string(),
@@ -637,9 +639,11 @@ mod tests {
 
         assert!(result.nodes.iter().all(|n| n.enabled));
 
-        let error_schemes: Vec<_> = result.errors.iter().map(|(uri, _)| {
-            uri.split("://").next().unwrap()
-        }).collect();
+        let error_schemes: Vec<_> = result
+            .errors
+            .iter()
+            .map(|(uri, _)| uri.split("://").next().unwrap())
+            .collect();
         assert!(error_schemes.contains(&"http"));
         assert!(error_schemes.contains(&"ss"));
     }

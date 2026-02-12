@@ -131,9 +131,7 @@ mod tests {
     #[test]
     fn error_transitions() {
         let mut state = ProcessState::Starting;
-        assert!(state
-            .transition(ProcessState::Error("test".into()))
-            .is_ok());
+        assert!(state.transition(ProcessState::Error("test".into())).is_ok());
         assert_eq!(state, ProcessState::Error("test".into()));
 
         assert!(state.transition(ProcessState::Starting).is_ok());
@@ -186,14 +184,8 @@ mod tests {
 
         match (event1, event2) {
             (
-                ProcessEvent::StateChanged {
-                    from: f1,
-                    to: t1,
-                },
-                ProcessEvent::StateChanged {
-                    from: f2,
-                    to: t2,
-                },
+                ProcessEvent::StateChanged { from: f1, to: t1 },
+                ProcessEvent::StateChanged { from: f2, to: t2 },
             ) => {
                 assert_eq!(f1, ProcessState::Stopped);
                 assert_eq!(t1, ProcessState::Starting);

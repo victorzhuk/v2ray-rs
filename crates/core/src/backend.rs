@@ -9,7 +9,9 @@ use crate::models::BackendType;
 
 #[derive(Error, Debug)]
 pub enum BackendError {
-    #[error("no supported backend found.\n\nInstall one of the following:\n  v2ray:    sudo pacman -S v2ray       (Arch) | sudo apt install v2ray (Debian/Ubuntu)\n  xray:     https://github.com/XTLS/Xray-core/releases\n  sing-box: sudo pacman -S sing-box    (Arch) | https://github.com/SagerNet/sing-box/releases")]
+    #[error(
+        "no supported backend found.\n\nInstall one of the following:\n  v2ray:    sudo pacman -S v2ray       (Arch) | sudo apt install v2ray (Debian/Ubuntu)\n  xray:     https://github.com/XTLS/Xray-core/releases\n  sing-box: sudo pacman -S sing-box    (Arch) | https://github.com/SagerNet/sing-box/releases"
+    )]
     NoneFound,
     #[error("binary not found at {path}")]
     NotFound { path: PathBuf },
@@ -81,12 +83,14 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 }
 
 fn detect_version(path: &Path) -> Result<String, BackendError> {
-    let output = Command::new(path).arg("version").output().map_err(|e| {
-        BackendError::ExecutionFailed {
-            path: path.to_path_buf(),
-            reason: e.to_string(),
-        }
-    })?;
+    let output =
+        Command::new(path)
+            .arg("version")
+            .output()
+            .map_err(|e| BackendError::ExecutionFailed {
+                path: path.to_path_buf(),
+                reason: e.to_string(),
+            })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -124,10 +128,7 @@ pub fn detect_single(bt: BackendType) -> Result<DetectedBackend, BackendError> {
     let path = detect_binary(bt).ok_or(BackendError::NotFound {
         path: PathBuf::from(binary_name(bt)),
     })?;
-    let version = match detect_version(&path) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    };
+    let version = detect_version(&path).ok();
     Ok(DetectedBackend {
         backend_type: bt,
         binary_path: path,
@@ -160,10 +161,7 @@ pub fn detect_all_or_error() -> Result<Vec<DetectedBackend>, BackendError> {
     }
 }
 
-pub fn validate_custom_path(
-    path: &Path,
-    bt: BackendType,
-) -> Result<DetectedBackend, BackendError> {
+pub fn validate_custom_path(path: &Path, bt: BackendType) -> Result<DetectedBackend, BackendError> {
     if !path.exists() {
         return Err(BackendError::NotFound {
             path: path.to_path_buf(),
@@ -174,10 +172,7 @@ pub fn validate_custom_path(
             path: path.to_path_buf(),
         });
     }
-    let version = match detect_version(path) {
-        Ok(v) => Some(v),
-        Err(_) => None,
-    };
+    let version = detect_version(path).ok();
     Ok(DetectedBackend {
         backend_type: bt,
         binary_path: path.to_path_buf(),
@@ -374,11 +369,7 @@ mod tests {
     fn test_mock_script_detection() {
         let dir = tempfile::TempDir::new().unwrap();
         let script_path = dir.path().join("test-backend");
-        fs::write(
-            &script_path,
-            "#!/bin/sh\necho \"TestBackend v1.0.0\"\n",
-        )
-        .unwrap();
+        fs::write(&script_path, "#!/bin/sh\necho \"TestBackend v1.0.0\"\n").unwrap();
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
         let result = validate_custom_path(&script_path, BackendType::V2ray);

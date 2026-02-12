@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, GrpcSettings, H2Settings, ProxyNode, RuleAction, RuleMatch, RoutingRule,
+    AppSettings, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
     ShadowsocksConfig, TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
@@ -339,10 +339,7 @@ mod tests {
         let outbounds = config["outbounds"].as_array().unwrap();
         let proxy = &outbounds[0];
         assert_eq!(proxy["protocol"], "vless");
-        assert_eq!(
-            proxy["settings"]["vnext"][0]["address"],
-            "example.com"
-        );
+        assert_eq!(proxy["settings"]["vnext"][0]["address"], "example.com");
         assert_eq!(proxy["settings"]["vnext"][0]["port"], 443);
 
         let stream = &proxy["streamSettings"];
@@ -360,7 +357,10 @@ mod tests {
 
         let proxy = &config["outbounds"][0];
         assert_eq!(proxy["protocol"], "vmess");
-        assert_eq!(proxy["settings"]["vnext"][0]["users"][0]["security"], "auto");
+        assert_eq!(
+            proxy["settings"]["vnext"][0]["users"][0]["security"],
+            "auto"
+        );
         assert_eq!(proxy["settings"]["vnext"][0]["users"][0]["alterId"], 0);
     }
 
@@ -409,7 +409,9 @@ mod tests {
     fn test_multiple_nodes() {
         let generator = V2rayGenerator;
         let nodes = vec![vless_node(), vmess_node(), ss_node(), trojan_node()];
-        let config = generator.generate(&nodes, &[], &default_settings(), None).unwrap();
+        let config = generator
+            .generate(&nodes, &[], &default_settings(), None)
+            .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
         // 4 proxy + direct + block = 6
@@ -606,7 +608,9 @@ mod tests {
             },
         ];
 
-        let config = generator.generate(&nodes, &rules, &default_settings(), None).unwrap();
+        let config = generator
+            .generate(&nodes, &rules, &default_settings(), None)
+            .unwrap();
         let json_str = serde_json::to_string_pretty(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
     }

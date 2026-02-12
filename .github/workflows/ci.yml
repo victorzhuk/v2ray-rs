@@ -11,47 +11,50 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Install GTK4 dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
-      - run: cargo check --workspace
-
   fmt:
     name: Format
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    container: archlinux:base
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest
+    container: archlinux:base
     steps:
-      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Install GTK4 dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - run: cargo clippy --workspace -- -D warnings
 
   test:
     name: Test
     runs-on: ubuntu-latest
+    container: archlinux:base
     steps:
-      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install GTK4 dependencies
-        run: sudo apt-get update && sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
       - run: cargo test --workspace

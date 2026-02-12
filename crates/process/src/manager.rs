@@ -224,16 +224,17 @@ impl ProcessManager {
             None => "process killed by signal".into(),
         };
 
-        let is_signal_exit = exit_code.is_none() || matches!(exit_code, Some(130) | Some(137) | Some(143));
+        let is_signal_exit =
+            exit_code.is_none() || matches!(exit_code, Some(130) | Some(137) | Some(143));
 
         if !is_signal_exit {
             self.crash_times.push(Instant::now());
             self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
 
             if self.crash_times.len() >= MAX_CRASHES {
-                let _ = self.state.transition(ProcessState::Error(
-                    format!("{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"),
-                ));
+                let _ = self.state.transition(ProcessState::Error(format!(
+                    "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
+                )));
                 return;
             }
         }
@@ -251,9 +252,9 @@ impl ProcessManager {
         sleep(CRASH_RESTART_DELAY).await;
 
         if let Err(e) = self.start().await {
-            let _ = self.state.transition(ProcessState::Error(
-                format!("restart failed: {e}"),
-            ));
+            let _ = self
+                .state
+                .transition(ProcessState::Error(format!("restart failed: {e}")));
         }
     }
 }

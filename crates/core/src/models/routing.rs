@@ -2,7 +2,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::validation::{validate_rule_match, ValidationError};
+use super::validation::{ValidationError, validate_rule_match};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingRule {
@@ -72,7 +72,10 @@ impl RoutingRuleSet {
 
     pub fn apply_preset(&mut self, preset: &crate::models::presets::Preset) {
         for rule in preset.rules() {
-            let already_exists = self.rules.iter().any(|r| r.match_condition == rule.match_condition);
+            let already_exists = self
+                .rules
+                .iter()
+                .any(|r| r.match_condition == rule.match_condition);
             if !already_exists {
                 self.rules.push(rule);
             }

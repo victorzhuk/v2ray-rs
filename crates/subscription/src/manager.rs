@@ -3,7 +3,7 @@ use uuid::Uuid;
 use v2ray_rs_core::models::Subscription;
 use v2ray_rs_core::persistence::{self, AppPaths, PersistenceError};
 
-use crate::fetch::{FetchError, CONNECT_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT};
+use crate::fetch::{CONNECT_TIMEOUT, FetchError, REQUEST_TIMEOUT, USER_AGENT};
 use crate::update::{self, UpdateResult};
 
 #[derive(Debug, Error)]

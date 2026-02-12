@@ -1,10 +1,10 @@
 use std::sync::Mutex;
 use std::time::Duration;
 
-use relm4::prelude::*;
-use relm4::adw;
 use adw::prelude::*;
 use gtk::glib;
+use relm4::adw;
+use relm4::prelude::*;
 use tokio::sync::broadcast;
 
 use v2ray_rs_core::config::ConfigWriter;
@@ -99,15 +99,16 @@ impl App {
         self.process_state = state.clone();
 
         let locked = matches!(state, ProcessState::Running | ProcessState::Starting);
-        self.subscriptions_page.emit(SubscriptionsMsg::SetLocked(locked));
+        self.subscriptions_page
+            .emit(SubscriptionsMsg::SetLocked(locked));
 
-        if let Ok(guard) = TRAY_EVENT_TX.lock() {
-            if let Some(tx) = guard.as_ref() {
-                let _ = tx.send(ProcessEvent::StateChanged {
-                    from,
-                    to: state.clone(),
-                });
-            }
+        if let Ok(guard) = TRAY_EVENT_TX.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            let _ = tx.send(ProcessEvent::StateChanged {
+                from,
+                to: state.clone(),
+            });
         }
     }
 }
@@ -201,9 +202,12 @@ impl SimpleComponent for App {
         }
     }
 
-    fn init(paths: Self::Init, root: Self::Root, sender: ComponentSender<Self>) -> ComponentParts<Self> {
-        let settings = v2ray_rs_core::persistence::load_settings(&paths)
-            .unwrap_or_default();
+    fn init(
+        paths: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();
 
         let show_wizard = !paths.settings_path().exists();
 
@@ -215,19 +219,17 @@ impl SimpleComponent for App {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
             });
 
-        let logs_page = LogsPage::builder()
-            .launch(())
-            .detach();
+        let logs_page = LogsPage::builder().launch(()).detach();
 
-        let wizard = OnboardingWizard::builder()
-            .launch(paths.clone())
-            .forward(sender.input_sender(), |msg| {
-                match msg {
-                    crate::wizard::WizardOutput::Complete { settings, subscription } => {
-                        AppMsg::OnboardingComplete(settings, subscription)
-                    }
-                }
-            });
+        let wizard = OnboardingWizard::builder().launch(paths.clone()).forward(
+            sender.input_sender(),
+            |msg| match msg {
+                crate::wizard::WizardOutput::Complete {
+                    settings,
+                    subscription,
+                } => AppMsg::OnboardingComplete(settings, subscription),
+            },
+        );
 
         let toast_overlay = adw::ToastOverlay::new();
 
@@ -275,7 +277,8 @@ impl SimpleComponent for App {
                 self.show_wizard = false;
 
                 if let Some((name, url)) = subscription {
-                    self.subscriptions_page.emit(SubscriptionsMsg::AddSubscription(name, url));
+                    self.subscriptions_page
+                        .emit(SubscriptionsMsg::AddSubscription(name, url));
                 }
             }
             AppMsg::SettingsChanged(settings) => {
@@ -308,8 +311,10 @@ impl SimpleComponent for App {
                     }
                 };
 
-                let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
-                let nodes: Vec<_> = subscriptions.iter()
+                let subscriptions =
+                    persistence::load_subscriptions(&self.paths).unwrap_or_default();
+                let nodes: Vec<_> = subscriptions
+                    .iter()
                     .filter(|s| s.enabled)
                     .flat_map(|s| s.enabled_nodes().cloned())
                     .collect();
@@ -323,7 +328,8 @@ impl SimpleComponent for App {
                 let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
-                let config_path = match writer.write_config(&nodes, &enabled_rules, &self.settings) {
+                let config_path = match writer.write_config(&nodes, &enabled_rules, &self.settings)
+                {
                     Ok(path) => path,
                     Err(e) => {
                         self.show_toast(&format!("Config generation failed: {e}"));
@@ -341,20 +347,17 @@ impl SimpleComponent for App {
                 let input_sender = sender.input_sender().clone();
 
                 tokio::spawn(async move {
-                    let mut mgr = v2ray_rs_process::ProcessManager::new(
-                        binary_path, config_path, pid_path,
-                    );
+                    let mut mgr =
+                        v2ray_rs_process::ProcessManager::new(binary_path, config_path, pid_path);
 
                     match mgr.start().await {
                         Ok(()) => {
-                            input_sender.emit(AppMsg::ProcessStateChanged(
-                                ProcessState::Running,
-                            ));
+                            input_sender.emit(AppMsg::ProcessStateChanged(ProcessState::Running));
                         }
                         Err(e) => {
-                            input_sender.emit(AppMsg::ProcessStateChanged(
-                                ProcessState::Error(e.to_string()),
-                            ));
+                            input_sender.emit(AppMsg::ProcessStateChanged(ProcessState::Error(
+                                e.to_string(),
+                            )));
                             return;
                         }
                     }
@@ -456,9 +459,14 @@ impl SimpleComponent for App {
                 let settings = self.settings.clone();
                 let window = self.window.clone();
                 let s = sender.input_sender().clone();
-                crate::preferences::show_preferences(&window, &paths, &settings, move |new_settings| {
-                    s.emit(AppMsg::SettingsChanged(new_settings));
-                });
+                crate::preferences::show_preferences(
+                    &window,
+                    &paths,
+                    &settings,
+                    move |new_settings| {
+                        s.emit(AppMsg::SettingsChanged(new_settings));
+                    },
+                );
             }
         }
     }
@@ -466,15 +474,15 @@ impl SimpleComponent for App {
 
 fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
     glib::timeout_add_local(TRAY_POLL_INTERVAL, move || {
-        if let Ok(guard) = TRAY_HANDLE.lock() {
-            if let Some(ref handle) = *guard {
-                while let Some(action) = handle.try_recv_action() {
-                    match action {
-                        TrayAction::ShowWindow => sender.emit(AppMsg::TrayShowWindow),
-                        TrayAction::Quit => sender.emit(AppMsg::TrayQuit),
-                        TrayAction::Connect => sender.emit(AppMsg::Connect),
-                        TrayAction::Disconnect => sender.emit(AppMsg::Disconnect),
-                    }
+        if let Ok(guard) = TRAY_HANDLE.lock()
+            && let Some(ref handle) = *guard
+        {
+            while let Some(action) = handle.try_recv_action() {
+                match action {
+                    TrayAction::ShowWindow => sender.emit(AppMsg::TrayShowWindow),
+                    TrayAction::Quit => sender.emit(AppMsg::TrayQuit),
+                    TrayAction::Connect => sender.emit(AppMsg::Connect),
+                    TrayAction::Disconnect => sender.emit(AppMsg::Disconnect),
                 }
             }
         }
@@ -485,7 +493,9 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
 fn install_app_icon() {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share")));
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
+        });
 
     if let Some(data_dir) = data_dir {
         let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
@@ -498,8 +508,7 @@ fn install_app_icon() {
 pub fn run() {
     let paths = AppPaths::new().expect("failed to determine XDG directories");
 
-    let settings = v2ray_rs_core::persistence::load_settings(&paths)
-        .unwrap_or_default();
+    let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();
     crate::i18n::init(settings.language);
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
@@ -512,7 +521,9 @@ pub fn run() {
 
     let tray_handle = rt.block_on(async {
         let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
-        v2ray_rs_tray::TrayService::spawn(event_rx, notifier).await.ok()
+        v2ray_rs_tray::TrayService::spawn(event_rx, notifier)
+            .await
+            .ok()
     });
 
     if let Some(handle) = tray_handle
@@ -541,10 +552,10 @@ pub fn run() {
     let relm_app = RelmApp::from_app(app);
     relm_app.run::<App>(paths);
 
-    if let Ok(mut guard) = TRAY_HANDLE.lock() {
-        if let Some(handle) = guard.take() {
-            rt.block_on(handle.shutdown());
-        }
+    if let Ok(mut guard) = TRAY_HANDLE.lock()
+        && let Some(handle) = guard.take()
+    {
+        rt.block_on(handle.shutdown());
     }
     if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
         guard.take();
