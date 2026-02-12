@@ -1,4 +1,5 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
@@ -11,7 +12,10 @@ fn setup_dir() -> TempDir {
 
 fn create_script(dir: &TempDir, name: &str, content: &str) -> PathBuf {
     let path = dir.path().join(name);
-    fs::write(&path, content).unwrap();
+    let mut f = File::create(&path).unwrap();
+    f.write_all(content.as_bytes()).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
     fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     path
 }

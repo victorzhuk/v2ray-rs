@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.2] - 2026-02-12
+
+### Fixed
+- CI test failure: ETXTBSY race in `crash_detection` test (sync script file before exec)
+- AUR publish not triggering after release (GITHUB_TOKEN events don't trigger other workflows)
+
+### Changed
+- AUR publish workflow now called directly from release via `workflow_call`
+
+---
+
+## [0.3.1] - 2026-02-12
+
+### Fixed
+- CI build failure: added `base-devel` to Arch container packages (fixes `glib-sys` compilation)
+- Release build failure: committed `Cargo.lock` for reproducible `--locked` builds
+
+---
+
 ## [0.3.0] - 2026-02-12
 
 ### Changed
@@ -156,7 +175,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.1...v0.3.2
+[0.3.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/victorzhuk/v2ray-rs/releases/tag/v0.1.0
