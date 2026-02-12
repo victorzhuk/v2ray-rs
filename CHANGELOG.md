@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.6] - 2026-02-12
+
+### Fixed
+- AUR build failure: disable LTO to fix `ring` assembly linking (`ring_core_0_17_14__*` undefined symbols)
+
+---
+
 ## [0.3.5] - 2026-02-12
 
 ### Fixed
@@ -197,7 +204,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.5...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.6...HEAD
+[0.3.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.4...v0.3.5
 [0.3.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.2...v0.3.3
