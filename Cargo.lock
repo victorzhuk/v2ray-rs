@@ -2965,7 +2965,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "directories",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-process"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "nix",
  "tempfile",
@@ -2992,7 +2992,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-subscription"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "base64",
  "chrono",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-tray"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "ksni",
  "log",
@@ -3024,13 +3024,14 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-ui"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "chrono",
  "gettext-rs",
  "ipnet",
  "log",
  "relm4",
+ "rustls",
  "tokio",
  "uuid",
  "v2ray-rs-core",

@@ -506,6 +506,10 @@ fn install_app_icon() {
 }
 
 pub fn run() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let paths = AppPaths::new().expect("failed to determine XDG directories");
 
     let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();

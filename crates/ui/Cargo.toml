@@ -15,6 +15,7 @@ uuid.workspace = true
 chrono.workspace = true
 gettext-rs.workspace = true
 ipnet.workspace = true
+rustls.workspace = true
 
 [package.metadata.deb]
 name = "v2ray-rs"

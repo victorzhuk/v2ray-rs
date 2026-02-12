@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/v2ray-rs.png" width="128" alt="v2ray-rs">
+<img src="assets/v2ray-rs.png" width="256" alt="v2ray-rs">
 
 # v2ray-rs
 
