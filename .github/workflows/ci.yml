@@ -39,7 +39,7 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
+        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,7 +53,7 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
+        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
