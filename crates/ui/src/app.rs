@@ -590,11 +590,10 @@ pub fn run() {
 
     let resource_bytes =
         glib::Bytes::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/icons.gresource")));
-    let resource = gtk::gio::Resource::from_data(&resource_bytes).expect("failed to load icon resource");
+    let resource =
+        gtk::gio::Resource::from_data(&resource_bytes).expect("failed to load icon resource");
     gtk::gio::resources_register(&resource);
-    let app = adw::Application::builder()
-        .application_id(APP_ID)
-        .build();
+    let app = adw::Application::builder().application_id(APP_ID).build();
 
     app.connect_startup(|_| {
         if let Some(display) = gtk::gdk::Display::default() {

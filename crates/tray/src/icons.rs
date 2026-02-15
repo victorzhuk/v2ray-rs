@@ -34,7 +34,9 @@ fn data_dir() -> Option<PathBuf> {
 }
 
 pub fn install_icons() -> bool {
-    let Some(data_dir) = data_dir() else { return false };
+    let Some(data_dir) = data_dir() else {
+        return false;
+    };
     ensure_hicolor_index(&data_dir);
     let status_dir = data_dir.join(STATUS_ICON_DIR);
     if fs::create_dir_all(&status_dir).is_err() {
@@ -52,11 +54,7 @@ pub fn install_icons() -> bool {
         "v2ray-rs-connected-symbolic.svg",
         SVG_CONNECTED,
     );
-    success &= write_if_missing(
-        &status_dir,
-        "v2ray-rs-error-symbolic.svg",
-        SVG_ERROR,
-    );
+    success &= write_if_missing(&status_dir, "v2ray-rs-error-symbolic.svg", SVG_ERROR);
 
     if success {
         let theme_dir = data_dir.join(HICOLOR_DIR);
@@ -93,8 +91,16 @@ pub fn setup_icon_theme() -> Option<TempDir> {
     fs::create_dir_all(&status_dir).ok()?;
 
     fs::write(dir.path().join("hicolor/index.theme"), INDEX_THEME).ok()?;
-    write_svg(&status_dir, "v2ray-rs-disconnected-symbolic.svg", SVG_DISCONNECTED)?;
-    write_svg(&status_dir, "v2ray-rs-connected-symbolic.svg", SVG_CONNECTED)?;
+    write_svg(
+        &status_dir,
+        "v2ray-rs-disconnected-symbolic.svg",
+        SVG_DISCONNECTED,
+    )?;
+    write_svg(
+        &status_dir,
+        "v2ray-rs-connected-symbolic.svg",
+        SVG_CONNECTED,
+    )?;
     write_svg(&status_dir, "v2ray-rs-error-symbolic.svg", SVG_ERROR)?;
 
     Some(dir)
