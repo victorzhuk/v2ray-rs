@@ -10,4 +10,5 @@ ksni = "0.3"
 notify-rust = "4"
 resvg.workspace = true
 tokio.workspace = true
+tempfile.workspace = true
 log.workspace = true

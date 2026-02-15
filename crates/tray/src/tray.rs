@@ -2,6 +2,7 @@ use std::sync::mpsc;
 
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Handle, Tray, TrayMethods};
+use tempfile::TempDir;
 use tokio::sync::broadcast;
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 
@@ -42,6 +43,8 @@ impl TrayHandle {
 struct AppTray {
     process_state: ProcessState,
     action_tx: mpsc::Sender<TrayAction>,
+    _icon_theme_dir: Option<TempDir>,
+    icon_theme_path: String,
 }
 
 impl Tray for AppTray {
@@ -51,6 +54,15 @@ impl Tray for AppTray {
 
     fn title(&self) -> String {
         "V2Ray Manager".into()
+    }
+
+    fn icon_name(&self) -> String {
+        // Some hosts ignore IconThemePath; use pixmap for consistent rendering.
+        String::new()
+    }
+
+    fn icon_theme_path(&self) -> String {
+        self.icon_theme_path.clone()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -196,9 +208,20 @@ impl TrayService {
     ) -> Result<TrayHandle, ksni::Error> {
         let (action_tx, action_rx) = mpsc::channel();
 
+        let icon_theme_dir = icons::setup_icon_theme();
+        let icon_theme_path = icon_theme_dir
+            .as_ref()
+            .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        // Also install into the user icon theme for hosts that ignore IconThemePath.
+        icons::install_icons();
+
         let tray = AppTray {
             process_state: ProcessState::Stopped,
             action_tx,
+            _icon_theme_dir: icon_theme_dir,
+            icon_theme_path,
         };
 
         let handle = tray.spawn().await?;

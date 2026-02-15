@@ -25,6 +25,8 @@ nix = { version = "0.31", features = ["signal", "process"] }
 relm4 = { version = "0.10", features = ["gnome_48", "libadwaita"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 resvg = "0.47"
+tempfile = "3"
+glib-build-tools = "0.21"
 v2ray-rs-core = { path = "crates/core" }
 v2ray-rs-process = { path = "crates/process" }
 v2ray-rs-subscription = { path = "crates/subscription" }

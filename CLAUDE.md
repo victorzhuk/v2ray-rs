@@ -70,9 +70,9 @@ Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle manageme
 
 System tray integration via ksni (StatusNotifierItem protocol):
 
-- **`tray.rs`** — `AppTray` implements `ksni::Tray`. Uses `icon_name()` + `icon_theme_path()` for FreeDesktop theme-aware symbolic icons, with `icon_pixmap()` as fallback. Menu items: Connect/Disconnect toggle, status label, Open Main Window, Quit. `TrayService::spawn()` listens for process state events and updates tray state.
+- **`tray.rs`** — `AppTray` implements `ksni::Tray`. Uses `icon_name()` + `icon_theme_path()` for FreeDesktop theme-aware symbolic icons (DE handles `currentColor` recoloring), with `icon_pixmap()` as ARGB32 fallback. Menu items: Connect/Disconnect toggle, status label, Open Main Window, Quit. `TrayService::spawn()` calls `setup_icon_theme()` and listens for process state events.
 
-- **`icons.rs`** — Embeds both PNG icons (pixmap fallback) and symbolic SVGs. `setup_icon_theme()` creates a temporary FreeDesktop icon theme directory at runtime with hicolor/scalable/status structure. Symbolic icons: shield outline (disconnected), shield+checkmark (connected), shield+X (error).
+- **`icons.rs`** — Embeds 3 symbolic SVGs (disconnected/connected/error). `setup_icon_theme()` creates a temporary FreeDesktop hicolor icon theme directory with the SVGs preserving `currentColor` for theme-aware rendering. `icon_name_for_state()` maps `ProcessState` to icon names. Pixmap rendering (`render_svg()`) replaces `currentColor` with `#DEDDDA` as fallback for DEs without theme lookup.
 
 - **`notification.rs`** — Desktop notifications via `notify-rust` for state changes.
 

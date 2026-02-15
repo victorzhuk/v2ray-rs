@@ -16,7 +16,6 @@ use v2ray_rs_tray::{TrayAction, TrayHandle};
 static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
 static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::new(None);
 
-const APP_ICON_PNG: &[u8] = include_bytes!("../../../assets/v2ray-rs.png");
 const DEFAULT_WINDOW_WIDTH: i32 = 900;
 const DEFAULT_WINDOW_HEIGHT: i32 = 650;
 const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -125,6 +124,7 @@ impl SimpleComponent for App {
             set_default_width: DEFAULT_WINDOW_WIDTH,
             set_default_height: DEFAULT_WINDOW_HEIGHT,
             set_title: Some("V2Ray Manager"),
+            set_icon_name: Some(APP_ID),
 
             connect_close_request[sender] => move |_| {
                 sender.input(AppMsg::CloseRequested);
@@ -501,25 +501,60 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
     });
 }
 
-fn install_app_icon() {
+const APP_ID: &str = "com.github.v2ray-rs";
+
+fn install_icon_for_compositor() {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
             std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".local/share"))
         });
 
-    if let Some(data_dir) = data_dir {
-        let icon_dir = data_dir.join("icons/hicolor/256x256/apps");
-        if std::fs::create_dir_all(&icon_dir).is_ok() {
-            let _ = std::fs::write(icon_dir.join("v2ray-rs.png"), APP_ICON_PNG);
-            let theme_dir = data_dir.join("icons/hicolor");
-            let _ = std::process::Command::new("gtk-update-icon-cache")
-                .arg("-f")
-                .arg("-t")
-                .arg(&theme_dir)
-                .spawn();
-        }
+    let Some(data_dir) = data_dir else { return };
+    let res_prefix = format!("/{}/icons/hicolor", APP_ID.replace('.', "/"));
+
+    let installed = install_resource_icon(
+        &data_dir,
+        &res_prefix,
+        "scalable/apps",
+        &format!("{APP_ID}.svg"),
+    ) | install_resource_icon(
+        &data_dir,
+        &res_prefix,
+        "symbolic/apps",
+        &format!("{APP_ID}-symbolic.svg"),
+    );
+
+    if installed {
+        let theme_dir = data_dir.join("icons/hicolor");
+        let _ = std::process::Command::new("gtk-update-icon-cache")
+            .arg("-f")
+            .arg("-t")
+            .arg(&theme_dir)
+            .spawn();
     }
+}
+
+fn install_resource_icon(
+    data_dir: &std::path::Path,
+    res_prefix: &str,
+    subdir: &str,
+    filename: &str,
+) -> bool {
+    let icon_dir = data_dir.join(format!("icons/hicolor/{subdir}"));
+    let icon_path = icon_dir.join(filename);
+    if icon_path.exists() {
+        return false;
+    }
+
+    let Ok(svg) = gtk::gio::resources_lookup_data(
+        &format!("{res_prefix}/{subdir}/{filename}"),
+        gtk::gio::ResourceLookupFlags::NONE,
+    ) else {
+        return false;
+    };
+
+    std::fs::create_dir_all(&icon_dir).is_ok() && std::fs::write(&icon_path, &svg).is_ok()
 }
 
 pub fn run() {
@@ -553,14 +588,21 @@ pub fn run() {
         *guard = Some(handle);
     }
 
-    install_app_icon();
-
+    let resource_bytes =
+        glib::Bytes::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/icons.gresource")));
+    let resource = gtk::gio::Resource::from_data(&resource_bytes).expect("failed to load icon resource");
+    gtk::gio::resources_register(&resource);
     let app = adw::Application::builder()
-        .application_id("com.github.v2ray-rs")
+        .application_id(APP_ID)
         .build();
 
     app.connect_startup(|_| {
-        gtk::Window::set_default_icon_name("v2ray-rs");
+        if let Some(display) = gtk::gdk::Display::default() {
+            let theme = gtk::IconTheme::for_display(&display);
+            theme.add_resource_path("/com/github/v2ray-rs/icons");
+        }
+        install_icon_for_compositor();
+        gtk::Window::set_default_icon_name(APP_ID);
     });
 
     app.connect_activate(|app| {
