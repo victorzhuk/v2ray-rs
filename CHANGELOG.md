@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.10] - 2026-02-15
+
+### Fixed
+- System tray icons missing on some status notifier hosts: install symbolic icons into the user hicolor theme and update icon cache
+- App icon missing in some compositors: set window icon name and install icon cache on startup after registering resources
+
+---
+
 ## [0.3.7] - 2026-02-12
 
 ### Fixed
@@ -214,7 +222,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.7...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.10...HEAD
+[0.3.10]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.7...v0.3.10
 [0.3.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.5...v0.3.6
 [0.3.5]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.4...v0.3.5
