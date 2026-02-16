@@ -1,6 +1,4 @@
-# Spec: System Tray (delta)
-
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Tray icon display
 The system SHALL display a system tray icon that reflects the current proxy connection state.
@@ -38,25 +36,3 @@ The system SHALL include active connection details in the tray tooltip.
 #### Scenario: Tooltip when disconnected
 - **WHEN** the backend process is not running
 - **THEN** the tooltip SHALL show "Disconnected" with no active node details
-
-### Requirement: Quick connect/disconnect
-The system SHALL allow connecting and disconnecting via the tray menu.
-
-#### Scenario: Connect from tray
-- **WHEN** the user clicks "Connect" in the tray menu
-- **THEN** the system SHALL start the backend process with the current config
-
-#### Scenario: Disconnect from tray
-- **WHEN** the user clicks "Disconnect" in the tray menu
-- **THEN** the system SHALL gracefully stop the backend process
-
-### Requirement: Minimize to tray
-The system SHALL support minimizing the main window to the system tray instead of closing.
-
-#### Scenario: Close button minimizes
-- **WHEN** the user clicks the window close button and minimize-to-tray is enabled
-- **THEN** the main window SHALL be hidden and the app SHALL continue running in the tray
-
-#### Scenario: Restore from tray
-- **WHEN** the user clicks "Open Main Window" in the tray menu
-- **THEN** the main window SHALL be shown and focused

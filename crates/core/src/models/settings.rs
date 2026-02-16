@@ -1,6 +1,9 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+use crate::models::{AutoResolveStrategy, LastSuccessMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -8,6 +11,16 @@ pub enum BackendType {
     V2ray,
     Xray,
     SingBox,
+}
+
+impl fmt::Display for BackendType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            BackendType::V2ray => f.write_str("v2ray"),
+            BackendType::Xray => f.write_str("xray"),
+            BackendType::SingBox => f.write_str("sing-box"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -41,6 +54,10 @@ pub struct AppSettings {
     pub backend: BackendConfig,
     pub socks_port: u16,
     pub http_port: u16,
+    #[serde(default)]
+    pub auto_resolve_strategy: AutoResolveStrategy,
+    #[serde(default)]
+    pub last_success: Option<LastSuccessMetadata>,
     pub auto_update_subscriptions: bool,
     pub subscription_update_interval_secs: u64,
     pub auto_update_geodata: bool,
@@ -58,6 +75,8 @@ impl Default for AppSettings {
             backend: BackendConfig::default(),
             socks_port: 1080,
             http_port: 1081,
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            last_success: None,
             auto_update_subscriptions: true,
             subscription_update_interval_secs: 86400,
             auto_update_geodata: true,
@@ -79,6 +98,7 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.socks_port, 1080);
         assert_eq!(settings.http_port, 1081);
+        assert_eq!(settings.auto_resolve_strategy, AutoResolveStrategy::ListOrder);
         assert_eq!(settings.language, Language::English);
         assert_eq!(settings.version, 1);
         assert!(settings.auto_update_subscriptions);

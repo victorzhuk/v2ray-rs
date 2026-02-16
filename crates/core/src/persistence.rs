@@ -8,7 +8,8 @@ use thiserror::Error;
 
 use uuid::Uuid;
 
-use crate::models::{AppSettings, Preset, RoutingRuleSet, Subscription};
+use crate::models::{AppSettings, ConnectionMetadata, Preset, RoutingRuleSet, Subscription};
+use crate::resolve::LatencySnapshot;
 
 #[derive(Error, Debug)]
 pub enum PersistenceError {
@@ -72,6 +73,14 @@ impl AppPaths {
 
     pub fn geodata_dir(&self) -> PathBuf {
         self.data_dir.join("geodata")
+    }
+
+    pub fn connection_state_path(&self) -> PathBuf {
+        self.data_dir.join("connection_state.json")
+    }
+
+    pub fn latency_snapshot_path(&self) -> PathBuf {
+        self.data_dir.join("latency_snapshot.json")
     }
 
     pub fn presets_dir(&self) -> PathBuf {
@@ -220,6 +229,46 @@ pub fn load_routing_rules(paths: &AppPaths) -> Result<RoutingRuleSet, Persistenc
     let contents = fs::read_to_string(&path)?;
     let rules: RoutingRuleSet = serde_json::from_str(&contents)?;
     Ok(rules)
+}
+
+pub fn save_connection_state(
+    paths: &AppPaths,
+    state: &Option<ConnectionMetadata>,
+) -> Result<(), PersistenceError> {
+    paths.ensure_dirs()?;
+    let json = serde_json::to_string_pretty(state)?;
+    atomic_write(&paths.connection_state_path(), json.as_bytes())
+}
+
+pub fn load_connection_state(
+    paths: &AppPaths,
+) -> Result<Option<ConnectionMetadata>, PersistenceError> {
+    let path = paths.connection_state_path();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = fs::read_to_string(&path)?;
+    let state: Option<ConnectionMetadata> = serde_json::from_str(&contents)?;
+    Ok(state)
+}
+
+pub fn save_latency_snapshot(
+    paths: &AppPaths,
+    snapshot: &LatencySnapshot,
+) -> Result<(), PersistenceError> {
+    paths.ensure_dirs()?;
+    let json = serde_json::to_string_pretty(snapshot)?;
+    atomic_write(&paths.latency_snapshot_path(), json.as_bytes())
+}
+
+pub fn load_latency_snapshot(paths: &AppPaths) -> Result<LatencySnapshot, PersistenceError> {
+    let path = paths.latency_snapshot_path();
+    if !path.exists() {
+        return Ok(LatencySnapshot::default());
+    }
+    let contents = fs::read_to_string(&path)?;
+    let snapshot: LatencySnapshot = serde_json::from_str(&contents)?;
+    Ok(snapshot)
 }
 
 fn slugify(name: &str) -> String {

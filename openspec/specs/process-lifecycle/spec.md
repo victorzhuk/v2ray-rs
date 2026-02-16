@@ -62,11 +62,11 @@ The system SHALL detect unexpected process exits and optionally attempt automati
 - **THEN** the system SHALL transition to Error state and notify the user instead of restarting
 
 ### Requirement: Process state reporting
-The system SHALL expose current process state (Stopped, Starting, Running, Stopping, Error) to other components via events.
+The system SHALL expose current process state and active connection metadata to other components via events.
 
 #### Scenario: State change notification
 - **WHEN** the process state changes
-- **THEN** the system SHALL emit an event that the tray and UI can consume to update their display
+- **THEN** the system SHALL emit an event that includes connection metadata for the UI and tray to update their display
 
 ### Requirement: Cleanup on app exit
 The system SHALL ensure the backend process is terminated when the application exits.

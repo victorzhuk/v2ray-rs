@@ -359,6 +359,17 @@ impl Component for SubscriptionsPage {
                     for (node, latency) in sub.nodes.iter_mut().zip(results.iter()) {
                         node.last_latency_ms = *latency;
                     }
+                    if let Ok(mut snapshot) = persistence::load_latency_snapshot(&self.paths) {
+                        let now = chrono::Utc::now();
+                        for (idx, latency) in results.iter().enumerate() {
+                            if let Some(value) = latency {
+                                snapshot.upsert(sub.id, idx, *value, now);
+                            }
+                        }
+                        if let Err(e) = persistence::save_latency_snapshot(&self.paths, &snapshot) {
+                            log::error!("save latency snapshot: {e}");
+                        }
+                    }
                 }
             }
             SubscriptionsCmdOutput::RefreshFailed(id, error) => {

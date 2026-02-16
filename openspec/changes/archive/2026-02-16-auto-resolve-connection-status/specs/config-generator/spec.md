@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 
 ### Requirement: Generate v2ray-compatible configuration
 The system SHALL generate a valid JSON configuration file for v2ray/xray containing inbound, outbound, and routing sections.
@@ -28,21 +28,3 @@ The system SHALL translate the user's routing rules into the backend-specific ro
 #### Scenario: GeoSite proxy rule in sing-box config
 - **WHEN** the user has a rule "GeoSite:google → proxy"
 - **THEN** the sing-box config route section SHALL contain a rule matching geosite "google" pointing to the proxy outbound tag
-
-### Requirement: Atomic config file writes
-The system SHALL write generated config files atomically (write to temp file, then rename) to prevent corruption.
-
-#### Scenario: Crash during write
-- **WHEN** the app crashes during config generation
-- **THEN** the previously valid config file SHALL remain intact
-
-### Requirement: Reactive config regeneration
-The system SHALL automatically regenerate the config file when subscription data or routing rules change.
-
-#### Scenario: Subscription update triggers regen
-- **WHEN** a subscription is updated with new nodes
-- **THEN** the system SHALL regenerate the config within 1 second
-
-#### Scenario: Routing rule change triggers regen
-- **WHEN** the user adds or modifies a routing rule
-- **THEN** the system SHALL regenerate the config immediately

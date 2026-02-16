@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    AppSettings, BackendConfig, Language, Preset, RoutingRule, RoutingRuleSet, RuleAction,
-    RuleMatch, builtin_presets,
+    AppSettings, AutoResolveStrategy, BackendConfig, Language, Preset, RoutingRule,
+    RoutingRuleSet, RuleAction, RuleMatch, builtin_presets,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -252,6 +252,28 @@ fn build_network_page(
     sub_group.add(&interval_row);
     page.add(&sub_group);
 
+    let resolve_group = adw::PreferencesGroup::builder()
+        .title("Connection")
+        .build();
+
+    let resolve_row = adw::ComboRow::builder()
+        .title("Auto-resolve strategy")
+        .model(&gtk::StringList::new(&[
+            "List order",
+            "Lowest latency",
+            "Random",
+            "Last successful",
+        ]))
+        .selected(match s.auto_resolve_strategy {
+            AutoResolveStrategy::ListOrder => 0,
+            AutoResolveStrategy::LowestLatency => 1,
+            AutoResolveStrategy::Random => 2,
+            AutoResolveStrategy::LastSuccessful | AutoResolveStrategy::GeoAware => 3,
+        })
+        .build();
+    resolve_group.add(&resolve_row);
+    page.add(&resolve_group);
+
     drop(s);
 
     {
@@ -285,6 +307,19 @@ fn build_network_page(
         let cb = cb.clone();
         interval_row.connect_changed(move |row| {
             st.borrow_mut().subscription_update_interval_secs = row.value() as u64 * 3600;
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        resolve_row.connect_selected_notify(move |row| {
+            st.borrow_mut().auto_resolve_strategy = match row.selected() {
+                1 => AutoResolveStrategy::LowestLatency,
+                2 => AutoResolveStrategy::Random,
+                3 => AutoResolveStrategy::LastSuccessful,
+                _ => AutoResolveStrategy::ListOrder,
+            };
             emit(&st, &cb);
         });
     }

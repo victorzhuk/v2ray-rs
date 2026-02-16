@@ -12,6 +12,7 @@ directories.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 ipnet.workspace = true
+rand.workspace = true
 tempfile = "3"
 reqwest = { workspace = true, features = ["blocking"], optional = true }
 

@@ -13,6 +13,7 @@ use tokio::time::sleep;
 use crate::log_buffer::{LogBuffer, LogLine};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
+use v2ray_rs_core::models::ConnectionMetadata;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(2);
@@ -41,6 +42,7 @@ pub struct ProcessManager {
     crash_times: Vec<Instant>,
     auto_restart: bool,
     log_handles: Vec<tokio::task::JoinHandle<()>>,
+    current_connection: Option<ConnectionMetadata>,
 }
 
 impl ProcessManager {
@@ -55,6 +57,7 @@ impl ProcessManager {
             crash_times: Vec::new(),
             auto_restart: true,
             log_handles: Vec::new(),
+            current_connection: None,
         }
     }
 
@@ -75,6 +78,13 @@ impl ProcessManager {
     }
 
     pub async fn start(&mut self) -> Result<(), ProcessError> {
+        self.start_with_connection(None).await
+    }
+
+    pub async fn start_with_connection(
+        &mut self,
+        connection: Option<ConnectionMetadata>,
+    ) -> Result<(), ProcessError> {
         if !self.binary_path.exists() {
             return Err(ProcessError::BinaryNotFound(self.binary_path.clone()));
         }
@@ -82,15 +92,21 @@ impl ProcessManager {
             return Err(ProcessError::ConfigMissing(self.config_path.clone()));
         }
 
-        self.state.transition(ProcessState::Starting)?;
+        if connection.is_some() {
+            self.current_connection = connection.clone();
+        }
+
+        self.state.transition(ProcessState::Starting, connection.clone())?;
 
         match self.spawn_process().await {
             Ok(()) => {
-                self.state.transition(ProcessState::Running)?;
+                self.state.transition(ProcessState::Running, connection)?;
                 Ok(())
             }
             Err(e) => {
-                let _ = self.state.transition(ProcessState::Error(e.to_string()));
+                let _ = self
+                    .state
+                    .transition(ProcessState::Error(e.to_string()), None);
                 Err(e)
             }
         }
@@ -101,9 +117,9 @@ impl ProcessManager {
             return Ok(());
         }
 
-        self.state.transition(ProcessState::Stopping)?;
+        self.state.transition(ProcessState::Stopping, None)?;
         self.graceful_stop().await;
-        self.state.transition(ProcessState::Stopped)?;
+        self.state.transition(ProcessState::Stopped, None)?;
         self.pid_file.remove().ok();
         Ok(())
     }
@@ -252,29 +268,36 @@ impl ProcessManager {
             self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
 
             if self.crash_times.len() >= MAX_CRASHES {
-                let _ = self.state.transition(ProcessState::Error(format!(
-                    "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
-                )));
+                let _ = self.state.transition(
+                    ProcessState::Error(format!(
+                        "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
+                    )),
+                    None,
+                );
                 return;
             }
         }
 
         if !self.auto_restart || is_signal_exit {
-            let _ = self.state.transition(if is_signal_exit {
-                ProcessState::Stopped
-            } else {
-                ProcessState::Error(msg)
-            });
+            let _ = self.state.transition(
+                if is_signal_exit {
+                    ProcessState::Stopped
+                } else {
+                    ProcessState::Error(msg)
+                },
+                None,
+            );
             return;
         }
 
-        let _ = self.state.transition(ProcessState::Stopped);
+        let _ = self.state.transition(ProcessState::Stopped, None);
         sleep(CRASH_RESTART_DELAY).await;
 
-        if let Err(e) = self.start().await {
-            let _ = self
-                .state
-                .transition(ProcessState::Error(format!("restart failed: {e}")));
+        if let Err(e) = self.start_with_connection(self.current_connection.clone()).await {
+            let _ = self.state.transition(
+                ProcessState::Error(format!("restart failed: {e}")),
+                None,
+            );
         }
     }
 }

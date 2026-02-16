@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.4.0] - 2026-02-16
+
+### Added
+- Connection auto-resolve: automatically select proxy nodes using configurable strategies (list order, lowest latency, random, last successful, geo-aware)
+- Connection status bar in main window showing active node, latency, backend, and strategy
+- Auto-resolve strategy selector in preferences (Network → Connection)
+- Tray tooltip showing connection details (node, latency, backend, strategy, uptime)
+- Tray menu label showing active node name when connected
+- Latency snapshot persistence (`latency_snapshot.json`) — ping results survive restarts
+- Connection state persistence (`connection_state.json`) — tracks active connection metadata
+- `ConnectionPlanner` for ordered candidate resolution with fallback through all enabled nodes
+- Last-successful-node tracking for reconnection preference
+
+### Changed
+- Connect flow iterates through ranked candidates instead of sending all nodes at once
+- Process state events now carry `ConnectionMetadata` through the broadcast channel
+- Reconnect on settings change only triggers when auto-resolve strategy changes (not on every save)
+
+---
+
 ## [0.3.11] - 2026-02-15
 
 ### Fixed
@@ -222,7 +242,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.11...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.11...v0.4.0
 [0.3.11]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.7...v0.3.11
 [0.3.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.6...v0.3.7
 [0.3.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.5...v0.3.6

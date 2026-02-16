@@ -2,6 +2,7 @@ use thiserror::Error;
 use tokio::sync::broadcast;
 
 use crate::log_buffer::LogLine;
+use v2ray_rs_core::models::ConnectionMetadata;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessState {
@@ -46,6 +47,7 @@ pub enum ProcessEvent {
     StateChanged {
         from: ProcessState,
         to: ProcessState,
+        connection: Option<ConnectionMetadata>,
     },
     LogLine(LogLine),
     ProcessExited {
@@ -80,11 +82,16 @@ impl StateManager {
         self.state.clone()
     }
 
-    pub fn transition(&mut self, target: ProcessState) -> Result<ProcessState, TransitionError> {
+    pub fn transition(
+        &mut self,
+        target: ProcessState,
+        connection: Option<ConnectionMetadata>,
+    ) -> Result<ProcessState, TransitionError> {
         let old = self.state.transition(target.clone())?;
         let _ = self.tx.send(ProcessEvent::StateChanged {
             from: old.clone(),
             to: target,
+            connection,
         });
         Ok(old)
     }
@@ -159,11 +166,11 @@ mod tests {
         let mut mgr = StateManager::new();
         let mut rx = mgr.subscribe();
 
-        mgr.transition(ProcessState::Starting).unwrap();
+        mgr.transition(ProcessState::Starting, None).unwrap();
 
         let event = rx.try_recv().unwrap();
         match event {
-            ProcessEvent::StateChanged { from, to } => {
+            ProcessEvent::StateChanged { from, to, .. } => {
                 assert_eq!(from, ProcessState::Stopped);
                 assert_eq!(to, ProcessState::Starting);
             }
@@ -177,15 +184,15 @@ mod tests {
         let mut rx1 = mgr.subscribe();
         let mut rx2 = mgr.subscribe();
 
-        mgr.transition(ProcessState::Starting).unwrap();
+        mgr.transition(ProcessState::Starting, None).unwrap();
 
         let event1 = rx1.try_recv().unwrap();
         let event2 = rx2.try_recv().unwrap();
 
         match (event1, event2) {
             (
-                ProcessEvent::StateChanged { from: f1, to: t1 },
-                ProcessEvent::StateChanged { from: f2, to: t2 },
+                ProcessEvent::StateChanged { from: f1, to: t1, .. },
+                ProcessEvent::StateChanged { from: f2, to: t2, .. },
             ) => {
                 assert_eq!(f1, ProcessState::Stopped);
                 assert_eq!(t1, ProcessState::Starting);
@@ -221,7 +228,7 @@ mod tests {
     #[test]
     fn transition_returns_old_state() {
         let mut mgr = StateManager::new();
-        let old = mgr.transition(ProcessState::Starting).unwrap();
+        let old = mgr.transition(ProcessState::Starting, None).unwrap();
         assert_eq!(old, ProcessState::Stopped);
         assert_eq!(mgr.state(), ProcessState::Starting);
     }

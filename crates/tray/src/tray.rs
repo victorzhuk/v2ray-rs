@@ -5,6 +5,7 @@ use ksni::{Handle, Tray, TrayMethods};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use v2ray_rs_process::{ProcessEvent, ProcessState};
+use v2ray_rs_core::models::ConnectionMetadata;
 
 use crate::icons;
 use crate::notification::Notifier;
@@ -42,6 +43,7 @@ impl TrayHandle {
 
 struct AppTray {
     process_state: ProcessState,
+    connection: Option<ConnectionMetadata>,
     action_tx: mpsc::Sender<TrayAction>,
     _icon_theme_dir: Option<TempDir>,
     icon_theme_path: String,
@@ -70,6 +72,46 @@ impl Tray for AppTray {
             ProcessState::Running => icons::connected_pixmap(),
             ProcessState::Error(_) => icons::error_pixmap(),
             _ => icons::disconnected_pixmap(),
+        }
+    }
+
+    fn tool_tip(&self) -> ksni::ToolTip {
+        let (title, description) = match (&self.process_state, &self.connection) {
+            (ProcessState::Running, Some(meta)) => {
+                let latency = meta
+                    .latency_ms
+                    .map(|ms| format!("{ms} ms"))
+                    .unwrap_or_else(|| "n/a".into());
+                let description = format!(
+                    "{}\n{}\nLatency: {}\nBackend: {}\nStrategy: {}\nSince: {}",
+                    meta.subscription_name,
+                    meta.node_name,
+                    latency,
+                    meta.backend,
+                    meta.strategy,
+                    meta.connected_since.format("%Y-%m-%d %H:%M")
+                );
+                ("Connected".to_string(), description)
+            }
+            (ProcessState::Starting, _) => (
+                "Connecting".to_string(),
+                "Resolving nodes and starting backend".to_string(),
+            ),
+            (ProcessState::Stopping, _) => (
+                "Disconnecting".to_string(),
+                "Stopping backend".to_string(),
+            ),
+            (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
+            _ => (
+                "Disconnected".to_string(),
+                "No active connection".to_string(),
+            ),
+        };
+
+        ksni::ToolTip {
+            title,
+            description,
+            ..Default::default()
         }
     }
 
@@ -102,10 +144,16 @@ impl Tray for AppTray {
         };
 
         let status_label = match &self.process_state {
-            ProcessState::Stopped => "Status: Disconnected",
-            ProcessState::Starting => "Status: Connecting...",
-            ProcessState::Running => "Status: Connected",
-            ProcessState::Stopping => "Status: Disconnecting...",
+            ProcessState::Stopped => "Status: Disconnected".to_string(),
+            ProcessState::Starting => "Status: Connecting...".to_string(),
+            ProcessState::Running => {
+                if let Some(meta) = &self.connection {
+                    format!("Status: Connected ({})", meta.node_name)
+                } else {
+                    "Status: Connected".to_string()
+                }
+            }
+            ProcessState::Stopping => "Status: Disconnecting...".to_string(),
             ProcessState::Error(msg) => return self.menu_with_error(toggle, msg),
         };
 
@@ -135,7 +183,7 @@ impl Tray for AppTray {
             toggle.into(),
             MenuItem::Separator,
             StandardItem {
-                label: status_label.into(),
+                label: status_label,
                 enabled: false,
                 ..Default::default()
             }
@@ -219,6 +267,7 @@ impl TrayService {
 
         let tray = AppTray {
             process_state: ProcessState::Stopped,
+            connection: None,
             action_tx,
             _icon_theme_dir: icon_theme_dir,
             icon_theme_path,
@@ -231,11 +280,12 @@ impl TrayService {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
-                        if let ProcessEvent::StateChanged { from, to } = event {
+                        if let ProcessEvent::StateChanged { from, to, connection } = event {
                             let state = to.clone();
                             update_handle
                                 .update(move |tray| {
                                     tray.process_state = state;
+                                    tray.connection = connection;
                                 })
                                 .await;
                             let n = notifier.clone();
@@ -253,3 +303,4 @@ impl TrayService {
         Ok(TrayHandle { handle, action_rx })
     }
 }
+

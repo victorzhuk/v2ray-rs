@@ -8,7 +8,8 @@ use relm4::prelude::*;
 use tokio::sync::broadcast;
 
 use v2ray_rs_core::config::ConfigWriter;
-use v2ray_rs_core::models::AppSettings;
+use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, LastSuccessMetadata};
+use v2ray_rs_core::resolve::ConnectionPlanner;
 use v2ray_rs_core::persistence::{self, AppPaths};
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
@@ -39,6 +40,9 @@ pub struct App {
     connected: bool,
     button_sensitive: bool,
     has_active_nodes: bool,
+    connection_status: Option<ConnectionMetadata>,
+    status_label: gtk::Label,
+    status_details: gtk::Label,
     toast_overlay: adw::ToastOverlay,
 }
 
@@ -62,7 +66,9 @@ pub enum AppMsg {
     TrayQuit,
     ActiveNodesChanged(bool),
     ProcessStateChanged(ProcessState),
+    ProcessStateConnection(ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(String),
+    UpdateConnectionStatus(Option<ConnectionMetadata>),
     OpenPreferences,
 }
 
@@ -108,8 +114,40 @@ impl App {
             let _ = tx.send(ProcessEvent::StateChanged {
                 from,
                 to: state.clone(),
+                connection: self.connection_status.clone(),
             });
         }
+        self.update_status_labels();
+    }
+
+    fn update_status_labels(&self) {
+        let (primary, details) = match (&self.process_state, &self.connection_status) {
+            (ProcessState::Running, Some(meta)) => {
+                let latency = meta
+                    .latency_ms
+                    .map(|ms| format!("{ms} ms"))
+                    .unwrap_or_else(|| "n/a".into());
+                let details = format!(
+                    "{} · {} · {} · {} · {} · since {}",
+                    meta.subscription_name,
+                    meta.node_name,
+                    latency,
+                    meta.backend,
+                    meta.strategy,
+                    meta.connected_since.format("%Y-%m-%d %H:%M")
+                );
+                ("Connected".to_string(), details)
+            }
+            (ProcessState::Starting, _) => ("Connecting…".to_string(), "Resolving nodes".into()),
+            (ProcessState::Stopping, _) => ("Disconnecting…".to_string(), "Stopping backend".into()),
+            (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
+            _ => (
+                "Disconnected".to_string(),
+                "No active connection".to_string(),
+            ),
+        };
+        self.status_label.set_text(&primary);
+        self.status_details.set_text(&details);
     }
 }
 
@@ -143,33 +181,6 @@ impl SimpleComponent for App {
                             set_title: "V2Ray Manager",
                         },
 
-                        pack_start = &gtk::Button {
-                            #[wrap(Some)]
-                            set_child = &adw::ButtonContent {
-                                #[watch]
-                                set_icon_name: if model.connected {
-                                    "network-wired-disconnected-symbolic"
-                                } else {
-                                    "network-wired-symbolic"
-                                },
-                                #[watch]
-                                set_label: if model.connected { "Disconnect" } else { "Connect" },
-                            },
-                            #[watch]
-                            set_sensitive: model.button_sensitive && (model.connected || model.has_active_nodes),
-                            #[watch]
-                            set_tooltip_text: Some(if !model.connected && !model.has_active_nodes {
-                                "No enabled proxy nodes"
-                            } else if model.connected {
-                                "Disconnect from proxy"
-                            } else {
-                                "Connect to proxy"
-                            }),
-                            #[watch]
-                            set_css_classes: &["pill", if model.connected { "destructive-action" } else { "suggested-action" }],
-                            connect_clicked => AppMsg::ToggleConnection,
-                        },
-
                         pack_end = &gtk::MenuButton {
                             set_icon_name: "open-menu-symbolic",
                             set_tooltip_text: Some("Main Menu"),
@@ -196,6 +207,60 @@ impl SimpleComponent for App {
 
                             #[wrap(Some)]
                             set_end_child = model.logs_page.widget(),
+                        },
+                    },
+
+                    gtk::ActionBar {
+                        set_hexpand: true,
+
+                        pack_start = &gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_spacing: 2,
+                            set_margin_top: 6,
+                            set_margin_bottom: 6,
+                            set_margin_start: 12,
+
+                            #[local_ref]
+                            status_label -> gtk::Label {
+                                set_xalign: 0.0,
+                                add_css_class: "title-4",
+                            },
+
+                            #[local_ref]
+                            status_details -> gtk::Label {
+                                set_xalign: 0.0,
+                                add_css_class: "caption",
+                            },
+                        },
+
+                        pack_end = &gtk::Button {
+                            set_margin_top: 6,
+                            set_margin_bottom: 6,
+                            set_margin_end: 12,
+                            #[wrap(Some)]
+                            set_child = &adw::ButtonContent {
+                                #[watch]
+                                set_icon_name: if model.connected {
+                                    "network-wired-disconnected-symbolic"
+                                } else {
+                                    "network-wired-symbolic"
+                                },
+                                #[watch]
+                                set_label: if model.connected { "Disconnect" } else { "Connect" },
+                            },
+                            #[watch]
+                            set_sensitive: model.button_sensitive && (model.connected || model.has_active_nodes),
+                            #[watch]
+                            set_tooltip_text: Some(if !model.connected && !model.has_active_nodes {
+                                "No enabled proxy nodes"
+                            } else if model.connected {
+                                "Disconnect from proxy"
+                            } else {
+                                "Connect to proxy"
+                            }),
+                            #[watch]
+                            set_css_classes: &["pill", if model.connected { "destructive-action" } else { "suggested-action" }],
+                            connect_clicked => AppMsg::ToggleConnection,
                         },
                     },
                 }
@@ -233,6 +298,8 @@ impl SimpleComponent for App {
         );
 
         let toast_overlay = adw::ToastOverlay::new();
+        let status_label = gtk::Label::new(None);
+        let status_details = gtk::Label::new(None);
 
         let subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
         let has_active_nodes = subscriptions.iter().any(|s| s.has_enabled_nodes());
@@ -251,11 +318,19 @@ impl SimpleComponent for App {
             connected: false,
             button_sensitive: true,
             has_active_nodes,
+            connection_status: None,
+            status_label: status_label.clone(),
+            status_details: status_details.clone(),
             toast_overlay: toast_overlay.clone(),
         };
 
+        let _ = persistence::save_connection_state(&model.paths, &None);
+
         let toast_overlay = &model.toast_overlay;
+        let status_label = &model.status_label;
+        let status_details = &model.status_details;
         let widgets = view_output!();
+        model.update_status_labels();
 
         let prefs_action = gtk::gio::SimpleAction::new("preferences", None);
         {
@@ -289,8 +364,10 @@ impl SimpleComponent for App {
                     log::error!("save settings: {e}");
                 }
                 let was_connected = self.process_handle.is_some();
+                let strategy_changed =
+                    self.settings.auto_resolve_strategy != settings.auto_resolve_strategy;
                 self.settings = settings;
-                if was_connected {
+                if was_connected && strategy_changed {
                     self.reconnect_pending = true;
                     sender.input(AppMsg::Disconnect);
                 }
@@ -320,13 +397,16 @@ impl SimpleComponent for App {
 
                 let subscriptions =
                     persistence::load_subscriptions(&self.paths).unwrap_or_default();
-                let nodes: Vec<_> = subscriptions
-                    .iter()
-                    .filter(|s| s.enabled)
-                    .flat_map(|s| s.enabled_nodes().cloned())
-                    .collect();
+                let snapshot = persistence::load_latency_snapshot(&self.paths).unwrap_or_default();
+                let planner = ConnectionPlanner::new(
+                    self.settings.auto_resolve_strategy,
+                    self.settings.last_success.clone(),
+                    snapshot,
+                    Vec::new(),
+                );
+                let candidates = planner.plan(&subscriptions);
 
-                if nodes.is_empty() {
+                if candidates.is_empty() {
                     self.show_toast("No enabled proxy nodes — add a subscription first");
                     return;
                 }
@@ -335,15 +415,6 @@ impl SimpleComponent for App {
                 let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
-                let config_path = match writer.write_config(&nodes, &enabled_rules, &self.settings)
-                {
-                    Ok(path) => path,
-                    Err(e) => {
-                        self.show_toast(&format!("Config generation failed: {e}"));
-                        return;
-                    }
-                };
-
                 let pid_path = self.paths.data_dir().join("backend.pid");
 
                 self.apply_state(&ProcessState::Starting);
@@ -352,71 +423,125 @@ impl SimpleComponent for App {
 
                 let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<ProcessCmd>(4);
                 let input_sender = sender.input_sender().clone();
+                let settings = self.settings.clone();
 
                 tokio::spawn(async move {
-                    let mut mgr =
-                        v2ray_rs_process::ProcessManager::new(binary_path, config_path, pid_path);
+                    let mut connected_meta: Option<ConnectionMetadata> = None;
+                    let mut last_error: Option<String> = None;
 
-                    match mgr.start().await {
-                        Ok(()) => {
-                            input_sender.emit(AppMsg::ProcessStateChanged(ProcessState::Running));
+                    for candidate in candidates {
+                        let config_path = match writer.write_config(
+                            &[candidate.node.clone()],
+                            &enabled_rules,
+                            &settings,
+                        ) {
+                            Ok(path) => path,
+                            Err(e) => {
+                                last_error = Some(format!("Config generation failed: {e}"));
+                                break;
+                            }
+                        };
+
+                        let node_name = candidate
+                            .node
+                            .remark()
+                            .unwrap_or(candidate.node.address())
+                            .to_string();
+                        let meta = ConnectionMetadata {
+                            subscription_id: candidate.subscription_id,
+                            subscription_name: candidate.subscription_name.clone(),
+                            node_index: candidate.node_index,
+                            node_name,
+                            node_address: candidate.node.address().to_string(),
+                            node_port: candidate.node.port(),
+                            backend: settings.backend.backend_type,
+                            strategy: settings.auto_resolve_strategy,
+                            latency_ms: candidate.latency_ms,
+                            connected_since: chrono::Utc::now(),
+                        };
+
+                        let mut mgr = v2ray_rs_process::ProcessManager::new(
+                            binary_path.clone(),
+                            config_path,
+                            pid_path.clone(),
+                        );
+
+                        match mgr.start_with_connection(Some(meta.clone())).await {
+                            Ok(()) => {
+                                input_sender.emit(AppMsg::ProcessStateConnection(
+                                    ProcessState::Running,
+                                    Some(meta.clone()),
+                                ));
+                                connected_meta = Some(meta);
+                            }
+                            Err(e) => {
+                                last_error = Some(e.to_string());
+                                mgr.shutdown().await;
+                                continue;
+                            }
                         }
-                        Err(e) => {
-                            input_sender.emit(AppMsg::ProcessStateChanged(ProcessState::Error(
-                                e.to_string(),
-                            )));
-                            return;
+
+                        let mut event_rx = mgr.subscribe();
+                        let log_sender = input_sender.clone();
+                        let mut log_rx = mgr.subscribe();
+                        tokio::spawn(async move {
+                            while let Ok(event) = log_rx.recv().await {
+                                if let ProcessEvent::LogLine(line) = event {
+                                    log_sender.emit(AppMsg::ProcessLogLine(line.content));
+                                }
+                            }
+                        });
+
+                        loop {
+                            tokio::select! {
+                                Some(cmd) = cmd_rx.recv() => {
+                                    match cmd {
+                                        ProcessCmd::Stop => {
+                                            mgr.shutdown().await;
+                                            input_sender.emit(AppMsg::ProcessStateConnection(
+                                                ProcessState::Stopped,
+                                                None,
+                                            ));
+                                            return;
+                                        }
+                                    }
+                                }
+                                result = event_rx.recv() => {
+                                    match result {
+                                        Ok(ProcessEvent::StateChanged { to, connection, .. }) => {
+                                            let is_error = matches!(to, ProcessState::Error(_));
+                                            input_sender.emit(AppMsg::ProcessStateConnection(to, connection));
+                                            if is_error {
+                                                break;
+                                            }
+                                        }
+                                        Ok(ProcessEvent::ProcessExited { .. }) => {
+                                            let _ = mgr.wait_and_handle_exit().await;
+                                            let state = mgr.state();
+                                            input_sender.emit(AppMsg::ProcessStateConnection(state, None));
+                                            if mgr.state() != ProcessState::Running {
+                                                break;
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                                        Err(broadcast::error::RecvError::Closed) => break,
+                                    }
+                                }
+                            }
+                        }
+
+                        if connected_meta.is_some() {
+                            break;
                         }
                     }
 
-                    let mut event_rx = mgr.subscribe();
-
-                    let log_sender = input_sender.clone();
-                    let mut log_rx = mgr.subscribe();
-                    tokio::spawn(async move {
-                        while let Ok(event) = log_rx.recv().await {
-                            if let ProcessEvent::LogLine(line) = event {
-                                log_sender.emit(AppMsg::ProcessLogLine(line.content));
-                            }
-                        }
-                    });
-
-                    loop {
-                        tokio::select! {
-                            Some(cmd) = cmd_rx.recv() => {
-                                match cmd {
-                                    ProcessCmd::Stop => {
-                                        mgr.shutdown().await;
-                                        input_sender.emit(AppMsg::ProcessStateChanged(
-                                            ProcessState::Stopped,
-                                        ));
-                                        break;
-                                    }
-                                }
-                            }
-                            result = event_rx.recv() => {
-                                match result {
-                                    Ok(ProcessEvent::StateChanged { to, .. }) => {
-                                        let is_error = matches!(to, ProcessState::Error(_));
-                                        input_sender.emit(AppMsg::ProcessStateChanged(to));
-                                        if is_error {
-                                            break;
-                                        }
-                                    }
-                                    Ok(ProcessEvent::ProcessExited { .. }) => {
-                                        let _ = mgr.wait_and_handle_exit().await;
-                                        let state = mgr.state();
-                                        input_sender.emit(AppMsg::ProcessStateChanged(state));
-                                        if mgr.state() != ProcessState::Running {
-                                            break;
-                                        }
-                                    }
-                                    Ok(_) => {}
-                                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                    Err(broadcast::error::RecvError::Closed) => break,
-                                }
-                            }
-                        }
+                    if connected_meta.is_none() {
+                        let msg = last_error.unwrap_or_else(|| "All candidates failed".into());
+                        input_sender.emit(AppMsg::ProcessStateConnection(
+                            ProcessState::Error(msg),
+                            None,
+                        ));
                     }
                 });
 
@@ -431,16 +556,50 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::ProcessStateChanged(state) => {
+                sender.input(AppMsg::ProcessStateConnection(state, None));
+            }
+            AppMsg::ProcessStateConnection(state, connection) => {
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
                 if stopped {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
+                }
+                if connection.is_some() {
+                    self.connection_status = connection;
+                    if let Some(meta) = &self.connection_status {
+                        self.settings.last_success = Some(LastSuccessMetadata {
+                            subscription_id: meta.subscription_id,
+                            node_index: meta.node_index,
+                            connected_at: meta.connected_since,
+                        });
+                        if let Err(e) =
+                            v2ray_rs_core::persistence::save_settings(&self.paths, &self.settings)
+                        {
+                            log::error!("save settings: {e}");
+                        }
+                    }
+                } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
+                    self.connection_status = None;
+                }
+                if let Err(e) =
+                    persistence::save_connection_state(&self.paths, &self.connection_status)
+                {
+                    log::error!("save connection state: {e}");
                 }
                 self.apply_state(&state);
                 if matches!(state, ProcessState::Stopped) && self.reconnect_pending {
                     self.reconnect_pending = false;
                     sender.input(AppMsg::Connect);
                 }
+            }
+            AppMsg::UpdateConnectionStatus(status) => {
+                self.connection_status = status;
+                if let Err(e) =
+                    persistence::save_connection_state(&self.paths, &self.connection_status)
+                {
+                    log::error!("save connection state: {e}");
+                }
+                self.update_status_labels();
             }
             AppMsg::ProcessLogLine(line) => {
                 self.logs_page.emit(LogsMsg::AppendLine(line));
@@ -502,6 +661,7 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
 }
 
 const APP_ID: &str = "com.github.v2ray-rs";
+
 
 fn install_icon_for_compositor() {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
