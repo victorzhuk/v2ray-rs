@@ -365,17 +365,11 @@ fn build_routing_page(paths: &AppPaths) -> adw::PreferencesPage {
     toolbar_group.add(&toolbar_row);
     page.add(&toolbar_group);
 
-    let rules_group = adw::PreferencesGroup::builder()
-        .title("Rules")
-        .description("Rules are evaluated in order from top to bottom")
-        .build();
-    page.add(&rules_group);
-
     let ctx = RenderCtx {
-        rules_group: rules_group.clone(),
+        page: page.clone(),
         rule_set: rule_set.clone(),
         paths: paths.clone(),
-        added_rows: Rc::new(RefCell::new(Vec::new())),
+        added_groups: Rc::new(RefCell::new(Vec::new())),
     };
 
     render_routing_rules(&ctx);
@@ -399,19 +393,17 @@ fn build_routing_page(paths: &AppPaths) -> adw::PreferencesPage {
 
 #[derive(Clone)]
 struct RenderCtx {
-    rules_group: adw::PreferencesGroup,
+    page: adw::PreferencesPage,
     rule_set: Rc<RefCell<RoutingRuleSet>>,
     paths: Rc<AppPaths>,
-    added_rows: Rc<RefCell<Vec<adw::ActionRow>>>,
+    added_groups: Rc<RefCell<Vec<adw::PreferencesGroup>>>,
 }
 
 fn render_routing_rules(ctx: &RenderCtx) {
-    let group = &ctx.rules_group;
-
-    for row in ctx.added_rows.borrow().iter() {
-        group.remove(row);
+    for g in ctx.added_groups.borrow().iter() {
+        ctx.page.remove(g);
     }
-    ctx.added_rows.borrow_mut().clear();
+    ctx.added_groups.borrow_mut().clear();
 
     let rs = ctx.rule_set.borrow();
     let rules = rs.rules();
@@ -421,11 +413,62 @@ fn render_routing_rules(ctx: &RenderCtx) {
     }
 
     let total = rules.len();
-    let mut rows = ctx.added_rows.borrow_mut();
-    for (idx, rule) in rules.iter().enumerate() {
-        let row = build_routing_rule_row(rule, idx, total, ctx);
-        group.add(&row);
-        rows.push(row);
+    let mut seen: Vec<Option<String>> = Vec::new();
+    for rule in rules.iter() {
+        if !seen.contains(&rule.group) {
+            seen.push(rule.group.clone());
+        }
+    }
+
+    let mut added = ctx.added_groups.borrow_mut();
+    for group_name in &seen {
+        let group_rules: Vec<(usize, &RoutingRule)> = rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| &r.group == group_name)
+            .collect();
+
+        let title = group_name.as_deref().unwrap_or("Custom Rules");
+        let pref_group = adw::PreferencesGroup::builder().title(title).build();
+
+        if let Some(name) = group_name {
+            let remove_btn = gtk::Button::builder()
+                .label("Remove")
+                .css_classes(["destructive-action"])
+                .valign(gtk::Align::Center)
+                .build();
+            let gname = name.clone();
+            let ctx = ctx.clone();
+            remove_btn.connect_clicked(move |_| {
+                let ids: Vec<Uuid> = ctx
+                    .rule_set
+                    .borrow()
+                    .rules()
+                    .iter()
+                    .filter(|r| r.group.as_deref() == Some(&gname))
+                    .map(|r| r.id)
+                    .collect();
+                {
+                    let mut rs = ctx.rule_set.borrow_mut();
+                    for id in &ids {
+                        rs.remove(id);
+                    }
+                    if let Err(e) = persistence::save_routing_rules(&ctx.paths, &rs) {
+                        log::error!("save routing rules: {e}");
+                    }
+                }
+                render_routing_rules(&ctx);
+            });
+            pref_group.set_header_suffix(Some(&remove_btn));
+        }
+
+        for (idx, rule) in group_rules {
+            let row = build_routing_rule_row(rule, idx, total, ctx);
+            pref_group.add(&row);
+        }
+
+        ctx.page.add(&pref_group);
+        added.push(pref_group);
     }
 }
 
@@ -665,6 +708,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             match_condition,
             action,
             enabled: true,
+            group: None,
         };
 
         {

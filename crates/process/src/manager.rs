@@ -39,6 +39,7 @@ pub struct ProcessManager {
     child: Option<Child>,
     binary_path: PathBuf,
     config_path: PathBuf,
+    geodata_dir: Option<PathBuf>,
     crash_times: Vec<Instant>,
     auto_restart: bool,
     log_handles: Vec<tokio::task::JoinHandle<()>>,
@@ -46,7 +47,12 @@ pub struct ProcessManager {
 }
 
 impl ProcessManager {
-    pub fn new(binary_path: PathBuf, config_path: PathBuf, pid_path: PathBuf) -> Self {
+    pub fn new(
+        binary_path: PathBuf,
+        config_path: PathBuf,
+        pid_path: PathBuf,
+        geodata_dir: Option<PathBuf>,
+    ) -> Self {
         Self {
             state: StateManager::new(),
             log_buffer: Arc::new(Mutex::new(LogBuffer::new())),
@@ -54,6 +60,7 @@ impl ProcessManager {
             child: None,
             binary_path,
             config_path,
+            geodata_dir,
             crash_times: Vec::new(),
             auto_restart: true,
             log_handles: Vec::new(),
@@ -176,14 +183,19 @@ impl ProcessManager {
     async fn try_spawn(&self) -> Result<Child, std::io::Error> {
         const MAX_RETRIES: u32 = 5;
         for attempt in 0..MAX_RETRIES {
-            match Command::new(&self.binary_path)
-                .arg("run")
+            let mut cmd = Command::new(&self.binary_path);
+            cmd.arg("run")
                 .arg("-c")
                 .arg(&self.config_path)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn()
-            {
+                .stderr(std::process::Stdio::piped());
+
+            if let Some(dir) = &self.geodata_dir {
+                cmd.env("V2RAY_LOCATION_ASSET", dir);
+                cmd.env("XRAY_LOCATION_ASSET", dir);
+            }
+
+            match cmd.spawn() {
                 Ok(child) => return Ok(child),
                 Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                     if attempt == MAX_RETRIES - 1 {

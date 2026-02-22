@@ -39,6 +39,7 @@ impl Preset {
                 match_condition: pr.match_condition.clone(),
                 action: pr.action,
                 enabled: true,
+                group: Some(self.name.clone()),
             })
             .collect()
     }
@@ -47,14 +48,90 @@ impl Preset {
 pub fn builtin_presets() -> Vec<Preset> {
     vec![
         Preset {
-            name: "RU Direct".into(),
-            description: "Route Russian traffic directly".into(),
-            rules: vec![PresetRule {
-                match_condition: RuleMatch::GeoIp {
-                    country_code: "RU".into(),
+            name: "RU Bypass".into(),
+            description: "Route Russian and private traffic directly".into(),
+            rules: vec![
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "RU".into() },
+                    action: RuleAction::Direct,
                 },
-                action: RuleAction::Direct,
-            }],
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "10.0.0.0/8".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "172.16.0.0/12".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "192.168.0.0/16".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "169.254.0.0/16".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "224.0.0.0/4".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::IpCidr { cidr: "255.255.255.255/32".parse().unwrap() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-gov-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-media-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-retail-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "mailru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "mailru-group".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-entertainment-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-ecommerce-ru".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "rutube".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "avito".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "kaspersky".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "yandex".into() },
+                    action: RuleAction::Direct,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-doh".into() },
+                    action: RuleAction::Direct,
+                },
+            ],
         },
         Preset {
             name: "CN Direct".into(),
@@ -81,6 +158,132 @@ pub fn builtin_presets() -> Vec<Preset> {
             ],
         },
         Preset {
+            name: "Proxy Popular".into(),
+            description: "Route popular AI, social, and streaming services through proxy".into(),
+            rules: vec![
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "FACEBOOK".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "GOOGLE".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "NETFLIX".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "TELEGRAM".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoIp { country_code: "TWITTER".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "amazon".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "anthropic".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "aws".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "azure".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "aws-cn".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-ai-!cn".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "category-ai-chat-!cn".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "deezer".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "duckduckgo".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "facebook".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "f-droid".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "discord".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "telegram".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "whatsapp".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "tiktok".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "instagram".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "twitter".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "youtube".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "reddit".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "github".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "openai".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "google".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "netflix".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "spotify".into() },
+                    action: RuleAction::Proxy,
+                },
+                PresetRule {
+                    match_condition: RuleMatch::GeoSite { category: "stackoverflow".into() },
+                    action: RuleAction::Proxy,
+                },
+            ],
+        },
+        Preset {
             name: "Block Ads".into(),
             description: "Block advertising domains".into(),
             rules: vec![PresetRule {
@@ -89,120 +292,6 @@ pub fn builtin_presets() -> Vec<Preset> {
                 },
                 action: RuleAction::Block,
             }],
-        },
-        Preset {
-            name: "Popular AI".into(),
-            description: "Route AI services through proxy".into(),
-            rules: vec![
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "openai".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "anthropic".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "google".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-            ],
-        },
-        Preset {
-            name: "Social Networks".into(),
-            description: "Route social media through proxy".into(),
-            rules: vec![
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "discord".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "telegram".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "whatsapp".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "tiktok".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "instagram".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "twitter".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "facebook".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "youtube".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "reddit".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::GeoSite {
-                        category: "github".into(),
-                    },
-                    action: RuleAction::Proxy,
-                },
-            ],
-        },
-        Preset {
-            name: "Bypass LAN".into(),
-            description: "Route local network traffic directly".into(),
-            rules: vec![
-                PresetRule {
-                    match_condition: RuleMatch::IpCidr {
-                        cidr: "10.0.0.0/8".parse().unwrap(),
-                    },
-                    action: RuleAction::Direct,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::IpCidr {
-                        cidr: "172.16.0.0/12".parse().unwrap(),
-                    },
-                    action: RuleAction::Direct,
-                },
-                PresetRule {
-                    match_condition: RuleMatch::IpCidr {
-                        cidr: "192.168.0.0/16".parse().unwrap(),
-                    },
-                    action: RuleAction::Direct,
-                },
-            ],
         },
     ]
 }
@@ -214,7 +303,7 @@ mod tests {
     #[test]
     fn test_builtin_presets_count() {
         let presets = builtin_presets();
-        assert_eq!(presets.len(), 6);
+        assert_eq!(presets.len(), 4);
     }
 
     #[test]
@@ -240,12 +329,17 @@ mod tests {
         let mut rule_set = RoutingRuleSet::new();
         let presets = builtin_presets();
         let preset = &presets[0];
+        let rule_count = preset.rules().len();
 
         rule_set.apply_preset(preset);
-        assert_eq!(rule_set.rules().len(), 1);
+        assert_eq!(rule_set.rules().len(), rule_count);
 
         rule_set.apply_preset(preset);
-        assert_eq!(rule_set.rules().len(), 1, "duplicates should be skipped");
+        assert_eq!(
+            rule_set.rules().len(),
+            rule_count,
+            "duplicates should be skipped"
+        );
 
         let ids: Vec<_> = rule_set.rules().iter().map(|r| r.id).collect();
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();

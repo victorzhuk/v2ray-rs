@@ -118,6 +118,7 @@ mod tests {
             },
             action,
             enabled: true,
+            group: None,
         }
     }
 
@@ -137,10 +138,11 @@ mod tests {
         let rule = RoutingRule {
             id: Uuid::new_v4(),
             match_condition: RuleMatch::GeoIp {
-                country_code: "ZZ".into(),
+                country_code: "1Z".into(),
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         };
         assert!(mgr.add_rule(rule).is_err());
         assert!(mgr.rules().rules().is_empty());
@@ -191,11 +193,13 @@ mod tests {
     fn test_apply_preset_and_persist() {
         let (tmp, mut mgr) = setup();
         let presets = builtin_presets();
-        mgr.apply_preset(&presets[0]).unwrap();
+        let preset = &presets[0];
+        let expected = preset.rules().len();
+        mgr.apply_preset(preset).unwrap();
 
         let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
         let loaded = persistence::load_routing_rules(&paths).unwrap();
-        assert_eq!(loaded.rules().len(), 1);
+        assert_eq!(loaded.rules().len(), expected);
     }
 
     #[test]

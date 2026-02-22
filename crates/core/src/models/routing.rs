@@ -10,6 +10,8 @@ pub struct RoutingRule {
     pub match_condition: RuleMatch,
     pub action: RuleAction,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -136,6 +138,7 @@ mod tests {
             },
             action,
             enabled: true,
+            group: None,
         }
     }
 
@@ -221,6 +224,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -236,6 +240,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -252,6 +257,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         };
 
         let result = set.add_validated(rule.clone());
@@ -266,10 +272,11 @@ mod tests {
         let rule = RoutingRule {
             id: Uuid::new_v4(),
             match_condition: RuleMatch::GeoIp {
-                country_code: "USA".to_string(),
+                country_code: "1RU".to_string(),
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         };
 
         let result = set.add_validated(rule);
@@ -287,6 +294,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         };
 
         let result = set.add_validated(rule);
@@ -309,6 +317,7 @@ mod tests {
             },
             action: RuleAction::Block,
             enabled: true,
+            group: None,
         };
 
         let result = set.add_at(1, r_middle.clone());
@@ -325,10 +334,11 @@ mod tests {
         let rule = RoutingRule {
             id: Uuid::new_v4(),
             match_condition: RuleMatch::GeoIp {
-                country_code: "ZZ".to_string(),
+                country_code: "1Z".to_string(),
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         };
 
         let result = set.add_at(0, rule);

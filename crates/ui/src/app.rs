@@ -65,10 +65,8 @@ pub enum AppMsg {
     TrayShowWindow,
     TrayQuit,
     ActiveNodesChanged(bool),
-    ProcessStateChanged(ProcessState),
     ProcessStateConnection(ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(String),
-    UpdateConnectionStatus(Option<ConnectionMetadata>),
     OpenPreferences,
 }
 
@@ -416,6 +414,7 @@ impl SimpleComponent for App {
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
                 let pid_path = self.paths.data_dir().join("backend.pid");
+                let geodata_dir = self.paths.geodata_dir();
 
                 self.apply_state(&ProcessState::Starting);
                 self.logs_page.emit(LogsMsg::SetRunning(true));
@@ -464,6 +463,7 @@ impl SimpleComponent for App {
                             binary_path.clone(),
                             config_path,
                             pid_path.clone(),
+                            Some(geodata_dir.clone()),
                         );
 
                         match mgr.start_with_connection(Some(meta.clone())).await {
@@ -555,9 +555,6 @@ impl SimpleComponent for App {
                     self.show_toast("Not connected");
                 }
             }
-            AppMsg::ProcessStateChanged(state) => {
-                sender.input(AppMsg::ProcessStateConnection(state, None));
-            }
             AppMsg::ProcessStateConnection(state, connection) => {
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
                 if stopped {
@@ -591,15 +588,6 @@ impl SimpleComponent for App {
                     self.reconnect_pending = false;
                     sender.input(AppMsg::Connect);
                 }
-            }
-            AppMsg::UpdateConnectionStatus(status) => {
-                self.connection_status = status;
-                if let Err(e) =
-                    persistence::save_connection_state(&self.paths, &self.connection_status)
-                {
-                    log::error!("save connection state: {e}");
-                }
-                self.update_status_labels();
             }
             AppMsg::ProcessLogLine(line) => {
                 self.logs_page.emit(LogsMsg::AppendLine(line));

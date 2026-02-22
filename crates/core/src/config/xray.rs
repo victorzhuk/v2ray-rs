@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use crate::config::v2ray::V2rayGenerator;
 use crate::config::{ConfigError, ConfigGenerator};
-use crate::models::{AppSettings, ProxyNode, RoutingRule, TransportSettings, VlessConfig};
+use crate::models::{AppSettings, ProxyNode, RoutingRule, VlessConfig};
 
 pub struct XrayGenerator;
 
@@ -46,10 +46,6 @@ fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
             && let Some(user) = users.first_mut()
         {
             user["flow"] = serde_json::json!(flow);
-        }
-
-        if matches!(c.transport, TransportSettings::Tcp) && c.tls.is_some() {
-            outbound["streamSettings"]["security"] = serde_json::json!("xtls");
         }
     }
 }
@@ -118,7 +114,7 @@ mod tests {
         let outbound = &config["outbounds"][0];
         let user = &outbound["settings"]["vnext"][0]["users"][0];
         assert_eq!(user["flow"], "xtls-rprx-vision");
-        assert_eq!(outbound["streamSettings"]["security"], "xtls");
+        assert_eq!(outbound["streamSettings"]["security"], "tls");
     }
 
     #[test]
@@ -155,7 +151,7 @@ mod tests {
         // 3 proxy + direct + block = 5
         assert_eq!(outbounds.len(), 5);
 
-        assert_eq!(outbounds[0]["streamSettings"]["security"], "xtls");
+        assert_eq!(outbounds[0]["streamSettings"]["security"], "tls");
         assert_eq!(outbounds[1]["streamSettings"]["security"], "tls");
         assert_eq!(outbounds[2]["protocol"], "shadowsocks");
     }

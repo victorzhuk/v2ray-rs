@@ -26,16 +26,18 @@ impl ConfigGenerator for V2rayGenerator {
 }
 
 fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) -> Value {
-    let inbounds = build_inbounds(settings);
-    let outbounds = build_outbounds(nodes);
-    let routing = build_routing(rules);
-
-    json!({
+    let mut config = json!({
         "log": { "loglevel": "warning" },
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "routing": routing,
-    })
+        "inbounds": build_inbounds(settings),
+        "outbounds": build_outbounds(nodes),
+        "routing": build_routing(rules),
+    });
+
+    if settings.dns.enabled {
+        config["dns"] = build_dns(rules, settings);
+    }
+
+    config
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
@@ -288,6 +290,50 @@ fn first_proxy_tag() -> String {
     "proxy-0".to_string()
 }
 
+fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+    let mut remote_domains: Vec<String> = Vec::new();
+    let mut domestic_domains: Vec<String> = Vec::new();
+
+    for rule in rules.iter().filter(|r| r.enabled) {
+        let entry = match &rule.match_condition {
+            RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
+            RuleMatch::Domain { pattern } => Some(pattern.clone()),
+            _ => None,
+        };
+        if let Some(d) = entry {
+            match rule.action {
+                RuleAction::Proxy => remote_domains.push(d),
+                RuleAction::Direct => domestic_domains.push(d),
+                RuleAction::Block => {}
+            }
+        }
+    }
+
+    let mut servers: Vec<Value> = Vec::new();
+
+    if !remote_domains.is_empty() {
+        servers.push(json!({
+            "address": settings.dns.remote.server_address(),
+            "domains": remote_domains,
+        }));
+    }
+
+    if !domestic_domains.is_empty() {
+        servers.push(json!({
+            "address": settings.dns.domestic.server_address(),
+            "domains": domestic_domains,
+        }));
+    }
+
+    if servers.is_empty() {
+        servers.push(json!(settings.dns.remote.server_address()));
+    }
+
+    servers.push(json!("localhost"));
+
+    json!({ "servers": servers })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,6 +474,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -450,6 +497,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -470,6 +518,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -490,6 +539,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -512,6 +562,7 @@ mod tests {
                 },
                 action: RuleAction::Direct,
                 enabled: false,
+                group: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -520,6 +571,7 @@ mod tests {
                 },
                 action: RuleAction::Proxy,
                 enabled: true,
+                group: None,
             },
         ];
 
@@ -597,6 +649,7 @@ mod tests {
                 },
                 action: RuleAction::Direct,
                 enabled: true,
+                group: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -605,6 +658,7 @@ mod tests {
                 },
                 action: RuleAction::Proxy,
                 enabled: true,
+                group: None,
             },
         ];
 

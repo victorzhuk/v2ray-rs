@@ -98,6 +98,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         }]
     }
 

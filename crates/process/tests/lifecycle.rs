@@ -36,7 +36,7 @@ async fn start_and_stop() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
 
     assert_eq!(mgr.state(), ProcessState::Stopped);
 
@@ -53,7 +53,7 @@ async fn restart_transitions() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
 
     mgr.start().await.unwrap();
     assert_eq!(mgr.state(), ProcessState::Running);
@@ -71,7 +71,7 @@ async fn binary_not_found() {
     let config = create_config(&dir);
     let binary = dir.path().join("nonexistent");
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     let result = mgr.start().await;
 
     assert!(result.is_err());
@@ -84,7 +84,7 @@ async fn config_missing() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nsleep 60\n");
     let config = dir.path().join("nonexistent.json");
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     let result = mgr.start().await;
 
     assert!(result.is_err());
@@ -98,7 +98,7 @@ async fn pid_file_written_on_start() {
     let config = create_config(&dir);
     let pid = pid_path(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid.clone());
+    let mut mgr = ProcessManager::new(binary, config, pid.clone(), None);
     mgr.start().await.unwrap();
 
     assert!(pid.exists());
@@ -118,7 +118,7 @@ async fn log_capture() {
     );
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     mgr.start().await.unwrap();
 
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -138,7 +138,7 @@ async fn shutdown_disables_auto_restart() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nwhile true; do sleep 1; done\n");
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     mgr.start().await.unwrap();
 
     mgr.shutdown().await;
@@ -151,7 +151,7 @@ async fn stop_when_already_stopped() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nsleep 60\n");
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     let result = mgr.stop().await;
 
     assert!(result.is_ok());
@@ -164,7 +164,7 @@ async fn crash_detection() {
     let binary = create_script(&dir, "backend", "#!/bin/sh\nexit 1\n");
     let config = create_config(&dir);
 
-    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir));
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     mgr.set_auto_restart(false);
     mgr.start().await.unwrap();
 

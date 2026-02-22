@@ -3,7 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{AutoResolveStrategy, LastSuccessMetadata};
+use crate::models::{AutoResolveStrategy, DnsConfig, LastSuccessMetadata};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -66,6 +66,8 @@ pub struct AppSettings {
     pub minimize_to_tray: bool,
     pub notifications_enabled: bool,
     pub onboarding_complete: bool,
+    #[serde(default)]
+    pub dns: DnsConfig,
 }
 
 impl Default for AppSettings {
@@ -85,6 +87,7 @@ impl Default for AppSettings {
             minimize_to_tray: true,
             notifications_enabled: true,
             onboarding_complete: false,
+            dns: DnsConfig::default(),
         }
     }
 }

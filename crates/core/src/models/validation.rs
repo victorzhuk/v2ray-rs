@@ -16,67 +16,15 @@ pub enum ValidationError {
     IndexOutOfBounds(usize),
 }
 
-const VALID_COUNTRY_CODES: &[&str] = &[
-    "AD", "AE", "AF", "AG", "AI", "AL", "AM", "AO", "AQ", "AR", "AS", "AT", "AU", "AW", "AX", "AZ",
-    "BA", "BB", "BD", "BE", "BF", "BG", "BH", "BI", "BJ", "BL", "BM", "BN", "BO", "BQ", "BR", "BS",
-    "BT", "BV", "BW", "BY", "BZ", "CA", "CC", "CD", "CF", "CG", "CH", "CI", "CK", "CL", "CM", "CN",
-    "CO", "CR", "CU", "CV", "CW", "CX", "CY", "CZ", "DE", "DJ", "DK", "DM", "DO", "DZ", "EC", "EE",
-    "EG", "EH", "ER", "ES", "ET", "FI", "FJ", "FK", "FM", "FO", "FR", "GA", "GB", "GD", "GE", "GF",
-    "GG", "GH", "GI", "GL", "GM", "GN", "GP", "GQ", "GR", "GS", "GT", "GU", "GW", "GY", "HK", "HM",
-    "HN", "HR", "HT", "HU", "ID", "IE", "IL", "IM", "IN", "IO", "IQ", "IR", "IS", "IT", "JE", "JM",
-    "JO", "JP", "KE", "KG", "KH", "KI", "KM", "KN", "KP", "KR", "KW", "KY", "KZ", "LA", "LB", "LC",
-    "LI", "LK", "LR", "LS", "LT", "LU", "LV", "LY", "MA", "MC", "MD", "ME", "MF", "MG", "MH", "MK",
-    "ML", "MM", "MN", "MO", "MP", "MQ", "MR", "MS", "MT", "MU", "MV", "MW", "MX", "MY", "MZ", "NA",
-    "NC", "NE", "NF", "NG", "NI", "NL", "NO", "NP", "NR", "NU", "NZ", "OM", "PA", "PE", "PF", "PG",
-    "PH", "PK", "PL", "PM", "PN", "PR", "PS", "PT", "PW", "PY", "QA", "RE", "RO", "RS", "RU", "RW",
-    "SA", "SB", "SC", "SD", "SE", "SG", "SH", "SI", "SJ", "SK", "SL", "SM", "SN", "SO", "SR", "SS",
-    "ST", "SV", "SX", "SY", "SZ", "TC", "TD", "TF", "TG", "TH", "TJ", "TK", "TL", "TM", "TN", "TO",
-    "TR", "TT", "TV", "TW", "TZ", "UA", "UG", "UM", "US", "UY", "UZ", "VA", "VC", "VE", "VG", "VI",
-    "VN", "VU", "WF", "WS", "YE", "YT", "ZA", "ZM", "ZW",
-];
-
-const VALID_GEOSITE_CATEGORIES: &[&str] = &[
-    "google",
-    "facebook",
-    "twitter",
-    "amazon",
-    "apple",
-    "microsoft",
-    "netflix",
-    "spotify",
-    "telegram",
-    "youtube",
-    "tiktok",
-    "instagram",
-    "whatsapp",
-    "reddit",
-    "github",
-    "stackoverflow",
-    "cn",
-    "ru",
-    "ir",
-    "category-ads",
-    "category-ads-all",
-    "category-porn",
-    "geolocation-cn",
-    "geolocation-!cn",
-    "tld-cn",
-    "tld-ru",
-];
-
+/// Validates a GeoIP country code or extended tag.
+///
+/// Accepts 2 or more uppercase ASCII characters. Used for both ISO 3166-1 country
+/// codes (e.g., US, CN, RU) AND extended GeoIP tags (GOOGLE, FACEBOOK, NETFLIX,
+/// PRIVATE, etc.).
 pub fn validate_country_code(code: &str) -> Result<(), ValidationError> {
-    if code.len() != 2 {
+    if code.len() < 2 || !code.chars().all(|c| c.is_ascii_uppercase()) {
         return Err(ValidationError::InvalidCountryCode(code.to_string()));
     }
-
-    if !code.chars().all(|c| c.is_ascii_uppercase()) {
-        return Err(ValidationError::InvalidCountryCode(code.to_string()));
-    }
-
-    if !VALID_COUNTRY_CODES.contains(&code) {
-        return Err(ValidationError::InvalidCountryCode(code.to_string()));
-    }
-
     Ok(())
 }
 
@@ -130,12 +78,6 @@ pub fn validate_geosite_category(category: &str) -> Result<(), ValidationError> 
         }
     }
 
-    if !VALID_GEOSITE_CATEGORIES.contains(&category) {
-        return Err(ValidationError::InvalidGeoSiteCategory(
-            category.to_string(),
-        ));
-    }
-
     Ok(())
 }
 
@@ -158,10 +100,12 @@ mod tests {
             ("US", true),
             ("CN", true),
             ("RU", true),
+            ("GOOGLE", true),
+            ("PRIVATE", true),
+            ("FACEBOOK", true),
             ("us", false),
-            ("USA", false),
             ("U", false),
-            ("ZZ", false),
+            ("1X", false),
             ("A1", false),
             ("", false),
         ];
@@ -245,9 +189,12 @@ mod tests {
             ("geolocation-!cn", true),
             ("category-ads", true),
             ("tld-cn", true),
+            ("category-ru", true),
+            ("unknown-category", true),
+            ("category-ai-!cn", true),
+            ("category-ai-chat-!cn", true),
             ("Google", false),
             ("GOOGLE", false),
-            ("unknown-category", false),
             ("", false),
             ("category with spaces", false),
             ("category_underscore", false),
@@ -272,8 +219,14 @@ mod tests {
             RuleMatch::GeoIp {
                 country_code: "US".to_string(),
             },
+            RuleMatch::GeoIp {
+                country_code: "GOOGLE".to_string(),
+            },
             RuleMatch::GeoSite {
                 category: "google".to_string(),
+            },
+            RuleMatch::GeoSite {
+                category: "category-ai-!cn".to_string(),
             },
             RuleMatch::Domain {
                 pattern: "example.com".to_string(),
@@ -289,7 +242,7 @@ mod tests {
 
         let invalid_cases = vec![
             RuleMatch::GeoIp {
-                country_code: "USA".to_string(),
+                country_code: "1RU".to_string(),
             },
             RuleMatch::GeoSite {
                 category: "INVALID".to_string(),

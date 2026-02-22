@@ -36,16 +36,18 @@ fn assemble(
     settings: &AppSettings,
     geodata_dir: Option<&Path>,
 ) -> Value {
-    let inbounds = build_inbounds(settings);
-    let outbounds = build_outbounds(nodes);
-    let route = build_route(rules, geodata_dir);
-
-    json!({
+    let mut config = json!({
         "log": { "level": "warn" },
-        "inbounds": inbounds,
-        "outbounds": outbounds,
-        "route": route,
-    })
+        "inbounds": build_inbounds(settings),
+        "outbounds": build_outbounds(nodes),
+        "route": build_route(rules, geodata_dir),
+    });
+
+    if settings.dns.enabled {
+        config["dns"] = build_dns(rules, settings);
+    }
+
+    config
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
@@ -209,6 +211,63 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
     }
 
     out["tls"] = tls_obj;
+}
+
+fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+    let mut remote_geosite: Vec<String> = Vec::new();
+    let mut domestic_geosite: Vec<String> = Vec::new();
+    let mut remote_domains: Vec<String> = Vec::new();
+    let mut domestic_domains: Vec<String> = Vec::new();
+
+    for rule in rules.iter().filter(|r| r.enabled) {
+        match &rule.match_condition {
+            RuleMatch::GeoSite { category } => {
+                let tag = format!("geosite-{category}");
+                match rule.action {
+                    RuleAction::Proxy => remote_geosite.push(tag),
+                    RuleAction::Direct => domestic_geosite.push(tag),
+                    RuleAction::Block => {}
+                }
+            }
+            RuleMatch::Domain { pattern } => match rule.action {
+                RuleAction::Proxy => remote_domains.push(pattern.clone()),
+                RuleAction::Direct => domestic_domains.push(pattern.clone()),
+                RuleAction::Block => {}
+            },
+            _ => {}
+        }
+    }
+
+    let mut dns_rules: Vec<Value> = Vec::new();
+    if !remote_geosite.is_empty() {
+        dns_rules.push(json!({ "rule_set": remote_geosite, "server": "remote" }));
+    }
+    if !remote_domains.is_empty() {
+        dns_rules.push(json!({ "domain_suffix": remote_domains, "server": "remote" }));
+    }
+    if !domestic_geosite.is_empty() {
+        dns_rules.push(json!({ "rule_set": domestic_geosite, "server": "domestic" }));
+    }
+    if !domestic_domains.is_empty() {
+        dns_rules.push(json!({ "domain_suffix": domestic_domains, "server": "domestic" }));
+    }
+
+    json!({
+        "servers": [
+            {
+                "tag": "remote",
+                "address": settings.dns.remote.server_address(),
+                "detour": "proxy-0",
+            },
+            {
+                "tag": "domestic",
+                "address": settings.dns.domestic.server_address(),
+                "detour": "direct",
+            },
+        ],
+        "rules": dns_rules,
+        "final": "domestic",
+    })
 }
 
 fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
@@ -402,6 +461,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -437,6 +497,7 @@ mod tests {
             },
             action: RuleAction::Proxy,
             enabled: true,
+            group: None,
         }];
 
         let config = generator
@@ -471,6 +532,7 @@ mod tests {
                 },
                 action: RuleAction::Direct,
                 enabled: false,
+                group: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -479,6 +541,7 @@ mod tests {
                 },
                 action: RuleAction::Proxy,
                 enabled: true,
+                group: None,
             },
         ];
 
@@ -501,6 +564,7 @@ mod tests {
             },
             action: RuleAction::Direct,
             enabled: true,
+            group: None,
         }];
 
         let config = generator

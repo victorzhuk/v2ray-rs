@@ -2,6 +2,8 @@ use adw::prelude::*;
 use relm4::adw;
 use relm4::prelude::*;
 
+const MAX_LOG_LINES: i32 = 10_000;
+
 pub struct LogsPage {
     running: bool,
     log_buffer: gtk::TextBuffer,
@@ -100,6 +102,15 @@ impl SimpleComponent for LogsPage {
                     end_iter = self.log_buffer.end_iter();
                 }
                 self.log_buffer.insert(&mut end_iter, &line);
+
+                let line_count = self.log_buffer.line_count();
+                if line_count > MAX_LOG_LINES {
+                    let excess = line_count - MAX_LOG_LINES;
+                    let mut start = self.log_buffer.start_iter();
+                    if let Some(mut trim_to) = self.log_buffer.iter_at_line(excess) {
+                        self.log_buffer.delete(&mut start, &mut trim_to);
+                    }
+                }
 
                 if let Some(mark) = self.log_buffer.mark("insert") {
                     let end = self.log_buffer.end_iter();
