@@ -4,8 +4,8 @@ use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Handle, Tray, TrayMethods};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
-use v2ray_rs_process::{ProcessEvent, ProcessState};
 use v2ray_rs_core::models::ConnectionMetadata;
+use v2ray_rs_process::{ProcessEvent, ProcessState};
 
 use crate::icons;
 use crate::notification::Notifier;
@@ -97,10 +97,9 @@ impl Tray for AppTray {
                 "Connecting".to_string(),
                 "Resolving nodes and starting backend".to_string(),
             ),
-            (ProcessState::Stopping, _) => (
-                "Disconnecting".to_string(),
-                "Stopping backend".to_string(),
-            ),
+            (ProcessState::Stopping, _) => {
+                ("Disconnecting".to_string(), "Stopping backend".to_string())
+            }
             (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
             _ => (
                 "Disconnected".to_string(),
@@ -280,7 +279,12 @@ impl TrayService {
             loop {
                 match event_rx.recv().await {
                     Ok(event) => {
-                        if let ProcessEvent::StateChanged { from, to, connection } = event {
+                        if let ProcessEvent::StateChanged {
+                            from,
+                            to,
+                            connection,
+                        } = event
+                        {
                             let state = to.clone();
                             update_handle
                                 .update(move |tray| {
@@ -303,4 +307,3 @@ impl TrayService {
         Ok(TrayHandle { handle, action_rx })
     }
 }
-

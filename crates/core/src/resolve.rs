@@ -5,7 +5,7 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    AutoResolveStrategy, LatencySample, LastSuccessMetadata, ProxyNode, Subscription,
+    AutoResolveStrategy, LastSuccessMetadata, LatencySample, ProxyNode, Subscription,
 };
 
 #[derive(Debug, Clone)]
@@ -31,7 +31,9 @@ pub struct LatencySnapshot {
 
 impl LatencySnapshot {
     pub fn new() -> Self {
-        Self { samples: Vec::new() }
+        Self {
+            samples: Vec::new(),
+        }
     }
 
     pub fn get(&self, subscription_id: uuid::Uuid, node_index: usize) -> Option<&LatencySample> {
@@ -234,14 +236,10 @@ mod tests {
 
     #[test]
     fn plan_list_order_preserves_subscription_order() {
-        let sub1 = subscription_with_nodes(
-            "Alpha",
-            vec![(vless_node("a.com", "A"), true, Some(50))],
-        );
-        let sub2 = subscription_with_nodes(
-            "Beta",
-            vec![(vless_node("b.com", "B"), true, Some(10))],
-        );
+        let sub1 =
+            subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), true, Some(50))]);
+        let sub2 =
+            subscription_with_nodes("Beta", vec![(vless_node("b.com", "B"), true, Some(10))]);
         let planner = ConnectionPlanner::new(
             AutoResolveStrategy::ListOrder,
             None,

@@ -191,8 +191,12 @@ mod tests {
 
         match (event1, event2) {
             (
-                ProcessEvent::StateChanged { from: f1, to: t1, .. },
-                ProcessEvent::StateChanged { from: f2, to: t2, .. },
+                ProcessEvent::StateChanged {
+                    from: f1, to: t1, ..
+                },
+                ProcessEvent::StateChanged {
+                    from: f2, to: t2, ..
+                },
             ) => {
                 assert_eq!(f1, ProcessState::Stopped);
                 assert_eq!(t1, ProcessState::Starting);

@@ -101,7 +101,10 @@ mod tests {
         let settings = AppSettings::default();
         assert_eq!(settings.socks_port, 1080);
         assert_eq!(settings.http_port, 1081);
-        assert_eq!(settings.auto_resolve_strategy, AutoResolveStrategy::ListOrder);
+        assert_eq!(
+            settings.auto_resolve_strategy,
+            AutoResolveStrategy::ListOrder
+        );
         assert_eq!(settings.language, Language::English);
         assert_eq!(settings.version, 1);
         assert!(settings.auto_update_subscriptions);

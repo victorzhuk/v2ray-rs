@@ -219,9 +219,7 @@ impl Component for SubscriptionsPage {
             }
             SubscriptionsMsg::DeleteSubscription(id) => {
                 self.subscriptions.retain(|s| s.id != id);
-                if let Err(e) =
-                    persistence::save_subscriptions(&self.paths, &self.subscriptions)
-                {
+                if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
                     log::error!("save subscriptions: {e}");
                 }
             }
@@ -229,9 +227,7 @@ impl Component for SubscriptionsPage {
                 let sub = Subscription::new_from_url(name, url);
                 let id = sub.id;
                 self.subscriptions.push(sub);
-                if let Err(e) =
-                    persistence::save_subscriptions(&self.paths, &self.subscriptions)
-                {
+                if let Err(e) = persistence::save_subscriptions(&self.paths, &self.subscriptions) {
                     log::error!("save subscriptions: {e}");
                 }
                 sender.input(SubscriptionsMsg::UpdateSubscription(id));

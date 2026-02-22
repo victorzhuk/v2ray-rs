@@ -103,7 +103,8 @@ impl ProcessManager {
             self.current_connection = connection.clone();
         }
 
-        self.state.transition(ProcessState::Starting, connection.clone())?;
+        self.state
+            .transition(ProcessState::Starting, connection.clone())?;
 
         match self.spawn_process().await {
             Ok(()) => {
@@ -305,11 +306,13 @@ impl ProcessManager {
         let _ = self.state.transition(ProcessState::Stopped, None);
         sleep(CRASH_RESTART_DELAY).await;
 
-        if let Err(e) = self.start_with_connection(self.current_connection.clone()).await {
-            let _ = self.state.transition(
-                ProcessState::Error(format!("restart failed: {e}")),
-                None,
-            );
+        if let Err(e) = self
+            .start_with_connection(self.current_connection.clone())
+            .await
+        {
+            let _ = self
+                .state
+                .transition(ProcessState::Error(format!("restart failed: {e}")), None);
         }
     }
 }

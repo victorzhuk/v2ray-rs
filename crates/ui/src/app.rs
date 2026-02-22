@@ -9,8 +9,8 @@ use tokio::sync::broadcast;
 
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, LastSuccessMetadata};
-use v2ray_rs_core::resolve::ConnectionPlanner;
 use v2ray_rs_core::persistence::{self, AppPaths};
+use v2ray_rs_core::resolve::ConnectionPlanner;
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
 
@@ -137,7 +137,9 @@ impl App {
                 ("Connected".to_string(), details)
             }
             (ProcessState::Starting, _) => ("Connecting…".to_string(), "Resolving nodes".into()),
-            (ProcessState::Stopping, _) => ("Disconnecting…".to_string(), "Stopping backend".into()),
+            (ProcessState::Stopping, _) => {
+                ("Disconnecting…".to_string(), "Stopping backend".into())
+            }
             (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
             _ => (
                 "Disconnected".to_string(),
@@ -649,7 +651,6 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
 }
 
 const APP_ID: &str = "com.github.v2ray-rs";
-
 
 fn install_icon_for_compositor() {
     let data_dir = std::env::var_os("XDG_DATA_HOME")

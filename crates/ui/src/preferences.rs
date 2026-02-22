@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    AppSettings, AutoResolveStrategy, BackendConfig, Language, Preset, RoutingRule,
-    RoutingRuleSet, RuleAction, RuleMatch, builtin_presets,
+    AppSettings, AutoResolveStrategy, BackendConfig, Language, Preset, RoutingRule, RoutingRuleSet,
+    RuleAction, RuleMatch, builtin_presets,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -252,9 +252,7 @@ fn build_network_page(
     sub_group.add(&interval_row);
     page.add(&sub_group);
 
-    let resolve_group = adw::PreferencesGroup::builder()
-        .title("Connection")
-        .build();
+    let resolve_group = adw::PreferencesGroup::builder().title("Connection").build();
 
     let resolve_row = adw::ComboRow::builder()
         .title("Auto-resolve strategy")
