@@ -17,7 +17,6 @@ pub enum AutoResolveStrategy {
     GeoAware,
 }
 
-
 impl fmt::Display for AutoResolveStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
