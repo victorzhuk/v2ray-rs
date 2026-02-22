@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-02-22
+
+### Added
+- DNS configuration model (`DnsConfig`, `DnsServer`, `DnsProtocol`) with DoH and plain DNS support
+- DNS config generation for all backends (v2ray, xray, sing-box) — enabled via Settings when `dns.enabled = true`
+- Routing rule groups: rules carry an optional `group` name (set automatically when applying a preset)
+- Group-based routing rules UI: rules grouped by preset name in Preferences → Routing, with per-group "Remove" button
+- `geodata_dir` forwarded to `ProcessManager` and exported as `V2RAY_LOCATION_ASSET` / `XRAY_LOCATION_ASSET` env vars on process spawn
+- Log viewer buffer cap: trims to 10,000 lines to prevent memory growth on long-running sessions
+
+### Changed
+- "RU Direct" preset renamed to "RU Bypass" and expanded with private CIDRs and Russian GeoSite categories (media, retail, gov, mail, entertainment, e-commerce, etc.)
+- "Popular AI", "Social Networks", and "Bypass LAN" presets merged into single "Proxy Popular" preset
+- Country code validation now accepts extended GeoIP tags (GOOGLE, FACEBOOK, NETFLIX, TELEGRAM, TWITTER, etc.) in addition to ISO 3166-1 codes
+- GeoSite category validation no longer requires membership in a hardcoded allowlist — accepts any valid lowercase hyphenated string
+- Subscription operations (toggle, rename, move, delete, add) now use atomic whole-file saves via `save_subscriptions` instead of granular per-item persistence
+- Xray: removed `security: "xtls"` override — xray-core v1.8+ uses `security: "tls"` with the `flow` field for XTLS vision
+
+---
+
 ## [0.4.0] - 2026-02-16
 
 ### Added
@@ -242,7 +262,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.11...v0.4.0
 [0.3.11]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.7...v0.3.11
 [0.3.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.6...v0.3.7
