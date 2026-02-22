@@ -432,7 +432,7 @@ impl SimpleComponent for App {
 
                     for candidate in candidates {
                         let config_path = match writer.write_config(
-                            &[candidate.node.clone()],
+                            std::slice::from_ref(&candidate.node),
                             &enabled_rules,
                             &settings,
                         ) {

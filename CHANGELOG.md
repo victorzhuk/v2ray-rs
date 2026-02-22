@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.2] - 2026-02-22
+
+### Fixed
+- Clippy `collapsible_if` in `xray.rs`: collapse nested `if let` into a single `&&` chain
+- Clippy `derivable_impls` in `resolve.rs`: replace manual `Default` impl with `#[derive(Default)]`
+- Clippy `clone_on_ref_ptr` in `app.rs`: replace `&[node.clone()]` with `std::slice::from_ref`
+
+---
+
 ## [0.5.1] - 2026-02-22
 
 ### Fixed
@@ -269,7 +278,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.3.11...v0.4.0

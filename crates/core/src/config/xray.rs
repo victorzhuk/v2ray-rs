@@ -41,12 +41,10 @@ fn patch_xray_outbounds(config: &mut Value, nodes: &[ProxyNode]) {
 fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
     if let Some(ref flow) = c.flow
         && is_xtls_flow(flow)
+        && let Some(users) = outbound["settings"]["vnext"][0]["users"].as_array_mut()
+        && let Some(user) = users.first_mut()
     {
-        if let Some(users) = outbound["settings"]["vnext"][0]["users"].as_array_mut()
-            && let Some(user) = users.first_mut()
-        {
-            user["flow"] = serde_json::json!(flow);
-        }
+        user["flow"] = serde_json::json!(flow);
     }
 }
 

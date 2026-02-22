@@ -6,9 +6,10 @@ use uuid::Uuid;
 
 use crate::models::BackendType;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutoResolveStrategy {
+    #[default]
     ListOrder,
     LowestLatency,
     Random,
@@ -16,11 +17,6 @@ pub enum AutoResolveStrategy {
     GeoAware,
 }
 
-impl Default for AutoResolveStrategy {
-    fn default() -> Self {
-        Self::ListOrder
-    }
-}
 
 impl fmt::Display for AutoResolveStrategy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
