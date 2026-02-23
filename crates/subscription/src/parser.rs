@@ -58,17 +58,25 @@ fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
 fn parse_url_tls(params: &HashMap<String, String>) -> Option<TlsSettings> {
     match params.get("security").map(|s| s.as_str()) {
         Some("tls") | Some("reality") => {
+            let reality = params.get("security").map(|s| s.as_str()) == Some("reality");
             let server_name = params.get("sni").cloned();
             let alpn = params
                 .get("alpn")
                 .map(|a| a.split(',').map(|s| s.to_owned()).collect())
                 .unwrap_or_default();
             let fingerprint = params.get("fp").cloned();
+            let public_key = params.get("pbk").cloned();
+            let short_id = params.get("sid").cloned();
+            let spider_x = params.get("spx").cloned();
             Some(TlsSettings {
                 server_name,
                 alpn,
                 verify: true,
                 fingerprint,
+                reality,
+                public_key,
+                short_id,
+                spider_x,
             })
         }
         _ => None,
@@ -185,9 +193,7 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
             .map(|s| s.to_owned());
         Some(TlsSettings {
             server_name,
-            alpn: vec![],
-            verify: true,
-            fingerprint: None,
+            ..Default::default()
         })
     } else {
         None
@@ -280,9 +286,7 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
         if port == 443 {
             Some(TlsSettings {
                 server_name: Some(address.clone()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             })
         } else {
             None

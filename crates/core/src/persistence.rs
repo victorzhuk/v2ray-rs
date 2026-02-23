@@ -35,8 +35,15 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn new() -> Result<Self, PersistenceError> {
-        let dirs =
-            ProjectDirs::from("com", "v2ray-rs", "v2ray-rs").ok_or(PersistenceError::NoDirs)?;
+        Self::with_qualifier("v2ray-rs")
+    }
+
+    pub fn new_dev() -> Result<Self, PersistenceError> {
+        Self::with_qualifier("v2ray-rs-dev")
+    }
+
+    fn with_qualifier(name: &str) -> Result<Self, PersistenceError> {
+        let dirs = ProjectDirs::from("com", "v2ray-rs", name).ok_or(PersistenceError::NoDirs)?;
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
             data_dir: dirs.data_dir().to_path_buf(),

@@ -210,6 +210,21 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
         tls_obj["insecure"] = json!(true);
     }
 
+    if tls_cfg.reality {
+        let mut reality_obj = json!({ "enabled": true });
+        if let Some(pbk) = &tls_cfg.public_key {
+            reality_obj["public_key"] = json!(pbk);
+        }
+        if let Some(sid) = &tls_cfg.short_id {
+            reality_obj["short_id"] = json!(sid);
+        }
+        tls_obj["reality"] = reality_obj;
+    }
+
+    if let Some(fp) = &tls_cfg.fingerprint {
+        tls_obj["utls"] = json!({ "enabled": true, "fingerprint": fp });
+    }
+
     out["tls"] = tls_obj;
 }
 

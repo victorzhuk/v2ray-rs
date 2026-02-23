@@ -40,31 +40,31 @@ default: check build test
         build-core build-ui build-tray build-process build-subscription
 
 build:
-	@echo "$(BLUE)Building release...$(RESET)"
+	@printf "$(BLUE)Building release...$(RESET)\n"
 	$(CARGO) build --release $(CARGO_FLAGS)
 
 build-dev:
-	@echo "$(BLUE)Building debug...$(RESET)"
+	@printf "$(BLUE)Building debug...$(RESET)\n"
 	$(CARGO) build $(CARGO_FLAGS)
 
 build-core:
-	@echo "$(BLUE)Building core crate...$(RESET)"
+	@printf "$(BLUE)Building core crate...$(RESET)\n"
 	$(CARGO) build -p $(CORE) --release $(CARGO_FLAGS)
 
 build-ui:
-	@echo "$(BLUE)Building UI crate...$(RESET)"
+	@printf "$(BLUE)Building UI crate...$(RESET)\n"
 	$(CARGO) build -p $(UI) --release $(CARGO_FLAGS)
 
 build-tray:
-	@echo "$(BLUE)Building tray crate...$(RESET)"
+	@printf "$(BLUE)Building tray crate...$(RESET)\n"
 	$(CARGO) build -p $(TRAY) --release $(CARGO_FLAGS)
 
 build-process:
-	@echo "$(BLUE)Building process crate...$(RESET)"
+	@printf "$(BLUE)Building process crate...$(RESET)\n"
 	$(CARGO) build -p $(PROCESS) --release $(CARGO_FLAGS)
 
 build-subscription:
-	@echo "$(BLUE)Building subscription crate...$(RESET)"
+	@printf "$(BLUE)Building subscription crate...$(RESET)\n"
 	$(CARGO) build -p $(SUBSCRIPTION) --release $(CARGO_FLAGS)
 
 # =============================================================================
@@ -74,23 +74,23 @@ build-subscription:
 .PHONY: check check-all clippy fmt fmt-fix
 
 check:
-	@echo "$(BLUE)Running cargo check...$(RESET)"
+	@printf "$(BLUE)Running cargo check...$(RESET)\n"
 	$(CARGO) check $(CARGO_FLAGS)
 
 check-all:
-	@echo "$(BLUE)Running cargo check (all targets)...$(RESET)"
+	@printf "$(BLUE)Running cargo check (all targets)...$(RESET)\n"
 	$(CARGO) check --all-targets $(CARGO_FLAGS)
 
 clippy:
-	@echo "$(BLUE)Running clippy...$(RESET)"
+	@printf "$(BLUE)Running clippy...$(RESET)\n"
 	$(CARGO) clippy --all-features -- -D warnings $(CARGO_FLAGS)
 
 fmt:
-	@echo "$(BLUE)Checking formatting...$(RESET)"
+	@printf "$(BLUE)Checking formatting...$(RESET)\n"
 	$(CARGO) fmt -- --check
 
 fmt-fix:
-	@echo "$(GREEN)Auto-fixing formatting...$(RESET)"
+	@printf "$(GREEN)Auto-fixing formatting...$(RESET)\n"
 	$(CARGO) fmt
 
 # =============================================================================
@@ -100,31 +100,31 @@ fmt-fix:
 .PHONY: test test-core test-ui test-tray test-process test-subscription test-watch
 
 test:
-	@echo "$(BLUE)Running all tests...$(RESET)"
+	@printf "$(BLUE)Running all tests...$(RESET)\n"
 	$(CARGO) test --workspace $(CARGO_FLAGS)
 
 test-core:
-	@echo "$(BLUE)Testing core crate...$(RESET)"
+	@printf "$(BLUE)Testing core crate...$(RESET)\n"
 	$(CARGO) test -p $(CORE) $(CARGO_FLAGS)
 
 test-ui:
-	@echo "$(BLUE)Testing UI crate...$(RESET)"
+	@printf "$(BLUE)Testing UI crate...$(RESET)\n"
 	$(CARGO) test -p $(UI) $(CARGO_FLAGS)
 
 test-tray:
-	@echo "$(BLUE)Testing tray crate...$(RESET)"
+	@printf "$(BLUE)Testing tray crate...$(RESET)\n"
 	$(CARGO) test -p $(TRAY) $(CARGO_FLAGS)
 
 test-process:
-	@echo "$(BLUE)Testing process crate...$(RESET)"
+	@printf "$(BLUE)Testing process crate...$(RESET)\n"
 	$(CARGO) test -p $(PROCESS) $(CARGO_FLAGS)
 
 test-subscription:
-	@echo "$(BLUE)Testing subscription crate...$(RESET)"
+	@printf "$(BLUE)Testing subscription crate...$(RESET)\n"
 	$(CARGO) test -p $(SUBSCRIPTION) $(CARGO_FLAGS)
 
 test-watch:
-	@echo "$(YELLOW)Running tests in watch mode (requires cargo-watch)...$(RESET)"
+	@printf "$(YELLOW)Running tests in watch mode (requires cargo-watch)...$(RESET)\n"
 	$(CARGO) watch -x test
 
 # =============================================================================
@@ -134,7 +134,7 @@ test-watch:
 .PHONY: clean
 
 clean:
-	@echo "$(YELLOW)Cleaning build artifacts...$(RESET)"
+	@printf "$(YELLOW)Cleaning build artifacts...$(RESET)\n"
 	$(CARGO) clean
 
 # =============================================================================
@@ -144,12 +144,12 @@ clean:
 .PHONY: run run-dev
 
 run:
-	@echo "$(GREEN)Running UI application...$(RESET)"
+	@printf "$(GREEN)Running UI application...$(RESET)\n"
 	$(CARGO) run -p $(UI) --release $(CARGO_FLAGS)
 
 run-dev:
-	@echo "$(GREEN)Running UI application (debug)...$(RESET)"
-	$(CARGO) run -p $(UI) $(CARGO_FLAGS)
+	@printf "$(GREEN)Running UI application (dev mode, no tray, separate data)...$(RESET)\n"
+	V2RAY_RS_DEV=1 $(CARGO) run -p $(UI) $(CARGO_FLAGS)
 
 # =============================================================================
 # Documentation Targets
@@ -158,11 +158,11 @@ run-dev:
 .PHONY: doc doc-open
 
 doc:
-	@echo "$(BLUE)Generating documentation...$(RESET)"
+	@printf "$(BLUE)Generating documentation...$(RESET)\n"
 	$(CARGO) doc --no-deps $(CARGO_FLAGS)
 
 doc-open:
-	@echo "$(GREEN)Generating and opening documentation...$(RESET)"
+	@printf "$(GREEN)Generating and opening documentation...$(RESET)\n"
 	$(CARGO) doc --no-deps --open $(CARGO_FLAGS)
 
 # =============================================================================
@@ -172,10 +172,10 @@ doc-open:
 .PHONY: lint fix
 
 lint: fmt clippy
-	@echo "$(GREEN)Lint checks complete.$(RESET)"
+	@printf "$(GREEN)Lint checks complete.$(RESET)\n"
 
 fix:
-	@echo "$(GREEN)Auto-fixing code issues...$(RESET)"
+	@printf "$(GREEN)Auto-fixing code issues...$(RESET)\n"
 	$(CARGO) fix --allow-staged --allow-dirty $(CARGO_FLAGS)
 	$(CARGO) fmt
 	$(CARGO) clippy --all-features --fix --allow-staged --allow-dirty -- -D warnings $(CARGO_FLAGS)
@@ -187,7 +187,7 @@ fix:
 .PHONY: release
 
 release:
-	@echo "$(GREEN)Building optimized release...$(RESET)"
+	@printf "$(GREEN)Building optimized release...$(RESET)\n"
 	RUSTFLAGS="-C target-cpu=native $(RUSTFLAGS)" $(CARGO) build --release $(CARGO_FLAGS)
 
 # =============================================================================
@@ -197,12 +197,12 @@ release:
 .PHONY: help
 
 help:
-	@echo "$(GREEN)v2ray-rs Workspace Makefile$(RESET)"
+	@printf "$(GREEN)v2ray-rs Workspace Makefile$(RESET)\n"
 	@echo ""
-	@echo "$(BLUE)Default:$(RESET)"
+	@printf "$(BLUE)Default:$(RESET)\n"
 	@echo "  make                Run check, build, and test"
 	@echo ""
-	@echo "$(BLUE)Build:$(RESET)"
+	@printf "$(BLUE)Build:$(RESET)\n"
 	@echo "  make build          Release build"
 	@echo "  make build-dev      Debug build"
 	@echo "  make build-core     Build core crate"
@@ -211,14 +211,14 @@ help:
 	@echo "  make build-process  Build process crate"
 	@echo "  make build-subscription Build subscription crate"
 	@echo ""
-	@echo "$(BLUE)Check:$(RESET)"
+	@printf "$(BLUE)Check:$(RESET)\n"
 	@echo "  make check          Run cargo check"
 	@echo "  make check-all      Check all targets including tests"
 	@echo "  make clippy         Run clippy with all features"
 	@echo "  make fmt            Check formatting"
 	@echo "  make fmt-fix        Auto-fix formatting"
 	@echo ""
-	@echo "$(BLUE)Test:$(RESET)"
+	@printf "$(BLUE)Test:$(RESET)\n"
 	@echo "  make test           Run all tests"
 	@echo "  make test-core      Test core crate"
 	@echo "  make test-ui        Test UI crate"
@@ -227,26 +227,26 @@ help:
 	@echo "  make test-subscription Test subscription crate"
 	@echo "  make test-watch     Run tests in watch mode"
 	@echo ""
-	@echo "$(BLUE)Run:$(RESET)"
+	@printf "$(BLUE)Run:$(RESET)\n"
 	@echo "  make run            Run the UI application"
-	@echo "  make run-dev        Run in debug mode"
+	@echo "  make run-dev        Run in dev mode (no tray, separate data)"
 	@echo ""
-	@echo "$(BLUE)Documentation:$(RESET)"
+	@printf "$(BLUE)Documentation:$(RESET)\n"
 	@echo "  make doc            Generate documentation"
 	@echo "  make doc-open       Generate and open docs"
 	@echo ""
-	@echo "$(BLUE)Quality:$(RESET)"
+	@printf "$(BLUE)Quality:$(RESET)\n"
 	@echo "  make lint           Run clippy + fmt check"
 	@echo "  make fix            Auto-fix clippy and fmt issues"
 	@echo "  make clean          Clean build artifacts"
 	@echo ""
-	@echo "$(BLUE)Release:$(RESET)"
+	@printf "$(BLUE)Release:$(RESET)\n"
 	@echo "  make release        Build optimized release"
 	@echo ""
-	@echo "$(BLUE)Help:$(RESET)"
+	@printf "$(BLUE)Help:$(RESET)\n"
 	@echo "  make help           Show this help message"
 	@echo ""
-	@echo "$(YELLOW)Environment Variables:$(RESET)"
+	@printf "$(YELLOW)Environment Variables:$(RESET)\n"
 	@echo "  CARGO_FLAGS         Additional flags for cargo"
 	@echo "  RUSTFLAGS           Additional flags for rustc"
 	@echo "  CARGO_TARGET_DIR    Override target directory"

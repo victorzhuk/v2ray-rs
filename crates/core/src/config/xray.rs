@@ -67,9 +67,8 @@ mod tests {
             transport: TransportSettings::Tcp,
             tls: Some(TlsSettings {
                 server_name: Some("xray.example.com".into()),
-                alpn: vec![],
-                verify: true,
                 fingerprint: Some("chrome".into()),
+                ..Default::default()
             }),
             remark: Some("XTLS Node".into()),
         })
@@ -89,9 +88,7 @@ mod tests {
             }),
             tls: Some(TlsSettings {
                 server_name: Some("plain.example.com".into()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             }),
             remark: Some("Plain VLESS".into()),
         })

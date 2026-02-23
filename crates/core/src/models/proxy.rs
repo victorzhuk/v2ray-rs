@@ -144,6 +144,29 @@ pub struct TlsSettings {
     pub verify: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub reality: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub short_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spider_x: Option<String>,
+}
+
+impl Default for TlsSettings {
+    fn default() -> Self {
+        Self {
+            server_name: None,
+            alpn: Vec::new(),
+            verify: true,
+            fingerprint: None,
+            reality: false,
+            public_key: None,
+            short_id: None,
+            spider_x: None,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -169,8 +192,7 @@ mod tests {
             tls: Some(TlsSettings {
                 server_name: Some("example.com".into()),
                 alpn: vec!["h2".into()],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             }),
             remark: Some("Test VLESS".into()),
         })
@@ -207,9 +229,7 @@ mod tests {
             transport: TransportSettings::Tcp,
             tls: Some(TlsSettings {
                 server_name: Some("trojan.example.com".into()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             }),
             remark: Some("Test Trojan".into()),
         })

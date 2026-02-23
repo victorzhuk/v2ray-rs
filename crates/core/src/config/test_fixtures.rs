@@ -21,8 +21,7 @@ pub(crate) mod fixtures {
             tls: Some(TlsSettings {
                 server_name: Some("example.com".into()),
                 alpn: vec!["h2".into()],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             }),
             remark: Some("Test VLESS".into()),
         })
@@ -59,9 +58,7 @@ pub(crate) mod fixtures {
             transport: TransportSettings::Tcp,
             tls: Some(TlsSettings {
                 server_name: Some("trojan.example.com".into()),
-                alpn: vec![],
-                verify: true,
-                fingerprint: None,
+                ..Default::default()
             }),
             remark: Some("Test Trojan".into()),
         })

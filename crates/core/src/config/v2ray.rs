@@ -195,19 +195,40 @@ fn apply_stream_settings(
     }
 
     if let Some(tls_cfg) = tls {
-        stream["security"] = json!("tls");
-        let mut tls_obj = json!({});
-        if let Some(sni) = &tls_cfg.server_name {
-            tls_obj["serverName"] = json!(sni);
+        if tls_cfg.reality {
+            stream["security"] = json!("reality");
+            let mut reality_obj = json!({});
+            if let Some(sni) = &tls_cfg.server_name {
+                reality_obj["serverName"] = json!(sni);
+            }
+            if let Some(fp) = &tls_cfg.fingerprint {
+                reality_obj["fingerprint"] = json!(fp);
+            }
+            if let Some(pbk) = &tls_cfg.public_key {
+                reality_obj["publicKey"] = json!(pbk);
+            }
+            if let Some(sid) = &tls_cfg.short_id {
+                reality_obj["shortId"] = json!(sid);
+            }
+            if let Some(spx) = &tls_cfg.spider_x {
+                reality_obj["spiderX"] = json!(spx);
+            }
+            stream["realitySettings"] = reality_obj;
+        } else {
+            stream["security"] = json!("tls");
+            let mut tls_obj = json!({});
+            if let Some(sni) = &tls_cfg.server_name {
+                tls_obj["serverName"] = json!(sni);
+            }
+            if !tls_cfg.alpn.is_empty() {
+                tls_obj["alpn"] = json!(tls_cfg.alpn);
+            }
+            tls_obj["allowInsecure"] = json!(!tls_cfg.verify);
+            if let Some(fp) = &tls_cfg.fingerprint {
+                tls_obj["fingerprint"] = json!(fp);
+            }
+            stream["tlsSettings"] = tls_obj;
         }
-        if !tls_cfg.alpn.is_empty() {
-            tls_obj["alpn"] = json!(tls_cfg.alpn);
-        }
-        tls_obj["allowInsecure"] = json!(!tls_cfg.verify);
-        if let Some(fp) = &tls_cfg.fingerprint {
-            tls_obj["fingerprint"] = json!(fp);
-        }
-        stream["tlsSettings"] = tls_obj;
     }
 
     outbound["streamSettings"] = stream;

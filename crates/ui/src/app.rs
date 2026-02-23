@@ -651,6 +651,7 @@ fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
 }
 
 const APP_ID: &str = "com.github.v2ray-rs";
+const APP_ID_DEV: &str = "com.github.v2ray-rs.dev";
 
 fn install_icon_for_compositor() {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
@@ -707,11 +708,21 @@ fn install_resource_icon(
 }
 
 pub fn run() {
+    #[cfg(debug_assertions)]
+    let dev_mode = std::env::var_os("V2RAY_RS_DEV").is_some_and(|v| !v.is_empty());
+    #[cfg(not(debug_assertions))]
+    let dev_mode = false;
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls crypto provider");
 
-    let paths = AppPaths::new().expect("failed to determine XDG directories");
+    let paths = if dev_mode {
+        AppPaths::new_dev()
+    } else {
+        AppPaths::new()
+    }
+    .expect("failed to determine XDG directories");
 
     let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();
     crate::i18n::init(settings.language);
@@ -724,17 +735,19 @@ pub fn run() {
         *guard = Some(event_tx);
     }
 
-    let tray_handle = rt.block_on(async {
-        let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
-        v2ray_rs_tray::TrayService::spawn(event_rx, notifier)
-            .await
-            .ok()
-    });
+    if !dev_mode {
+        let tray_handle = rt.block_on(async {
+            let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
+            v2ray_rs_tray::TrayService::spawn(event_rx, notifier)
+                .await
+                .ok()
+        });
 
-    if let Some(handle) = tray_handle
-        && let Ok(mut guard) = TRAY_HANDLE.lock()
-    {
-        *guard = Some(handle);
+        if let Some(handle) = tray_handle
+            && let Ok(mut guard) = TRAY_HANDLE.lock()
+        {
+            *guard = Some(handle);
+        }
     }
 
     let resource_bytes =
@@ -742,9 +755,11 @@ pub fn run() {
     let resource =
         gtk::gio::Resource::from_data(&resource_bytes).expect("failed to load icon resource");
     gtk::gio::resources_register(&resource);
-    let app = adw::Application::builder().application_id(APP_ID).build();
 
-    app.connect_startup(|_| {
+    let app_id = if dev_mode { APP_ID_DEV } else { APP_ID };
+    let app = adw::Application::builder().application_id(app_id).build();
+
+    app.connect_startup(move |_| {
         if let Some(display) = gtk::gdk::Display::default() {
             let theme = gtk::IconTheme::for_display(&display);
             theme.add_resource_path("/com/github/v2ray-rs/icons");
