@@ -7,7 +7,10 @@ mod settings;
 mod subscription;
 mod validation;
 
-pub use dns::{DnsConfig, DnsProtocol, DnsServer};
+pub use dns::{
+    DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, FakeIpConfig,
+    HostOverride,
+};
 pub use presets::*;
 pub use proxy::*;
 pub use resolve::*;

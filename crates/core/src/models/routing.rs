@@ -2,7 +2,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::validation::{ValidationError, validate_rule_match};
+use super::validation::{validate_rule_match, ValidationError};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RoutingRule {

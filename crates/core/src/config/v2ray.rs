@@ -1,11 +1,12 @@
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
-    ShadowsocksConfig, TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
+    AppSettings, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings,
+    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
+    TrojanConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 pub struct V2rayGenerator;
@@ -311,55 +312,124 @@ fn first_proxy_tag() -> String {
     "proxy-0".to_string()
 }
 
-fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
-    let mut remote_domains: Vec<String> = Vec::new();
-    let mut domestic_domains: Vec<String> = Vec::new();
+fn v2ray_address_with_fallback(server: &DnsServerConfig) -> String {
+    match server.protocol {
+        DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3 => {
+            eprintln!(
+                "DNS protocol {:?} not supported by v2ray, falling back to DoH for server '{}'",
+                server.protocol, server.tag
+            );
+            DnsProtocol::Doh.server_address(&server.address, server.port)
+        }
+        _ => server.protocol.server_address(&server.address, server.port),
+    }
+}
 
-    for rule in rules.iter().filter(|r| r.enabled) {
-        let entry = match &rule.match_condition {
-            RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
-            RuleMatch::Domain { pattern } => Some(pattern.clone()),
-            _ => None,
-        };
-        if let Some(d) = entry {
-            match rule.action {
-                RuleAction::Proxy => remote_domains.push(d),
-                RuleAction::Direct => domestic_domains.push(d),
-                RuleAction::Block => {}
+fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+    let mut dns_config = json!({});
+
+    let mut servers: Vec<Value> = Vec::new();
+
+    if settings.dns.use_custom_rules {
+        for server in &settings.dns.servers {
+            let domains: Vec<String> = settings
+                .dns
+                .rules
+                .iter()
+                .filter(|rule| rule.server_tag == server.tag)
+                .map(|rule| match &rule.match_condition {
+                    DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
+                    DnsRuleMatch::DomainSuffix { suffix } => format!("domain:{suffix}"),
+                })
+                .collect();
+
+            let address = v2ray_address_with_fallback(server);
+
+            if domains.is_empty() {
+                servers.push(json!(address));
+            } else {
+                servers.push(json!({
+                    "address": address,
+                    "domains": domains,
+                }));
+            }
+        }
+    } else {
+        let mut remote_domains: Vec<String> = Vec::new();
+        let mut domestic_domains: Vec<String> = Vec::new();
+
+        for rule in rules.iter().filter(|r| r.enabled) {
+            let entry = match &rule.match_condition {
+                RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
+                RuleMatch::Domain { pattern } => Some(pattern.clone()),
+                _ => None,
+            };
+            if let Some(d) = entry {
+                match rule.action {
+                    RuleAction::Proxy => remote_domains.push(d),
+                    RuleAction::Direct => domestic_domains.push(d),
+                    RuleAction::Block => {}
+                }
+            }
+        }
+
+        for server in &settings.dns.servers {
+            let address = v2ray_address_with_fallback(server);
+
+            if server.tag == "remote" && !remote_domains.is_empty() {
+                servers.push(json!({
+                    "address": address,
+                    "domains": remote_domains,
+                }));
+            } else if server.tag == "domestic" && !domestic_domains.is_empty() {
+                servers.push(json!({
+                    "address": address,
+                    "domains": domestic_domains,
+                }));
+            } else {
+                servers.push(json!(address));
             }
         }
     }
 
-    let mut servers: Vec<Value> = Vec::new();
-
-    if !remote_domains.is_empty() {
-        servers.push(json!({
-            "address": settings.dns.remote.server_address(),
-            "domains": remote_domains,
-        }));
-    }
-
-    if !domestic_domains.is_empty() {
-        servers.push(json!({
-            "address": settings.dns.domestic.server_address(),
-            "domains": domestic_domains,
-        }));
-    }
-
     if servers.is_empty() {
-        servers.push(json!(settings.dns.remote.server_address()));
+        servers.push(json!("localhost"));
     }
 
-    servers.push(json!("localhost"));
+    dns_config["servers"] = json!(servers);
 
-    json!({ "servers": servers })
+    let query_strategy = match settings.dns.strategy {
+        DnsStrategy::PreferIpv4 => "UseIPv4",
+        DnsStrategy::PreferIpv6 => "UseIPv6",
+        DnsStrategy::Ipv4Only => "UseIPv4",
+        DnsStrategy::Ipv6Only => "UseIPv6",
+    };
+    dns_config["queryStrategy"] = json!(query_strategy);
+
+    if !settings.dns.hosts.is_empty() {
+        let mut hosts: serde_json::Map<String, Value> = serde_json::Map::new();
+        for host in &settings.dns.hosts {
+            hosts.insert(host.domain.clone(), json!(host.ip));
+        }
+        dns_config["hosts"] = json!(hosts);
+    }
+
+    if settings.dns.disable_cache {
+        dns_config["disableCache"] = json!(true);
+    }
+
+    if let Some(ref subnet) = settings.dns.client_subnet {
+        dns_config["clientIp"] = json!(subnet);
+    }
+
+    dns_config
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::test_fixtures::fixtures::*;
-    use crate::models::*;
+    use crate::models::{DnsServerConfig, DnsStrategy, HostOverride, *};
 
     #[test]
     fn test_generate_returns_error_on_empty_nodes() {
@@ -687,6 +757,295 @@ mod tests {
             .generate(&nodes, &rules, &default_settings(), None)
             .unwrap();
         let json_str = serde_json::to_string_pretty(&config).unwrap();
+        let _: Value = serde_json::from_str(&json_str).unwrap();
+    }
+
+    #[test]
+    fn test_dns_multiple_servers() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "cloudflare".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "google".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "8.8.8.8".to_string(),
+                port: Some(5353),
+                detour: None,
+            },
+        ];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].as_str(), Some("https://1.1.1.1/dns-query"));
+        assert_eq!(servers[1].as_str(), Some("8.8.8.8:5353"));
+    }
+
+    #[test]
+    fn test_dns_query_strategy_mapping() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let strategies = vec![
+            (DnsStrategy::PreferIpv4, "UseIPv4"),
+            (DnsStrategy::PreferIpv6, "UseIPv6"),
+            (DnsStrategy::Ipv4Only, "UseIPv4"),
+            (DnsStrategy::Ipv6Only, "UseIPv6"),
+        ];
+
+        for (strategy, expected) in strategies {
+            settings.dns.strategy = strategy;
+            let dns = build_dns(&[], &settings);
+            assert_eq!(dns["queryStrategy"], expected);
+        }
+    }
+
+    #[test]
+    fn test_dns_hosts_generation() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "example.com".to_string(),
+                ip: "192.0.2.1".to_string(),
+            },
+            HostOverride {
+                domain: "test.local".to_string(),
+                ip: "10.0.0.1".to_string(),
+            },
+        ];
+
+        let dns = build_dns(&[], &settings);
+        let hosts = dns["hosts"].as_object().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts.get("example.com"), Some(&json!("192.0.2.1")));
+        assert_eq!(hosts.get("test.local"), Some(&json!("10.0.0.1")));
+    }
+
+    #[test]
+    fn test_dns_protocol_fallback() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+
+        let protocols = vec![
+            (DnsProtocol::Dot, "https://1.1.1.1/dns-query"),
+            (DnsProtocol::Doq, "https://1.1.1.1/dns-query"),
+            (DnsProtocol::H3, "https://1.1.1.1/dns-query"),
+            (DnsProtocol::Doh, "https://1.1.1.1/dns-query"),
+        ];
+
+        for (protocol, expected_address) in protocols {
+            settings.dns.servers = vec![DnsServerConfig {
+                tag: "test".to_string(),
+                protocol,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }];
+
+            let dns = build_dns(&[], &settings);
+            let servers = dns["servers"].as_array().unwrap();
+            assert_eq!(servers[0].as_str(), Some(expected_address));
+        }
+    }
+
+    #[test]
+    fn test_dns_disable_cache_and_client_subnet() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.disable_cache = true;
+        settings.dns.client_subnet = Some("203.0.113.1".to_string());
+
+        let dns = build_dns(&[], &settings);
+        assert_eq!(dns["disableCache"], true);
+        assert_eq!(dns["clientIp"], "203.0.113.1");
+    }
+
+    #[test]
+    fn test_dns_custom_rules_with_per_server_domains() {
+        use crate::models::{DnsRule, DnsRuleMatch};
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "domestic".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "223.5.5.5".to_string(),
+                port: None,
+                detour: None,
+            },
+        ];
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "google".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: ".cn".to_string(),
+                },
+                server_tag: "domestic".to_string(),
+            },
+        ];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+
+        let remote = &servers[0];
+        assert_eq!(remote["address"], "https://1.1.1.1/dns-query");
+        let remote_domains = remote["domains"].as_array().unwrap();
+        assert_eq!(remote_domains.len(), 1);
+        assert_eq!(remote_domains[0], "geosite:google");
+
+        let domestic = &servers[1];
+        assert_eq!(domestic["address"], "223.5.5.5:53");
+        let domestic_domains = domestic["domains"].as_array().unwrap();
+        assert_eq!(domestic_domains.len(), 1);
+        assert_eq!(domestic_domains[0], "domain:.cn");
+    }
+
+    #[test]
+    fn test_dns_empty_servers_uses_localhost() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].as_str(), Some("localhost"));
+    }
+
+    #[test]
+    fn test_dns_tcp_protocol_formatting() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Tcp,
+            address: "8.8.8.8".to_string(),
+            port: Some(5353),
+            detour: None,
+        }];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers[0].as_str(), Some("tcp://8.8.8.8:5353"));
+    }
+
+    #[test]
+    fn test_dns_full_config_valid_json() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.strategy = DnsStrategy::Ipv4Only;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "cloudflare".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "google".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "8.8.8.8".to_string(),
+                port: Some(5353),
+                detour: None,
+            },
+        ];
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "google".to_string(),
+                },
+                server_tag: "cloudflare".to_string(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: ".cn".to_string(),
+                },
+                server_tag: "google".to_string(),
+            },
+        ];
+        settings.dns.disable_cache = true;
+        settings.dns.client_subnet = Some("203.0.113.1".to_string());
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "example.com".to_string(),
+                ip: "192.0.2.1".to_string(),
+            },
+            HostOverride {
+                domain: "test.local".to_string(),
+                ip: "10.0.0.1".to_string(),
+            },
+        ];
+
+        let generator = V2rayGenerator;
+        let config = generator
+            .generate(&[vless_node()], &[], &settings, None)
+            .unwrap();
+
+        // Verify DNS config is present
+        assert!(config.get("dns").is_some());
+        let dns = &config["dns"];
+
+        // Verify all fields are present
+        assert_eq!(dns["queryStrategy"], "UseIPv4");
+        assert_eq!(dns["disableCache"], true);
+        assert_eq!(dns["clientIp"], "203.0.113.1");
+
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+
+        let hosts = dns["hosts"].as_object().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts.get("example.com"), Some(&json!("192.0.2.1")));
+        assert_eq!(hosts.get("test.local"), Some(&json!("10.0.0.1")));
+
+        // Verify JSON roundtrip
+        let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
     }
 }

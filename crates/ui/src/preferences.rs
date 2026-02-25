@@ -9,8 +9,9 @@ use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    AppSettings, AutoResolveStrategy, BackendConfig, Language, Preset, RoutingRule, RoutingRuleSet,
-    RuleAction, RuleMatch, builtin_presets,
+    builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig, BackendType, DnsProtocol,
+    DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, Language, Preset,
+    RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -36,6 +37,9 @@ pub fn show_preferences(
 
     let routing_page = build_routing_page(paths);
     dialog.add(&routing_page);
+
+    let dns_page = build_dns_page(&settings_state, &cb);
+    dialog.add(&dns_page);
 
     dialog.present(Some(parent));
 }
@@ -904,4 +908,875 @@ fn format_match(m: &RuleMatch) -> String {
         RuleMatch::Domain { pattern } => format!("Domain: {pattern}"),
         RuleMatch::IpCidr { cidr } => format!("IP CIDR: {cidr}"),
     }
+}
+
+fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> adw::PreferencesPage {
+    let page = adw::PreferencesPage::builder()
+        .title("DNS")
+        .icon_name("network-transmit-symbolic")
+        .build();
+
+    let s = state.borrow();
+
+    let dns_group = adw::PreferencesGroup::builder().title("DNS").build();
+
+    let enable_row = adw::SwitchRow::builder()
+        .title("Enable DNS")
+        .active(s.dns.enabled)
+        .build();
+    dns_group.add(&enable_row);
+
+    let strategy_row = adw::ComboRow::builder()
+        .title("IP Strategy")
+        .model(&gtk::StringList::new(&[
+            "Prefer IPv4",
+            "Prefer IPv6",
+            "IPv4 Only",
+            "IPv6 Only",
+        ]))
+        .selected(match s.dns.strategy {
+            DnsStrategy::PreferIpv4 => 0,
+            DnsStrategy::PreferIpv6 => 1,
+            DnsStrategy::Ipv4Only => 2,
+            DnsStrategy::Ipv6Only => 3,
+        })
+        .build();
+    dns_group.add(&strategy_row);
+    page.add(&dns_group);
+
+    drop(s);
+
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        enable_row.connect_active_notify(move |row| {
+            st.borrow_mut().dns.enabled = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        strategy_row.connect_selected_notify(move |row| {
+            st.borrow_mut().dns.strategy = match row.selected() {
+                1 => DnsStrategy::PreferIpv6,
+                2 => DnsStrategy::Ipv4Only,
+                3 => DnsStrategy::Ipv6Only,
+                _ => DnsStrategy::PreferIpv4,
+            };
+            emit(&st, &cb);
+        });
+    }
+
+    let servers_group = adw::PreferencesGroup::builder().title("Servers").build();
+    let servers_toolbar = adw::ActionRow::builder().activatable(false).build();
+    let servers_toolbar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .hexpand(true)
+        .build();
+    let add_server_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add Server")
+        .css_classes(["flat"])
+        .build();
+    servers_toolbar_box.append(&add_server_btn);
+    servers_toolbar.add_suffix(&servers_toolbar_box);
+    servers_group.add(&servers_toolbar);
+    page.add(&servers_group);
+
+    let rules_group = adw::PreferencesGroup::builder().title("DNS Rules").build();
+    let rules_toolbar = adw::ActionRow::builder().activatable(false).build();
+    let rules_toolbar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .hexpand(true)
+        .build();
+    let custom_rules_switch = gtk::Switch::builder()
+        .active(state.borrow().dns.use_custom_rules)
+        .valign(gtk::Align::Center)
+        .build();
+    let custom_rules_label = gtk::Label::builder()
+        .label("Custom Rules")
+        .margin_start(6)
+        .build();
+    let add_rule_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add Rule")
+        .css_classes(["flat"])
+        .sensitive(state.borrow().dns.use_custom_rules)
+        .build();
+    rules_toolbar_box.append(&custom_rules_switch);
+    rules_toolbar_box.append(&custom_rules_label);
+    rules_toolbar_box.append(&add_rule_btn);
+    rules_toolbar.add_suffix(&rules_toolbar_box);
+    rules_group.add(&rules_toolbar);
+    page.add(&rules_group);
+
+    let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
+    let disable_cache_row = adw::SwitchRow::builder()
+        .title("Disable Cache")
+        .active(state.borrow().dns.disable_cache)
+        .build();
+    advanced_group.add(&disable_cache_row);
+    let client_subnet_row = adw::EntryRow::builder()
+        .title("Client Subnet IP")
+        .text(
+            state
+                .borrow()
+                .dns
+                .client_subnet
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .build();
+    advanced_group.add(&client_subnet_row);
+    page.add(&advanced_group);
+
+    let hosts_group = adw::PreferencesGroup::builder().title("Hosts").build();
+    let hosts_toolbar = adw::ActionRow::builder().activatable(false).build();
+    let hosts_toolbar_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .hexpand(true)
+        .build();
+    let add_host_btn = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Add Host")
+        .css_classes(["flat"])
+        .build();
+    hosts_toolbar_box.append(&add_host_btn);
+    hosts_toolbar.add_suffix(&hosts_toolbar_box);
+    hosts_group.add(&hosts_toolbar);
+    page.add(&hosts_group);
+
+    let is_singbox = state.borrow().backend.backend_type == BackendType::SingBox;
+
+    let fakeip_group = adw::PreferencesGroup::builder()
+        .title("FakeIP")
+        .visible(is_singbox)
+        .build();
+    let fakeip_enable_row = adw::SwitchRow::builder()
+        .title("Enable FakeIP")
+        .active(state.borrow().dns.fakeip.enabled)
+        .build();
+    fakeip_group.add(&fakeip_enable_row);
+    let fakeip_inet4_row = adw::EntryRow::builder()
+        .title("IPv4 Range")
+        .text(&state.borrow().dns.fakeip.inet4_range)
+        .build();
+    fakeip_group.add(&fakeip_inet4_row);
+    let fakeip_inet6_row = adw::EntryRow::builder()
+        .title("IPv6 Range")
+        .text(&state.borrow().dns.fakeip.inet6_range)
+        .build();
+    fakeip_group.add(&fakeip_inet6_row);
+    page.add(&fakeip_group);
+
+    let st = state.clone();
+    let cb_clone = cb.clone();
+    let add_rule_btn_clone = add_rule_btn.clone();
+    custom_rules_switch.connect_active_notify(move |sw| {
+        st.borrow_mut().dns.use_custom_rules = sw.is_active();
+        add_rule_btn_clone.set_sensitive(sw.is_active());
+        emit(&st, &cb_clone);
+    });
+
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        disable_cache_row.connect_active_notify(move |row| {
+            st.borrow_mut().dns.disable_cache = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        client_subnet_row.connect_changed(move |row| {
+            let text = row.text().to_string();
+            if text.trim().is_empty() {
+                st.borrow_mut().dns.client_subnet = None;
+            } else {
+                st.borrow_mut().dns.client_subnet = Some(text.trim().to_string());
+            }
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        fakeip_enable_row.connect_active_notify(move |row| {
+            st.borrow_mut().dns.fakeip.enabled = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        fakeip_inet4_row.connect_changed(move |row| {
+            st.borrow_mut().dns.fakeip.inet4_range = row.text().to_string();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        fakeip_inet6_row.connect_changed(move |row| {
+            st.borrow_mut().dns.fakeip.inet6_range = row.text().to_string();
+            emit(&st, &cb);
+        });
+    }
+
+    let dns_ctx = DnsRenderCtx {
+        state: state.clone(),
+        cb: cb.clone(),
+        servers_group: servers_group.clone(),
+        rules_group: rules_group.clone(),
+        hosts_group: hosts_group.clone(),
+        added_servers: Rc::new(RefCell::new(Vec::new())),
+        added_rules: Rc::new(RefCell::new(Vec::new())),
+        added_hosts: Rc::new(RefCell::new(Vec::new())),
+    };
+
+    render_dns_servers(&dns_ctx);
+    render_dns_rules(&dns_ctx);
+    render_dns_hosts(&dns_ctx);
+
+    {
+        let ctx = dns_ctx.clone();
+        add_server_btn.connect_clicked(move |_| {
+            show_dns_server_dialog(None, &ctx);
+        });
+    }
+    {
+        let ctx = dns_ctx.clone();
+        add_rule_btn.connect_clicked(move |_| {
+            show_dns_rule_dialog(None, &ctx);
+        });
+    }
+    {
+        let ctx = dns_ctx.clone();
+        add_host_btn.connect_clicked(move |_| {
+            show_dns_host_dialog(None, &ctx);
+        });
+    }
+
+    page
+}
+
+#[derive(Clone)]
+struct DnsRenderCtx {
+    state: Rc<RefCell<AppSettings>>,
+    cb: SettingsCallback,
+    servers_group: adw::PreferencesGroup,
+    rules_group: adw::PreferencesGroup,
+    hosts_group: adw::PreferencesGroup,
+    added_servers: Rc<RefCell<Vec<adw::ActionRow>>>,
+    added_rules: Rc<RefCell<Vec<adw::ActionRow>>>,
+    added_hosts: Rc<RefCell<Vec<adw::ActionRow>>>,
+}
+
+fn render_dns_servers(ctx: &DnsRenderCtx) {
+    for row in ctx.added_servers.borrow().iter() {
+        ctx.servers_group.remove(row);
+    }
+    ctx.added_servers.borrow_mut().clear();
+
+    let servers = ctx.state.borrow().dns.servers.clone();
+    let _is_singbox = ctx.state.borrow().backend.backend_type == BackendType::SingBox;
+
+    let mut added = ctx.added_servers.borrow_mut();
+    for server in &servers {
+        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
+
+        let subtitle = format!(
+            "{}://{}:{}",
+            protocol_str,
+            server.address,
+            server.port.unwrap_or_else(|| {
+                match server.protocol {
+                    DnsProtocol::Udp | DnsProtocol::Tcp => 53,
+                    DnsProtocol::Doh | DnsProtocol::H3 => 443,
+                    DnsProtocol::Dot | DnsProtocol::Doq => 853,
+                }
+            })
+        );
+
+        let row = adw::ActionRow::builder()
+            .title(&server.tag)
+            .subtitle(&subtitle)
+            .build();
+
+        let edit_btn = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let server_clone = server.clone();
+        edit_btn.connect_clicked(move |_| {
+            show_dns_server_dialog(Some(server_clone.clone()), &ctx_clone);
+        });
+        row.add_suffix(&edit_btn);
+
+        let remove_btn = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let tag = server.tag.clone();
+        remove_btn.connect_clicked(move |_| {
+            show_dns_remove_server_dialog(tag.clone(), &ctx_clone);
+        });
+        row.add_suffix(&remove_btn);
+
+        ctx.servers_group.add(&row);
+        added.push(row);
+    }
+}
+
+fn render_dns_rules(ctx: &DnsRenderCtx) {
+    for row in ctx.added_rules.borrow().iter() {
+        ctx.rules_group.remove(row);
+    }
+    ctx.added_rules.borrow_mut().clear();
+
+    let use_custom = ctx.state.borrow().dns.use_custom_rules;
+
+    if !use_custom {
+        let label = adw::ActionRow::builder()
+            .title("Rules auto-derived from routing")
+            .subtitle("Enable custom rules to manually configure DNS rules")
+            .sensitive(false)
+            .build();
+        ctx.rules_group.add(&label);
+        ctx.added_rules.borrow_mut().push(label);
+        return;
+    }
+
+    let rules = ctx.state.borrow().dns.rules.clone();
+    let _servers: Vec<String> = ctx
+        .state
+        .borrow()
+        .dns
+        .servers
+        .iter()
+        .map(|s| s.tag.clone())
+        .collect();
+
+    let mut added = ctx.added_rules.borrow_mut();
+    for rule in &rules {
+        let (match_type, value) = match &rule.match_condition {
+            DnsRuleMatch::GeoSite { category } => ("GeoSite", category),
+            DnsRuleMatch::DomainSuffix { suffix } => ("Domain Suffix", suffix),
+        };
+
+        let row = adw::ActionRow::builder()
+            .title(format!("{match_type}: {value}"))
+            .subtitle(format!("Server: {}", rule.server_tag))
+            .build();
+
+        let edit_btn = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let rule_clone = rule.clone();
+        edit_btn.connect_clicked(move |_| {
+            show_dns_rule_dialog(Some(rule_clone.clone()), &ctx_clone);
+        });
+        row.add_suffix(&edit_btn);
+
+        let remove_btn = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let rule_clone = rule.clone();
+        remove_btn.connect_clicked(move |_| {
+            ctx_clone
+                .state
+                .borrow_mut()
+                .dns
+                .rules
+                .retain(|r| r != &rule_clone);
+            emit(&ctx_clone.state, &ctx_clone.cb);
+            render_dns_rules(&ctx_clone);
+        });
+        row.add_suffix(&remove_btn);
+
+        ctx.rules_group.add(&row);
+        added.push(row);
+    }
+}
+
+fn render_dns_hosts(ctx: &DnsRenderCtx) {
+    for row in ctx.added_hosts.borrow().iter() {
+        ctx.hosts_group.remove(row);
+    }
+    ctx.added_hosts.borrow_mut().clear();
+
+    let hosts = ctx.state.borrow().dns.hosts.clone();
+
+    let mut added = ctx.added_hosts.borrow_mut();
+    for host in &hosts {
+        let row = adw::ActionRow::builder()
+            .title(&host.domain)
+            .subtitle(&host.ip)
+            .build();
+
+        let remove_btn = gtk::Button::builder()
+            .icon_name("user-trash-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat", "destructive-action"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let domain = host.domain.clone();
+        remove_btn.connect_clicked(move |_| {
+            ctx_clone
+                .state
+                .borrow_mut()
+                .dns
+                .hosts
+                .retain(|h| h.domain != domain);
+            emit(&ctx_clone.state, &ctx_clone.cb);
+            render_dns_hosts(&ctx_clone);
+        });
+        row.add_suffix(&remove_btn);
+
+        ctx.hosts_group.add(&row);
+        added.push(row);
+    }
+}
+
+fn show_dns_remove_server_dialog(tag: String, ctx: &DnsRenderCtx) {
+    let dialog = adw::AlertDialog::builder()
+        .heading("Remove DNS Server")
+        .body(format!(
+            "Are you sure you want to remove the DNS server \"{}\"? Any DNS rules referencing this server will also be removed.",
+            tag
+        ))
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("remove", "Remove");
+    dialog.set_response_appearance("remove", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    let ctx = ctx.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "remove" {
+            return;
+        }
+
+        {
+            let mut s = ctx.state.borrow_mut();
+            s.dns.servers.retain(|srv| srv.tag != tag);
+            s.dns.rules.retain(|r| r.server_tag != tag);
+        }
+        emit(&ctx.state, &ctx.cb);
+        render_dns_servers(&ctx);
+        render_dns_rules(&ctx);
+    });
+
+    dialog.present(gtk::Window::NONE);
+}
+
+fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx) {
+    let is_edit = existing.is_some();
+
+    let (init_tag, init_protocol, init_address, init_port, init_detour) = match &existing {
+        Some(srv) => (
+            srv.tag.clone(),
+            match srv.protocol {
+                DnsProtocol::Udp => 0u32,
+                DnsProtocol::Tcp => 1,
+                DnsProtocol::Doh => 2,
+                DnsProtocol::Dot => 3,
+                DnsProtocol::Doq => 4,
+                DnsProtocol::H3 => 5,
+            },
+            srv.address.clone(),
+            srv.port.unwrap_or_default(),
+            srv.detour.clone().unwrap_or_default(),
+        ),
+        None => (String::new(), 0, String::new(), 0u16, String::new()),
+    };
+
+    let is_singbox = ctx.state.borrow().backend.backend_type == BackendType::SingBox;
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(if is_edit {
+            "Edit DNS Server"
+        } else {
+            "Add DNS Server"
+        })
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+
+    let tag_entry = adw::EntryRow::builder()
+        .title("Tag")
+        .text(&init_tag)
+        .build();
+    group.add(&tag_entry);
+
+    let protocol_combo = adw::ComboRow::builder()
+        .title("Protocol")
+        .model(&gtk::StringList::new(&[
+            "UDP", "TCP", "DoH", "DoT", "DoQ", "H3",
+        ]))
+        .selected(init_protocol)
+        .build();
+    group.add(&protocol_combo);
+
+    let address_entry = adw::EntryRow::builder()
+        .title("Address")
+        .text(&init_address)
+        .build();
+    group.add(&address_entry);
+
+    let port_spin = adw::SpinRow::builder()
+        .title("Port")
+        .adjustment(&gtk::Adjustment::new(
+            init_port as f64,
+            1.0,
+            65535.0,
+            1.0,
+            0.0,
+            0.0,
+        ))
+        .build();
+    group.add(&port_spin);
+
+    let detour_combo = adw::ComboRow::builder()
+        .title("Detour")
+        .visible(is_singbox)
+        .model(&gtk::StringList::new(&["proxy-0", "direct"]))
+        .selected(if init_detour == "direct" { 1 } else { 0 })
+        .build();
+    group.add(&detour_combo);
+
+    content.append(&group);
+    dialog.set_extra_child(Some(&content));
+
+    let ctx = ctx.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+
+        let tag = tag_entry.text().to_string().trim().to_string();
+        if tag.is_empty() {
+            return;
+        }
+
+        let address = address_entry.text().to_string().trim().to_string();
+        if address.is_empty() {
+            return;
+        }
+
+        let protocol = match protocol_combo.selected() {
+            1 => DnsProtocol::Tcp,
+            2 => DnsProtocol::Doh,
+            3 => DnsProtocol::Dot,
+            4 => DnsProtocol::Doq,
+            5 => DnsProtocol::H3,
+            _ => DnsProtocol::Udp,
+        };
+
+        let port = {
+            let p = port_spin.value() as u16;
+            let default_port = match protocol {
+                DnsProtocol::Udp | DnsProtocol::Tcp => 53,
+                DnsProtocol::Doh | DnsProtocol::H3 => 443,
+                DnsProtocol::Dot | DnsProtocol::Doq => 853,
+            };
+            if p == default_port {
+                None
+            } else {
+                Some(p)
+            }
+        };
+
+        let detour = if is_singbox {
+            let sel = detour_combo.selected();
+            if sel == 1 {
+                Some("direct".to_string())
+            } else {
+                Some("proxy-0".to_string())
+            }
+        } else {
+            None
+        };
+
+        let server = DnsServerConfig {
+            tag: tag.clone(),
+            protocol,
+            address,
+            port,
+            detour,
+        };
+
+        {
+            let mut s = ctx.state.borrow_mut();
+            if is_edit {
+                if let Some(idx) = s.dns.servers.iter().position(|srv| srv.tag == tag) {
+                    s.dns.servers[idx] = server;
+                }
+            } else {
+                s.dns.servers.push(server);
+            }
+        }
+        emit(&ctx.state, &ctx.cb);
+        render_dns_servers(&ctx);
+    });
+
+    dialog.present(gtk::Window::NONE);
+}
+
+fn show_dns_rule_dialog(existing: Option<DnsRule>, ctx: &DnsRenderCtx) {
+    let is_edit = existing.is_some();
+
+    let (init_type, init_value, init_server_tag) = match &existing {
+        Some(rule) => {
+            let (type_idx, val) = match &rule.match_condition {
+                DnsRuleMatch::GeoSite { category } => (0u32, category.clone()),
+                DnsRuleMatch::DomainSuffix { suffix } => (1, suffix.clone()),
+            };
+            (type_idx, val, rule.server_tag.clone())
+        }
+        None => (0, String::new(), String::new()),
+    };
+
+    let servers: Vec<String> = ctx
+        .state
+        .borrow()
+        .dns
+        .servers
+        .iter()
+        .map(|s| s.tag.clone())
+        .collect();
+
+    if servers.is_empty() {
+        let dialog = adw::AlertDialog::builder()
+            .heading("No DNS Servers")
+            .body("Please add at least one DNS server before creating DNS rules.")
+            .build();
+        dialog.add_response("close", "Close");
+        dialog.set_default_response(Some("close"));
+        dialog.present(gtk::Window::NONE);
+        return;
+    }
+
+    let server_tags: Vec<&str> = servers.iter().map(|s| s.as_str()).collect();
+    let init_server_idx = if existing.is_some() && !init_server_tag.is_empty() {
+        servers
+            .iter()
+            .position(|s| s == &init_server_tag)
+            .unwrap_or(0) as u32
+    } else {
+        0
+    };
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(if is_edit {
+            "Edit DNS Rule"
+        } else {
+            "Add DNS Rule"
+        })
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+
+    let match_combo = adw::ComboRow::builder()
+        .title("Match Type")
+        .model(&gtk::StringList::new(&[
+            "GeoSite Category",
+            "Domain Suffix",
+        ]))
+        .selected(init_type)
+        .build();
+    group.add(&match_combo);
+
+    let value_entry = adw::EntryRow::builder()
+        .title("Value")
+        .text(&init_value)
+        .build();
+    group.add(&value_entry);
+
+    let server_combo = adw::ComboRow::builder()
+        .title("Server Tag")
+        .model(&gtk::StringList::new(&server_tags))
+        .selected(init_server_idx)
+        .build();
+    group.add(&server_combo);
+
+    content.append(&group);
+    dialog.set_extra_child(Some(&content));
+
+    let ctx = ctx.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+
+        let value = value_entry.text().to_string().trim().to_string();
+        if value.is_empty() {
+            return;
+        }
+
+        let match_condition = match match_combo.selected() {
+            1 => DnsRuleMatch::DomainSuffix { suffix: value },
+            _ => DnsRuleMatch::GeoSite { category: value },
+        };
+
+        let server_idx = server_combo.selected() as usize;
+        let server_tag = if server_idx < servers.len() {
+            servers[server_idx].clone()
+        } else {
+            return;
+        };
+
+        let rule = DnsRule {
+            match_condition,
+            server_tag,
+        };
+
+        {
+            let mut s = ctx.state.borrow_mut();
+            if is_edit {
+                if let Some(idx) = s.dns.rules.iter().position(|r| {
+                    std::mem::discriminant(&r.match_condition)
+                        == std::mem::discriminant(&rule.match_condition)
+                }) {
+                    s.dns.rules[idx] = rule;
+                }
+            } else {
+                s.dns.rules.push(rule);
+            }
+        }
+        emit(&ctx.state, &ctx.cb);
+        render_dns_rules(&ctx);
+    });
+
+    dialog.present(gtk::Window::NONE);
+}
+
+fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRenderCtx) {
+    let is_edit = existing.is_some();
+
+    let (init_domain, init_ip) = match &existing {
+        Some(host) => (host.domain.clone(), host.ip.clone()),
+        None => (String::new(), String::new()),
+    };
+
+    let dialog = adw::AlertDialog::builder()
+        .heading(if is_edit { "Edit Host" } else { "Add Host" })
+        .build();
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("save"));
+    dialog.set_close_response("cancel");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(12)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+
+    let domain_entry = adw::EntryRow::builder()
+        .title("Domain")
+        .text(&init_domain)
+        .build();
+    group.add(&domain_entry);
+
+    let ip_entry = adw::EntryRow::builder()
+        .title("IP Address")
+        .text(&init_ip)
+        .build();
+    group.add(&ip_entry);
+
+    content.append(&group);
+    dialog.set_extra_child(Some(&content));
+
+    let ctx = ctx.clone();
+    dialog.connect_response(None, move |_, response| {
+        if response != "save" {
+            return;
+        }
+
+        let domain = domain_entry.text().to_string().trim().to_string();
+        if domain.is_empty() {
+            return;
+        }
+
+        let ip = ip_entry.text().to_string().trim().to_string();
+        if ip.is_empty() {
+            return;
+        }
+
+        let host = HostOverride { domain, ip };
+
+        {
+            let mut s = ctx.state.borrow_mut();
+            if is_edit {
+                if let Some(idx) = s.dns.hosts.iter().position(|h| h.domain == host.domain) {
+                    s.dns.hosts[idx] = host;
+                }
+            } else {
+                s.dns.hosts.push(host);
+            }
+        }
+        emit(&ctx.state, &ctx.cb);
+        render_dns_hosts(&ctx);
+    });
+
+    dialog.present(gtk::Window::NONE);
 }
