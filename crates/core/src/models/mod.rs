@@ -8,8 +8,8 @@ mod subscription;
 mod validation;
 
 pub use dns::{
-    DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, FakeIpConfig,
-    HostOverride,
+    DnsConfig, DnsProtocol, DnsProviderPreset, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
+    DnsValidationError, FakeIpConfig, HostOverride, builtin_dns_presets,
 };
 pub use presets::*;
 pub use proxy::*;

@@ -9,9 +9,9 @@ use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig, BackendType, DnsProtocol,
-    DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, Language, Preset,
-    RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
+    AppSettings, AutoResolveStrategy, BackendConfig, BackendType, DnsProtocol, DnsRule,
+    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, Language, Preset, RoutingRule,
+    RoutingRuleSet, RuleAction, RuleMatch, builtin_dns_presets, builtin_presets,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -934,12 +934,7 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
             "IPv4 Only",
             "IPv6 Only",
         ]))
-        .selected(match s.dns.strategy {
-            DnsStrategy::PreferIpv4 => 0,
-            DnsStrategy::PreferIpv6 => 1,
-            DnsStrategy::Ipv4Only => 2,
-            DnsStrategy::Ipv6Only => 3,
-        })
+        .selected(strategy_to_index(s.dns.strategy))
         .build();
     dns_group.add(&strategy_row);
     page.add(&dns_group);
@@ -958,12 +953,7 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         let st = state.clone();
         let cb = cb.clone();
         strategy_row.connect_selected_notify(move |row| {
-            st.borrow_mut().dns.strategy = match row.selected() {
-                1 => DnsStrategy::PreferIpv6,
-                2 => DnsStrategy::Ipv4Only,
-                3 => DnsStrategy::Ipv6Only,
-                _ => DnsStrategy::PreferIpv4,
-            };
+            st.borrow_mut().dns.strategy = index_to_strategy(row.selected());
             emit(&st, &cb);
         });
     }
@@ -976,6 +966,12 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         .halign(gtk::Align::End)
         .hexpand(true)
         .build();
+    let providers_btn = gtk::Button::builder()
+        .icon_name("starred-symbolic")
+        .tooltip_text("DNS Providers")
+        .css_classes(["flat"])
+        .build();
+    servers_toolbar_box.append(&providers_btn);
     let add_server_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
         .tooltip_text("Add Server")
@@ -1137,6 +1133,7 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         servers_group: servers_group.clone(),
         rules_group: rules_group.clone(),
         hosts_group: hosts_group.clone(),
+        strategy_row: strategy_row.clone(),
         added_servers: Rc::new(RefCell::new(Vec::new())),
         added_rules: Rc::new(RefCell::new(Vec::new())),
         added_hosts: Rc::new(RefCell::new(Vec::new())),
@@ -1146,6 +1143,12 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     render_dns_rules(&dns_ctx);
     render_dns_hosts(&dns_ctx);
 
+    {
+        let ctx = dns_ctx.clone();
+        providers_btn.connect_clicked(move |_| {
+            show_dns_providers_dialog(&ctx);
+        });
+    }
     {
         let ctx = dns_ctx.clone();
         add_server_btn.connect_clicked(move |_| {
@@ -1175,9 +1178,50 @@ struct DnsRenderCtx {
     servers_group: adw::PreferencesGroup,
     rules_group: adw::PreferencesGroup,
     hosts_group: adw::PreferencesGroup,
+    strategy_row: adw::ComboRow,
     added_servers: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_rules: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_hosts: Rc<RefCell<Vec<adw::ActionRow>>>,
+}
+
+fn strategy_to_index(s: DnsStrategy) -> u32 {
+    match s {
+        DnsStrategy::PreferIpv4 => 0,
+        DnsStrategy::PreferIpv6 => 1,
+        DnsStrategy::Ipv4Only => 2,
+        DnsStrategy::Ipv6Only => 3,
+    }
+}
+
+fn index_to_strategy(i: u32) -> DnsStrategy {
+    match i {
+        1 => DnsStrategy::PreferIpv6,
+        2 => DnsStrategy::Ipv4Only,
+        3 => DnsStrategy::Ipv6Only,
+        _ => DnsStrategy::PreferIpv4,
+    }
+}
+
+fn protocol_to_index(p: DnsProtocol) -> u32 {
+    match p {
+        DnsProtocol::Udp => 0,
+        DnsProtocol::Tcp => 1,
+        DnsProtocol::Doh => 2,
+        DnsProtocol::Dot => 3,
+        DnsProtocol::Doq => 4,
+        DnsProtocol::H3 => 5,
+    }
+}
+
+fn index_to_protocol(i: u32) -> DnsProtocol {
+    match i {
+        1 => DnsProtocol::Tcp,
+        2 => DnsProtocol::Doh,
+        3 => DnsProtocol::Dot,
+        4 => DnsProtocol::Doq,
+        5 => DnsProtocol::H3,
+        _ => DnsProtocol::Udp,
+    }
 }
 
 fn render_dns_servers(ctx: &DnsRenderCtx) {
@@ -1187,7 +1231,6 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
     ctx.added_servers.borrow_mut().clear();
 
     let servers = ctx.state.borrow().dns.servers.clone();
-    let _is_singbox = ctx.state.borrow().backend.backend_type == BackendType::SingBox;
 
     let mut added = ctx.added_servers.borrow_mut();
     for server in &servers {
@@ -1197,13 +1240,9 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
             "{}://{}:{}",
             protocol_str,
             server.address,
-            server.port.unwrap_or_else(|| {
-                match server.protocol {
-                    DnsProtocol::Udp | DnsProtocol::Tcp => 53,
-                    DnsProtocol::Doh | DnsProtocol::H3 => 443,
-                    DnsProtocol::Dot | DnsProtocol::Doq => 853,
-                }
-            })
+            server
+                .port
+                .unwrap_or_else(|| server.protocol.default_port())
         );
 
         let row = adw::ActionRow::builder()
@@ -1262,14 +1301,6 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
     }
 
     let rules = ctx.state.borrow().dns.rules.clone();
-    let _servers: Vec<String> = ctx
-        .state
-        .borrow()
-        .dns
-        .servers
-        .iter()
-        .map(|s| s.tag.clone())
-        .collect();
 
     let mut added = ctx.added_rules.borrow_mut();
     for rule in &rules {
@@ -1400,14 +1431,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
     let (init_tag, init_protocol, init_address, init_port, init_detour) = match &existing {
         Some(srv) => (
             srv.tag.clone(),
-            match srv.protocol {
-                DnsProtocol::Udp => 0u32,
-                DnsProtocol::Tcp => 1,
-                DnsProtocol::Doh => 2,
-                DnsProtocol::Dot => 3,
-                DnsProtocol::Doq => 4,
-                DnsProtocol::H3 => 5,
-            },
+            protocol_to_index(srv.protocol),
             srv.address.clone(),
             srv.port.unwrap_or_default(),
             srv.detour.clone().unwrap_or_default(),
@@ -1502,23 +1526,11 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
             return;
         }
 
-        let protocol = match protocol_combo.selected() {
-            1 => DnsProtocol::Tcp,
-            2 => DnsProtocol::Doh,
-            3 => DnsProtocol::Dot,
-            4 => DnsProtocol::Doq,
-            5 => DnsProtocol::H3,
-            _ => DnsProtocol::Udp,
-        };
+        let protocol = index_to_protocol(protocol_combo.selected());
 
         let port = {
             let p = port_spin.value() as u16;
-            let default_port = match protocol {
-                DnsProtocol::Udp | DnsProtocol::Tcp => 53,
-                DnsProtocol::Doh | DnsProtocol::H3 => 443,
-                DnsProtocol::Dot | DnsProtocol::Doq => 853,
-            };
-            if p == default_port {
+            if p == protocol.default_port() {
                 None
             } else {
                 Some(p)
@@ -1778,5 +1790,78 @@ fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRenderCtx) {
         render_dns_hosts(&ctx);
     });
 
+    dialog.present(gtk::Window::NONE);
+}
+
+fn show_dns_providers_dialog(ctx: &DnsRenderCtx) {
+    let dialog = adw::AlertDialog::builder().heading("DNS Providers").build();
+    dialog.add_response("close", "Close");
+    dialog.set_default_response(Some("close"));
+    dialog.set_close_response("close");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+
+    let builtin_group = adw::PreferencesGroup::builder().title("Built-in").build();
+    for preset in builtin_dns_presets() {
+        let row = adw::ActionRow::builder()
+            .title(&preset.name)
+            .subtitle(&preset.description)
+            .build();
+        let apply_btn = gtk::Button::builder()
+            .label("Apply")
+            .valign(gtk::Align::Center)
+            .css_classes(["suggested-action"])
+            .build();
+        let ctx = ctx.clone();
+        let p = preset.clone();
+        let providers_dialog = dialog.clone();
+        apply_btn.connect_clicked(move |_| {
+            let confirm_dialog = adw::AlertDialog::builder()
+                .heading("Apply DNS Provider")
+                .body(format!("Replace current DNS servers with {}?", p.name))
+                .build();
+            confirm_dialog.add_response("cancel", "Cancel");
+            confirm_dialog.add_response("apply", "Apply");
+            confirm_dialog.set_response_appearance("apply", adw::ResponseAppearance::Suggested);
+            confirm_dialog.set_default_response(Some("cancel"));
+            confirm_dialog.set_close_response("cancel");
+
+            let ctx_inner = ctx.clone();
+            let p_inner = p.clone();
+            let pd = providers_dialog.clone();
+            confirm_dialog.connect_response(None, move |_, response| {
+                if response != "apply" {
+                    return;
+                }
+
+                {
+                    let mut s = ctx_inner.state.borrow_mut();
+                    s.dns.apply_dns_preset(&p_inner);
+                }
+                emit(&ctx_inner.state, &ctx_inner.cb);
+                render_dns_servers(&ctx_inner);
+                ctx_inner
+                    .strategy_row
+                    .set_selected(strategy_to_index(ctx_inner.state.borrow().dns.strategy));
+                pd.close();
+            });
+
+            confirm_dialog.present(gtk::Window::NONE);
+        });
+        row.add_suffix(&apply_btn);
+        builtin_group.add(&row);
+    }
+    content.append(&builtin_group);
+
+    let scrolled = gtk::ScrolledWindow::builder()
+        .min_content_height(300)
+        .max_content_height(500)
+        .child(&content)
+        .build();
+
+    dialog.set_extra_child(Some(&scrolled));
     dialog.present(gtk::Window::NONE);
 }

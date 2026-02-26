@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.0] - 2026-02-26
+
+### Changed
+- `DnsProtocol` now exposes `default_port()` — eliminates duplicate port table across `singbox.rs`, `preferences.rs`, and `dns.rs`
+- `builtin_dns_presets()` refactored via `standard_preset()` helper, reducing ~170 lines to ~30
+- `apply_dns_preset()` now drops DNS rules whose `server_tag` no longer exists after the preset replaces servers
+
+### Fixed
+- Dead variables `_is_singbox` and `_servers` removed from `preferences.rs`
+- DNS providers dialog now closes automatically after a preset is successfully applied
+- `DnsValidationError` re-exported from `models` public API
+
+### Tests
+- `test_builtin_dns_presets_count` strengthened to `assert_eq!(8)` from `>= 8`
+- Added `test_apply_dns_preset_clears_orphaned_rules` to verify preset application passes `validate()`
+
+---
+
 ## [0.5.3] - 2026-02-22
 
 ### Fixed
@@ -285,7 +303,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.0...v0.5.1

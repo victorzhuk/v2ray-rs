@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
@@ -264,13 +264,9 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
 
     // Add real DNS servers
     for server_cfg in &settings.dns.servers {
-        let default_port = match server_cfg.protocol {
-            DnsProtocol::Udp | DnsProtocol::Tcp => 53,
-            DnsProtocol::Doh | DnsProtocol::H3 => 443,
-            DnsProtocol::Dot | DnsProtocol::Doq => 853,
-        };
-
-        let port = server_cfg.port.unwrap_or(default_port);
+        let port = server_cfg
+            .port
+            .unwrap_or_else(|| server_cfg.protocol.default_port());
 
         let mut server = match server_cfg.protocol {
             DnsProtocol::Udp => json!({
@@ -517,9 +513,11 @@ mod tests {
     #[test]
     fn test_singbox_error_on_empty() {
         let generator = SingboxGenerator;
-        assert!(generator
-            .generate(&[], &[], &default_settings(), None)
-            .is_err());
+        assert!(
+            generator
+                .generate(&[], &[], &default_settings(), None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -632,10 +630,12 @@ mod tests {
         assert_eq!(rule_sets[0]["type"], "remote");
         assert_eq!(rule_sets[0]["tag"], "geoip-ru");
         assert_eq!(rule_sets[0]["format"], "binary");
-        assert!(rule_sets[0]["url"]
-            .as_str()
-            .unwrap()
-            .contains("geoip-ru.srs"));
+        assert!(
+            rule_sets[0]["url"]
+                .as_str()
+                .unwrap()
+                .contains("geoip-ru.srs")
+        );
         assert_eq!(rule_sets[0]["download_detour"], "direct");
     }
 

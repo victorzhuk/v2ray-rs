@@ -13,54 +13,47 @@ pub enum DnsProtocol {
 }
 
 impl DnsProtocol {
-    pub fn server_address(&self, address: &str, port: Option<u16>) -> String {
-        let default_port = match self {
+    pub fn default_port(self) -> u16 {
+        match self {
             DnsProtocol::Udp | DnsProtocol::Tcp => 53,
             DnsProtocol::Doh | DnsProtocol::H3 => 443,
             DnsProtocol::Dot | DnsProtocol::Doq => 853,
-        };
+        }
+    }
+
+    pub fn server_address(&self, address: &str, port: Option<u16>) -> String {
+        let default_port = self.default_port();
+        let port = port.unwrap_or(default_port);
 
         match self {
-            DnsProtocol::Udp => {
-                if port == Some(default_port) || port.is_none() {
-                    format!("{}:{}", address, default_port)
-                } else {
-                    format!("{}:{}", address, port.unwrap())
-                }
-            }
-            DnsProtocol::Tcp => {
-                if port == Some(default_port) || port.is_none() {
-                    format!("tcp://{}:{}", address, default_port)
-                } else {
-                    format!("tcp://{}:{}", address, port.unwrap())
-                }
-            }
+            DnsProtocol::Udp => format!("{}:{}", address, port),
+            DnsProtocol::Tcp => format!("tcp://{}:{}", address, port),
             DnsProtocol::Doh => {
-                if port == Some(default_port) || port.is_none() {
+                if port == default_port {
                     format!("https://{}/dns-query", address)
                 } else {
-                    format!("https://{}:{}/dns-query", address, port.unwrap())
+                    format!("https://{}:{}/dns-query", address, port)
                 }
             }
             DnsProtocol::Dot => {
-                if port == Some(default_port) || port.is_none() {
+                if port == default_port {
                     format!("tls://{}", address)
                 } else {
-                    format!("tls://{}:{}", address, port.unwrap())
+                    format!("tls://{}:{}", address, port)
                 }
             }
             DnsProtocol::Doq => {
-                if port == Some(default_port) || port.is_none() {
+                if port == default_port {
                     format!("quic://{}", address)
                 } else {
-                    format!("quic://{}:{}", address, port.unwrap())
+                    format!("quic://{}:{}", address, port)
                 }
             }
             DnsProtocol::H3 => {
-                if port == Some(default_port) || port.is_none() {
+                if port == default_port {
                     format!("h3://{}/dns-query", address)
                 } else {
-                    format!("h3://{}:{}/dns-query", address, port.unwrap())
+                    format!("h3://{}:{}/dns-query", address, port)
                 }
             }
         }
@@ -236,6 +229,96 @@ fn migrate_legacy_server(tag: &str, legacy: LegacyDnsServer) -> DnsServerConfig 
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DnsProviderPreset {
+    pub name: String,
+    pub description: String,
+    pub servers: Vec<DnsServerConfig>,
+    pub strategy: DnsStrategy,
+}
+
+fn standard_preset(
+    name: &str,
+    desc: &str,
+    remote_addr: &str,
+    domestic_addr: &str,
+) -> DnsProviderPreset {
+    DnsProviderPreset {
+        name: name.to_string(),
+        description: desc.to_string(),
+        servers: vec![
+            DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: remote_addr.to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "domestic".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: domestic_addr.to_string(),
+                port: None,
+                detour: None,
+            },
+        ],
+        strategy: DnsStrategy::PreferIpv4,
+    }
+}
+
+pub fn builtin_dns_presets() -> Vec<DnsProviderPreset> {
+    vec![
+        standard_preset(
+            "Cloudflare",
+            "Cloudflare DNS - DoH primary, UDP fallback",
+            "1.1.1.1",
+            "1.0.0.1",
+        ),
+        standard_preset(
+            "Cloudflare Family",
+            "Cloudflare Family DNS - Blocks malware/adult content",
+            "1.1.1.3",
+            "1.0.0.3",
+        ),
+        standard_preset(
+            "Google",
+            "Google Public DNS - DoH primary, UDP fallback",
+            "8.8.8.8",
+            "8.8.4.4",
+        ),
+        standard_preset(
+            "AdGuard",
+            "AdGuard DNS - Blocks ads and trackers",
+            "dns.adguard.com",
+            "94.140.14.14",
+        ),
+        standard_preset(
+            "AdGuard Family",
+            "AdGuard Family DNS - Blocks ads and adult content",
+            "dns-family.adguard.com",
+            "94.140.14.15",
+        ),
+        standard_preset(
+            "Quad9",
+            "Quad9 DNS - Blocks malicious domains",
+            "dns.quad9.net",
+            "9.9.9.9",
+        ),
+        standard_preset(
+            "Ali DNS",
+            "Alibaba DNS - Optimized for China",
+            "dns.alidns.com",
+            "223.5.5.5",
+        ),
+        standard_preset(
+            "Yandex DNS",
+            "Yandex DNS - Basic protection",
+            "common.dot.dns.yandex.net",
+            "77.88.8.8",
+        ),
+    ]
+}
+
 impl Default for DnsConfig {
     fn default() -> Self {
         Self {
@@ -276,10 +359,10 @@ impl DnsConfig {
             }
         }
 
-        if let Some(ref subnet) = self.client_subnet {
-            if subnet.parse::<std::net::IpAddr>().is_err() {
-                return Err(DnsValidationError::InvalidClientSubnet(subnet.clone()));
-            }
+        if let Some(ref subnet) = self.client_subnet
+            && subnet.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(DnsValidationError::InvalidClientSubnet(subnet.clone()));
         }
 
         for rule in &self.rules {
@@ -291,6 +374,14 @@ impl DnsConfig {
         }
 
         Ok(())
+    }
+
+    pub fn apply_dns_preset(&mut self, preset: &DnsProviderPreset) {
+        self.servers = preset.servers.clone();
+        self.strategy = preset.strategy;
+        self.enabled = true;
+        self.rules
+            .retain(|r| self.servers.iter().any(|s| s.tag == r.server_tag));
     }
 }
 
@@ -666,6 +757,164 @@ server_tag = "google"
             let json = serde_json::to_string(&strategy).unwrap();
             let back: DnsStrategy = serde_json::from_str(&json).unwrap();
             assert_eq!(strategy, back);
+        }
+    }
+
+    #[test]
+    fn test_builtin_dns_presets_count() {
+        let presets = builtin_dns_presets();
+        assert_eq!(presets.len(), 8);
+    }
+
+    #[test]
+    fn test_apply_dns_preset_replaces_servers() {
+        let preset = builtin_dns_presets()
+            .iter()
+            .find(|p| p.name == "Google")
+            .unwrap()
+            .clone();
+
+        let mut cfg = DnsConfig::default();
+        cfg.apply_dns_preset(&preset);
+
+        assert_eq!(cfg.servers.len(), preset.servers.len());
+        assert_eq!(cfg.servers[0].address, "8.8.8.8");
+        assert_eq!(cfg.servers[1].address, "8.8.4.4");
+    }
+
+    #[test]
+    fn test_apply_dns_preset_preserves_other_settings() {
+        let preset = builtin_dns_presets().first().unwrap().clone();
+
+        let mut cfg = DnsConfig {
+            enabled: false,
+            strategy: DnsStrategy::PreferIpv6,
+            servers: vec![],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "cn".to_string(),
+                },
+                server_tag: "domestic".to_string(),
+            }],
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "10.0.0.0/8".to_string(),
+                inet6_range: "fd00::/8".to_string(),
+            },
+            disable_cache: true,
+            client_subnet: Some("192.0.2.1".to_string()),
+            hosts: vec![HostOverride {
+                domain: "local".to_string(),
+                ip: "127.0.0.1".to_string(),
+            }],
+            use_custom_rules: true,
+        };
+
+        let original_fakeip = cfg.fakeip.clone();
+        let original_disable_cache = cfg.disable_cache;
+        let original_client_subnet = cfg.client_subnet.clone();
+        let original_hosts = cfg.hosts.clone();
+        let original_use_custom_rules = cfg.use_custom_rules;
+
+        cfg.apply_dns_preset(&preset);
+
+        assert_eq!(cfg.rules.len(), 1, "rule with valid tag should be kept");
+        assert_eq!(cfg.fakeip, original_fakeip);
+        assert_eq!(cfg.disable_cache, original_disable_cache);
+        assert_eq!(cfg.client_subnet, original_client_subnet);
+        assert_eq!(cfg.hosts, original_hosts);
+        assert_eq!(cfg.use_custom_rules, original_use_custom_rules);
+    }
+
+    #[test]
+    fn test_apply_dns_preset_enables_dns() {
+        let preset = builtin_dns_presets().first().unwrap().clone();
+
+        let mut cfg = DnsConfig {
+            enabled: false,
+            strategy: DnsStrategy::default(),
+            servers: vec![],
+            rules: vec![],
+            fakeip: FakeIpConfig::default(),
+            disable_cache: false,
+            client_subnet: None,
+            hosts: vec![],
+            use_custom_rules: false,
+        };
+
+        cfg.apply_dns_preset(&preset);
+
+        assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn test_apply_dns_preset_clears_orphaned_rules() {
+        let preset = builtin_dns_presets()
+            .iter()
+            .find(|p| p.name == "Google")
+            .unwrap()
+            .clone();
+
+        let mut cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "old-server".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "1.2.3.4".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "cn".to_string(),
+                },
+                server_tag: "old-server".to_string(),
+            }],
+            fakeip: FakeIpConfig::default(),
+            disable_cache: false,
+            client_subnet: None,
+            hosts: vec![],
+            use_custom_rules: true,
+        };
+
+        cfg.apply_dns_preset(&preset);
+
+        assert!(cfg.validate().is_ok());
+        assert!(
+            cfg.rules.is_empty(),
+            "rules referencing old tags should be removed"
+        );
+    }
+
+    #[test]
+    fn test_each_preset_has_valid_server_configs() {
+        let presets = builtin_dns_presets();
+
+        for preset in presets {
+            assert!(!preset.servers.is_empty(), "{} has no servers", preset.name);
+            assert!(
+                preset.servers.len() >= 2,
+                "{} has less than 2 servers",
+                preset.name
+            );
+
+            let mut tags = std::collections::HashSet::new();
+            for server in &preset.servers {
+                assert!(
+                    tags.insert(&server.tag),
+                    "{} has duplicate server tag: {}",
+                    preset.name,
+                    server.tag
+                );
+                assert!(
+                    !server.tag.is_empty(),
+                    "{} has empty server tag",
+                    preset.name
+                );
+            }
+
+            assert_eq!(preset.strategy, DnsStrategy::PreferIpv4);
         }
     }
 }
