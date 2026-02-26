@@ -22,11 +22,15 @@ The system SHALL display a context menu when the tray icon is activated.
 
 #### Scenario: Menu when disconnected
 - **WHEN** the user activates the tray icon while disconnected
-- **THEN** the menu SHALL show: "Connect", separator, profile info, "Open Main Window", "Quit"
+- **THEN** the menu SHALL show: "Connect", separator, status label ("Status: Disconnected", disabled), separator, "Open Main Window", "Quit"
 
 #### Scenario: Menu when connected
 - **WHEN** the user activates the tray icon while connected
-- **THEN** the menu SHALL show: "Disconnect", separator, active profile name, "Open Main Window", "Quit"
+- **THEN** the menu SHALL show: "Disconnect", separator, status label ("Status: Connected (node name)", disabled), separator, "Open Main Window", "Quit"
+
+#### Scenario: Connect/Disconnect disabled during transitions
+- **WHEN** the state is Starting or Stopping
+- **THEN** the Connect/Disconnect menu item SHALL be disabled (not clickable)
 
 ### Requirement: Tray tooltip status
 The system SHALL include active connection details in the tray tooltip.

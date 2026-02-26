@@ -3,11 +3,11 @@
 ## ADDED Requirements
 
 ### Requirement: Application window structure
-The system SHALL display a main window with a header bar, tab navigation, and a connection status bar.
+The system SHALL display a main window with a header bar, a vertical split between subscriptions and logs, and a connection status bar.
 
 #### Scenario: Window layout
 - **WHEN** the main window is displayed
-- **THEN** it SHALL contain a header bar with app title, a tab switcher (Subscriptions, Routing, Logs, Settings), the active page content, and a bottom status bar showing connection state
+- **THEN** it SHALL contain a header bar with app title and hamburger menu, a `gtk::Paned` vertically splitting the subscriptions page (top) and logs page (bottom), and a bottom `gtk::ActionBar` showing connection state. Routing and Settings are accessible via the hamburger menu → Preferences dialog.
 
 ### Requirement: Subscriptions page
 The system SHALL provide a page for managing proxy subscriptions.
@@ -28,20 +28,12 @@ The system SHALL provide a page for managing proxy subscriptions.
 - **WHEN** the user deletes a subscription
 - **THEN** the system SHALL remove it and all its nodes after confirmation
 
-### Requirement: Routing rules page
-The system SHALL provide a page for managing routing rules.
+### Requirement: Routing rules and Settings
+The system SHALL provide routing rule management and settings via the hamburger menu → Preferences dialog (not a main-window tab).
 
-#### Scenario: View rules
-- **WHEN** the user navigates to the Routing tab
-- **THEN** the system SHALL display an ordered list of routing rules with match condition, action, and drag handles for reordering
-
-#### Scenario: Add rule
-- **WHEN** the user clicks "Add Rule"
-- **THEN** the system SHALL show a dialog to select rule type (GeoIP, GeoSite, Domain, IP), enter match value, and select action
-
-#### Scenario: Drag-and-drop reordering
-- **WHEN** the user drags a rule to a new position
-- **THEN** the rule order SHALL update and config SHALL be regenerated
+#### Scenario: Open Preferences
+- **WHEN** the user opens the hamburger menu and selects "Preferences"
+- **THEN** the system SHALL show an `adw::PreferencesDialog` with pages: System, Network, Routing, DNS
 
 ### Requirement: Logs page
 The system SHALL provide a page for viewing backend process logs.
@@ -53,21 +45,6 @@ The system SHALL provide a page for viewing backend process logs.
 #### Scenario: Log when stopped
 - **WHEN** no backend process is running
 - **THEN** the Logs page SHALL show the last session's logs (if any) with a "Process not running" indicator
-
-### Requirement: Settings page
-The system SHALL provide a page for app configuration.
-
-#### Scenario: Backend selection
-- **WHEN** the user navigates to Settings
-- **THEN** the system SHALL show detected backends with radio buttons to select the active one
-
-#### Scenario: Proxy port configuration
-- **WHEN** the user changes the SOCKS5 or HTTP port
-- **THEN** the system SHALL save the setting and trigger config regeneration
-
-#### Scenario: Language selection
-- **WHEN** the user changes the language
-- **THEN** the UI SHALL switch to the selected language
 
 ### Requirement: Connection status bar
 The system SHALL display a persistent status bar showing current connection state with a connect/disconnect button and active connection details.

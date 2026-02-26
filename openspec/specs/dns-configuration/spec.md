@@ -5,7 +5,7 @@ The system SHALL support the following DNS protocol types: UDP (plain), TCP, DoH
 
 #### Scenario: UDP address formatting
 - **WHEN** a DNS server is configured with protocol UDP and address "8.8.8.8"
-- **THEN** the system SHALL represent it as a plain IP address "8.8.8.8"
+- **THEN** the system SHALL represent it as "8.8.8.8:53" (default port always appended)
 
 #### Scenario: UDP with custom port
 - **WHEN** a DNS server is configured with protocol UDP, address "8.8.8.8", and port 5353
@@ -13,15 +13,11 @@ The system SHALL support the following DNS protocol types: UDP (plain), TCP, DoH
 
 #### Scenario: TCP address formatting
 - **WHEN** a DNS server is configured with protocol TCP and address "8.8.8.8"
-- **THEN** the system SHALL produce the address "tcp://8.8.8.8"
+- **THEN** the system SHALL produce the address "tcp://8.8.8.8:53"
 
 #### Scenario: DoH address formatting
 - **WHEN** a DNS server is configured with protocol DoH and address "1.1.1.1"
 - **THEN** the system SHALL produce the address "https://1.1.1.1/dns-query"
-
-#### Scenario: DoH with full URL preserved
-- **WHEN** a DNS server is configured with protocol DoH and address "https://dns.adguard.com/dns-query"
-- **THEN** the system SHALL preserve the full URL as-is
 
 #### Scenario: DoT address formatting
 - **WHEN** a DNS server is configured with protocol DoT and address "dns.google"
@@ -29,19 +25,11 @@ The system SHALL support the following DNS protocol types: UDP (plain), TCP, DoH
 
 #### Scenario: DoQ address formatting
 - **WHEN** a DNS server is configured with protocol DoQ and address "dns.adguard.com"
-- **THEN** the system SHALL produce the address "quic+local://dns.adguard.com"
+- **THEN** the system SHALL produce the address "quic://dns.adguard.com"
 
 #### Scenario: H3 address formatting
 - **WHEN** a DNS server is configured with protocol H3 and address "dns.google"
 - **THEN** the system SHALL produce the address "h3://dns.google/dns-query"
-
-#### Scenario: Unsupported protocol fallback for v2ray
-- **WHEN** a DNS server uses protocol DoT and the backend is v2ray
-- **THEN** the config generator SHALL fall back to DoH format for that server and log a warning
-
-#### Scenario: Unsupported protocol fallback for xray
-- **WHEN** a DNS server uses protocol H3 and the backend is xray
-- **THEN** the config generator SHALL fall back to DoH format for that server and log a warning
 
 ### Requirement: Named DNS servers
 The system SHALL support multiple named DNS servers. Each server SHALL have a tag (unique string identifier), protocol, address, optional port, and optional detour (outbound tag for routing DNS traffic).

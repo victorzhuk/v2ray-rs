@@ -19,7 +19,9 @@ The system SHALL support automatic periodic updates of subscriptions based on a 
 - **THEN** the system SHALL retry up to 3 times with exponential backoff and log the failure
 
 ### Requirement: Update node reconciliation
-The system SHALL reconcile updated subscription nodes with existing data, matching nodes by their address+port+protocol to preserve user preferences.
+**Note: Not yet implemented.** The current implementation replaces the node list entirely on update without reconciliation. The reconciliation behavior below is planned.
+
+The system SHOULD reconcile updated subscription nodes with existing data, matching nodes by their address+port+protocol to preserve user preferences.
 
 #### Scenario: Node added in update
 - **WHEN** a subscription update contains a new node not in the previous version

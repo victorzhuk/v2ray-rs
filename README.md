@@ -7,7 +7,7 @@
 **A modern Linux desktop GUI for v2ray/xray/sing-box proxy management**
 
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/victorzhuk/v2ray-rs/ci.yml)](https://github.com/victorzhuk/v2ray-rs/actions)
 
 </div>
@@ -95,7 +95,6 @@ Or via Makefile: `make build`, `make test`, `make lint`, `make fmt`.
 
 <div align="center">
 
-Made with ❤️ for the Linux community
 
 [v2ray](https://github.com/v2fly/v2ray-core) / [xray](https://github.com/XTLS/Xray-core) / [sing-box](https://github.com/SagerNet/sing-box) / [Relm4](https://github.com/Relm4/Relm4) / [v2fly GeoIP/GeoSite](https://github.com/v2fly/geoip)
 

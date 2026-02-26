@@ -1,10 +1,10 @@
 pkgname=v2ray-rs
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=1
 pkgdesc="Linux desktop GUI for v2ray/xray/sing-box proxy management"
 arch=('x86_64')
 url="https://github.com/victorzhuk/v2ray-rs"
-license=('MIT')
+license=('Apache-2.0')
 depends=('gtk4' 'libadwaita' 'dbus')
 makedepends=('rust' 'cargo')
 optdepends=(

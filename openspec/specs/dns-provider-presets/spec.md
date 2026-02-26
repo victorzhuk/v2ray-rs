@@ -20,7 +20,7 @@ Applying a DNS provider preset SHALL replace the current DNS server list and str
 
 #### Scenario: Apply preserves other DNS settings
 - **WHEN** the user has custom DNS rules, FakeIP enabled, and host overrides, then applies a preset
-- **THEN** the DNS rules, FakeIP config, and host overrides SHALL remain unchanged
+- **THEN** FakeIP config and host overrides SHALL remain unchanged. DNS rules whose `server_tag` references a server still present in the new list SHALL be preserved; rules referencing removed server tags SHALL be dropped.
 
 #### Scenario: Apply overwrites previous preset
 - **WHEN** the user applies "Google" preset after previously applying "Cloudflare"

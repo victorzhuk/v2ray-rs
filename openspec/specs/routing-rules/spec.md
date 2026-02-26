@@ -41,8 +41,8 @@ The system SHALL maintain an ordered list of routing rules, where rules are eval
 The system SHALL validate routing rules and provide feedback on errors.
 
 #### Scenario: Invalid country code
-- **WHEN** the user enters "XX" as a GeoIP country code
-- **THEN** the system SHALL reject the rule with an error message
+- **WHEN** the user enters a lowercase code like "ru" as a GeoIP country code
+- **THEN** the system SHALL reject the rule with an error message (validation requires uppercase ASCII; valid examples: "RU", "CN", "GOOGLE", "NETFLIX")
 
 #### Scenario: Invalid IP CIDR
 - **WHEN** the user enters "999.999.999.999/32" as an IP CIDR
@@ -51,6 +51,9 @@ The system SHALL validate routing rules and provide feedback on errors.
 ### Requirement: Predefined rule templates
 The system SHALL offer predefined routing rule presets that users can apply with one action.
 
-#### Scenario: Apply RU-direct preset
-- **WHEN** the user applies the "RU direct" preset
-- **THEN** the system SHALL add a GeoIP:RU→direct rule
+#### Scenario: Apply RU Bypass preset
+- **WHEN** the user applies the "RU Bypass" preset
+- **THEN** the system SHALL add a set of rules covering GeoIP:RU, private CIDRs, and Russian GeoSite categories (media, retail, gov, mail, etc.), all with direct action. Rules carry the preset name in their `group` field.
+
+#### Available presets
+Built-in presets: "RU Bypass", "CN Direct", "Proxy Popular", "Block Ads".

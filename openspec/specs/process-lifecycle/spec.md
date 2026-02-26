@@ -3,7 +3,7 @@
 ## ADDED Requirements
 
 ### Requirement: Start backend process
-The system SHALL launch the selected backend binary with the generated config file path as a command-line argument.
+The system SHALL launch the selected backend binary using the invocation `binary run -c <config_path>`.
 
 #### Scenario: Successful start
 - **WHEN** the user initiates a connection
@@ -15,7 +15,7 @@ The system SHALL launch the selected backend binary with the generated config fi
 
 #### Scenario: Config file missing
 - **WHEN** the config file does not exist at the expected path
-- **THEN** the system SHALL generate it first, then start the process
+- **THEN** the system SHALL transition to Error state with a `ConfigMissing` error (config generation is the caller's responsibility before invoking `start()`)
 
 ### Requirement: Stop backend process
 The system SHALL gracefully stop the running backend process using SIGTERM, falling back to SIGKILL after a timeout.
@@ -26,7 +26,7 @@ The system SHALL gracefully stop the running backend process using SIGTERM, fall
 
 #### Scenario: Already stopped
 - **WHEN** stop is requested but no process is running
-- **THEN** the system SHALL report that no process is running and remain in Stopped state
+- **THEN** the system SHALL return `Ok(())` silently and remain in Stopped state
 
 ### Requirement: Restart backend process
 The system SHALL support restarting the backend process (stop then start) when config is regenerated or the user requests it.
@@ -58,8 +58,8 @@ The system SHALL detect unexpected process exits and optionally attempt automati
 - **THEN** the system SHALL wait 2 seconds and attempt to restart automatically
 
 #### Scenario: Repeated crashes
-- **WHEN** the backend process crashes 3 times consecutively within 1 minute
-- **THEN** the system SHALL transition to Error state and notify the user instead of restarting
+- **WHEN** the backend process exits unexpectedly 3 or more times within a 1-minute sliding window
+- **THEN** the system SHALL transition to Error state instead of restarting. Signal-terminated exits (SIGINT/SIGTERM/SIGKILL, codes 130/137/143) are not counted as crashes and go directly to Stopped state.
 
 ### Requirement: Process state reporting
 The system SHALL expose current process state and active connection metadata to other components via events.

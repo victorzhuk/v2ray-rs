@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.1] - 2026-02-27
+
+### Changed
+- License changed from MIT to Apache 2.0
+
+### Documentation
+- CLAUDE.md: documented `models/dns.rs`, `models/resolve.rs`, `config/` module, `AppPaths::new_dev()`, corrected `app.rs` layout description (Paned + Preferences dialog), updated preset list and field descriptions
+- OpenSpec specs actualized against implementation: routing-rules, process-lifecycle, dns-configuration, dns-provider-presets, subscription-update, main-window, system-tray
+- README.md: updated license badge
+- CONTRIBUTING.md: corrected branch name (`master`), project structure (all 5 crates), license reference
+
+---
+
 ## [0.6.0] - 2026-02-26
 
 ### Changed
@@ -303,7 +316,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.1...v0.5.2

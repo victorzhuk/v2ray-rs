@@ -67,8 +67,8 @@ Search [GitHub Issues](https://github.com/victorzhuk/v2ray-rs/issues) to avoid d
 ### 2. Create a Branch
 
 ```bash
-git checkout main
-git pull upstream main
+git checkout master
+git pull upstream master
 git checkout -b feature/description-or-issue-number
 ```
 
@@ -123,7 +123,7 @@ cargo fmt --all
 git push origin feature/description
 ```
 
-Create a PR from your fork's branch to `upstream/main`.
+Create a PR from your fork's branch to `upstream/master`.
 
 ### 7. Address Feedback
 
@@ -135,7 +135,7 @@ Respond to reviewer comments, make requested changes, and push updates.
 
 ### Rust Conventions
 
-Follow [Effective Go](GO.md) principles adapted for Rust:
+Follow standard Rust conventions:
 
 #### Naming
 
@@ -300,7 +300,9 @@ crates/
 │   │   ├── geodata.rs
 │   │   └── routing_manager.rs
 ├── subscription/      # Subscription fetching/parsing
-└── process/          # Process lifecycle management
+├── process/           # Process lifecycle management
+├── tray/              # System tray (StatusNotifierItem)
+└── ui/                # GTK4/Relm4 GUI
 ```
 
 ### Adding New Features
@@ -471,7 +473,6 @@ For large features, we recommend:
 
 - [README.md](README.md) - Project overview
 - [CLAUDE.md](CLAUDE.md) - Development guidelines
-- [docs/](docs/) - Additional documentation
 - [openspec/](openspec/) - Feature specifications
 
 ### Common Issues
@@ -488,15 +489,14 @@ v2ray-rs is Linux-only (GTK4/libadwaita dependency). For development, use WSL2 o
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the MIT License.
+By contributing, you agree that your contributions will be licensed under the Apache License 2.0.
 
 ---
 
 ## Recognition
 
 Contributors are recognized in:
-- [CONTRIBUTORS.md](CONTRIBUTORS.md) (list of contributors)
 - GitHub release notes
 - Project documentation
 
-Thank you for contributing to v2ray-rs! 🎉
+Thank you for contributing to v2ray-rs!
