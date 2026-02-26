@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.6.2] - 2026-02-27
+
+### Fixed
+- LICENSE file restored to canonical Apache 2.0 text for correct GitHub license detection
+
+---
+
 ## [0.6.1] - 2026-02-27
 
 ### Changed
@@ -316,7 +323,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.2...HEAD
+[0.6.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.2...v0.5.3

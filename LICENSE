@@ -116,12 +116,6 @@
           attribution notices cannot be construed as modifying the
           License.
 
-      You may add Your own license statement for Your modifications and
-      may provide additional grant of rights to use, copy, modify, merge,
-      publish, distribute, sublicense, and/or sell copies of the
-      Contribution, either on its own or as part of the Work, provided
-      your use does not violate the terms and conditions of this License.
-
    5. Submission of Contributions. Unless You explicitly state otherwise,
       any Contribution intentionally submitted for inclusion in the Work
       by You to the Licensor shall be under the terms and conditions of
@@ -179,7 +173,7 @@
       comment syntax for the syntax of your file format. Please also
       include a "NOTICE" file as specified in Section 4(d).
 
-   Copyright 2026 victorzhuk
+   Copyright 2026 Victor Zhuk
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
