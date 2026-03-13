@@ -6,6 +6,18 @@ use uuid::Uuid;
 
 use crate::models::BackendType;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ConnectionNodeRef {
+    Subscription {
+        subscription_id: Uuid,
+        node_index: usize,
+    },
+    Manual {
+        node_id: Uuid,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum AutoResolveStrategy {
@@ -31,9 +43,9 @@ impl fmt::Display for AutoResolveStrategy {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ConnectionMetadata {
-    pub subscription_id: Uuid,
-    pub subscription_name: String,
-    pub node_index: usize,
+    pub node_ref: ConnectionNodeRef,
+    pub source: String,
+    pub source_id: String,
     pub node_name: String,
     pub node_address: String,
     pub node_port: u16,
@@ -45,8 +57,7 @@ pub struct ConnectionMetadata {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LastSuccessMetadata {
-    pub subscription_id: Uuid,
-    pub node_index: usize,
+    pub node_ref: ConnectionNodeRef,
     pub connected_at: DateTime<Utc>,
 }
 

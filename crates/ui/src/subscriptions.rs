@@ -379,7 +379,12 @@ impl Component for SubscriptionsPage {
                         let now = chrono::Utc::now();
                         for (idx, latency) in results.iter().enumerate() {
                             if let Some(value) = latency {
-                                snapshot.upsert(sub.id, idx, *value, now);
+                                let node_ref =
+                                    v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                                        subscription_id: sub.id,
+                                        node_index: idx,
+                                    };
+                                snapshot.upsert(node_ref, *value, now);
                             }
                         }
                         if let Err(e) = persistence::save_latency_snapshot(&self.paths, &snapshot) {

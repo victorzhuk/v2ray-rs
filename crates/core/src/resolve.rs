@@ -5,22 +5,21 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    AutoResolveStrategy, LastSuccessMetadata, LatencySample, ProxyNode, Subscription,
+    AutoResolveStrategy, ConnectionNodeRef, LastSuccessMetadata, LatencySample, ManualNode,
+    ProxyNode, Subscription,
 };
 
 #[derive(Debug, Clone)]
 pub struct ConnectionCandidate {
-    pub subscription_id: uuid::Uuid,
-    pub subscription_name: String,
-    pub node_index: usize,
+    pub node_ref: ConnectionNodeRef,
+    pub source_name: String,
     pub node: ProxyNode,
     pub latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LatencyEntry {
-    pub subscription_id: uuid::Uuid,
-    pub node_index: usize,
+    pub node_ref: ConnectionNodeRef,
     pub sample: LatencySample,
 }
 
@@ -36,25 +35,24 @@ impl LatencySnapshot {
         }
     }
 
-    pub fn get(&self, subscription_id: uuid::Uuid, node_index: usize) -> Option<&LatencySample> {
+    pub fn get(&self, node_ref: ConnectionNodeRef) -> Option<&LatencySample> {
         self.samples
             .iter()
-            .find(|entry| {
-                entry.subscription_id == subscription_id && entry.node_index == node_index
-            })
+            .find(|entry| entry.node_ref == node_ref)
             .map(|entry| &entry.sample)
     }
 
     pub fn upsert(
         &mut self,
-        subscription_id: uuid::Uuid,
-        node_index: usize,
+        node_ref: ConnectionNodeRef,
         latency_ms: u64,
         measured_at: DateTime<Utc>,
     ) {
-        if let Some(entry) = self.samples.iter_mut().find(|entry| {
-            entry.subscription_id == subscription_id && entry.node_index == node_index
-        }) {
+        if let Some(entry) = self
+            .samples
+            .iter_mut()
+            .find(|entry| entry.node_ref == node_ref)
+        {
             entry.sample = LatencySample {
                 latency_ms,
                 measured_at,
@@ -62,8 +60,7 @@ impl LatencySnapshot {
             return;
         }
         self.samples.push(LatencyEntry {
-            subscription_id,
-            node_index,
+            node_ref,
             sample: LatencySample {
                 latency_ms,
                 measured_at,
@@ -100,26 +97,48 @@ impl ConnectionPlanner {
         }
     }
 
-    pub fn plan(&self, subscriptions: &[Subscription]) -> Vec<ConnectionCandidate> {
+    pub fn plan(
+        &self,
+        subscriptions: &[Subscription],
+        manual_nodes: &[ManualNode],
+    ) -> Vec<ConnectionCandidate> {
         let mut candidates = Vec::new();
+
         for sub in subscriptions.iter().filter(|s| s.enabled) {
             for (idx, node) in sub.nodes.iter().enumerate() {
                 if !node.enabled {
                     continue;
                 }
+                let node_ref = ConnectionNodeRef::Subscription {
+                    subscription_id: sub.id,
+                    node_index: idx,
+                };
                 let latency_ms = self
                     .latency_snapshot
-                    .get(sub.id, idx)
+                    .get(node_ref)
                     .map(|sample| sample.latency_ms)
                     .or(node.last_latency_ms);
                 candidates.push(ConnectionCandidate {
-                    subscription_id: sub.id,
-                    subscription_name: sub.name.clone(),
-                    node_index: idx,
+                    node_ref,
+                    source_name: sub.name.clone(),
                     node: node.node.clone(),
                     latency_ms,
                 });
             }
+        }
+
+        for manual in manual_nodes.iter().filter(|n| n.enabled) {
+            let node_ref = ConnectionNodeRef::Manual { node_id: manual.id };
+            let latency_ms = self
+                .latency_snapshot
+                .get(node_ref)
+                .map(|sample| sample.latency_ms);
+            candidates.push(ConnectionCandidate {
+                node_ref,
+                source_name: "Manual".to_string(),
+                node: manual.node.clone(),
+                latency_ms,
+            });
         }
 
         match self.strategy {
@@ -137,9 +156,7 @@ impl ConnectionPlanner {
                     let mut prioritized = Vec::new();
                     let mut rest = Vec::new();
                     for candidate in candidates {
-                        if candidate.subscription_id == last.subscription_id
-                            && candidate.node_index == last.node_index
-                        {
+                        if candidate.node_ref == last.node_ref {
                             prioritized.push(candidate);
                         } else {
                             rest.push(candidate);
@@ -188,7 +205,7 @@ impl ConnectionPlanner {
         for idx in 0..self.geo_preference.len() {
             if let Some(list) = buckets.remove(&idx) {
                 for candidate in list {
-                    if seen.insert((candidate.subscription_id, candidate.node_index)) {
+                    if seen.insert(candidate.node_ref) {
                         ordered.push(candidate);
                     }
                 }
@@ -247,11 +264,11 @@ mod tests {
             Vec::new(),
         );
 
-        let planned = planner.plan(&[sub1.clone(), sub2.clone()]);
+        let planned = planner.plan(&[sub1.clone(), sub2.clone()], &[]);
 
         assert_eq!(planned.len(), 2);
-        assert_eq!(planned[0].subscription_id, sub1.id);
-        assert_eq!(planned[1].subscription_id, sub2.id);
+        assert_eq!(planned[0].source_name, "Alpha");
+        assert_eq!(planned[1].source_name, "Beta");
     }
 
     #[test]
@@ -271,7 +288,7 @@ mod tests {
             Vec::new(),
         );
 
-        let planned = planner.plan(&[sub.clone()]);
+        let planned = planner.plan(&[sub.clone()], &[]);
 
         assert_eq!(planned[0].node.address(), "c.com");
         assert_eq!(planned[1].node.address(), "a.com");
@@ -288,8 +305,10 @@ mod tests {
             ],
         );
         let last = LastSuccessMetadata {
-            subscription_id: sub.id,
-            node_index: 1,
+            node_ref: ConnectionNodeRef::Subscription {
+                subscription_id: sub.id,
+                node_index: 1,
+            },
             connected_at: Utc::now(),
         };
         let planner = ConnectionPlanner::new(
@@ -299,7 +318,7 @@ mod tests {
             Vec::new(),
         );
 
-        let planned = planner.plan(&[sub.clone()]);
+        let planned = planner.plan(&[sub.clone()], &[]);
 
         assert_eq!(planned[0].node.address(), "b.com");
     }
@@ -321,9 +340,50 @@ mod tests {
             vec!["jp".into(), "us".into()],
         );
 
-        let planned = planner.plan(&[sub.clone()]);
+        let planned = planner.plan(&[sub.clone()], &[]);
 
         assert_eq!(planned[0].node.address(), "jp.com");
         assert_eq!(planned[1].node.address(), "us.com");
+    }
+
+    #[test]
+    fn test_latency_stable_after_manual_node_insert() {
+        let snapshot = LatencySnapshot::new();
+        let node_id = uuid::Uuid::new_v4();
+
+        let node_ref = ConnectionNodeRef::Manual { node_id };
+        let now = Utc::now();
+
+        let mut snapshot = snapshot;
+        snapshot.upsert(node_ref, 100, now);
+
+        // Insert another node
+        snapshot.upsert(
+            ConnectionNodeRef::Manual {
+                node_id: uuid::Uuid::new_v4(),
+            },
+            200,
+            now,
+        );
+
+        // Original latency should still be accessible
+        let latency = snapshot.get(node_ref);
+        assert!(latency.is_some());
+        assert_eq!(latency.unwrap().latency_ms, 100);
+    }
+
+    #[test]
+    fn test_last_success_ref_stable_across_operations() {
+        let node_id = uuid::Uuid::new_v4();
+        let last = LastSuccessMetadata {
+            node_ref: ConnectionNodeRef::Manual { node_id },
+            connected_at: Utc::now(),
+        };
+
+        // Serialize and deserialize to simulate persistence
+        let json = serde_json::to_string(&last).unwrap();
+        let loaded: LastSuccessMetadata = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(loaded.node_ref, last.node_ref);
     }
 }

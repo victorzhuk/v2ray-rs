@@ -78,20 +78,7 @@ impl Tray for AppTray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let (title, description) = match (&self.process_state, &self.connection) {
             (ProcessState::Running, Some(meta)) => {
-                let latency = meta
-                    .latency_ms
-                    .map(|ms| format!("{ms} ms"))
-                    .unwrap_or_else(|| "n/a".into());
-                let description = format!(
-                    "{}\n{}\nLatency: {}\nBackend: {}\nStrategy: {}\nSince: {}",
-                    meta.subscription_name,
-                    meta.node_name,
-                    latency,
-                    meta.backend,
-                    meta.strategy,
-                    meta.connected_since.format("%Y-%m-%d %H:%M")
-                );
-                ("Connected".to_string(), description)
+                ("Connected".to_string(), tooltip_description(meta))
             }
             (ProcessState::Starting, _) => (
                 "Connecting".to_string(),
@@ -147,7 +134,7 @@ impl Tray for AppTray {
             ProcessState::Starting => "Status: Connecting...".to_string(),
             ProcessState::Running => {
                 if let Some(meta) = &self.connection {
-                    format!("Status: Connected ({})", meta.node_name)
+                    format!("Status: Connected ({})", connected_source_and_node(meta))
                 } else {
                     "Status: Connected".to_string()
                 }
@@ -192,6 +179,26 @@ impl Tray for AppTray {
             quit.into(),
         ]
     }
+}
+
+fn connected_source_and_node(meta: &ConnectionMetadata) -> String {
+    format!("{} · {}", meta.source, meta.node_name)
+}
+
+fn tooltip_description(meta: &ConnectionMetadata) -> String {
+    let latency = meta
+        .latency_ms
+        .map(|ms| format!("{ms} ms"))
+        .unwrap_or_else(|| "n/a".into());
+    format!(
+        "{}\n{}\nLatency: {}\nBackend: {}\nStrategy: {}\nSince: {}",
+        meta.source,
+        meta.node_name,
+        latency,
+        meta.backend,
+        meta.strategy,
+        meta.connected_since.format("%Y-%m-%d %H:%M")
+    )
 }
 
 impl AppTray {
@@ -305,5 +312,45 @@ impl TrayService {
         });
 
         Ok(TrayHandle { handle, action_rx })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use uuid::Uuid;
+    use v2ray_rs_core::models::{AutoResolveStrategy, BackendType, ConnectionNodeRef};
+
+    use super::*;
+
+    fn sample_metadata() -> ConnectionMetadata {
+        ConnectionMetadata {
+            node_ref: ConnectionNodeRef::Manual {
+                node_id: Uuid::nil(),
+            },
+            source: "Manual".into(),
+            source_id: Uuid::nil().to_string(),
+            node_name: "Test Node".into(),
+            node_address: "example.com".into(),
+            node_port: 443,
+            backend: BackendType::Xray,
+            strategy: AutoResolveStrategy::ListOrder,
+            latency_ms: Some(42),
+            connected_since: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn connected_status_text_includes_source_and_node() {
+        let meta = sample_metadata();
+        assert_eq!(connected_source_and_node(&meta), "Manual · Test Node");
+    }
+
+    #[test]
+    fn tooltip_description_includes_manual_source() {
+        let meta = sample_metadata();
+        let description = tooltip_description(&meta);
+        assert!(description.starts_with("Manual\nTest Node"));
+        assert!(description.contains("Latency: 42 ms"));
     }
 }

@@ -8,7 +8,9 @@ use relm4::prelude::*;
 use tokio::sync::broadcast;
 
 use v2ray_rs_core::config::ConfigWriter;
-use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, LastSuccessMetadata};
+use v2ray_rs_core::models::{
+    AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, Subscription,
+};
 use v2ray_rs_core::persistence::{self, AppPaths};
 use v2ray_rs_core::resolve::ConnectionPlanner;
 use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
@@ -24,6 +26,7 @@ const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_CHANNEL_CAPACITY: usize = 16;
 
 use crate::logs::{LogsMsg, LogsPage};
+use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
 use crate::wizard::OnboardingWizard;
 
@@ -31,6 +34,7 @@ pub struct App {
     settings: AppSettings,
     paths: AppPaths,
     subscriptions_page: Controller<SubscriptionsPage>,
+    nodes_page: Controller<NodesPage>,
     logs_page: Controller<LogsPage>,
     show_wizard: bool,
     wizard: Controller<OnboardingWizard>,
@@ -48,6 +52,7 @@ pub struct App {
     preferences_dialog: Option<adw::PreferencesDialog>,
     runtime_snapshot: Option<RuntimeConfigSnapshot>,
     restart_required: bool,
+    current_view: usize,
 }
 
 struct ProcessHandle {
@@ -74,8 +79,10 @@ pub enum AppMsg {
     OpenPreferences,
     PreferencesClosed,
     RoutingChanged,
+    ManualNodesChanged,
     ApplyAndRestart,
     DiscardChanges,
+    SwitchView(usize),
 }
 
 impl App {
@@ -135,7 +142,7 @@ impl App {
                     .unwrap_or_else(|| "n/a".into());
                 let details = format!(
                     "{} · {} · {} · {} · {} · since {}",
-                    meta.subscription_name,
+                    meta.source,
                     meta.node_name,
                     latency,
                     meta.backend,
@@ -167,6 +174,14 @@ impl App {
         self.restart_required = false;
     }
 
+    fn handle_manual_node_changed(&mut self) {
+        if runtime_process_active(&self.process_state) {
+            self.restart_required = self.check_restart_required();
+        } else {
+            self.regenerate_config_disconnected();
+        }
+    }
+
     fn close_preferences_dialog(&mut self) {
         if let Some(dialog) = self.preferences_dialog.take() {
             let _ = dialog.close();
@@ -185,31 +200,49 @@ impl App {
             Ok(rules) => rules,
             Err(_) => return false,
         };
+        let current_manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
 
-        snapshot.diverges_from(&self.settings, &current_rules)
+        snapshot.diverges_from(&self.settings, &current_rules, &current_manual_nodes)
+    }
+
+    fn refresh_has_active_nodes(&mut self) {
+        let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
+        let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
+        self.has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
     }
 
     fn regenerate_config_disconnected(&mut self) {
         let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
+        let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
 
         let candidate = if let Some(last) = &self.settings.last_success {
-            subscriptions
-                .iter()
-                .flat_map(|s| {
-                    s.nodes
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, n)| n.enabled)
-                        .map(move |(i, n)| (s.id, i, n.node.clone()))
-                })
-                .find(|(sub_id, idx, _)| *sub_id == last.subscription_id && *idx == last.node_index)
-                .map(|(_, _, node)| node)
+            match last.node_ref {
+                v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                    subscription_id,
+                    node_index,
+                } => subscriptions
+                    .iter()
+                    .find(|s| s.id == subscription_id)
+                    .and_then(|s| s.nodes.get(node_index))
+                    .filter(|n| n.enabled)
+                    .map(|n| n.node.clone()),
+                v2ray_rs_core::models::ConnectionNodeRef::Manual { node_id } => manual_nodes
+                    .iter()
+                    .find(|n| n.id == node_id && n.enabled)
+                    .map(|n| n.node.clone()),
+            }
         } else {
             subscriptions
                 .iter()
                 .flat_map(|s| s.nodes.iter())
                 .find(|n| n.enabled)
                 .map(|n| n.node.clone())
+                .or_else(|| {
+                    manual_nodes
+                        .iter()
+                        .find(|n| n.enabled)
+                        .map(|n| n.node.clone())
+                })
         };
 
         let Some(node) = candidate else {
@@ -313,7 +346,44 @@ impl SimpleComponent for App {
                             set_shrink_end_child: false,
 
                             #[wrap(Some)]
-                            set_start_child = model.subscriptions_page.widget(),
+                            set_start_child = &gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
+                                set_vexpand: true,
+
+                                gtk::Box {
+                                    set_orientation: gtk::Orientation::Horizontal,
+                                    set_halign: gtk::Align::Center,
+                                    set_margin_top: 6,
+                                    set_margin_bottom: 6,
+
+                                    gtk::ToggleButton {
+                                        set_label: "Subscriptions",
+                                        #[watch]
+                                        set_active: model.current_view == 0,
+                                        connect_clicked => AppMsg::SwitchView(0),
+                                    },
+
+                                    gtk::ToggleButton {
+                                        set_label: "Nodes",
+                                        #[watch]
+                                        set_active: model.current_view == 1,
+                                        connect_clicked => AppMsg::SwitchView(1),
+                                    },
+                                },
+
+                                #[name = "pane_stack"]
+                                gtk::Stack {
+                                    set_hexpand: true,
+                                    set_vexpand: true,
+
+                                    #[watch]
+                                    set_visible_child_name: if model.current_view == 0 {
+                                        "subscriptions"
+                                    } else {
+                                        "nodes"
+                                    },
+                                },
+                            },
 
                             #[wrap(Some)]
                             set_end_child = model.logs_page.widget(),
@@ -396,6 +466,13 @@ impl SimpleComponent for App {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
             });
 
+        let nodes_page = NodesPage::builder()
+            .launch((paths.clone(), settings.clone()))
+            .forward(sender.input_sender(), |msg| match msg {
+                NodesOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
+                NodesOutput::NodesChanged => AppMsg::ManualNodesChanged,
+            });
+
         let logs_page = LogsPage::builder().launch(()).detach();
 
         let wizard = OnboardingWizard::builder().launch(paths.clone()).forward(
@@ -413,12 +490,14 @@ impl SimpleComponent for App {
         let status_details = gtk::Label::new(None);
 
         let subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
-        let has_active_nodes = subscriptions.iter().any(|s| s.has_enabled_nodes());
+        let manual_nodes = persistence::load_manual_nodes_or_default(&paths);
+        let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
 
         let model = App {
             settings,
             paths,
             subscriptions_page,
+            nodes_page,
             logs_page,
             show_wizard,
             wizard,
@@ -436,6 +515,7 @@ impl SimpleComponent for App {
             preferences_dialog: None,
             runtime_snapshot: None,
             restart_required: false,
+            current_view: 0,
         };
 
         let _ = persistence::save_connection_state(&model.paths, &None);
@@ -444,6 +524,8 @@ impl SimpleComponent for App {
         let status_label = &model.status_label;
         let status_details = &model.status_details;
         let widgets = view_output!();
+        widgets.pane_stack.add_named(model.subscriptions_page.widget(), Some("subscriptions"));
+        widgets.pane_stack.add_named(model.nodes_page.widget(), Some("nodes"));
         model.update_status_labels();
 
         let prefs_action = gtk::gio::SimpleAction::new("preferences", None);
@@ -490,8 +572,8 @@ impl SimpleComponent for App {
                     self.regenerate_config_disconnected();
                 }
             }
-            AppMsg::ActiveNodesChanged(has) => {
-                self.has_active_nodes = has;
+            AppMsg::ActiveNodesChanged(_has) => {
+                self.refresh_has_active_nodes();
             }
             AppMsg::ToggleConnection => {
                 if self.connected {
@@ -515,6 +597,7 @@ impl SimpleComponent for App {
 
                 let subscriptions =
                     persistence::load_subscriptions(&self.paths).unwrap_or_default();
+                let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
                 let snapshot = persistence::load_latency_snapshot(&self.paths).unwrap_or_default();
                 let planner = ConnectionPlanner::new(
                     self.settings.auto_resolve_strategy,
@@ -522,10 +605,12 @@ impl SimpleComponent for App {
                     snapshot,
                     Vec::new(),
                 );
-                let candidates = planner.plan(&subscriptions);
+                let candidates = planner.plan(&subscriptions, &manual_nodes);
 
                 if candidates.is_empty() {
-                    self.show_toast("No enabled proxy nodes — add a subscription first");
+                    self.show_toast(
+                        "No enabled proxy nodes — add a subscription or manual node first",
+                    );
                     return;
                 }
 
@@ -539,6 +624,7 @@ impl SimpleComponent for App {
                     self.settings.http_port,
                     self.settings.dns.clone(),
                     rules,
+                    manual_nodes.clone(),
                     chrono::Utc::now().timestamp(),
                 ));
 
@@ -577,9 +663,17 @@ impl SimpleComponent for App {
                             .unwrap_or(candidate.node.address())
                             .to_string();
                         let meta = ConnectionMetadata {
-                            subscription_id: candidate.subscription_id,
-                            subscription_name: candidate.subscription_name.clone(),
-                            node_index: candidate.node_index,
+                            node_ref: candidate.node_ref,
+                            source: candidate.source_name,
+                            source_id: match &candidate.node_ref {
+                                v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                                    subscription_id,
+                                    ..
+                                } => subscription_id.to_string(),
+                                v2ray_rs_core::models::ConnectionNodeRef::Manual { node_id } => {
+                                    node_id.to_string()
+                                }
+                            },
                             node_name,
                             node_address: candidate.node.address().to_string(),
                             node_port: candidate.node.port(),
@@ -697,8 +791,7 @@ impl SimpleComponent for App {
                     self.connection_status = connection;
                     if let Some(meta) = &self.connection_status {
                         self.settings.last_success = Some(LastSuccessMetadata {
-                            subscription_id: meta.subscription_id,
-                            node_index: meta.node_index,
+                            node_ref: meta.node_ref,
                             connected_at: meta.connected_since,
                         });
                         if let Err(e) =
@@ -787,6 +880,10 @@ impl SimpleComponent for App {
                     self.regenerate_config_disconnected();
                 }
             }
+            AppMsg::ManualNodesChanged => {
+                self.refresh_has_active_nodes();
+                self.handle_manual_node_changed();
+            }
             AppMsg::ApplyAndRestart => {
                 self.restart_required = false;
                 self.reconnect_pending = true;
@@ -808,10 +905,24 @@ impl SimpleComponent for App {
                         log::error!("save routing: {e}");
                     }
 
+                    let restored_manual_nodes = snapshot.restore_manual_nodes();
+                    if let Err(e) =
+                        persistence::save_manual_nodes(&self.paths, &restored_manual_nodes)
+                    {
+                        log::error!("save manual nodes: {e}");
+                    } else {
+                        self.nodes_page
+                            .emit(NodesMsg::ReplaceNodes(restored_manual_nodes));
+                    }
+
                     self.settings = settings;
+                    self.refresh_has_active_nodes();
                 }
 
                 self.restart_required = false;
+            }
+            AppMsg::SwitchView(view_index) => {
+                self.current_view = view_index;
             }
         }
     }
@@ -825,9 +936,17 @@ fn restart_banner_visible_for_state(restart_required: bool, state: &ProcessState
     restart_required && runtime_process_active(state)
 }
 
+fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[ManualNode]) -> bool {
+    subscriptions
+        .iter()
+        .any(|subscription| subscription.has_enabled_nodes())
+        || manual_nodes.iter().any(|node| node.enabled)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use v2ray_rs_core::models::{ProxyNode, TransportSettings, VlessConfig};
 
     #[test]
     fn restart_banner_only_visible_while_runtime_is_active() {
@@ -851,6 +970,30 @@ mod tests {
             false,
             &ProcessState::Running
         ));
+    }
+
+    #[test]
+    fn active_nodes_include_manual_nodes_and_subscriptions() {
+        let mut subscription = Subscription::new_from_url("Test", "https://example.com");
+        subscription.enabled = true;
+        subscription.nodes.clear();
+
+        let manual_nodes = vec![ManualNode::with_id(
+            uuid::Uuid::nil(),
+            ProxyNode::Vless(VlessConfig {
+                address: "manual.example.com".into(),
+                port: 443,
+                uuid: "manual-uuid".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: Some("Manual".into()),
+            }),
+            true,
+        )];
+
+        assert!(active_nodes_available(&[subscription], &manual_nodes));
     }
 }
 
