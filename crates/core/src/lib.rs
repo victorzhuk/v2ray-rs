@@ -5,3 +5,4 @@ pub mod models;
 pub mod persistence;
 pub mod resolve;
 pub mod routing_manager;
+pub mod runtime_snapshot;

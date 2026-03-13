@@ -16,17 +16,20 @@ use v2ray_rs_core::models::{
 use v2ray_rs_core::persistence::{self, AppPaths};
 
 type SettingsCallback = Rc<dyn Fn(AppSettings)>;
+type RoutingCallback = Rc<dyn Fn()>;
 
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     paths: &AppPaths,
     settings: &AppSettings,
     on_settings_changed: impl Fn(AppSettings) + 'static,
-) {
+    on_routing_changed: impl Fn() + 'static,
+) -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
 
     let cb: SettingsCallback = Rc::new(on_settings_changed);
+    let routing_cb: RoutingCallback = Rc::new(on_routing_changed);
     let settings_state = Rc::new(RefCell::new(settings.clone()));
 
     let system_page = build_system_page(&settings_state, &cb);
@@ -35,13 +38,14 @@ pub fn show_preferences(
     let network_page = build_network_page(&settings_state, &cb);
     dialog.add(&network_page);
 
-    let routing_page = build_routing_page(paths);
+    let routing_page = build_routing_page(paths, routing_cb);
     dialog.add(&routing_page);
 
     let dns_page = build_dns_page(&settings_state, &cb);
     dialog.add(&dns_page);
 
     dialog.present(Some(parent));
+    dialog
 }
 
 fn emit(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) {
@@ -329,7 +333,10 @@ fn build_network_page(
     page
 }
 
-fn build_routing_page(paths: &AppPaths) -> adw::PreferencesPage {
+fn build_routing_page(
+    paths: &AppPaths,
+    routing_changed_cb: RoutingCallback,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Routing")
         .icon_name("network-workgroup-symbolic")
@@ -372,6 +379,7 @@ fn build_routing_page(paths: &AppPaths) -> adw::PreferencesPage {
         rule_set: rule_set.clone(),
         paths: paths.clone(),
         added_groups: Rc::new(RefCell::new(Vec::new())),
+        routing_changed_cb,
     };
 
     render_routing_rules(&ctx);
@@ -399,6 +407,7 @@ struct RenderCtx {
     rule_set: Rc<RefCell<RoutingRuleSet>>,
     paths: Rc<AppPaths>,
     added_groups: Rc<RefCell<Vec<adw::PreferencesGroup>>>,
+    routing_changed_cb: RoutingCallback,
 }
 
 fn render_routing_rules(ctx: &RenderCtx) {
@@ -459,6 +468,7 @@ fn render_routing_rules(ctx: &RenderCtx) {
                         log::error!("save routing rules: {e}");
                     }
                 }
+                (ctx.routing_changed_cb)();
                 render_routing_rules(&ctx);
             });
             pref_group.set_header_suffix(Some(&remove_btn));
@@ -500,6 +510,7 @@ fn build_routing_rule_row(
             if let Err(e) = persistence::save_routing_rules(&ctx.paths, &rs) {
                 log::error!("save routing rules: {e}");
             }
+            (ctx.routing_changed_cb)();
         });
     }
     row.add_suffix(&switch);
@@ -530,6 +541,7 @@ fn build_routing_rule_row(
             if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
                 log::error!("save routing rules: {e}");
             }
+            (ctx.routing_changed_cb)();
             render_routing_rules(&ctx);
         });
         popover_box.append(&btn);
@@ -548,6 +560,7 @@ fn build_routing_rule_row(
             if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
                 log::error!("save routing rules: {e}");
             }
+            (ctx.routing_changed_cb)();
             render_routing_rules(&ctx);
         });
         popover_box.append(&btn);
@@ -592,6 +605,7 @@ fn build_routing_rule_row(
             if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
                 log::error!("save routing rules: {e}");
             }
+            (ctx.routing_changed_cb)();
             render_routing_rules(&ctx);
         });
     }
@@ -725,6 +739,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
                 log::error!("save routing rules: {e}");
             }
         }
+        (ctx.routing_changed_cb)();
         render_routing_rules(&ctx);
     });
 
@@ -762,6 +777,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             if let Err(e) = persistence::save_routing_rules(&ctx.paths, &ctx.rule_set.borrow()) {
                 log::error!("save routing rules: {e}");
             }
+            (ctx.routing_changed_cb)();
             render_routing_rules(&ctx);
         });
         row.add_suffix(&apply_btn);
@@ -790,6 +806,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
                 {
                     log::error!("save routing rules: {e}");
                 }
+                (ctx.routing_changed_cb)();
                 render_routing_rules(&ctx);
             });
             row.add_suffix(&apply_btn);

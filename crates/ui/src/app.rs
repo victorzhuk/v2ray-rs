@@ -11,6 +11,7 @@ use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, LastSuccessMetadata};
 use v2ray_rs_core::persistence::{self, AppPaths};
 use v2ray_rs_core::resolve::ConnectionPlanner;
+use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
 
@@ -44,6 +45,9 @@ pub struct App {
     status_label: gtk::Label,
     status_details: gtk::Label,
     toast_overlay: adw::ToastOverlay,
+    preferences_dialog: Option<adw::PreferencesDialog>,
+    runtime_snapshot: Option<RuntimeConfigSnapshot>,
+    restart_required: bool,
 }
 
 struct ProcessHandle {
@@ -68,6 +72,10 @@ pub enum AppMsg {
     ProcessStateConnection(ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(String),
     OpenPreferences,
+    PreferencesClosed,
+    RoutingChanged,
+    ApplyAndRestart,
+    DiscardChanges,
 }
 
 impl App {
@@ -149,6 +157,75 @@ impl App {
         self.status_label.set_text(&primary);
         self.status_details.set_text(&details);
     }
+
+    fn restart_banner_visible(&self) -> bool {
+        restart_banner_visible_for_state(self.restart_required, &self.process_state)
+    }
+
+    fn clear_restart_flow(&mut self) {
+        self.runtime_snapshot = None;
+        self.restart_required = false;
+    }
+
+    fn close_preferences_dialog(&mut self) {
+        if let Some(dialog) = self.preferences_dialog.take() {
+            let _ = dialog.close();
+        }
+    }
+
+    fn check_restart_required(&self) -> bool {
+        if !runtime_process_active(&self.process_state) {
+            return false;
+        }
+        let Some(snapshot) = &self.runtime_snapshot else {
+            return false;
+        };
+
+        let current_rules = match persistence::load_routing_rules(&self.paths) {
+            Ok(rules) => rules,
+            Err(_) => return false,
+        };
+
+        snapshot.diverges_from(&self.settings, &current_rules)
+    }
+
+    fn regenerate_config_disconnected(&mut self) {
+        let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
+
+        let candidate = if let Some(last) = &self.settings.last_success {
+            subscriptions
+                .iter()
+                .flat_map(|s| {
+                    s.nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, n)| n.enabled)
+                        .map(move |(i, n)| (s.id, i, n.node.clone()))
+                })
+                .find(|(sub_id, idx, _)| *sub_id == last.subscription_id && *idx == last.node_index)
+                .map(|(_, _, node)| node)
+        } else {
+            subscriptions
+                .iter()
+                .flat_map(|s| s.nodes.iter())
+                .find(|n| n.enabled)
+                .map(|n| n.node.clone())
+        };
+
+        let Some(node) = candidate else {
+            log::debug!("No enabled nodes, skipping config regeneration");
+            return;
+        };
+
+        let rules = persistence::load_routing_rules(&self.paths).unwrap_or_default();
+        let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+
+        let writer = ConfigWriter::new(&self.settings, &self.paths);
+        match writer.write_config(std::slice::from_ref(&node), &enabled_rules, &self.settings) {
+            Ok(path) => log::info!("Regenerated config at {:?}", path),
+            Err(e) => log::error!("Failed to regenerate config: {}", e),
+        }
+    }
 }
 
 #[relm4::component(pub)]
@@ -195,7 +272,40 @@ impl SimpleComponent for App {
 
                     #[local_ref]
                     toast_overlay -> adw::ToastOverlay {
-                        gtk::Paned {
+                        gtk::Box {
+                            set_orientation: gtk::Orientation::Vertical,
+                            set_vexpand: true,
+
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 12,
+                                set_margin_top: 6,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                #[watch]
+                                set_visible: model.restart_banner_visible(),
+
+                                adw::Banner {
+                                    set_hexpand: true,
+                                    set_title: "Configuration changed",
+                                    set_button_label: Some("Apply & Restart"),
+                                    #[watch]
+                                    set_revealed: model.restart_banner_visible(),
+
+                                    connect_button_clicked[sender] => move |_| {
+                                        sender.input(AppMsg::ApplyAndRestart);
+                                    },
+                                },
+
+                                gtk::Button {
+                                    set_label: "Discard",
+                                    set_valign: gtk::Align::Center,
+                                    set_css_classes: &["flat"],
+                                    connect_clicked => AppMsg::DiscardChanges,
+                                },
+                            },
+
+                            gtk::Paned {
                             set_orientation: gtk::Orientation::Vertical,
                             set_vexpand: true,
                             set_position: 380,
@@ -209,8 +319,9 @@ impl SimpleComponent for App {
                             set_end_child = model.logs_page.widget(),
                         },
                     },
+                },
 
-                    gtk::ActionBar {
+                gtk::ActionBar {
                         set_hexpand: true,
 
                         pack_start = &gtk::Box {
@@ -322,6 +433,9 @@ impl SimpleComponent for App {
             status_label: status_label.clone(),
             status_details: status_details.clone(),
             toast_overlay: toast_overlay.clone(),
+            preferences_dialog: None,
+            runtime_snapshot: None,
+            restart_required: false,
         };
 
         let _ = persistence::save_connection_state(&model.paths, &None);
@@ -367,9 +481,13 @@ impl SimpleComponent for App {
                 let strategy_changed =
                     self.settings.auto_resolve_strategy != settings.auto_resolve_strategy;
                 self.settings = settings;
+                self.restart_required = self.check_restart_required();
                 if was_connected && strategy_changed {
                     self.reconnect_pending = true;
                     sender.input(AppMsg::Disconnect);
+                }
+                if self.process_handle.is_none() {
+                    self.regenerate_config_disconnected();
                 }
             }
             AppMsg::ActiveNodesChanged(has) => {
@@ -413,6 +531,16 @@ impl SimpleComponent for App {
 
                 let rules = persistence::load_routing_rules(&self.paths).unwrap_or_default();
                 let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+
+                self.runtime_snapshot = Some(RuntimeConfigSnapshot::new(
+                    self.settings.backend.backend_type,
+                    self.settings.backend.binary_path.clone(),
+                    self.settings.socks_port,
+                    self.settings.http_port,
+                    self.settings.dns.clone(),
+                    rules,
+                    chrono::Utc::now().timestamp(),
+                ));
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
                 let pid_path = self.paths.data_dir().join("backend.pid");
@@ -550,6 +678,7 @@ impl SimpleComponent for App {
                 self.process_handle = Some(ProcessHandle { cmd_tx });
             }
             AppMsg::Disconnect => {
+                self.clear_restart_flow();
                 if let Some(handle) = self.process_handle.take() {
                     self.apply_state(&ProcessState::Stopping);
                     let _ = handle.cmd_tx.try_send(ProcessCmd::Stop);
@@ -562,6 +691,7 @@ impl SimpleComponent for App {
                 if stopped {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
+                    self.clear_restart_flow();
                 }
                 if connection.is_some() {
                     self.connection_status = connection;
@@ -586,6 +716,9 @@ impl SimpleComponent for App {
                     log::error!("save connection state: {e}");
                 }
                 self.apply_state(&state);
+                if stopped && !self.reconnect_pending {
+                    self.regenerate_config_disconnected();
+                }
                 if matches!(state, ProcessState::Stopped) && self.reconnect_pending {
                     self.reconnect_pending = false;
                     sender.input(AppMsg::Connect);
@@ -615,20 +748,109 @@ impl SimpleComponent for App {
                 self.window.destroy();
             }
             AppMsg::OpenPreferences => {
+                if let Some(dialog) = &self.preferences_dialog {
+                    dialog.present(Some(&self.window));
+                    return;
+                }
+
                 let paths = self.paths.clone();
                 let settings = self.settings.clone();
                 let window = self.window.clone();
                 let s = sender.input_sender().clone();
-                crate::preferences::show_preferences(
+                let s1 = s.clone();
+                let dialog = crate::preferences::show_preferences(
                     &window,
                     &paths,
                     &settings,
                     move |new_settings| {
                         s.emit(AppMsg::SettingsChanged(new_settings));
                     },
+                    move || {
+                        s1.emit(AppMsg::RoutingChanged);
+                    },
                 );
+                {
+                    let s = sender.input_sender().clone();
+                    dialog.connect_closed(move |_| {
+                        s.emit(AppMsg::PreferencesClosed);
+                    });
+                }
+                self.preferences_dialog = Some(dialog);
+            }
+            AppMsg::PreferencesClosed => {
+                self.preferences_dialog = None;
+            }
+            AppMsg::RoutingChanged => {
+                log::info!("Routing rules changed");
+                self.restart_required = self.check_restart_required();
+                if self.process_handle.is_none() {
+                    self.regenerate_config_disconnected();
+                }
+            }
+            AppMsg::ApplyAndRestart => {
+                self.restart_required = false;
+                self.reconnect_pending = true;
+                sender.input(AppMsg::Disconnect);
+            }
+            AppMsg::DiscardChanges => {
+                self.close_preferences_dialog();
+
+                if let Some(snapshot) = self.runtime_snapshot.clone() {
+                    let mut settings = self.settings.clone();
+                    snapshot.restore_settings(&mut settings);
+
+                    if let Err(e) = persistence::save_settings(&self.paths, &settings) {
+                        log::error!("save settings: {e}");
+                    }
+
+                    if let Err(e) = persistence::save_routing_rules(&self.paths, &snapshot.routing)
+                    {
+                        log::error!("save routing: {e}");
+                    }
+
+                    self.settings = settings;
+                }
+
+                self.restart_required = false;
             }
         }
+    }
+}
+
+fn runtime_process_active(state: &ProcessState) -> bool {
+    matches!(state, ProcessState::Starting | ProcessState::Running)
+}
+
+fn restart_banner_visible_for_state(restart_required: bool, state: &ProcessState) -> bool {
+    restart_required && runtime_process_active(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_banner_only_visible_while_runtime_is_active() {
+        assert!(restart_banner_visible_for_state(
+            true,
+            &ProcessState::Starting
+        ));
+        assert!(restart_banner_visible_for_state(
+            true,
+            &ProcessState::Running
+        ));
+        assert!(!restart_banner_visible_for_state(
+            true,
+            &ProcessState::Stopping
+        ));
+        assert!(!restart_banner_visible_for_state(
+            true,
+            &ProcessState::Stopped
+        ));
+        assert!(!restart_banner_visible_for_state(
+            false,
+            &ProcessState::Running
+        ));
     }
 }
 
