@@ -25,6 +25,32 @@ The DNS page SHALL have a dropdown to select the IP query strategy (Prefer IPv4,
 - **WHEN** the user selects "IPv6 Only" from the strategy dropdown
 - **THEN** the setting SHALL be saved to AppSettings and reflected in the next config generation
 
+### Requirement: Simplified default DNS projection
+The DNS page SHALL show dedicated `remote` and `domestic` rows as the primary surface, while keeping the full server list available in Advanced.
+
+#### Scenario: Standard config shows remote and domestic rows
+- **WHEN** the user opens the DNS preferences page with standard `remote` and `domestic` servers configured
+- **THEN** the primary section shows those two rows first
+
+#### Scenario: Config without standard tags
+- **WHEN** the current DNS config lacks a `remote` or `domestic` server tag
+- **THEN** the primary row shows "Not configured" and the full editable server list remains available in Advanced without silent tag normalization
+
+#### Scenario: Custom rules active indicator in primary view
+- **WHEN** `use_custom_rules` is true
+- **THEN** the primary DNS section SHALL indicate that custom DNS rules are active (e.g. via subtitle text or an info row), so the user is aware without expanding Advanced
+
+### Requirement: Advanced DNS controls
+Advanced DNS controls SHALL contain the full server list, the `use_custom_rules` toggle, the editable custom-rule list, FakeIP settings, and sing-box-only detour fields.
+
+#### Scenario: Enable custom rules in Advanced
+- **WHEN** the user expands Advanced and enables custom DNS rules
+- **THEN** the existing `use_custom_rules` behavior becomes active and the editable custom-rule list is shown
+
+#### Scenario: Extra servers remain editable in Advanced
+- **WHEN** the DNS config contains additional nonstandard servers
+- **THEN** the primary section continues to show only the standard roles and Advanced retains the full server list unchanged
+
 ### Requirement: DNS server list management
 The DNS page SHALL display the list of configured DNS servers with controls to add, edit, and remove servers. The Servers group SHALL include a "Providers" button that opens a provider picker dialog.
 
@@ -68,6 +94,10 @@ The DNS page SHALL display the list of configured DNS servers with controls to a
 - **WHEN** the user confirms applying a provider preset
 - **THEN** the settings SHALL be saved via the existing auto-persist callback
 
+#### Scenario: Server list accessible via Advanced
+- **WHEN** the user opens the DNS preferences page
+- **THEN** the full editable server list is accessible by expanding the Advanced section, not at the top level of the page
+
 ### Requirement: DNS rules management
 The DNS page SHALL have a rules section with a toggle between auto-derived rules (from routing) and custom rules. When custom rules mode is active, the user SHALL be able to add, edit, and remove DNS rules.
 
@@ -83,6 +113,10 @@ The DNS page SHALL have a rules section with a toggle between auto-derived rules
 - **WHEN** the user adds a DNS rule
 - **THEN** a dialog SHALL appear with match type (GeoSite, Domain Suffix), match value, and target server tag (dropdown of configured servers)
 
+#### Scenario: Rules section in Advanced
+- **WHEN** the user wants to manage DNS routing rules
+- **THEN** the rules section is accessible inside Advanced, not as a standalone section at the top level
+
 ### Requirement: FakeIP section (sing-box conditional)
 The DNS page SHALL show a FakeIP configuration section only when the selected backend is sing-box.
 
@@ -94,8 +128,12 @@ The DNS page SHALL show a FakeIP configuration section only when the selected ba
 - **WHEN** the selected backend is sing-box
 - **THEN** the FakeIP group SHALL be visible with an enable toggle and IPv4/IPv6 range entries
 
+#### Scenario: FakeIP inside Advanced for sing-box
+- **WHEN** the selected backend is sing-box and the user expands Advanced
+- **THEN** the FakeIP group is visible inside Advanced, not as a top-level section
+
 ### Requirement: Advanced DNS settings
-The DNS page SHALL have an Advanced group with cache control toggle and EDNS client subnet entry.
+The DNS page SHALL have an Advanced section containing the full server list, rules section, hosts section, FakeIP settings, the custom-rules toggle, disable-cache toggle, and client-subnet entry.
 
 #### Scenario: Disable cache toggle
 - **WHEN** the user toggles "Disable DNS cache"
@@ -104,6 +142,10 @@ The DNS page SHALL have an Advanced group with cache control toggle and EDNS cli
 #### Scenario: Client subnet entry
 - **WHEN** the user enters a client subnet IP
 - **THEN** the value SHALL be validated as a valid IPv4 or IPv6 address and saved
+
+#### Scenario: Advanced contains all complex controls
+- **WHEN** the user expands the Advanced section
+- **THEN** it contains servers, rules, hosts, FakeIP, the custom-rules toggle, disable-cache toggle, and client-subnet entry
 
 ### Requirement: Static hosts table
 The DNS page SHALL have a Hosts group where users can add and remove static domain→IP mappings.
@@ -115,6 +157,10 @@ The DNS page SHALL have a Hosts group where users can add and remove static doma
 #### Scenario: Remove host override
 - **WHEN** the user removes a host entry
 - **THEN** the entry SHALL be removed from the list and persisted immediately
+
+#### Scenario: Hosts group inside Advanced
+- **WHEN** the user wants to manage static host overrides
+- **THEN** the Hosts group is accessible inside Advanced, not as a standalone section at the top level
 
 ### Requirement: Settings changes auto-persist
 All DNS preference changes SHALL be saved immediately via the existing `on_settings_changed` callback pattern, consistent with other Preferences pages.

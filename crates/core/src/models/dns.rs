@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use ipnet::IpNet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -373,6 +374,22 @@ impl DnsConfig {
             }
         }
 
+        if self.fakeip.enabled {
+            if self.fakeip.inet4_range.parse::<IpNet>().is_err() {
+                return Err(DnsValidationError::InvalidFakeIpCidr {
+                    field: "inet4_range".to_string(),
+                    value: self.fakeip.inet4_range.clone(),
+                });
+            }
+
+            if self.fakeip.inet6_range.parse::<IpNet>().is_err() {
+                return Err(DnsValidationError::InvalidFakeIpCidr {
+                    field: "inet6_range".to_string(),
+                    value: self.fakeip.inet6_range.clone(),
+                });
+            }
+        }
+
         Ok(())
     }
 
@@ -393,6 +410,8 @@ pub enum DnsValidationError {
     InvalidClientSubnet(String),
     #[error("DNS rule references non-existent server tag: {0}")]
     InvalidRuleServerTag(String),
+    #[error("invalid FakeIP CIDR for {field}: {value}")]
+    InvalidFakeIpCidr { field: String, value: String },
 }
 
 #[cfg(test)]
@@ -916,5 +935,150 @@ server_tag = "google"
 
             assert_eq!(preset.strategy, DnsStrategy::PreferIpv4);
         }
+    }
+
+    #[test]
+    fn test_validate_fakeip_valid_ipv4_cidr() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "198.18.0.0/15".to_string(),
+                inet6_range: "fc00::/18".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_fakeip_invalid_ipv4_cidr() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "not-a-cidr".to_string(),
+                inet6_range: "fc00::/18".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        let result = cfg.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DnsValidationError::InvalidFakeIpCidr { field, .. } if field == "inet4_range"
+        ));
+    }
+
+    #[test]
+    fn test_validate_fakeip_valid_ipv6_cidr() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "198.18.0.0/15".to_string(),
+                inet6_range: "fd00:dead:beef::/48".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_fakeip_invalid_ipv6_cidr() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "198.18.0.0/15".to_string(),
+                inet6_range: "not-valid-ipv6".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        let result = cfg.validate();
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            DnsValidationError::InvalidFakeIpCidr { field, .. } if field == "inet6_range"
+        ));
+    }
+
+    #[test]
+    fn test_validate_fakeip_skipped_when_disabled() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }],
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: false,
+                inet4_range: "not-a-cidr".to_string(),
+                inet6_range: "not-valid-ipv6".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        assert!(cfg.validate().is_ok());
     }
 }

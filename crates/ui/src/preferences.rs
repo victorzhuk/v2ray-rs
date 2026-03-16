@@ -1,17 +1,18 @@
 use adw::prelude::*;
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use relm4::adw;
 use relm4::gtk;
 use std::cell::RefCell;
+use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
 use v2ray_rs_core::models::{
-    AppSettings, AutoResolveStrategy, BackendConfig, BackendType, DnsProtocol, DnsRule,
-    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, Language, Preset, RoutingRule,
-    RoutingRuleSet, RuleAction, RuleMatch, builtin_dns_presets, builtin_presets,
+    builtin_dns_presets, builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig,
+    BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride,
+    Language, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -935,13 +936,15 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
 
     let s = state.borrow();
 
-    let dns_group = adw::PreferencesGroup::builder().title("DNS").build();
+    let primary_group = adw::PreferencesGroup::builder()
+        .title("Primary DNS")
+        .build();
 
     let enable_row = adw::SwitchRow::builder()
         .title("Enable DNS")
         .active(s.dns.enabled)
         .build();
-    dns_group.add(&enable_row);
+    primary_group.add(&enable_row);
 
     let strategy_row = adw::ComboRow::builder()
         .title("IP Strategy")
@@ -953,8 +956,37 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         ]))
         .selected(strategy_to_index(s.dns.strategy))
         .build();
-    dns_group.add(&strategy_row);
-    page.add(&dns_group);
+    primary_group.add(&strategy_row);
+
+    let remote_server_row = adw::ActionRow::builder()
+        .title("Remote")
+        .subtitle("Not configured")
+        .build();
+    let remote_edit_btn = gtk::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .valign(gtk::Align::Center)
+        .has_frame(false)
+        .css_classes(["flat"])
+        .tooltip_text("Edit Remote Server")
+        .build();
+    remote_server_row.add_suffix(&remote_edit_btn);
+    primary_group.add(&remote_server_row);
+
+    let domestic_server_row = adw::ActionRow::builder()
+        .title("Domestic")
+        .subtitle("Not configured")
+        .build();
+    let domestic_edit_btn = gtk::Button::builder()
+        .icon_name("document-edit-symbolic")
+        .valign(gtk::Align::Center)
+        .has_frame(false)
+        .css_classes(["flat"])
+        .tooltip_text("Edit Domestic Server")
+        .build();
+    domestic_server_row.add_suffix(&domestic_edit_btn);
+    primary_group.add(&domestic_server_row);
+
+    page.add(&primary_group);
 
     drop(s);
 
@@ -974,6 +1006,11 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
             emit(&st, &cb);
         });
     }
+
+    let advanced_expander = adw::ExpanderRow::builder()
+        .title("Advanced")
+        .subtitle("Full configuration")
+        .build();
 
     let servers_group = adw::PreferencesGroup::builder().title("Servers").build();
     let servers_toolbar = adw::ActionRow::builder().activatable(false).build();
@@ -997,7 +1034,6 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     servers_toolbar_box.append(&add_server_btn);
     servers_toolbar.add_suffix(&servers_toolbar_box);
     servers_group.add(&servers_toolbar);
-    page.add(&servers_group);
 
     let rules_group = adw::PreferencesGroup::builder().title("DNS Rules").build();
     let rules_toolbar = adw::ActionRow::builder().activatable(false).build();
@@ -1026,27 +1062,6 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     rules_toolbar_box.append(&add_rule_btn);
     rules_toolbar.add_suffix(&rules_toolbar_box);
     rules_group.add(&rules_toolbar);
-    page.add(&rules_group);
-
-    let advanced_group = adw::PreferencesGroup::builder().title("Advanced").build();
-    let disable_cache_row = adw::SwitchRow::builder()
-        .title("Disable Cache")
-        .active(state.borrow().dns.disable_cache)
-        .build();
-    advanced_group.add(&disable_cache_row);
-    let client_subnet_row = adw::EntryRow::builder()
-        .title("Client Subnet IP")
-        .text(
-            state
-                .borrow()
-                .dns
-                .client_subnet
-                .as_deref()
-                .unwrap_or_default(),
-        )
-        .build();
-    advanced_group.add(&client_subnet_row);
-    page.add(&advanced_group);
 
     let hosts_group = adw::PreferencesGroup::builder().title("Hosts").build();
     let hosts_toolbar = adw::ActionRow::builder().activatable(false).build();
@@ -1064,7 +1079,6 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     hosts_toolbar_box.append(&add_host_btn);
     hosts_toolbar.add_suffix(&hosts_toolbar_box);
     hosts_group.add(&hosts_toolbar);
-    page.add(&hosts_group);
 
     let is_singbox = state.borrow().backend.backend_type == BackendType::SingBox;
 
@@ -1077,17 +1091,73 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         .active(state.borrow().dns.fakeip.enabled)
         .build();
     fakeip_group.add(&fakeip_enable_row);
+
     let fakeip_inet4_row = adw::EntryRow::builder()
         .title("IPv4 Range")
         .text(&state.borrow().dns.fakeip.inet4_range)
         .build();
+    let fakeip_inet4_error = gtk::Label::builder()
+        .label("")
+        .css_classes(["error-label"])
+        .halign(gtk::Align::Start)
+        .margin_start(12)
+        .margin_bottom(6)
+        .visible(false)
+        .build();
     fakeip_group.add(&fakeip_inet4_row);
+    fakeip_group.add(&fakeip_inet4_error);
+
     let fakeip_inet6_row = adw::EntryRow::builder()
         .title("IPv6 Range")
         .text(&state.borrow().dns.fakeip.inet6_range)
         .build();
+    let fakeip_inet6_error = gtk::Label::builder()
+        .label("")
+        .css_classes(["error-label"])
+        .halign(gtk::Align::Start)
+        .margin_start(12)
+        .margin_bottom(6)
+        .visible(false)
+        .build();
     fakeip_group.add(&fakeip_inet6_row);
-    page.add(&fakeip_group);
+    fakeip_group.add(&fakeip_inet6_error);
+
+    let disable_cache_row = adw::SwitchRow::builder()
+        .title("Disable Cache")
+        .active(state.borrow().dns.disable_cache)
+        .build();
+
+    let client_subnet_row = adw::EntryRow::builder()
+        .title("Client Subnet IP")
+        .text(
+            state
+                .borrow()
+                .dns
+                .client_subnet
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .build();
+    let client_subnet_error = gtk::Label::builder()
+        .label("")
+        .css_classes(["error-label"])
+        .halign(gtk::Align::Start)
+        .margin_start(12)
+        .margin_bottom(6)
+        .visible(false)
+        .build();
+
+    advanced_expander.add_row(&servers_group);
+    advanced_expander.add_row(&rules_group);
+    advanced_expander.add_row(&hosts_group);
+    advanced_expander.add_row(&fakeip_group);
+    advanced_expander.add_row(&disable_cache_row);
+    advanced_expander.add_row(&client_subnet_row);
+    advanced_expander.add_row(&client_subnet_error);
+
+    let advanced_group = adw::PreferencesGroup::new();
+    advanced_group.add(&advanced_expander);
+    page.add(&advanced_group);
 
     let st = state.clone();
     let cb_clone = cb.clone();
@@ -1109,12 +1179,27 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     {
         let st = state.clone();
         let cb = cb.clone();
-        client_subnet_row.connect_changed(move |row| {
+        let error_label = client_subnet_error.clone();
+        let row = client_subnet_row.clone();
+        client_subnet_row.connect_changed(move |_| {
             let text = row.text().to_string();
-            if text.trim().is_empty() {
-                st.borrow_mut().dns.client_subnet = None;
-            } else {
-                st.borrow_mut().dns.client_subnet = Some(text.trim().to_string());
+            let trimmed = text.trim();
+
+            match validate_ip_address(trimmed) {
+                Ok(()) => {
+                    if trimmed.is_empty() {
+                        st.borrow_mut().dns.client_subnet = None;
+                    } else {
+                        st.borrow_mut().dns.client_subnet = Some(trimmed.to_string());
+                    }
+                    error_label.set_visible(false);
+                    row.remove_css_class("error");
+                }
+                Err(msg) => {
+                    error_label.set_text(&msg);
+                    error_label.set_visible(true);
+                    row.add_css_class("error");
+                }
             }
             emit(&st, &cb);
         });
@@ -1122,24 +1207,95 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     {
         let st = state.clone();
         let cb = cb.clone();
+        let inet4_error = fakeip_inet4_error.clone();
+        let inet6_error = fakeip_inet6_error.clone();
+        let inet4_row = fakeip_inet4_row.clone();
+        let inet6_row = fakeip_inet6_row.clone();
         fakeip_enable_row.connect_active_notify(move |row| {
-            st.borrow_mut().dns.fakeip.enabled = row.is_active();
+            let enabled = row.is_active();
+            st.borrow_mut().dns.fakeip.enabled = enabled;
+
+            if enabled {
+                let inet4_text = inet4_row.text().to_string();
+                let inet6_text = inet6_row.text().to_string();
+
+                if let Err(msg) = validate_ipv4_cidr(&inet4_text) {
+                    inet4_error.set_text(&msg);
+                    inet4_error.set_visible(true);
+                    inet4_row.add_css_class("error");
+                }
+
+                if let Err(msg) = validate_ipv6_cidr(&inet6_text) {
+                    inet6_error.set_text(&msg);
+                    inet6_error.set_visible(true);
+                    inet6_row.add_css_class("error");
+                }
+            } else {
+                inet4_error.set_visible(false);
+                inet6_error.set_visible(false);
+                inet4_row.remove_css_class("error");
+                inet6_row.remove_css_class("error");
+            }
             emit(&st, &cb);
         });
     }
     {
         let st = state.clone();
         let cb = cb.clone();
-        fakeip_inet4_row.connect_changed(move |row| {
-            st.borrow_mut().dns.fakeip.inet4_range = row.text().to_string();
+        let error_label = fakeip_inet4_error.clone();
+        let row = fakeip_inet4_row.clone();
+        let enable_row = fakeip_enable_row.clone();
+        fakeip_inet4_row.connect_changed(move |_| {
+            let text = row.text().to_string();
+            st.borrow_mut().dns.fakeip.inet4_range = text.clone();
+
+            let enabled = enable_row.is_active();
+            if enabled {
+                match validate_ipv4_cidr(&text) {
+                    Ok(()) => {
+                        error_label.set_visible(false);
+                        row.remove_css_class("error");
+                    }
+                    Err(msg) => {
+                        error_label.set_text(&msg);
+                        error_label.set_visible(true);
+                        row.add_css_class("error");
+                    }
+                }
+            } else {
+                error_label.set_visible(false);
+                row.remove_css_class("error");
+            }
             emit(&st, &cb);
         });
     }
     {
         let st = state.clone();
         let cb = cb.clone();
-        fakeip_inet6_row.connect_changed(move |row| {
-            st.borrow_mut().dns.fakeip.inet6_range = row.text().to_string();
+        let error_label = fakeip_inet6_error.clone();
+        let row = fakeip_inet6_row.clone();
+        let enable_row = fakeip_enable_row.clone();
+        fakeip_inet6_row.connect_changed(move |_| {
+            let text = row.text().to_string();
+            st.borrow_mut().dns.fakeip.inet6_range = text.clone();
+
+            let enabled = enable_row.is_active();
+            if enabled {
+                match validate_ipv6_cidr(&text) {
+                    Ok(()) => {
+                        error_label.set_visible(false);
+                        row.remove_css_class("error");
+                    }
+                    Err(msg) => {
+                        error_label.set_text(&msg);
+                        error_label.set_visible(true);
+                        row.add_css_class("error");
+                    }
+                }
+            } else {
+                error_label.set_visible(false);
+                row.remove_css_class("error");
+            }
             emit(&st, &cb);
         });
     }
@@ -1151,6 +1307,10 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
         rules_group: rules_group.clone(),
         hosts_group: hosts_group.clone(),
         strategy_row: strategy_row.clone(),
+        remote_row: remote_server_row.clone(),
+        domestic_row: domestic_server_row.clone(),
+        remote_edit_btn: remote_edit_btn.clone(),
+        domestic_edit_btn: domestic_edit_btn.clone(),
         added_servers: Rc::new(RefCell::new(Vec::new())),
         added_rules: Rc::new(RefCell::new(Vec::new())),
         added_hosts: Rc::new(RefCell::new(Vec::new())),
@@ -1159,6 +1319,7 @@ fn build_dns_page(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) -> ad
     render_dns_servers(&dns_ctx);
     render_dns_rules(&dns_ctx);
     render_dns_hosts(&dns_ctx);
+    render_primary_dns_servers(&dns_ctx);
 
     {
         let ctx = dns_ctx.clone();
@@ -1196,6 +1357,10 @@ struct DnsRenderCtx {
     rules_group: adw::PreferencesGroup,
     hosts_group: adw::PreferencesGroup,
     strategy_row: adw::ComboRow,
+    remote_row: adw::ActionRow,
+    domestic_row: adw::ActionRow,
+    remote_edit_btn: gtk::Button,
+    domestic_edit_btn: gtk::Button,
     added_servers: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_rules: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_hosts: Rc<RefCell<Vec<adw::ActionRow>>>,
@@ -1217,6 +1382,34 @@ fn index_to_strategy(i: u32) -> DnsStrategy {
         3 => DnsStrategy::Ipv6Only,
         _ => DnsStrategy::PreferIpv4,
     }
+}
+
+fn validate_ipv4_cidr(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("IPv4 CIDR is required".to_string());
+    }
+    Ipv4Net::from_str(value.trim())
+        .map(|_| ())
+        .map_err(|_| "Invalid IPv4 CIDR notation".to_string())
+}
+
+fn validate_ipv6_cidr(value: &str) -> Result<(), String> {
+    if value.trim().is_empty() {
+        return Err("IPv6 CIDR is required".to_string());
+    }
+    Ipv6Net::from_str(value.trim())
+        .map(|_| ())
+        .map_err(|_| "Invalid IPv6 CIDR notation".to_string())
+}
+
+fn validate_ip_address(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(()); // Optional field, empty is valid
+    }
+    IpAddr::from_str(trimmed)
+        .map(|_| ())
+        .map_err(|_| "Invalid IP address".to_string())
 }
 
 fn protocol_to_index(p: DnsProtocol) -> u32 {
@@ -1369,6 +1562,61 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
     }
 }
 
+fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
+    let servers = ctx.state.borrow().dns.servers.clone();
+
+    let remote_server = servers.iter().find(|s| s.tag == "remote");
+    let domestic_server = servers.iter().find(|s| s.tag == "domestic");
+
+    if let Some(server) = remote_server {
+        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
+        let subtitle = format!(
+            "{}://{}:{}",
+            protocol_str,
+            server.address,
+            server
+                .port
+                .unwrap_or_else(|| server.protocol.default_port())
+        );
+        ctx.remote_row.set_subtitle(&subtitle);
+
+        let ctx_clone = ctx.clone();
+        let server_clone = server.clone();
+        ctx.remote_edit_btn.connect_clicked(move |_| {
+            show_dns_server_dialog(Some(server_clone.clone()), &ctx_clone);
+        });
+        ctx.remote_edit_btn.set_sensitive(true);
+    } else {
+        ctx.remote_row
+            .set_subtitle("Not configured - set up in Advanced");
+        ctx.remote_edit_btn.set_sensitive(false);
+    }
+
+    if let Some(server) = domestic_server {
+        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
+        let subtitle = format!(
+            "{}://{}:{}",
+            protocol_str,
+            server.address,
+            server
+                .port
+                .unwrap_or_else(|| server.protocol.default_port())
+        );
+        ctx.domestic_row.set_subtitle(&subtitle);
+
+        let ctx_clone = ctx.clone();
+        let server_clone = server.clone();
+        ctx.domestic_edit_btn.connect_clicked(move |_| {
+            show_dns_server_dialog(Some(server_clone.clone()), &ctx_clone);
+        });
+        ctx.domestic_edit_btn.set_sensitive(true);
+    } else {
+        ctx.domestic_row
+            .set_subtitle("Not configured - set up in Advanced");
+        ctx.domestic_edit_btn.set_sensitive(false);
+    }
+}
+
 fn render_dns_hosts(ctx: &DnsRenderCtx) {
     for row in ctx.added_hosts.borrow().iter() {
         ctx.hosts_group.remove(row);
@@ -1437,6 +1685,7 @@ fn show_dns_remove_server_dialog(tag: String, ctx: &DnsRenderCtx) {
         emit(&ctx.state, &ctx.cb);
         render_dns_servers(&ctx);
         render_dns_rules(&ctx);
+        render_primary_dns_servers(&ctx);
     });
 
     dialog.present(gtk::Window::NONE);
@@ -1585,6 +1834,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         }
         emit(&ctx.state, &ctx.cb);
         render_dns_servers(&ctx);
+        render_primary_dns_servers(&ctx);
     });
 
     dialog.present(gtk::Window::NONE);
@@ -1860,6 +2110,7 @@ fn show_dns_providers_dialog(ctx: &DnsRenderCtx) {
                 }
                 emit(&ctx_inner.state, &ctx_inner.cb);
                 render_dns_servers(&ctx_inner);
+                render_primary_dns_servers(&ctx_inner);
                 ctx_inner
                     .strategy_row
                     .set_selected(strategy_to_index(ctx_inner.state.borrow().dns.strategy));

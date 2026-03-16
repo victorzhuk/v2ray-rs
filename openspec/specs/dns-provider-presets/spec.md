@@ -26,6 +26,14 @@ Applying a DNS provider preset SHALL replace the current DNS server list and str
 - **WHEN** the user applies "Google" preset after previously applying "Cloudflare"
 - **THEN** the server list SHALL contain only Google's servers, not a mix of both
 
+#### Scenario: Apply confirmed replaces servers
+- **WHEN** the user confirms applying a preset over a customized DNS server list
+- **THEN** `dns.servers` is replaced with only the preset servers and `dns.strategy` is set to the preset strategy
+
+#### Scenario: Apply cancelled preserves current DNS config
+- **WHEN** the user cancels the preset confirmation dialog
+- **THEN** the existing DNS server list and strategy remain unchanged
+
 ### Requirement: Preset server conventions
 Each preset's remote server SHALL use DoH protocol (encrypted, suitable for proxy routing) and the domestic server SHALL use UDP protocol (fast, suitable for direct routing).
 
