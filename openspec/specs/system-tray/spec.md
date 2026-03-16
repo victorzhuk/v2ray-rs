@@ -28,6 +28,10 @@ The system SHALL display a context menu when the tray icon is activated.
 - **WHEN** the user activates the tray icon while connected
 - **THEN** the menu SHALL show: "Disconnect", separator, status label ("Status: Connected (node name)", disabled), separator, "Open Main Window", "Quit"
 
+#### Scenario: Menu when connected to manual node
+- **WHEN** the user activates the tray icon while connected to a manual node
+- **THEN** the menu status label shows `Connected` together with source `Manual` and the active node name
+
 #### Scenario: Connect/Disconnect disabled during transitions
 - **WHEN** the state is Starting or Stopping
 - **THEN** the Connect/Disconnect menu item SHALL be disabled (not clickable)
@@ -38,6 +42,10 @@ The system SHALL include active connection details in the tray tooltip.
 #### Scenario: Tooltip when connected
 - **WHEN** the backend process is running successfully
 - **THEN** the tooltip SHALL show connection state, subscription, node, latency, backend, strategy, and connected-since timestamp
+
+#### Scenario: Tooltip when connected to manual node
+- **WHEN** the backend process is running successfully on a manual node
+- **THEN** the tooltip shows connection state, source `Manual`, node, latency, backend, strategy, and connected-since timestamp
 
 #### Scenario: Tooltip when disconnected
 - **WHEN** the backend process is not running

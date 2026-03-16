@@ -43,3 +43,25 @@ The wizard display in app.rs SHALL not use a redundant `gtk::Box` wrapper around
 #### Scenario: Wizard renders without extra wrapper
 - **WHEN** the onboarding wizard is shown
 - **THEN** the wizard widget is rendered directly without an intermediate Box container
+
+### Requirement: Restart-required banner
+The main window SHALL display an `adw::Banner` when the persisted runtime configuration diverges from the active runtime snapshot while the backend is starting or running.
+
+#### Scenario: Connected DNS or routing change
+- **WHEN** the backend is connected and the user changes a runtime-relevant DNS or routing setting
+- **THEN** a banner appears with "Apply & Restart" and "Discard" actions
+
+#### Scenario: Divergence resolved
+- **WHEN** the user applies the restart, discards the changes, or disconnects
+- **THEN** the banner is dismissed
+
+### Requirement: Restart-required banner for manual nodes
+The main window SHALL reuse the restart-required banner for connected manual-node changes that diverge from the launched runtime snapshot.
+
+#### Scenario: Connected manual-node change
+- **WHEN** the backend is connected and the user adds, edits, deletes, or toggles the enabled state of a manual node
+- **THEN** a banner appears with `Apply & Restart` and `Discard` actions
+
+#### Scenario: Discard connected manual-node change
+- **WHEN** the user selects `Discard` after connected manual-node changes
+- **THEN** the banner is dismissed and the persisted manual-node set returns to the launched snapshot

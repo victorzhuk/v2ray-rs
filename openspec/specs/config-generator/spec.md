@@ -85,16 +85,26 @@ The system SHALL write generated config files atomically (write to temp file, th
 - **THEN** the previously valid config file SHALL remain intact
 
 ### Requirement: Reactive config regeneration
-The system SHALL automatically regenerate the config file when subscription data, routing rules, or DNS settings change.
+The system SHALL automatically regenerate the config file when subscription data, manual nodes, routing rules, or DNS settings change, with behavior depending on connection state.
+- When the backend is stopped, changes SHALL regenerate the config immediately.
+- When the backend is starting or running, changes SHALL be persisted but SHALL NOT replace the active runtime config until the user applies restart or reconnects.
 
 #### Scenario: Subscription update triggers regen
 - **WHEN** a subscription is updated with new nodes
 - **THEN** the system SHALL regenerate the config within 1 second
 
-#### Scenario: Routing rule change triggers regen
-- **WHEN** the user adds or modifies a routing rule
+#### Scenario: Disconnected routing change triggers regen
+- **WHEN** the backend is stopped and the user changes a routing rule
+- **THEN** the system regenerates the config immediately
+
+#### Scenario: Connected DNS change waits for restart
+- **WHEN** the backend is connected and the user changes DNS settings
+- **THEN** the new settings are persisted, the active runtime config is marked as restart-required, and the running backend continues using the previous launched config
+
+#### Scenario: Disconnected manual node change triggers regen
+- **WHEN** the backend is stopped and the user adds, edits, deletes, or toggles the enabled state of a manual node
 - **THEN** the system SHALL regenerate the config immediately
 
-#### Scenario: DNS settings change triggers regen
-- **WHEN** the user modifies any DNS setting (servers, rules, strategy, FakeIP, etc.)
-- **THEN** the system SHALL regenerate the config immediately
+#### Scenario: Connected manual node change waits for restart
+- **WHEN** the backend is connected and the user adds, edits, deletes, or toggles the enabled state of a manual node
+- **THEN** the change is persisted, but the active runtime config is not replaced until the user applies restart or reconnects later

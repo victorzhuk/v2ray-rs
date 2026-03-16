@@ -3,11 +3,15 @@
 ## ADDED Requirements
 
 ### Requirement: Application window structure
-The system SHALL display a main window with a header bar, a vertical split between subscriptions and logs, and a connection status bar.
+The system SHALL display a main window with a header bar, an upper-pane source switcher for `Subscriptions` and `Nodes`, a logs pane, and a connection status bar.
 
 #### Scenario: Window layout
 - **WHEN** the main window is displayed
 - **THEN** it SHALL contain a header bar with app title and hamburger menu, a `gtk::Paned` vertically splitting the subscriptions page (top) and logs page (bottom), and a bottom `gtk::ActionBar` showing connection state. Routing and Settings are accessible via the hamburger menu → Preferences dialog.
+
+#### Scenario: Nodes section visible
+- **WHEN** the main window is displayed
+- **THEN** the upper pane lets the user switch between subscription management and manual-node management without opening Preferences
 
 ### Requirement: Subscriptions page
 The system SHALL provide a page for managing proxy subscriptions.
@@ -47,7 +51,7 @@ The system SHALL provide a page for viewing backend process logs.
 - **THEN** the Logs page SHALL show the last session's logs (if any) with a "Process not running" indicator
 
 ### Requirement: Connection status bar
-The system SHALL display a persistent status bar showing current connection state with a connect/disconnect button and active connection details.
+The system SHALL display a persistent status bar showing current connection state with a connect or disconnect button and active connection details for both subscription and manual nodes.
 
 #### Scenario: Status bar when connected
 - **WHEN** the backend process is running
@@ -56,3 +60,7 @@ The system SHALL display a persistent status bar showing current connection stat
 #### Scenario: Status bar when disconnected
 - **WHEN** no backend process is running
 - **THEN** the status bar SHALL show "Disconnected" with a "Connect" button and placeholders indicating no active node
+
+#### Scenario: Status bar when connected to manual node
+- **WHEN** the active connection comes from a manual node
+- **THEN** the status bar shows `Manual` as the source label together with the node name, latency, backend, strategy, and connected-since timestamp

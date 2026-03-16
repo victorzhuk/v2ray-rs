@@ -57,6 +57,7 @@ pub enum SubscriptionsCmdOutput {
     LatencyResult(Uuid, Vec<Option<u64>>),
     RefreshFailed(Uuid, String),
     AutoUpdateDone(Vec<(Uuid, Result<UpdateResult, String>)>),
+    BackgroundLatencyTick,
 }
 
 #[relm4::component(pub)]
@@ -106,7 +107,20 @@ impl Component for SubscriptionsPage {
     ) -> ComponentParts<Self> {
         let (paths, settings) = init;
         let service = SubscriptionService::new(paths.clone());
-        let subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
+        let mut subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
+        if let Ok(snapshot) = persistence::load_latency_snapshot(&paths) {
+            for sub in &mut subscriptions {
+                for (idx, node) in sub.nodes.iter_mut().enumerate() {
+                    let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                        subscription_id: sub.id,
+                        node_index: idx,
+                    };
+                    if let Some(sample) = snapshot.get(node_ref) {
+                        node.last_latency_ms = Some(sample.latency_ms);
+                    }
+                }
+            }
+        }
 
         let list_container = gtk::ListBox::builder()
             .margin_top(12)
@@ -139,6 +153,11 @@ impl Component for SubscriptionsPage {
         if settings.auto_update_subscriptions {
             sender.input(SubscriptionsMsg::CheckAutoUpdate);
         }
+
+        sender.oneshot_command(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+            SubscriptionsCmdOutput::BackgroundLatencyTick
+        });
 
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -349,9 +368,9 @@ impl Component for SubscriptionsPage {
             &self.testing_latency,
             self.locked,
         );
-    }
+}
 
-    fn update_cmd(
+fn update_cmd(
         &mut self,
         msg: Self::CommandOutput,
         sender: ComponentSender<Self>,
@@ -413,6 +432,19 @@ impl Component for SubscriptionsPage {
                     }
                 }
             }
+            SubscriptionsCmdOutput::BackgroundLatencyTick => {
+                let eligible = subscriptions_eligible_for_latency_test(
+                    &self.subscriptions,
+                    &self.testing_latency,
+                );
+                for id in eligible {
+                    sender.input(SubscriptionsMsg::TestLatency(id));
+                }
+                sender.oneshot_command(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    SubscriptionsCmdOutput::BackgroundLatencyTick
+                });
+            }
         }
         let has_active = self.subscriptions.iter().any(|s| s.has_enabled_nodes());
         let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
@@ -426,6 +458,19 @@ impl Component for SubscriptionsPage {
             self.locked,
         );
     }
+}
+
+fn subscriptions_eligible_for_latency_test(
+    subscriptions: &[Subscription],
+    testing_latency: &HashSet<Uuid>,
+) -> Vec<Uuid> {
+    subscriptions
+        .iter()
+        .filter(|sub| {
+            sub.enabled && sub.has_enabled_nodes() && !testing_latency.contains(&sub.id)
+        })
+        .map(|sub| sub.id)
+        .collect()
 }
 
 fn capture_expanded(container: &gtk::ListBox) -> HashSet<Uuid> {
@@ -1014,3 +1059,138 @@ fn show_delete_dialog(id: Uuid, sender: ComponentSender<SubscriptionsPage>) {
 
     dialog.present(gtk::Window::NONE);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::SocketAddr;
+    use v2ray_rs_core::models::{ProxyNode, SubscriptionNode, VlessConfig};
+
+    fn create_test_subscription(name: &str, enabled: bool, nodes: Vec<SubscriptionNode>) -> Subscription {
+        Subscription {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            source: v2ray_rs_core::models::SubscriptionSource::Url {
+                url: "https://example.com".to_string(),
+            },
+            nodes,
+            last_updated: None,
+            auto_update_interval_secs: None,
+            enabled,
+        }
+    }
+
+    fn create_test_node(address: &str, port: u16, enabled: bool) -> SubscriptionNode {
+        let addr: SocketAddr = format!("{address}:{port}").parse().unwrap();
+        SubscriptionNode {
+            node: ProxyNode::Vless(VlessConfig {
+                address: addr.ip().to_string(),
+                port: addr.port(),
+                uuid: Uuid::new_v4().to_string(),
+                encryption: None,
+                flow: None,
+                transport: Default::default(),
+                tls: None,
+                remark: None,
+            }),
+            enabled,
+            last_latency_ms: None,
+        }
+    }
+
+    #[test]
+    fn enabled_subscription_with_enabled_nodes_eligible() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        let testing_latency = HashSet::new();
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+
+        assert_eq!(eligible.len(), 1);
+    }
+
+    #[test]
+    fn disabled_subscription_not_eligible() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            false,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        let testing_latency = HashSet::new();
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn subscription_with_no_enabled_nodes_not_eligible() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            true,
+            vec![
+                create_test_node("127.0.0.1", 8080, false),
+                create_test_node("127.0.0.2", 8081, false),
+            ],
+        );
+        let testing_latency = HashSet::new();
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn subscription_already_testing_not_eligible() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        let mut testing_latency = HashSet::new();
+        testing_latency.insert(sub.id);
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn mixed_subscriptions_correct_subset_selected() {
+        let sub1 = create_test_subscription(
+            "Enabled with nodes",
+            true,
+            vec![
+                create_test_node("127.0.0.1", 8080, true),
+                create_test_node("127.0.0.2", 8081, true),
+            ],
+        );
+        let sub2 = create_test_subscription(
+            "Disabled subscription",
+            false,
+            vec![create_test_node("127.0.0.3", 8082, true)],
+        );
+        let sub3 = create_test_subscription(
+            "Enabled but no enabled nodes",
+            true,
+            vec![create_test_node("127.0.0.4", 8083, false)],
+        );
+        let sub4 = create_test_subscription(
+            "Already testing",
+            true,
+            vec![create_test_node("127.0.0.5", 8084, true)],
+        );
+        let sub1_id = sub1.id;
+        let mut testing_latency = HashSet::new();
+        testing_latency.insert(sub4.id);
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub1, sub2, sub3, sub4], &testing_latency);
+
+        assert_eq!(eligible.len(), 1);
+        assert_eq!(eligible[0], sub1_id);
+    }
+}
+
