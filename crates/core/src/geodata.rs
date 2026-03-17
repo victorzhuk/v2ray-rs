@@ -232,7 +232,7 @@ pub fn download_geodata(
             ))
         })?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        std::io::Write::write_all(&mut tmp, &bytes)?;
+        tmp.write_all(&bytes)?;
         tmp.persist(&target)
             .map_err(|e| GeodataError::Io(e.error))?;
     }
