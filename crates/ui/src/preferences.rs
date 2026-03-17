@@ -268,7 +268,6 @@ fn build_network_page(
 
     let geodata_group = adw::PreferencesGroup::builder().title("GeoData").build();
 
-    let _geodata_manager = GeodataManager::new(paths);
     let index_manager = GeodataIndexManager::new(paths);
 
     let geodata_status = match index_manager.load_index(backend_type) {
@@ -333,6 +332,7 @@ fn build_network_page(
 
             let backend_type = st.borrow().backend.backend_type;
             let geodata_manager = GeodataManager::new(&paths);
+            let paths_for_status = paths.clone();
             let index_manager = GeodataIndexManager::new(&paths);
 
             let btn_clone = btn.clone();
@@ -371,7 +371,9 @@ fn build_network_page(
 
                 match result {
                     Ok(Ok(_)) => {
-                        if let Ok(Some(index)) = index_manager.load_index(backend_type) {
+                        if let Ok(Some(index)) =
+                            GeodataIndexManager::new(&paths_for_status).load_index(backend_type)
+                        {
                             let last_refresh = index
                                 .last_refresh
                                 .map(|dt| {
