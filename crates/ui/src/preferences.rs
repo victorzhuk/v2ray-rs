@@ -2,6 +2,7 @@ use adw::prelude::*;
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use relm4::adw;
 use relm4::gtk;
+use relm4::gtk::glib;
 use std::cell::RefCell;
 use std::net::IpAddr;
 use std::rc::Rc;
@@ -331,57 +332,68 @@ fn build_network_page(
             spinner.start();
 
             let backend_type = st.borrow().backend.backend_type;
-            let _geodata_manager = GeodataManager::new(&paths);
+            let geodata_manager = GeodataManager::new(&paths);
             let index_manager = GeodataIndexManager::new(&paths);
 
-            let result: Result<String, String> = (|| {
-                #[cfg(feature = "geodata-fetch")]
-                {
-                    use v2ray_rs_core::geodata::download_geodata;
+            let btn_clone = btn.clone();
+            let spinner_clone = spinner.clone();
+            let status_row_clone = status_row.clone();
 
-                    download_geodata(&geodata_manager, backend_type)
-                        .map_err(|e| format!("Download failed: {}", e))?;
+            glib::MainContext::default().spawn_local(async move {
+                let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+                    #[cfg(feature = "geodata-fetch")]
+                    {
+                        use v2ray_rs_core::geodata::download_geodata;
 
-                    let geoip_path = geodata_manager.geoip_path(backend_type);
-                    let geosite_path = geodata_manager.geosite_path(backend_type);
+                        download_geodata(&geodata_manager, backend_type)
+                            .map_err(|e| format!("Download failed: {}", e))?;
 
-                    index_manager
-                        .build_index(backend_type, &geoip_path, &geosite_path)
-                        .map_err(|e| format!("Index build failed: {}", e))?;
+                        let geoip_path = geodata_manager.geoip_path(backend_type);
+                        let geosite_path = geodata_manager.geosite_path(backend_type);
 
-                    Ok("Geodata updated successfully".to_string())
-                }
+                        index_manager
+                            .build_index(backend_type, &geoip_path, &geosite_path)
+                            .map_err(|e| format!("Index build failed: {}", e))?;
 
-                #[cfg(not(feature = "geodata-fetch"))]
-                {
-                    Err("Geodata download feature not enabled".to_string())
-                }
-            })();
+                        Ok("Geodata updated successfully".to_string())
+                    }
 
-            spinner.stop();
-            spinner.set_visible(false);
-            btn.set_sensitive(true);
+                    #[cfg(not(feature = "geodata-fetch"))]
+                    {
+                        Err("Geodata download feature not enabled".to_string())
+                    }
+                })
+                .await;
 
-            match result {
-                Ok(_) => {
-                    if let Ok(Some(index)) = index_manager.load_index(backend_type) {
-                        let last_refresh = index
-                            .last_refresh
-                            .map(|dt| {
-                                let local: chrono::DateTime<chrono::Local> = dt.into();
-                                local.format("%Y-%m-%d %H:%M").to_string()
-                            })
-                            .unwrap_or_else(|| "Never".to_string());
-                        status_row.set_subtitle(&format!(
-                            "Last refresh: {} | GeoIP: {} entries | GeoSite: {} entries",
-                            last_refresh, index.tag_counts.0, index.tag_counts.1
-                        ));
+                spinner_clone.stop();
+                spinner_clone.set_visible(false);
+                btn_clone.set_sensitive(true);
+
+                match result {
+                    Ok(Ok(_)) => {
+                        if let Ok(Some(index)) = index_manager.load_index(backend_type) {
+                            let last_refresh = index
+                                .last_refresh
+                                .map(|dt| {
+                                    let local: chrono::DateTime<chrono::Local> = dt.into();
+                                    local.format("%Y-%m-%d %H:%M").to_string()
+                                })
+                                .unwrap_or_else(|| "Never".to_string());
+                            status_row_clone.set_subtitle(&format!(
+                                "Last refresh: {} | GeoIP: {} entries | GeoSite: {} entries",
+                                last_refresh, index.tag_counts.0, index.tag_counts.1
+                            ));
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        status_row_clone.set_subtitle(&format!("Error: {}", err));
+                    }
+                    Err(join_err) => {
+                        status_row_clone
+                            .set_subtitle(&format!("Error: task panicked: {}", join_err));
                     }
                 }
-                Err(err) => {
-                    status_row.set_subtitle(&format!("Error: {}", err));
-                }
-            }
+            });
         });
     }
 
