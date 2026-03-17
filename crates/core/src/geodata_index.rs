@@ -150,24 +150,24 @@ impl GeodataIndexManager {
 
 fn parse_v2ray_geoip_dat(path: &Path) -> Result<Vec<String>, GeodataIndexError> {
     let bytes = std::fs::read(path)?;
-    let geoip: v2ray_geoip::GeoIp = v2ray_geoip::GeoIp::decode(&*bytes)
+    let list = v2ray_geoip::GeoIpList::decode(bytes.as_slice())
         .map_err(|e: prost::DecodeError| GeodataIndexError::ProtoDecode(e.to_string()))?;
 
-    let tags: HashSet<String> = geoip.country_code.into_iter().collect();
-    let mut mut_tags: Vec<String> = tags.into_iter().collect();
-    mut_tags.sort();
-    Ok(mut_tags)
+    let tags: HashSet<String> = list.entry.into_iter().map(|e| e.country_code).collect();
+    let mut sorted: Vec<String> = tags.into_iter().collect();
+    sorted.sort();
+    Ok(sorted)
 }
 
 fn parse_v2ray_geosite_dat(path: &Path) -> Result<Vec<String>, GeodataIndexError> {
     let bytes = std::fs::read(path)?;
-    let geosite: v2ray_geosite::GeoSite = v2ray_geosite::GeoSite::decode(&*bytes)
+    let list = v2ray_geosite::GeoSiteList::decode(bytes.as_slice())
         .map_err(|e: prost::DecodeError| GeodataIndexError::ProtoDecode(e.to_string()))?;
 
-    let tags: HashSet<String> = geosite.country_code.into_iter().collect();
-    let mut mut_tags: Vec<String> = tags.into_iter().collect();
-    mut_tags.sort();
-    Ok(mut_tags)
+    let tags: HashSet<String> = list.entry.into_iter().map(|e| e.country_code).collect();
+    let mut sorted: Vec<String> = tags.into_iter().collect();
+    sorted.sort();
+    Ok(sorted)
 }
 
 fn parse_singbox_db(

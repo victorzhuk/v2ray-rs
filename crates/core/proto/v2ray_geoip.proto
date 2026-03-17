@@ -2,6 +2,16 @@ syntax = "proto3";
 
 package v2ray_geoip;
 
-message GeoIP {
-    repeated string country_code = 1;
+message Cidr {
+    bytes ip = 1;
+    uint32 prefix = 2;
+}
+
+message GeoIp {
+    string country_code = 1;
+    repeated Cidr cidr = 2;
+}
+
+message GeoIpList {
+    repeated GeoIp entry = 1;
 }
