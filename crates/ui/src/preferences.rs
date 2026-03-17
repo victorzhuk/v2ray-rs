@@ -9,6 +9,8 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use v2ray_rs_core::backend::{backend_name, detect_all};
+use v2ray_rs_core::geodata::GeodataManager;
+use v2ray_rs_core::geodata_index::GeodataIndexManager;
 use v2ray_rs_core::models::{
     builtin_dns_presets, builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig,
     BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride,
@@ -36,10 +38,10 @@ pub fn show_preferences(
     let system_page = build_system_page(&settings_state, &cb);
     dialog.add(&system_page);
 
-    let network_page = build_network_page(&settings_state, &cb);
+    let network_page = build_network_page(&settings_state, &cb, paths);
     dialog.add(&network_page);
 
-    let routing_page = build_routing_page(paths, routing_cb);
+    let routing_page = build_routing_page(paths, &settings_state, routing_cb);
     dialog.add(&routing_page);
 
     let dns_page = build_dns_page(&settings_state, &cb);
@@ -107,22 +109,6 @@ fn build_system_page(
             emit(&st, &cb);
         });
     }
-    {
-        let st = state.clone();
-        let cb = cb.clone();
-        tray_row.connect_active_notify(move |row| {
-            st.borrow_mut().minimize_to_tray = row.is_active();
-            emit(&st, &cb);
-        });
-    }
-    {
-        let st = state.clone();
-        let cb = cb.clone();
-        notif_row.connect_active_notify(move |row| {
-            st.borrow_mut().notifications_enabled = row.is_active();
-            emit(&st, &cb);
-        });
-    }
 
     page
 }
@@ -130,6 +116,7 @@ fn build_system_page(
 fn build_network_page(
     state: &Rc<RefCell<AppSettings>>,
     cb: &SettingsCallback,
+    paths: &AppPaths,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Network")
@@ -137,6 +124,7 @@ fn build_network_page(
         .build();
 
     let s = state.borrow();
+    let backend_type = s.backend.backend_type;
 
     let backend_group = adw::PreferencesGroup::builder()
         .title("Backend")
@@ -261,6 +249,126 @@ fn build_network_page(
     sub_group.add(&interval_row);
     page.add(&sub_group);
 
+    let geodata_group = adw::PreferencesGroup::builder().title("GeoData").build();
+
+    let _geodata_manager = GeodataManager::new(paths);
+    let index_manager = GeodataIndexManager::new(paths);
+
+    let geodata_status = match index_manager.load_index(backend_type) {
+        Ok(Some(index)) => {
+            let last_refresh = index
+                .last_refresh
+                .map(|dt| {
+                    let local: chrono::DateTime<chrono::Local> = dt.into();
+                    local.format("%Y-%m-%d %H:%M").to_string()
+                })
+                .unwrap_or_else(|| "Never".to_string());
+            format!(
+                "Last refresh: {} | GeoIP: {} entries | GeoSite: {} entries",
+                last_refresh, index.tag_counts.0, index.tag_counts.1
+            )
+        }
+        Ok(None) => "Not indexed".to_string(),
+        Err(_) => "Error loading index".to_string(),
+    };
+
+    let geodata_row = adw::ActionRow::builder()
+        .title("GeoData Status")
+        .subtitle(geodata_status)
+        .build();
+    geodata_group.add(&geodata_row);
+
+    let geodata_btn_box = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(6)
+        .halign(gtk::Align::End)
+        .build();
+
+    let geodata_update_btn = gtk::Button::builder()
+        .label("Update Now")
+        .css_classes(["suggested-action"])
+        .build();
+    geodata_btn_box.append(&geodata_update_btn);
+
+    let geodata_spinner = gtk::Spinner::builder()
+        .visible(false)
+        .halign(gtk::Align::Center)
+        .valign(gtk::Align::Center)
+        .build();
+    geodata_btn_box.append(&geodata_spinner);
+
+    let geodata_toolbar_row = adw::ActionRow::builder().activatable(false).build();
+    geodata_toolbar_row.add_suffix(&geodata_btn_box);
+    geodata_group.add(&geodata_toolbar_row);
+    page.add(&geodata_group);
+
+    {
+        let btn = geodata_update_btn.clone();
+        let spinner = geodata_spinner.clone();
+        let status_row = geodata_row.clone();
+        let paths = paths.clone();
+        let st = state.clone();
+
+        geodata_update_btn.connect_clicked(move |_| {
+            btn.set_sensitive(false);
+            spinner.set_visible(true);
+            spinner.start();
+
+            let backend_type = st.borrow().backend.backend_type;
+            let _geodata_manager = GeodataManager::new(&paths);
+            let index_manager = GeodataIndexManager::new(&paths);
+
+            let result: Result<String, String> = (|| {
+                #[cfg(feature = "geodata-fetch")]
+                {
+                    use v2ray_rs_core::geodata::download_geodata;
+
+                    download_geodata(&geodata_manager, backend_type)
+                        .map_err(|e| format!("Download failed: {}", e))?;
+
+                    let geoip_path = geodata_manager.geoip_path(backend_type);
+                    let geosite_path = geodata_manager.geosite_path(backend_type);
+
+                    index_manager
+                        .build_and_save_index(backend_type, &geoip_path, &geosite_path)
+                        .map_err(|e| format!("Index build failed: {}", e))?;
+
+                    Ok("Geodata updated successfully".to_string())
+                }
+
+                #[cfg(not(feature = "geodata-fetch"))]
+                {
+                    Err("Geodata download feature not enabled".to_string())
+                }
+            })();
+
+            spinner.stop();
+            spinner.set_visible(false);
+            btn.set_sensitive(true);
+
+            match result {
+                Ok(_) => {
+                    if let Ok(Some(index)) = index_manager.load_index(backend_type) {
+                        let last_refresh = index
+                            .last_refresh
+                            .map(|dt| {
+                                let local: chrono::DateTime<chrono::Local> = dt.into();
+                                local.format("%Y-%m-%d %H:%M").to_string()
+                            })
+                            .unwrap_or_else(|| "Never".to_string());
+                        status_row.set_subtitle(&format!(
+                            "Last refresh: {} | GeoIP: {} entries | GeoSite: {} entries",
+                            last_refresh, index.tag_counts.0, index.tag_counts.1
+                        ));
+                    }
+                }
+                Err(err) => {
+                    status_row.set_subtitle(&format!("Error: {}", err));
+                }
+            }
+        });
+    }
+
     let resolve_group = adw::PreferencesGroup::builder().title("Connection").build();
 
     let resolve_row = adw::ComboRow::builder()
@@ -336,6 +444,7 @@ fn build_network_page(
 
 fn build_routing_page(
     paths: &AppPaths,
+    settings_state: &Rc<RefCell<AppSettings>>,
     routing_changed_cb: RoutingCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
@@ -346,6 +455,8 @@ fn build_routing_page(
     let rule_set = persistence::load_routing_rules(paths).unwrap_or_default();
     let rule_set = Rc::new(RefCell::new(rule_set));
     let paths = Rc::new(paths.clone());
+
+    let backend_type = settings_state.borrow().backend.backend_type;
 
     let toolbar_group = adw::PreferencesGroup::new();
 
@@ -381,6 +492,7 @@ fn build_routing_page(
         paths: paths.clone(),
         added_groups: Rc::new(RefCell::new(Vec::new())),
         routing_changed_cb,
+        backend_type,
     };
 
     render_routing_rules(&ctx);
@@ -409,6 +521,7 @@ struct RenderCtx {
     paths: Rc<AppPaths>,
     added_groups: Rc<RefCell<Vec<adw::PreferencesGroup>>>,
     routing_changed_cb: RoutingCallback,
+    backend_type: BackendType,
 }
 
 fn render_routing_rules(ctx: &RenderCtx) {
@@ -616,6 +729,70 @@ fn build_routing_rule_row(
     menu_btn.set_popover(Some(&popover));
     row.add_suffix(&menu_btn);
 
+    // Drag-and-drop support for reordering
+    let drag_source = gtk::DragSource::new();
+    drag_source.set_actions(gtk::gdk::DragAction::MOVE);
+
+    let drag_idx = idx as u32;
+    drag_source.connect_prepare(move |_, _, _| {
+        let value = gtk::glib::Value::from(drag_idx);
+        let content_provider = gtk::gdk::ContentProvider::for_value(&value);
+        Some(content_provider)
+    });
+
+    drag_source.connect_drag_begin(|_, _| {});
+
+    row.add_controller(drag_source);
+
+    let drop_target = gtk::DropTarget::new(gtk::glib::Type::U32, gtk::gdk::DragAction::MOVE);
+
+    let ctx_drop = ctx.clone();
+    let drop_idx_target = idx;
+    drop_target.connect_drop(
+        move |target: &gtk::DropTarget, value: &gtk::glib::Value, _, _| {
+            let drop_idx = value.get::<u32>().unwrap() as usize;
+
+            if drop_idx == drop_idx_target {
+                return false;
+            }
+
+            ctx_drop
+                .rule_set
+                .borrow_mut()
+                .move_rule(drop_idx, drop_idx_target);
+
+            if let Err(e) =
+                persistence::save_routing_rules(&ctx_drop.paths, &ctx_drop.rule_set.borrow())
+            {
+                log::error!("save routing rules: {e}");
+            }
+            (ctx_drop.routing_changed_cb)();
+            render_routing_rules(&ctx_drop);
+
+            target.widget().and_then(|w| {
+                w.remove_css_class("drop-target");
+                Some(())
+            });
+            true
+        },
+    );
+
+    drop_target.connect_enter(|target, _, _| {
+        target.widget().and_then(|w| {
+            w.add_css_class("drop-target");
+            Some(())
+        });
+        gtk::gdk::DragAction::MOVE
+    });
+
+    drop_target.connect_leave(|target: &gtk::DropTarget| {
+        if let Some(w) = target.widget() {
+            w.remove_css_class("drop-target");
+        }
+    });
+
+    row.add_controller(drop_target);
+
     row
 }
 
@@ -689,6 +866,156 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
 
     dialog.set_extra_child(Some(&content));
 
+    let type_combo_clone = type_combo.clone();
+    let value_entry_clone = value_entry.clone();
+    let paths = ctx.paths.clone();
+    let backend_type = ctx.backend_type;
+
+    let show_suggestions = gtk::Button::builder()
+        .icon_name("list-add-symbolic")
+        .tooltip_text("Show suggestions")
+        .valign(gtk::Align::Center)
+        .css_classes(["flat"])
+        .build();
+
+    {
+        let type_combo = type_combo_clone.clone();
+        let value_entry = value_entry_clone.clone();
+        let paths = paths.clone();
+        let backend_type = backend_type;
+
+        show_suggestions.connect_clicked(move |_| {
+            let rule_type = type_combo.selected();
+
+            let tags = match rule_type {
+                0 => {
+                    let manager = GeodataIndexManager::new(&paths);
+                    manager
+                        .load_index(backend_type)
+                        .ok()
+                        .flatten()
+                        .map(|idx| idx.geoip_tags)
+                        .unwrap_or_default()
+                }
+                1 => {
+                    let manager = GeodataIndexManager::new(&paths);
+                    manager
+                        .load_index(backend_type)
+                        .ok()
+                        .flatten()
+                        .map(|idx| idx.geosite_tags)
+                        .unwrap_or_default()
+                }
+                _ => vec![],
+            };
+
+            if tags.is_empty() || (rule_type != 0 && rule_type != 1) {
+                return;
+            }
+
+            let suggestion_dialog = adw::AlertDialog::builder()
+                .heading(match rule_type {
+                    0 => "GeoIP Country Codes",
+                    1 => "GeoSite Categories",
+                    _ => "Suggestions",
+                })
+                .build();
+            suggestion_dialog.add_response("close", "Close");
+            suggestion_dialog.set_close_response("close");
+
+            let search_entry = gtk::Entry::builder().placeholder_text("Search...").build();
+
+            let suggestion_list = gtk::ListBox::builder()
+                .selection_mode(gtk::SelectionMode::Single)
+                .css_classes(["navigation-sidebar"])
+                .build();
+
+            let suggestion_dialog = Rc::new(suggestion_dialog);
+            let tags = Rc::new(tags);
+            let value_entry = Rc::new(value_entry.clone());
+            let suggestion_list_rc = Rc::new(suggestion_list);
+
+            let list_box_content = gtk::Box::builder()
+                .orientation(gtk::Orientation::Vertical)
+                .spacing(12)
+                .margin_top(12)
+                .margin_bottom(12)
+                .margin_start(12)
+                .margin_end(12)
+                .build();
+            list_box_content.append(&search_entry);
+            list_box_content.append(&*suggestion_list_rc);
+
+            let scrolled = gtk::ScrolledWindow::builder()
+                .min_content_height(300)
+                .max_content_height(400)
+                .child(&list_box_content)
+                .build();
+
+            (*suggestion_dialog).set_extra_child(Some(&scrolled));
+
+            let suggestion_dialog_for_list = suggestion_dialog.clone();
+            let update_list = {
+                let tags = tags.clone();
+                let suggestion_list = suggestion_list_rc.clone();
+                move |search_text: String| {
+                    while let Some(widget) = suggestion_list.first_child() {
+                        suggestion_list.remove(&widget);
+                    }
+
+                    let filtered: Vec<String> = tags
+                        .iter()
+                        .filter(|tag| {
+                            search_text.is_empty()
+                                || tag.to_lowercase().contains(&search_text.to_lowercase())
+                        })
+                        .cloned()
+                        .collect();
+
+                    if filtered.is_empty() {
+                        let row = adw::ActionRow::builder()
+                            .title("No matching tags")
+                            .sensitive(false)
+                            .build();
+                        suggestion_list.append(&row);
+                    } else {
+                        for tag in &filtered[..filtered.len().min(20)] {
+                            let row = adw::ActionRow::builder()
+                                .title(tag)
+                                .activatable(true)
+                                .build();
+                            let tag_clone = tag.clone();
+                            let value_entry = value_entry.clone();
+                            let suggestion_dialog = suggestion_dialog_for_list.clone();
+                            row.connect_activated(move |_| {
+                                value_entry.set_text(&tag_clone);
+                                suggestion_dialog.close();
+                            });
+                            suggestion_list.append(&row);
+                        }
+                        if filtered.len() > 20 {
+                            let row = adw::ActionRow::builder()
+                                .title(&format!("... and {} more", filtered.len() - 20))
+                                .sensitive(false)
+                                .build();
+                            suggestion_list.append(&row);
+                        }
+                    }
+                }
+            };
+
+            update_list(String::new());
+
+            search_entry.connect_changed(move |entry| {
+                update_list(entry.text().to_string());
+            });
+
+            (*suggestion_dialog).present(gtk::Window::NONE);
+        });
+    }
+
+    value_entry.add_suffix(&show_suggestions);
+
     let ctx = ctx.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "save" {
@@ -702,10 +1029,18 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
         let value = value.trim().to_string();
 
         let match_condition = match type_combo.selected() {
-            0 => RuleMatch::GeoIp {
-                country_code: value,
-            },
-            1 => RuleMatch::GeoSite { category: value },
+            0 => {
+                let normalized = value.to_uppercase();
+                RuleMatch::GeoIp {
+                    country_code: normalized,
+                }
+            }
+            1 => {
+                let normalized = value.to_lowercase();
+                RuleMatch::GeoSite {
+                    category: normalized,
+                }
+            }
             2 => RuleMatch::Domain { pattern: value },
             3 => match IpNet::from_str(&value) {
                 Ok(cidr) => RuleMatch::IpCidr { cidr },

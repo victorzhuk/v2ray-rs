@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod config;
 pub mod geodata;
+pub mod geodata_index;
 pub mod models;
 pub mod persistence;
 pub mod resolve;

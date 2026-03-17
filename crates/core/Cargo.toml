@@ -15,6 +15,11 @@ ipnet.workspace = true
 rand.workspace = true
 tempfile = "3"
 reqwest = { workspace = true, features = ["blocking"], optional = true }
+prost = "0.12"
+rusqlite = { version = "0.30", features = ["bundled"] }
+
+[build-dependencies]
+prost-build = "0.12"
 
 [features]
 default = ["geodata-fetch"]

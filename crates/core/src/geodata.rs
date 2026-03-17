@@ -6,6 +6,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::geodata_index::GeodataIndexManager;
 use crate::models::BackendType;
 use crate::persistence::AppPaths;
 
@@ -150,6 +151,29 @@ impl GeodataManager {
                 },
             ],
         }
+    }
+
+    pub fn reindex(&self, backend: BackendType) -> Result<(), GeodataError> {
+        let index_manager = GeodataIndexManager::new_from_geodata_dir(&self.geodata_dir);
+        let geoip_path = self.geoip_path(backend);
+        let geosite_path = self.geosite_path(backend);
+
+        if !geoip_path.exists() || !geosite_path.exists() {
+            return Err(GeodataError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "geodata files not found",
+            )));
+        }
+
+        index_manager
+            .build_and_save_index(backend, &geoip_path, &geosite_path)
+            .map_err(|e| {
+                GeodataError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    e.to_string(),
+                ))
+            })?;
+        Ok(())
     }
 }
 
@@ -382,5 +406,47 @@ mod tests {
         let (_tmp, manager) = test_manager();
         manager.ensure_dir().unwrap();
         assert!(manager.geodata_dir().exists());
+    }
+
+    #[test]
+    fn test_reindex_creates_index_file() {
+        let (_tmp, manager) = test_manager();
+        manager.ensure_dir().unwrap();
+
+        use crate::geodata_index::GeodataIndexManager;
+
+        let tmp_dir = TempDir::new().unwrap();
+        let geoip_path = tmp_dir.path().join("geoip.db");
+        let geosite_path = tmp_dir.path().join("geosite.db");
+
+        let conn = rusqlite::Connection::open(&geoip_path).unwrap();
+        conn.execute("CREATE TABLE geoip (country_code TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO geoip (country_code) VALUES (?1)", ["US"])
+            .unwrap();
+
+        let conn = rusqlite::Connection::open(&geosite_path).unwrap();
+        conn.execute("CREATE TABLE geosite (tag TEXT)", []).unwrap();
+        conn.execute("INSERT INTO geosite (tag) VALUES (?1)", ["google"])
+            .unwrap();
+
+        std::fs::copy(&geoip_path, manager.geoip_path(BackendType::SingBox)).unwrap();
+        std::fs::copy(&geosite_path, manager.geosite_path(BackendType::SingBox)).unwrap();
+
+        manager.reindex(BackendType::SingBox).unwrap();
+
+        let index_manager = GeodataIndexManager::new_from_geodata_dir(manager.geodata_dir());
+        let index = index_manager.load_index(BackendType::SingBox).unwrap();
+        assert!(index.is_some());
+        let index = index.unwrap();
+        assert_eq!(index.geoip_tags, vec!["US"]);
+        assert_eq!(index.geosite_tags, vec!["google"]);
+    }
+
+    #[test]
+    fn test_reindex_missing_files_returns_error() {
+        let (_tmp, manager) = test_manager();
+        let result = manager.reindex(BackendType::V2ray);
+        assert!(result.is_err());
     }
 }
