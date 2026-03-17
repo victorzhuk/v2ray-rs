@@ -14,7 +14,7 @@ use v2ray_rs_core::geodata_index::GeodataIndexManager;
 use v2ray_rs_core::models::{
     builtin_dns_presets, builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig,
     BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride,
-    Language, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
+    Language, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch, validate_rule_match,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -1064,6 +1064,13 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             },
             _ => return,
         };
+
+        if let Err(e) = validate_rule_match(&match_condition) {
+            value_entry.add_css_class("error");
+            log::warn!("invalid rule match: {e}");
+            return;
+        }
+        value_entry.remove_css_class("error");
 
         let action = match action_combo.selected() {
             0 => RuleAction::Proxy,
