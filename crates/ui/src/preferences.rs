@@ -330,7 +330,7 @@ fn build_network_page(
                     let geosite_path = geodata_manager.geosite_path(backend_type);
 
                     index_manager
-                        .build_and_save_index(backend_type, &geoip_path, &geosite_path)
+                        .build_index(backend_type, &geoip_path, &geosite_path)
                         .map_err(|e| format!("Index build failed: {}", e))?;
 
                     Ok("Geodata updated successfully".to_string())

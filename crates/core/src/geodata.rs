@@ -166,7 +166,7 @@ impl GeodataManager {
         }
 
         index_manager
-            .build_and_save_index(backend, &geoip_path, &geosite_path)
+            .build_index(backend, &geoip_path, &geosite_path)
             .map_err(|e| {
                 GeodataError::Io(std::io::Error::new(
                     std::io::ErrorKind::Other,

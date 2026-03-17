@@ -108,7 +108,7 @@ impl GeodataIndexManager {
         }
 
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        std::io::Write::write_all(&mut tmp, json.as_bytes())?;
+        tmp.write_all(json.as_bytes())?;
         tmp.flush()?;
         tmp.persist(&path)
             .map_err(|e| GeodataIndexError::Io(e.error))?;
@@ -138,14 +138,6 @@ impl GeodataIndexManager {
         Ok(index)
     }
 
-    pub fn build_and_save_index(
-        &self,
-        backend: BackendType,
-        geoip_path: &Path,
-        geosite_path: &Path,
-    ) -> Result<GeodataIndex, GeodataIndexError> {
-        self.build_index(backend, geoip_path, geosite_path)
-    }
 }
 
 fn parse_v2ray_geoip_dat(path: &Path) -> Result<Vec<String>, GeodataIndexError> {
