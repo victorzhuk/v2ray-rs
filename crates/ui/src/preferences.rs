@@ -109,6 +109,22 @@ fn build_system_page(
             emit(&st, &cb);
         });
     }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        tray_row.connect_active_notify(move |row| {
+            st.borrow_mut().minimize_to_tray = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        notif_row.connect_active_notify(move |row| {
+            st.borrow_mut().notifications_enabled = row.is_active();
+            emit(&st, &cb);
+        });
+    }
 
     page
 }
