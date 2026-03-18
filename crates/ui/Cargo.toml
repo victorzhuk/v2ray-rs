@@ -17,6 +17,10 @@ gettext-rs.workspace = true
 ipnet.workspace = true
 rustls.workspace = true
 
+[features]
+default = ["geodata-fetch"]
+geodata-fetch = ["v2ray-rs-core/geodata-fetch"]
+
 [build-dependencies]
 glib-build-tools.workspace = true
 

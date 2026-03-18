@@ -27,7 +27,7 @@ impl DnsProtocol {
         let port = port.unwrap_or(default_port);
 
         match self {
-            DnsProtocol::Udp => format!("{}:{}", address, port),
+            DnsProtocol::Udp => address.to_string(),
             DnsProtocol::Tcp => format!("tcp://{}:{}", address, port),
             DnsProtocol::Doh => {
                 if port == default_port {
@@ -421,19 +421,19 @@ mod tests {
     #[test]
     fn test_dns_protocol_udp_default_port() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", None);
-        assert_eq!(addr, "8.8.8.8:53");
+        assert_eq!(addr, "8.8.8.8");
     }
 
     #[test]
     fn test_dns_protocol_udp_custom_port() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", Some(5353));
-        assert_eq!(addr, "8.8.8.8:5353");
+        assert_eq!(addr, "8.8.8.8");
     }
 
     #[test]
     fn test_dns_protocol_udp_default_port_explicit() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", Some(53));
-        assert_eq!(addr, "8.8.8.8:53");
+        assert_eq!(addr, "8.8.8.8");
     }
 
     #[test]

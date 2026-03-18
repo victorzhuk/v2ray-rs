@@ -312,6 +312,14 @@ fn first_proxy_tag() -> String {
     "proxy-0".to_string()
 }
 
+fn udp_port_for_v2ray(server: &DnsServerConfig) -> Option<u16> {
+    if server.protocol == DnsProtocol::Udp {
+        server.port.filter(|&p| p != DnsProtocol::Udp.default_port())
+    } else {
+        None
+    }
+}
+
 fn v2ray_address_with_fallback(server: &DnsServerConfig) -> String {
     match server.protocol {
         DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3 => {
@@ -344,14 +352,19 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
                 .collect();
 
             let address = v2ray_address_with_fallback(server);
+            let port = udp_port_for_v2ray(server);
 
             if domains.is_empty() {
-                servers.push(json!(address));
+                match port {
+                    Some(p) => servers.push(json!({ "address": address, "port": p })),
+                    None => servers.push(json!(address)),
+                }
             } else {
-                servers.push(json!({
-                    "address": address,
-                    "domains": domains,
-                }));
+                let mut entry = json!({ "address": address, "domains": domains });
+                if let Some(p) = port {
+                    entry["port"] = json!(p);
+                }
+                servers.push(entry);
             }
         }
     } else {
@@ -375,19 +388,25 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
 
         for server in &settings.dns.servers {
             let address = v2ray_address_with_fallback(server);
+            let port = udp_port_for_v2ray(server);
 
             if server.tag == "remote" && !remote_domains.is_empty() {
-                servers.push(json!({
-                    "address": address,
-                    "domains": remote_domains,
-                }));
+                let mut entry = json!({ "address": address, "domains": remote_domains });
+                if let Some(p) = port {
+                    entry["port"] = json!(p);
+                }
+                servers.push(entry);
             } else if server.tag == "domestic" && !domestic_domains.is_empty() {
-                servers.push(json!({
-                    "address": address,
-                    "domains": domestic_domains,
-                }));
+                let mut entry = json!({ "address": address, "domains": domestic_domains });
+                if let Some(p) = port {
+                    entry["port"] = json!(p);
+                }
+                servers.push(entry);
             } else {
-                servers.push(json!(address));
+                match port {
+                    Some(p) => servers.push(json!({ "address": address, "port": p })),
+                    None => servers.push(json!(address)),
+                }
             }
         }
     }
@@ -785,7 +804,8 @@ mod tests {
         let servers = dns["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].as_str(), Some("https://1.1.1.1/dns-query"));
-        assert_eq!(servers[1].as_str(), Some("8.8.8.8:5353"));
+        assert_eq!(servers[1]["address"].as_str(), Some("8.8.8.8"));
+        assert_eq!(servers[1]["port"], 5353);
     }
 
     #[test]
@@ -938,7 +958,7 @@ mod tests {
         assert_eq!(remote_domains[0], "geosite:google");
 
         let domestic = &servers[1];
-        assert_eq!(domestic["address"], "223.5.5.5:53");
+        assert_eq!(domestic["address"], "223.5.5.5");
         let domestic_domains = domestic["domains"].as_array().unwrap();
         assert_eq!(domestic_domains.len(), 1);
         assert_eq!(domestic_domains[0], "domain:.cn");
