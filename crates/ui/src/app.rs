@@ -8,12 +8,14 @@ use relm4::prelude::*;
 use tokio::sync::broadcast;
 
 use v2ray_rs_core::config::ConfigWriter;
+use v2ray_rs_core::geodata::GeodataManager;
 use v2ray_rs_core::models::{
     AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, Subscription,
+    SubscriptionSource,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 use v2ray_rs_core::resolve::ConnectionPlanner;
-use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
+use v2ray_rs_core::runtime_snapshot::{RuntimeConfigSnapshot, RuntimeConfigSnapshotInput};
 use v2ray_rs_process::{ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
 
@@ -25,6 +27,7 @@ const DEFAULT_WINDOW_HEIGHT: i32 = 650;
 const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_CHANNEL_CAPACITY: usize = 16;
 
+use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
 use crate::logs::{LogsMsg, LogsPage};
 use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
@@ -53,6 +56,7 @@ pub struct App {
     runtime_snapshot: Option<RuntimeConfigSnapshot>,
     restart_required: bool,
     current_view: usize,
+    geodata_service: GeodataRefreshService,
 }
 
 struct ProcessHandle {
@@ -65,7 +69,7 @@ enum ProcessCmd {
 
 #[derive(Debug)]
 pub enum AppMsg {
-    OnboardingComplete(AppSettings, Option<(String, String)>),
+    OnboardingComplete(AppSettings, Option<(String, SubscriptionSource)>),
     SettingsChanged(AppSettings),
     ToggleConnection,
     Connect,
@@ -83,6 +87,7 @@ pub enum AppMsg {
     ApplyAndRestart,
     DiscardChanges,
     SwitchView(usize),
+    ShowToast(String),
 }
 
 impl App {
@@ -464,6 +469,7 @@ impl SimpleComponent for App {
             .launch((paths.clone(), settings.clone()))
             .forward(sender.input_sender(), |msg| match msg {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
+                SubscriptionsOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
         let nodes_page = NodesPage::builder()
@@ -492,6 +498,8 @@ impl SimpleComponent for App {
         let subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
         let manual_nodes = persistence::load_manual_nodes_or_default(&paths);
         let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
+        let geodata_service =
+            GeodataRefreshService::spawn(GeodataRefreshConfig::from_settings(&paths, &settings));
 
         let model = App {
             settings,
@@ -516,16 +524,19 @@ impl SimpleComponent for App {
             runtime_snapshot: None,
             restart_required: false,
             current_view: 0,
+            geodata_service,
         };
-
-        let _ = persistence::save_connection_state(&model.paths, &None);
 
         let toast_overlay = &model.toast_overlay;
         let status_label = &model.status_label;
         let status_details = &model.status_details;
         let widgets = view_output!();
-        widgets.pane_stack.add_named(model.subscriptions_page.widget(), Some("subscriptions"));
-        widgets.pane_stack.add_named(model.nodes_page.widget(), Some("nodes"));
+        widgets
+            .pane_stack
+            .add_named(model.subscriptions_page.widget(), Some("subscriptions"));
+        widgets
+            .pane_stack
+            .add_named(model.nodes_page.widget(), Some("nodes"));
         model.update_status_labels();
 
         let prefs_action = gtk::gio::SimpleAction::new("preferences", None);
@@ -548,10 +559,15 @@ impl SimpleComponent for App {
                 }
                 self.settings = settings;
                 self.show_wizard = false;
+                self.geodata_service
+                    .update(GeodataRefreshConfig::from_settings(
+                        &self.paths,
+                        &self.settings,
+                    ));
 
-                if let Some((name, url)) = subscription {
+                if let Some((name, source)) = subscription {
                     self.subscriptions_page
-                        .emit(SubscriptionsMsg::AddSubscription(name, url));
+                        .emit(SubscriptionsMsg::AddSubscription(name, source));
                 }
             }
             AppMsg::SettingsChanged(settings) => {
@@ -563,6 +579,11 @@ impl SimpleComponent for App {
                 let strategy_changed =
                     self.settings.auto_resolve_strategy != settings.auto_resolve_strategy;
                 self.settings = settings;
+                self.geodata_service
+                    .update(GeodataRefreshConfig::from_settings(
+                        &self.paths,
+                        &self.settings,
+                    ));
                 self.restart_required = self.check_restart_required();
                 if was_connected && strategy_changed {
                     self.reconnect_pending = true;
@@ -574,6 +595,9 @@ impl SimpleComponent for App {
             }
             AppMsg::ActiveNodesChanged(_has) => {
                 self.refresh_has_active_nodes();
+            }
+            AppMsg::ShowToast(message) => {
+                self.show_toast(&message);
             }
             AppMsg::ToggleConnection => {
                 if self.connected {
@@ -603,7 +627,6 @@ impl SimpleComponent for App {
                     self.settings.auto_resolve_strategy,
                     self.settings.last_success.clone(),
                     snapshot,
-                    Vec::new(),
                 );
                 let candidates = planner.plan(&subscriptions, &manual_nodes);
 
@@ -617,16 +640,17 @@ impl SimpleComponent for App {
                 let rules = persistence::load_routing_rules(&self.paths).unwrap_or_default();
                 let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
 
-                self.runtime_snapshot = Some(RuntimeConfigSnapshot::new(
-                    self.settings.backend.backend_type,
-                    self.settings.backend.binary_path.clone(),
-                    self.settings.socks_port,
-                    self.settings.http_port,
-                    self.settings.dns.clone(),
-                    rules,
-                    manual_nodes.clone(),
-                    chrono::Utc::now().timestamp(),
-                ));
+                self.runtime_snapshot =
+                    Some(RuntimeConfigSnapshot::new(RuntimeConfigSnapshotInput {
+                        backend_type: self.settings.backend.backend_type,
+                        binary_path: self.settings.backend.binary_path.clone(),
+                        socks_port: self.settings.socks_port,
+                        http_port: self.settings.http_port,
+                        dns: self.settings.dns.clone(),
+                        routing: rules,
+                        manual_nodes: manual_nodes.clone(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                    }));
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
                 let pid_path = self.paths.data_dir().join("backend.pid");
@@ -803,11 +827,6 @@ impl SimpleComponent for App {
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
                     self.connection_status = None;
                 }
-                if let Err(e) =
-                    persistence::save_connection_state(&self.paths, &self.connection_status)
-                {
-                    log::error!("save connection state: {e}");
-                }
                 self.apply_state(&state);
                 if stopped && !self.reconnect_pending {
                     self.regenerate_config_disconnected();
@@ -944,6 +963,7 @@ fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[Manual
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
     use v2ray_rs_core::models::{ProxyNode, TransportSettings, VlessConfig};
@@ -1072,6 +1092,61 @@ fn install_resource_icon(
     std::fs::create_dir_all(&icon_dir).is_ok() && std::fs::write(&icon_path, &svg).is_ok()
 }
 
+#[cfg(feature = "geodata-fetch")]
+fn spawn_geodata_refresh(paths: AppPaths, settings: AppSettings) {
+    if !settings.onboarding_complete && settings.backend.binary_path.is_none() {
+        return;
+    }
+
+    let interval = Duration::from_secs(settings.geodata_update_interval_secs.max(60));
+    let backend = settings.backend.backend_type;
+    let repeat = settings.auto_update_geodata;
+
+    tokio::spawn(async move {
+        run_geodata_refresh_pass(paths.clone(), backend, interval).await;
+        if !repeat {
+            return;
+        }
+
+        loop {
+            tokio::time::sleep(interval).await;
+            run_geodata_refresh_pass(paths.clone(), backend, interval).await;
+        }
+    });
+}
+
+#[cfg(not(feature = "geodata-fetch"))]
+fn spawn_geodata_refresh(_paths: AppPaths, _settings: AppSettings) {}
+
+#[cfg(feature = "geodata-fetch")]
+async fn run_geodata_refresh_pass(
+    paths: AppPaths,
+    backend: v2ray_rs_core::models::BackendType,
+    interval: Duration,
+) {
+    let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let manager = GeodataManager::new(&paths);
+        match v2ray_rs_core::geodata::check_and_download(&manager, backend, interval) {
+            Ok(Some(_)) => {
+                if let Err(err) = manager.reindex(backend) {
+                    return Err(err.to_string());
+                }
+                Ok(true)
+            }
+            Ok(None) => Ok(false),
+            Err(err) => Err(err.to_string()),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(true)) => log::info!("geodata refreshed for {}", backend),
+        Ok(Ok(false)) => log::debug!("geodata already up to date for {}", backend),
+        Ok(Err(err)) => log::warn!("geodata refresh failed for {}: {}", backend, err),
+        Err(join_err) => log::error!("geodata refresh task failed: {}", join_err),
+    }
+}
+
 pub fn run() {
     #[cfg(debug_assertions)]
     let dev_mode = std::env::var_os("V2RAY_RS_DEV").is_some_and(|v| !v.is_empty());
@@ -1094,6 +1169,8 @@ pub fn run() {
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let _rt_guard = rt.enter();
+
+    spawn_geodata_refresh(paths.clone(), settings.clone());
 
     let (event_tx, event_rx) = broadcast::channel::<ProcessEvent>(EVENT_CHANNEL_CAPACITY);
     if let Ok(mut guard) = TRAY_EVENT_TX.lock() {

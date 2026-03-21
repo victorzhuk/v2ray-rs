@@ -16,9 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - uses: dtolnay/rust-toolchain@1.93.1
       - run: cargo fmt --all -- --check
 
   check:
@@ -29,7 +27,7 @@ jobs:
       - name: Install dependencies
         run: pacman -Syu --noconfirm gcc pkgconf gtk4 libadwaita gettext
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace
 
@@ -41,11 +39,9 @@ jobs:
       - name: Install dependencies
         run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace -- -D warnings
+      - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
     name: Test
@@ -55,6 +51,6 @@ jobs:
       - name: Install dependencies
         run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace --all-targets

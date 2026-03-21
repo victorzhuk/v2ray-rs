@@ -26,7 +26,6 @@ pub enum AutoResolveStrategy {
     LowestLatency,
     Random,
     LastSuccessful,
-    GeoAware,
 }
 
 impl fmt::Display for AutoResolveStrategy {
@@ -36,7 +35,6 @@ impl fmt::Display for AutoResolveStrategy {
             Self::LowestLatency => f.write_str("lowest latency"),
             Self::Random => f.write_str("random"),
             Self::LastSuccessful => f.write_str("last successful"),
-            Self::GeoAware => f.write_str("geo-aware"),
         }
     }
 }

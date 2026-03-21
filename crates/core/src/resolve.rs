@@ -1,5 +1,3 @@
-use std::collections::{HashMap, HashSet};
-
 use chrono::{DateTime, Utc};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -79,7 +77,6 @@ pub struct ConnectionPlanner {
     strategy: AutoResolveStrategy,
     last_success: Option<LastSuccessMetadata>,
     latency_snapshot: LatencySnapshot,
-    geo_preference: Vec<String>,
 }
 
 impl ConnectionPlanner {
@@ -87,13 +84,11 @@ impl ConnectionPlanner {
         strategy: AutoResolveStrategy,
         last_success: Option<LastSuccessMetadata>,
         latency_snapshot: LatencySnapshot,
-        geo_preference: Vec<String>,
     ) -> Self {
         Self {
             strategy,
             last_success,
             latency_snapshot,
-            geo_preference,
         }
     }
 
@@ -168,51 +163,7 @@ impl ConnectionPlanner {
                     candidates
                 }
             }
-            AutoResolveStrategy::GeoAware => self.order_geo(candidates),
         }
-    }
-
-    fn order_geo(&self, candidates: Vec<ConnectionCandidate>) -> Vec<ConnectionCandidate> {
-        if self.geo_preference.is_empty() {
-            return candidates;
-        }
-
-        let mut buckets: HashMap<usize, Vec<ConnectionCandidate>> = HashMap::new();
-        let mut unmatched = Vec::new();
-
-        for candidate in candidates {
-            let remark = candidate
-                .node
-                .remark()
-                .map(|r| r.to_lowercase())
-                .unwrap_or_default();
-
-            let bucket_idx = self
-                .geo_preference
-                .iter()
-                .enumerate()
-                .find_map(|(idx, pref)| remark.contains(&pref.to_lowercase()).then_some(idx));
-
-            if let Some(idx) = bucket_idx {
-                buckets.entry(idx).or_default().push(candidate);
-            } else {
-                unmatched.push(candidate);
-            }
-        }
-
-        let mut ordered = Vec::new();
-        let mut seen = HashSet::new();
-        for idx in 0..self.geo_preference.len() {
-            if let Some(list) = buckets.remove(&idx) {
-                for candidate in list {
-                    if seen.insert(candidate.node_ref) {
-                        ordered.push(candidate);
-                    }
-                }
-            }
-        }
-        ordered.extend(unmatched);
-        ordered
     }
 }
 
@@ -261,7 +212,6 @@ mod tests {
             AutoResolveStrategy::ListOrder,
             None,
             LatencySnapshot::default(),
-            Vec::new(),
         );
 
         let planned = planner.plan(&[sub1.clone(), sub2.clone()], &[]);
@@ -285,10 +235,9 @@ mod tests {
             AutoResolveStrategy::LowestLatency,
             None,
             LatencySnapshot::default(),
-            Vec::new(),
         );
 
-        let planned = planner.plan(&[sub.clone()], &[]);
+        let planned = planner.plan(std::slice::from_ref(&sub), &[]);
 
         assert_eq!(planned[0].node.address(), "c.com");
         assert_eq!(planned[1].node.address(), "a.com");
@@ -315,35 +264,11 @@ mod tests {
             AutoResolveStrategy::LastSuccessful,
             Some(last),
             LatencySnapshot::default(),
-            Vec::new(),
         );
 
-        let planned = planner.plan(&[sub.clone()], &[]);
+        let planned = planner.plan(std::slice::from_ref(&sub), &[]);
 
         assert_eq!(planned[0].node.address(), "b.com");
-    }
-
-    #[test]
-    fn plan_geo_prefers_matching_remarks() {
-        let sub = subscription_with_nodes(
-            "Alpha",
-            vec![
-                (vless_node("us.com", "US - West"), true, None),
-                (vless_node("jp.com", "JP Tokyo"), true, None),
-                (vless_node("de.com", "DE Berlin"), true, None),
-            ],
-        );
-        let planner = ConnectionPlanner::new(
-            AutoResolveStrategy::GeoAware,
-            None,
-            LatencySnapshot::default(),
-            vec!["jp".into(), "us".into()],
-        );
-
-        let planned = planner.plan(&[sub.clone()], &[]);
-
-        assert_eq!(planned[0].node.address(), "jp.com");
-        assert_eq!(planned[1].node.address(), "us.com");
     }
 
     #[test]

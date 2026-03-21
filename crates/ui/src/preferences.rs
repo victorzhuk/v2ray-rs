@@ -9,13 +9,14 @@ use std::rc::Rc;
 use std::str::FromStr;
 use uuid::Uuid;
 
-use v2ray_rs_core::backend::{backend_name, detect_all};
+use v2ray_rs_core::backend::{DetectedBackend, backend_name, detect_all, validate_custom_path};
 use v2ray_rs_core::geodata::GeodataManager;
 use v2ray_rs_core::geodata_index::GeodataIndexManager;
 use v2ray_rs_core::models::{
-    builtin_dns_presets, builtin_presets, AppSettings, AutoResolveStrategy, BackendConfig,
-    BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride,
-    Language, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch, validate_rule_match,
+    AppSettings, AutoResolveStrategy, BackendConfig, BackendType, DnsProtocol, DnsRule,
+    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, Language, Preset, RoutingRule,
+    RoutingRuleSet, RuleAction, RuleMatch, builtin_dns_presets, builtin_presets,
+    validate_rule_match,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -54,6 +55,54 @@ pub fn show_preferences(
 
 fn emit(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) {
     cb(state.borrow().clone());
+}
+
+fn backend_type_index(backend_type: BackendType) -> u32 {
+    match backend_type {
+        BackendType::V2ray => 0,
+        BackendType::Xray => 1,
+        BackendType::SingBox => 2,
+    }
+}
+
+fn backend_type_from_index(index: u32) -> BackendType {
+    match index {
+        0 => BackendType::V2ray,
+        2 => BackendType::SingBox,
+        _ => BackendType::Xray,
+    }
+}
+
+fn detected_backend_subtitle(backend: &DetectedBackend) -> String {
+    match &backend.version_error {
+        Some(err) => format!("{} | unavailable: {err}", backend.binary_path.display()),
+        None => backend.binary_path.display().to_string(),
+    }
+}
+
+fn current_backend_status(settings: &AppSettings, detected: &[DetectedBackend]) -> String {
+    match &settings.backend.binary_path {
+        Some(path) => {
+            let is_detected = detected.iter().any(|backend| {
+                backend.backend_type == settings.backend.backend_type
+                    && backend.binary_path == *path
+            });
+            if is_detected {
+                format!(
+                    "Using detected {} at {}",
+                    backend_name(settings.backend.backend_type),
+                    path.display()
+                )
+            } else {
+                format!(
+                    "Using custom {} at {}",
+                    backend_name(settings.backend.backend_type),
+                    path.display()
+                )
+            }
+        }
+        None => "No backend path configured".to_string(),
+    }
 }
 
 fn build_system_page(
@@ -149,6 +198,7 @@ fn build_network_page(
         .build();
 
     let detected = detect_all();
+    let custom_status_text = current_backend_status(&s, &detected);
 
     if detected.is_empty() {
         let row = adw::ActionRow::builder()
@@ -165,6 +215,7 @@ fn build_network_page(
                 .as_ref()
                 .map(|v| format!("({})", v))
                 .unwrap_or_default();
+            let is_available = backend.is_available();
 
             let row = adw::ActionRow::builder()
                 .title(format!(
@@ -172,12 +223,17 @@ fn build_network_page(
                     backend_name(backend.backend_type),
                     version_str
                 ))
-                .subtitle(backend.binary_path.display().to_string())
-                .activatable(true)
+                .subtitle(detected_backend_subtitle(backend))
+                .activatable(is_available)
+                .sensitive(is_available)
                 .build();
 
             let check = gtk::CheckButton::builder()
-                .active(s.backend.backend_type == backend.backend_type)
+                .active(
+                    s.backend.backend_type == backend.backend_type
+                        && s.backend.binary_path.as_ref() == Some(&backend.binary_path),
+                )
+                .sensitive(is_available)
                 .valign(gtk::Align::Center)
                 .build();
 
@@ -209,6 +265,45 @@ fn build_network_page(
         }
     }
     page.add(&backend_group);
+
+    let custom_group = adw::PreferencesGroup::builder()
+        .title("Custom Backend Path")
+        .description("Validate and use a manually provided backend binary")
+        .build();
+
+    let custom_type_row = adw::ComboRow::builder()
+        .title("Backend type")
+        .model(&gtk::StringList::new(&["v2ray", "xray", "sing-box"]))
+        .selected(backend_type_index(s.backend.backend_type))
+        .build();
+    custom_group.add(&custom_type_row);
+
+    let custom_path_row = adw::EntryRow::builder()
+        .title("Binary path")
+        .text(
+            s.backend
+                .binary_path
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default(),
+        )
+        .build();
+    custom_group.add(&custom_path_row);
+
+    let custom_status_row = adw::ActionRow::builder()
+        .title("Custom path status")
+        .subtitle(custom_status_text)
+        .build();
+    custom_group.add(&custom_status_row);
+
+    let validate_custom_row = adw::ActionRow::builder().title("Custom path").build();
+    let validate_custom_btn = gtk::Button::builder()
+        .label("Validate & Use")
+        .css_classes(["suggested-action"])
+        .build();
+    validate_custom_row.add_suffix(&validate_custom_btn);
+    custom_group.add(&validate_custom_row);
+    page.add(&custom_group);
 
     let ports_group = adw::PreferencesGroup::builder()
         .title("Proxy Ports")
@@ -413,7 +508,7 @@ fn build_network_page(
             AutoResolveStrategy::ListOrder => 0,
             AutoResolveStrategy::LowestLatency => 1,
             AutoResolveStrategy::Random => 2,
-            AutoResolveStrategy::LastSuccessful | AutoResolveStrategy::GeoAware => 3,
+            AutoResolveStrategy::LastSuccessful => 3,
         })
         .build();
     resolve_group.add(&resolve_row);
@@ -421,6 +516,40 @@ fn build_network_page(
 
     drop(s);
 
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        let detected = detected.clone();
+        let custom_type_row = custom_type_row.clone();
+        let custom_path_row = custom_path_row.clone();
+        let custom_status_row = custom_status_row.clone();
+        validate_custom_btn.connect_clicked(move |_| {
+            let path_text = custom_path_row.text().trim().to_string();
+            if path_text.is_empty() {
+                custom_status_row.set_subtitle("Enter a path to validate");
+                return;
+            }
+
+            let backend_type = backend_type_from_index(custom_type_row.selected());
+            match validate_custom_path(std::path::Path::new(&path_text), backend_type) {
+                Ok(detected_backend) => {
+                    let mut settings = st.borrow_mut();
+                    settings.backend = BackendConfig {
+                        backend_type: detected_backend.backend_type,
+                        binary_path: Some(detected_backend.binary_path),
+                        config_output_dir: settings.backend.config_output_dir.clone(),
+                    };
+                    let status = current_backend_status(&settings, &detected);
+                    drop(settings);
+                    custom_status_row.set_subtitle(&status);
+                    emit(&st, &cb);
+                }
+                Err(err) => {
+                    custom_status_row.set_subtitle(&err.to_string());
+                }
+            }
+        });
+    }
     {
         let st = state.clone();
         let cb = cb.clone();
@@ -799,19 +928,17 @@ fn build_routing_rule_row(
             (ctx_drop.routing_changed_cb)();
             render_routing_rules(&ctx_drop);
 
-            target.widget().and_then(|w| {
+            if let Some(w) = target.widget() {
                 w.remove_css_class("drop-target");
-                Some(())
-            });
+            }
             true
         },
     );
 
     drop_target.connect_enter(|target, _, _| {
-        target.widget().and_then(|w| {
+        if let Some(w) = target.widget() {
             w.add_css_class("drop-target");
-            Some(())
-        });
+        }
         gtk::gdk::DragAction::MOVE
     });
 
@@ -912,7 +1039,6 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
         let type_combo = type_combo_clone.clone();
         let value_entry = value_entry_clone.clone();
         let paths = paths.clone();
-        let backend_type = backend_type;
 
         show_suggestions.connect_clicked(move |_| {
             let rule_type = type_combo.selected();
@@ -1025,7 +1151,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
                         }
                         if filtered.len() > 20 {
                             let row = adw::ActionRow::builder()
-                                .title(&format!("... and {} more", filtered.len() - 20))
+                                .title(format!("... and {} more", filtered.len() - 20))
                                 .sensitive(false)
                                 .build();
                             suggestion_list.append(&row);

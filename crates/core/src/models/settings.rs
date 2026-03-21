@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{AutoResolveStrategy, DnsConfig, LastSuccessMetadata};
 
@@ -54,7 +54,7 @@ pub struct AppSettings {
     pub backend: BackendConfig,
     pub socks_port: u16,
     pub http_port: u16,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_auto_resolve_strategy")]
     pub auto_resolve_strategy: AutoResolveStrategy,
     #[serde(default)]
     pub last_success: Option<LastSuccessMetadata>,
@@ -68,6 +68,25 @@ pub struct AppSettings {
     pub onboarding_complete: bool,
     #[serde(default)]
     pub dns: DnsConfig,
+}
+
+fn deserialize_auto_resolve_strategy<'de, D>(
+    deserializer: D,
+) -> Result<AutoResolveStrategy, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let s = String::deserialize(deserializer)?;
+    match s.as_str() {
+        "list-order" => Ok(AutoResolveStrategy::ListOrder),
+        "lowest-latency" => Ok(AutoResolveStrategy::LowestLatency),
+        "random" => Ok(AutoResolveStrategy::Random),
+        "last-successful" | "geo-aware" => Ok(AutoResolveStrategy::LastSuccessful),
+        other => Err(serde::de::Error::unknown_variant(
+            other,
+            &["list-order", "lowest-latency", "random", "last-successful"],
+        )),
+    }
 }
 
 impl Default for AppSettings {
@@ -134,5 +153,16 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let deserialized: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_geo_aware_strategy_migrates_to_last_successful() {
+        let settings: AppSettings =
+            toml::from_str("version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\nauto_resolve_strategy = \"geo-aware\"\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n").unwrap();
+
+        assert_eq!(
+            settings.auto_resolve_strategy,
+            AutoResolveStrategy::LastSuccessful
+        );
     }
 }
