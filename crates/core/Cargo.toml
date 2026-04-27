@@ -13,10 +13,13 @@ thiserror.workspace = true
 chrono.workspace = true
 ipnet.workspace = true
 rand.workspace = true
-tempfile = "3"
+tempfile.workspace = true
 reqwest = { workspace = true, features = ["blocking"], optional = true }
+nix = { workspace = true, features = ["fs"] }
 prost = "0.12"
 rusqlite = { version = "0.30", features = ["bundled"] }
+log.workspace = true
+clap.workspace = true
 
 [build-dependencies]
 prost-build = "0.12"

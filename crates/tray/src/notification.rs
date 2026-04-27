@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use notify_rust::{Notification, Timeout};
 use v2ray_rs_process::ProcessState;
 
@@ -5,20 +8,22 @@ const NOTIFICATION_TIMEOUT_MS: u32 = 5000;
 
 #[derive(Clone)]
 pub struct Notifier {
-    enabled: bool,
+    enabled: Arc<AtomicBool>,
 }
 
 impl Notifier {
     pub fn new(enabled: bool) -> Self {
-        Self { enabled }
+        Self {
+            enabled: Arc::new(AtomicBool::new(enabled)),
+        }
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
+        self.enabled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn on_state_change(&self, from: &ProcessState, to: &ProcessState) {
-        if !self.enabled {
+        if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
 
@@ -37,12 +42,15 @@ impl Notifier {
     }
 
     fn send(&self, summary: &str, body: &str) {
-        let _ = Notification::new()
+        if let Err(e) = Notification::new()
             .appname("V2Ray Manager")
             .summary(summary)
             .body(body)
             .icon("network-vpn")
             .timeout(Timeout::Milliseconds(NOTIFICATION_TIMEOUT_MS))
-            .show();
+            .show()
+        {
+            log::debug!("desktop notification failed: {e}");
+        }
     }
 }

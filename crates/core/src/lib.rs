@@ -1,9 +1,13 @@
 pub mod backend;
+pub mod cli;
 pub mod config;
+pub(crate) mod fs;
 pub mod geodata;
 pub mod geodata_index;
+pub mod instance;
 pub mod models;
 pub mod persistence;
+pub mod profile;
 pub mod resolve;
 pub mod routing_manager;
 pub mod runtime_snapshot;

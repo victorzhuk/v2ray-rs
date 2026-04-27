@@ -1,13 +1,15 @@
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use crate::config::{ConfigError, generator_for};
+use crate::fs::atomic_write;
 use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule};
 use crate::persistence::AppPaths;
 
 pub struct ConfigWriter {
     output_dir: PathBuf,
-    geodata_dir: PathBuf,
 }
 
 impl ConfigWriter {
@@ -16,21 +18,14 @@ impl ConfigWriter {
             .backend
             .config_output_dir
             .clone()
-            .unwrap_or_else(|| paths.data_dir().join("generated"));
+            .unwrap_or_else(|| paths.generated_dir());
 
-        Self {
-            output_dir,
-            geodata_dir: paths.geodata_dir(),
-        }
+        Self { output_dir }
     }
 
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Self {
-        let geodata_dir = dir.join("geodata");
-        Self {
-            output_dir: dir,
-            geodata_dir,
-        }
+        Self { output_dir: dir }
     }
 
     pub fn output_path(&self, backend: BackendType) -> PathBuf {
@@ -48,30 +43,33 @@ impl ConfigWriter {
         rules: &[RoutingRule],
         settings: &AppSettings,
     ) -> Result<PathBuf, ConfigError> {
+        validate_runtime_inputs(nodes, settings)?;
+
         let backend = settings.backend.backend_type;
         let generator = generator_for(backend);
-        let config = generator.generate(nodes, rules, settings, Some(&self.geodata_dir))?;
-        let json = serde_json::to_string_pretty(&config)?;
+        let config = generator.generate(nodes, rules, settings)?;
+        let json = serde_json::to_string(&config)?;
 
         std::fs::create_dir_all(&self.output_dir)?;
+        #[cfg(unix)]
+        std::fs::set_permissions(&self.output_dir, std::fs::Permissions::from_mode(0o700))?;
+
         let path = self.output_path(backend);
-        atomic_write(&path, json.as_bytes())?;
+        atomic_write(&path, json.as_bytes()).map_err(ConfigError::Io)?;
 
         Ok(path)
     }
 }
 
-fn atomic_write(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
-    let dir = path.parent().ok_or_else(|| {
-        ConfigError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "path has no parent directory",
-        ))
-    })?;
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(data)?;
-    tmp.flush()?;
-    tmp.persist(path).map_err(|e| ConfigError::Io(e.error))?;
+fn validate_runtime_inputs(nodes: &[ProxyNode], settings: &AppSettings) -> Result<(), ConfigError> {
+    for node in nodes {
+        node.validate()?;
+    }
+
+    if settings.dns.enabled {
+        settings.dns.validate()?;
+    }
+
     Ok(())
 }
 
@@ -79,6 +77,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<(), ConfigError> {
 mod tests {
     use super::*;
     use crate::models::*;
+    use crate::profile::AppProfile;
 
     fn sample_nodes() -> Vec<ProxyNode> {
         vec![ProxyNode::Shadowsocks(ShadowsocksConfig {
@@ -210,6 +209,41 @@ mod tests {
     }
 
     #[test]
+    fn test_write_config_rejects_invalid_proxy_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let settings = AppSettings::default();
+        let nodes = vec![ProxyNode::Shadowsocks(ShadowsocksConfig {
+            address: "example.com".into(),
+            port: 8388,
+            method: String::new(),
+            password: "secret".into(),
+            remark: None,
+        })];
+
+        let result = writer.write_config(&nodes, &[], &settings);
+        assert!(matches!(result, Err(ConfigError::InvalidProxyNode(_))));
+    }
+
+    #[test]
+    fn test_write_config_accepts_dns_protocols_that_fall_back_in_generators() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".into(),
+            protocol: DnsProtocol::Dot,
+            address: "1.1.1.1".into(),
+            port: None,
+            detour: None,
+        }];
+
+        let result = writer.write_config(&sample_nodes(), &[], &settings);
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn test_write_creates_output_dir() {
         let dir = tempfile::TempDir::new().unwrap();
         let nested = dir.path().join("nested").join("output");
@@ -227,7 +261,7 @@ mod tests {
     #[test]
     fn test_config_writer_new_uses_user_override() {
         let dir = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(dir.path().join("config"), dir.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, dir.path());
         let mut settings = AppSettings::default();
         settings.backend.config_output_dir = Some(PathBuf::from("/custom/path"));
 
@@ -241,11 +275,11 @@ mod tests {
     #[test]
     fn test_config_writer_new_uses_default_path() {
         let dir = tempfile::TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(dir.path().join("config"), dir.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, dir.path());
         let settings = AppSettings::default();
 
         let writer = ConfigWriter::new(&settings, &paths);
-        let expected = dir.path().join("data").join("generated").join("xray.json");
+        let expected = dir.path().join("runtime").join("generated").join("xray.json");
         assert_eq!(writer.output_path(BackendType::Xray), expected);
     }
 

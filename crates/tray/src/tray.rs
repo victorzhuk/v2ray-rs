@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::path::Path;
+use std::sync::Arc;
 
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Handle, Tray, TrayMethods};
@@ -20,31 +21,23 @@ pub enum TrayAction {
 
 pub struct TrayHandle {
     handle: Handle<AppTray>,
-    action_rx: mpsc::Receiver<TrayAction>,
+    notifier: Notifier,
 }
 
 impl TrayHandle {
-    pub fn try_recv_action(&self) -> Option<TrayAction> {
-        self.action_rx.try_recv().ok()
-    }
-
-    pub async fn update_state(&self, state: ProcessState) {
-        self.handle
-            .update(move |tray| {
-                tray.process_state = state;
-            })
-            .await;
-    }
-
     pub async fn shutdown(&self) {
         self.handle.shutdown().await;
+    }
+
+    pub fn set_notifications_enabled(&mut self, enabled: bool) {
+        self.notifier.set_enabled(enabled);
     }
 }
 
 struct AppTray {
     process_state: ProcessState,
     connection: Option<ConnectionMetadata>,
-    action_tx: mpsc::Sender<TrayAction>,
+    on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     _icon_theme_dir: Option<TempDir>,
     icon_theme_path: String,
 }
@@ -105,11 +98,11 @@ impl Tray for AppTray {
         let connected = self.process_state == ProcessState::Running;
 
         let toggle = if connected {
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Disconnect".into(),
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::Disconnect);
+                    (cb)(TrayAction::Disconnect);
                 }),
                 ..Default::default()
             }
@@ -118,12 +111,12 @@ impl Tray for AppTray {
                 self.process_state,
                 ProcessState::Starting | ProcessState::Stopping
             );
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Connect".into(),
                 enabled: !starting,
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::Connect);
+                    (cb)(TrayAction::Connect);
                 }),
                 ..Default::default()
             }
@@ -144,22 +137,22 @@ impl Tray for AppTray {
         };
 
         let show_window = {
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Open Main Window".into(),
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::ShowWindow);
+                    (cb)(TrayAction::ShowWindow);
                 }),
                 ..Default::default()
             }
         };
 
         let quit = {
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::Quit);
+                    (cb)(TrayAction::Quit);
                 }),
                 ..Default::default()
             }
@@ -204,22 +197,22 @@ fn tooltip_description(meta: &ConnectionMetadata) -> String {
 impl AppTray {
     fn menu_with_error(&self, toggle: StandardItem<Self>, msg: &str) -> Vec<MenuItem<Self>> {
         let show_window = {
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Open Main Window".into(),
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::ShowWindow);
+                    (cb)(TrayAction::ShowWindow);
                 }),
                 ..Default::default()
             }
         };
 
         let quit = {
-            let tx = self.action_tx.clone();
+            let cb = Arc::clone(&self.on_action);
             StandardItem {
                 label: "Quit".into(),
                 activate: Box::new(move |_| {
-                    let _ = tx.send(TrayAction::Quit);
+                    (cb)(TrayAction::Quit);
                 }),
                 ..Default::default()
             }
@@ -259,8 +252,9 @@ impl TrayService {
     pub async fn spawn(
         mut event_rx: broadcast::Receiver<ProcessEvent>,
         notifier: Notifier,
+        on_action: impl Fn(TrayAction) + Send + Sync + 'static,
     ) -> Result<TrayHandle, ksni::Error> {
-        let (action_tx, action_rx) = mpsc::channel();
+        let on_action = Arc::new(on_action);
 
         let icon_theme_dir = icons::setup_icon_theme();
         let icon_theme_path = icon_theme_dir
@@ -268,19 +262,17 @@ impl TrayService {
             .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // Also install into the user icon theme for hosts that ignore IconThemePath.
-        icons::install_icons();
-
         let tray = AppTray {
             process_state: ProcessState::Stopped,
             connection: None,
-            action_tx,
+            on_action,
             _icon_theme_dir: icon_theme_dir,
             icon_theme_path,
         };
 
         let handle = tray.spawn().await?;
         let update_handle = handle.clone();
+        let shared_notifier = notifier.clone();
 
         tokio::spawn(async move {
             loop {
@@ -299,7 +291,7 @@ impl TrayService {
                                     tray.connection = connection;
                                 })
                                 .await;
-                            let n = notifier.clone();
+                            let n = shared_notifier.clone();
                             tokio::task::spawn_blocking(move || {
                                 n.on_state_change(&from, &to);
                             });
@@ -311,7 +303,67 @@ impl TrayService {
             }
         });
 
-        Ok(TrayHandle { handle, action_rx })
+        Ok(TrayHandle { handle, notifier })
+    }
+
+    pub async fn spawn_with_data_dir(
+        mut event_rx: broadcast::Receiver<ProcessEvent>,
+        notifier: Notifier,
+        on_action: impl Fn(TrayAction) + Send + Sync + 'static,
+        data_dir: &Path,
+    ) -> Result<TrayHandle, ksni::Error> {
+        let on_action = Arc::new(on_action);
+
+        let icon_theme_dir = icons::setup_icon_theme();
+        let icon_theme_path = icon_theme_dir
+            .as_ref()
+            .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
+            .unwrap_or_default();
+
+        icons::install_icons(data_dir);
+
+        let tray = AppTray {
+            process_state: ProcessState::Stopped,
+            connection: None,
+            on_action,
+            _icon_theme_dir: icon_theme_dir,
+            icon_theme_path,
+        };
+
+        let handle = tray.spawn().await?;
+        let update_handle = handle.clone();
+        let shared_notifier = notifier.clone();
+
+        tokio::spawn(async move {
+            loop {
+                match event_rx.recv().await {
+                    Ok(event) => {
+                        if let ProcessEvent::StateChanged {
+                            from,
+                            to,
+                            connection,
+                        } = event
+                        {
+                            let state = to.clone();
+                            update_handle
+                                .update(move |tray| {
+                                    tray.process_state = state;
+                                    tray.connection = connection;
+                                })
+                                .await;
+                            let n = shared_notifier.clone();
+                            tokio::task::spawn_blocking(move || {
+                                n.on_state_change(&from, &to);
+                            });
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        Ok(TrayHandle { handle, notifier })
     }
 }
 

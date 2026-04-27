@@ -4,10 +4,13 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-v2ray-rs-core = { path = "../core" }
+v2ray-rs-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true

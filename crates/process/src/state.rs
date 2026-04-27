@@ -19,6 +19,7 @@ impl ProcessState {
         matches!(
             (self, target),
             (Stopped, Starting)
+                | (Stopped, Error(_))
                 | (Starting, Running)
                 | (Starting, Error(_))
                 | (Running, Stopping)
@@ -137,6 +138,14 @@ mod tests {
 
     #[test]
     fn error_transitions() {
+        let mut state = ProcessState::Stopped;
+        assert!(
+            state
+                .transition(ProcessState::Error("preflight".into()))
+                .is_ok()
+        );
+        assert_eq!(state, ProcessState::Error("preflight".into()));
+
         let mut state = ProcessState::Starting;
         assert!(state.transition(ProcessState::Error("test".into())).is_ok());
         assert_eq!(state, ProcessState::Error("test".into()));

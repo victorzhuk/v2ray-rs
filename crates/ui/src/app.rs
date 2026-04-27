@@ -1,22 +1,24 @@
 use std::sync::Mutex;
-use std::time::Duration;
 
 use adw::prelude::*;
+use clap::Parser;
 use gtk::glib;
 use relm4::adw;
 use relm4::prelude::*;
 use tokio::sync::broadcast;
 
+use v2ray_rs_core::cli::{CliArgs, PathOverrides};
 use v2ray_rs_core::config::ConfigWriter;
-use v2ray_rs_core::geodata::GeodataManager;
+use v2ray_rs_core::instance::{check_compatibility, InstanceLock, InstanceStamp, reset_instance, CompatibilityResult};
 use v2ray_rs_core::models::{
-    AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, Subscription,
+    AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, RoutingRuleSet, Subscription,
     SubscriptionSource,
 };
-use v2ray_rs_core::persistence::{self, AppPaths};
-use v2ray_rs_core::resolve::ConnectionPlanner;
-use v2ray_rs_core::runtime_snapshot::{RuntimeConfigSnapshot, RuntimeConfigSnapshotInput};
-use v2ray_rs_process::{ProcessEvent, ProcessState};
+use v2ray_rs_core::persistence::AppPaths;
+use v2ray_rs_core::profile::{AppProfile, StdEnv};
+use v2ray_rs_core::resolve::{ConnectionPlanner, LatencySnapshot};
+use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
+use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
 
 static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
@@ -24,25 +26,33 @@ static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::ne
 
 const DEFAULT_WINDOW_WIDTH: i32 = 900;
 const DEFAULT_WINDOW_HEIGHT: i32 = 650;
-const TRAY_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const EVENT_CHANNEL_CAPACITY: usize = 16;
 
+pub struct AppInit {
+    pub paths: AppPaths,
+    pub tray_action_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TrayAction>>,
+}
+
+use crate::connection::{ConnectionHandle, ConnectionRequest};
 use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
 use crate::logs::{LogsMsg, LogsPage};
-use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
+use crate::nodes::{NodesOutput, NodesPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
 use crate::wizard::OnboardingWizard;
+use crate::workspace::WorkspaceStore;
 
 pub struct App {
     settings: AppSettings,
     paths: AppPaths,
+    store: WorkspaceStore,
     subscriptions_page: Controller<SubscriptionsPage>,
     nodes_page: Controller<NodesPage>,
     logs_page: Controller<LogsPage>,
     show_wizard: bool,
+    settings_load_error: Option<String>,
     wizard: Controller<OnboardingWizard>,
     window: adw::ApplicationWindow,
-    process_handle: Option<ProcessHandle>,
+    process_handle: Option<ConnectionHandle>,
     process_state: ProcessState,
     reconnect_pending: bool,
     connected: bool,
@@ -57,14 +67,8 @@ pub struct App {
     restart_required: bool,
     current_view: usize,
     geodata_service: GeodataRefreshService,
-}
-
-struct ProcessHandle {
-    cmd_tx: tokio::sync::mpsc::Sender<ProcessCmd>,
-}
-
-enum ProcessCmd {
-    Stop,
+    pending_exit: bool,
+    settings_debounce: Option<glib::SourceId>,
 }
 
 #[derive(Debug)]
@@ -82,12 +86,15 @@ pub enum AppMsg {
     ProcessLogLine(String),
     OpenPreferences,
     PreferencesClosed,
-    RoutingChanged,
+    ResetBrokenSettings,
+    QuitAfterSettingsError,
+    RoutingChanged(RoutingRuleSet),
     ManualNodesChanged,
+    SubscriptionsChanged,
     ApplyAndRestart,
-    DiscardChanges,
     SwitchView(usize),
     ShowToast(String),
+    FlushSettings(AppSettings),
 }
 
 impl App {
@@ -177,6 +184,25 @@ impl App {
     fn clear_restart_flow(&mut self) {
         self.runtime_snapshot = None;
         self.restart_required = false;
+        self.reconnect_pending = false;
+    }
+
+    fn persist_settings(&mut self, settings: AppSettings) -> Result<(), String> {
+        self.store
+            .save_settings(&settings)
+            .map_err(|err| err.to_string())?;
+        self.settings = settings;
+        Ok(())
+    }
+
+    fn load_latency_snapshot_or_default(&self) -> LatencySnapshot {
+        match self.store.load_latency_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => {
+                log::warn!("load latency snapshot: {err}");
+                LatencySnapshot::default()
+            }
+        }
     }
 
     fn handle_manual_node_changed(&mut self) {
@@ -187,13 +213,40 @@ impl App {
         }
     }
 
-    fn close_preferences_dialog(&mut self) {
-        if let Some(dialog) = self.preferences_dialog.take() {
-            let _ = dialog.close();
+    fn handle_subscription_changed(&mut self) {
+        let subscriptions = match self.store.load_subscriptions() {
+            Ok(s) => s,
+            Err(err) => {
+                log::warn!("load subscriptions: {err}");
+                self.has_active_nodes = false;
+                return;
+            }
+        };
+        let manual_nodes = self.store.load_manual_nodes_or_default();
+
+        self.has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
+
+        if runtime_process_active(&self.process_state) {
+            self.restart_required = self.check_restart_required_with(&subscriptions, &manual_nodes);
+        } else {
+            self.regenerate_config_with(&subscriptions, &manual_nodes);
         }
     }
 
     fn check_restart_required(&self) -> bool {
+        let subscriptions = match self.store.load_subscriptions() {
+            Ok(s) => s,
+            Err(_) => return false,
+        };
+        let manual_nodes = self.store.load_manual_nodes_or_default();
+        self.check_restart_required_with(&subscriptions, &manual_nodes)
+    }
+
+    fn check_restart_required_with(
+        &self,
+        subscriptions: &[Subscription],
+        manual_nodes: &[ManualNode],
+    ) -> bool {
         if !runtime_process_active(&self.process_state) {
             return false;
         }
@@ -201,74 +254,82 @@ impl App {
             return false;
         };
 
-        let current_rules = match persistence::load_routing_rules(&self.paths) {
+        let current_rules = match self.store.load_routing_rules() {
             Ok(rules) => rules,
             Err(_) => return false,
         };
-        let current_manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
 
-        snapshot.diverges_from(&self.settings, &current_rules, &current_manual_nodes)
+        snapshot.diverges_from(&self.settings, &current_rules, manual_nodes, subscriptions)
     }
 
     fn refresh_has_active_nodes(&mut self) {
-        let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
-        let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
+        let subscriptions = match self.store.load_subscriptions() {
+            Ok(subscriptions) => subscriptions,
+            Err(err) => {
+                log::warn!("load subscriptions for active state: {err}");
+                self.has_active_nodes = false;
+                return;
+            }
+        };
+        let manual_nodes = match self.store.load_manual_nodes() {
+            Ok(manual_nodes) => manual_nodes,
+            Err(err) => {
+                log::warn!("load manual nodes for active state: {err}");
+                self.has_active_nodes = subscriptions.iter().any(Subscription::has_enabled_nodes);
+                return;
+            }
+        };
         self.has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
     }
 
     fn regenerate_config_disconnected(&mut self) {
-        let subscriptions = persistence::load_subscriptions(&self.paths).unwrap_or_default();
-        let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
-
-        let candidate = if let Some(last) = &self.settings.last_success {
-            match last.node_ref {
-                v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                    subscription_id,
-                    node_index,
-                } => subscriptions
-                    .iter()
-                    .find(|s| s.id == subscription_id)
-                    .and_then(|s| s.nodes.get(node_index))
-                    .filter(|n| n.enabled)
-                    .map(|n| n.node.clone()),
-                v2ray_rs_core::models::ConnectionNodeRef::Manual { node_id } => manual_nodes
-                    .iter()
-                    .find(|n| n.id == node_id && n.enabled)
-                    .map(|n| n.node.clone()),
+        let subscriptions = match self.store.load_subscriptions() {
+            Ok(s) => s,
+            Err(err) => {
+                self.show_toast(&format!("Failed to load subscriptions: {err}"));
+                return;
             }
-        } else {
-            subscriptions
-                .iter()
-                .flat_map(|s| s.nodes.iter())
-                .find(|n| n.enabled)
-                .map(|n| n.node.clone())
-                .or_else(|| {
-                    manual_nodes
-                        .iter()
-                        .find(|n| n.enabled)
-                        .map(|n| n.node.clone())
-                })
         };
+        let manual_nodes = self.store.load_manual_nodes_or_default();
+        self.regenerate_config_with(&subscriptions, &manual_nodes);
+    }
+
+    fn regenerate_config_with(
+        &mut self,
+        subscriptions: &[Subscription],
+        manual_nodes: &[ManualNode],
+    ) {
+        let planner = ConnectionPlanner::new(
+            self.settings.auto_resolve_strategy,
+            self.settings.last_success.clone(),
+            self.load_latency_snapshot_or_default(),
+        );
+        let candidate = planner
+            .runtime_candidate(subscriptions, manual_nodes)
+            .map(|candidate| candidate.node);
 
         let Some(node) = candidate else {
             log::debug!("No enabled nodes, skipping config regeneration");
             return;
         };
 
-        let rules = persistence::load_routing_rules(&self.paths).unwrap_or_default();
+        let rules = self.store.load_routing_rules().unwrap_or_default();
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
 
         let writer = ConfigWriter::new(&self.settings, &self.paths);
         match writer.write_config(std::slice::from_ref(&node), &enabled_rules, &self.settings) {
             Ok(path) => log::info!("Regenerated config at {:?}", path),
-            Err(e) => log::error!("Failed to regenerate config: {}", e),
+            Err(e) => {
+                log::error!("Failed to regenerate config: {}", e);
+                self.show_toast(&format!("Failed to regenerate config: {e}"));
+            }
         }
     }
 }
 
 #[relm4::component(pub)]
 impl SimpleComponent for App {
-    type Init = AppPaths;
+    type Init = AppInit;
     type Input = AppMsg;
     type Output = ();
 
@@ -277,14 +338,47 @@ impl SimpleComponent for App {
             set_default_width: DEFAULT_WINDOW_WIDTH,
             set_default_height: DEFAULT_WINDOW_HEIGHT,
             set_title: Some("V2Ray Manager"),
-            set_icon_name: Some(APP_ID),
+            set_icon_name: Some(&model.paths.profile().app_id()),
 
             connect_close_request[sender] => move |_| {
                 sender.input(AppMsg::CloseRequested);
                 gtk::glib::Propagation::Stop
             },
 
-            if model.show_wizard {
+            if model.settings_load_error.is_some() {
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Vertical,
+                    set_vexpand: true,
+                    set_valign: gtk::Align::Center,
+
+                    adw::StatusPage {
+                        set_icon_name: Some("dialog-warning-symbolic"),
+                        set_title: "Settings File Needs Repair",
+                        set_description: model.settings_load_error.as_deref(),
+                        set_vexpand: true,
+                    },
+
+                    gtk::Box {
+                        set_orientation: gtk::Orientation::Horizontal,
+                        set_halign: gtk::Align::Center,
+                        set_spacing: 12,
+                        set_margin_all: 24,
+
+                        gtk::Button {
+                            set_label: "Quit",
+                            add_css_class: "pill",
+                            connect_clicked => AppMsg::QuitAfterSettingsError,
+                        },
+
+                        gtk::Button {
+                            set_label: "Reset Settings",
+                            add_css_class: "pill",
+                            add_css_class: "destructive-action",
+                            connect_clicked => AppMsg::ResetBrokenSettings,
+                        },
+                    },
+                }
+            } else if model.show_wizard {
                 model.wizard.widget().clone() {}
             } else {
                 gtk::Box {
@@ -335,12 +429,6 @@ impl SimpleComponent for App {
                                     },
                                 },
 
-                                gtk::Button {
-                                    set_label: "Discard",
-                                    set_valign: gtk::Align::Center,
-                                    set_css_classes: &["flat"],
-                                    connect_clicked => AppMsg::DiscardChanges,
-                                },
                             },
 
                             gtk::Paned {
@@ -455,48 +543,83 @@ impl SimpleComponent for App {
     }
 
     fn init(
-        paths: Self::Init,
+        init: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();
+        let AppInit {
+            paths,
+            tray_action_rx,
+        } = init;
+        if let Some(mut rx) = tray_action_rx {
+            let s = sender.input_sender().clone();
+            glib::spawn_future_local(async move {
+                while let Some(action) = rx.recv().await {
+                    match action {
+                        TrayAction::ShowWindow => s.emit(AppMsg::TrayShowWindow),
+                        TrayAction::Quit => s.emit(AppMsg::TrayQuit),
+                        TrayAction::Connect => s.emit(AppMsg::Connect),
+                        TrayAction::Disconnect => s.emit(AppMsg::Disconnect),
+                    }
+                }
+            });
+        }
 
-        let show_wizard = !paths.settings_path().exists();
+        let store = WorkspaceStore::new(paths.clone());
+        let (settings, settings_load_error) = match store.load_settings() {
+            Ok(settings) => (settings, None),
+            Err(err) => {
+                log::error!("load settings: {err}");
+                (AppSettings::default(), Some(err.to_string()))
+            }
+        };
+        if settings_load_error.is_none()
+            && let Err(err) = cleanup_orphaned_backend(&paths)
+        {
+            log::warn!("failed to clean orphaned backend process: {err}");
+        }
 
-        setup_tray_polling(sender.input_sender().clone());
+        let show_wizard = settings_load_error.is_none() && !settings.onboarding_complete;
 
         let subscriptions_page = SubscriptionsPage::builder()
-            .launch((paths.clone(), settings.clone()))
+            .launch((store.clone(), settings.clone()))
             .forward(sender.input_sender(), |msg| match msg {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
+                SubscriptionsOutput::SubscriptionsChanged => AppMsg::SubscriptionsChanged,
                 SubscriptionsOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
         let nodes_page = NodesPage::builder()
-            .launch((paths.clone(), settings.clone()))
+            .launch((store.clone(), settings.clone()))
             .forward(sender.input_sender(), |msg| match msg {
                 NodesOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 NodesOutput::NodesChanged => AppMsg::ManualNodesChanged,
+                NodesOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
         let logs_page = LogsPage::builder().launch(()).detach();
 
-        let wizard = OnboardingWizard::builder().launch(paths.clone()).forward(
-            sender.input_sender(),
-            |msg| match msg {
+        let wizard = OnboardingWizard::builder()
+            .launch(())
+            .forward(sender.input_sender(), |msg| match msg {
                 crate::wizard::WizardOutput::Complete {
                     settings,
                     subscription,
                 } => AppMsg::OnboardingComplete(settings, subscription),
-            },
-        );
+            });
 
         let toast_overlay = adw::ToastOverlay::new();
         let status_label = gtk::Label::new(None);
         let status_details = gtk::Label::new(None);
 
-        let subscriptions = persistence::load_subscriptions(&paths).unwrap_or_default();
-        let manual_nodes = persistence::load_manual_nodes_or_default(&paths);
+        let subscriptions = store.load_subscriptions().unwrap_or_else(|err| {
+            log::warn!("load subscriptions for init: {err}");
+            Vec::new()
+        });
+        let manual_nodes = store.load_manual_nodes().unwrap_or_else(|err| {
+            log::warn!("load manual nodes for init: {err}");
+            Vec::new()
+        });
         let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
         let geodata_service =
             GeodataRefreshService::spawn(GeodataRefreshConfig::from_settings(&paths, &settings));
@@ -504,10 +627,12 @@ impl SimpleComponent for App {
         let model = App {
             settings,
             paths,
+            store,
             subscriptions_page,
             nodes_page,
             logs_page,
             show_wizard,
+            settings_load_error,
             wizard,
             window: root.clone(),
             process_handle: None,
@@ -525,6 +650,8 @@ impl SimpleComponent for App {
             restart_required: false,
             current_view: 0,
             geodata_service,
+            pending_exit: false,
+            settings_debounce: None,
         };
 
         let toast_overlay = &model.toast_overlay;
@@ -554,16 +681,23 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::OnboardingComplete(settings, subscription) => {
-                if let Err(e) = v2ray_rs_core::persistence::save_settings(&self.paths, &settings) {
-                    log::error!("save settings: {e}");
+                if let Err(err) = self.persist_settings(settings) {
+                    log::error!("save settings: {err}");
+                    self.show_toast(&format!("Failed to save settings: {err}"));
+                    return;
                 }
-                self.settings = settings;
                 self.show_wizard = false;
+                self.settings_load_error = None;
                 self.geodata_service
                     .update(GeodataRefreshConfig::from_settings(
                         &self.paths,
                         &self.settings,
                     ));
+                self.subscriptions_page
+                    .emit(SubscriptionsMsg::SyncSettings {
+                        auto_update_enabled: self.settings.auto_update_subscriptions,
+                        auto_update_interval_secs: self.settings.subscription_update_interval_secs,
+                    });
 
                 if let Some((name, source)) = subscription {
                     self.subscriptions_page
@@ -571,19 +705,38 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::SettingsChanged(settings) => {
-                crate::i18n::switch_language(settings.language);
-                if let Err(e) = v2ray_rs_core::persistence::save_settings(&self.paths, &settings) {
-                    log::error!("save settings: {e}");
+                if let Some(id) = self.settings_debounce.take() {
+                    id.remove();
                 }
-                let was_connected = self.process_handle.is_some();
+                let s = sender.clone();
+                self.settings_debounce = Some(glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(300),
+                    move || s.input(AppMsg::FlushSettings(settings)),
+                ));
+            }
+            AppMsg::FlushSettings(settings) => {
+                self.settings_debounce = None;
+                let previous_settings = self.settings.clone();
                 let strategy_changed =
-                    self.settings.auto_resolve_strategy != settings.auto_resolve_strategy;
-                self.settings = settings;
+                    previous_settings.auto_resolve_strategy != settings.auto_resolve_strategy;
+                if let Err(err) = self.persist_settings(settings) {
+                    log::error!("save settings: {err}");
+                    self.show_toast(&format!("Failed to save settings: {err}"));
+                    return;
+                }
+                crate::i18n::switch_language(self.settings.language);
+                update_tray_notification_setting(self.settings.notifications_enabled);
+                let was_connected = self.process_handle.is_some();
                 self.geodata_service
                     .update(GeodataRefreshConfig::from_settings(
                         &self.paths,
                         &self.settings,
                     ));
+                self.subscriptions_page
+                    .emit(SubscriptionsMsg::SyncSettings {
+                        auto_update_enabled: self.settings.auto_update_subscriptions,
+                        auto_update_interval_secs: self.settings.subscription_update_interval_secs,
+                    });
                 self.restart_required = self.check_restart_required();
                 if was_connected && strategy_changed {
                     self.reconnect_pending = true;
@@ -619,10 +772,31 @@ impl SimpleComponent for App {
                     }
                 };
 
-                let subscriptions =
-                    persistence::load_subscriptions(&self.paths).unwrap_or_default();
-                let manual_nodes = persistence::load_manual_nodes_or_default(&self.paths);
-                let snapshot = persistence::load_latency_snapshot(&self.paths).unwrap_or_default();
+                if let Err(err) = cleanup_orphaned_backend(&self.paths) {
+                    log::warn!("failed to clean orphaned backend process: {err}");
+                }
+
+                let subscriptions = match self.store.load_subscriptions() {
+                    Ok(subscriptions) => subscriptions,
+                    Err(err) => {
+                        self.show_toast(&format!("Failed to load subscriptions: {err}"));
+                        return;
+                    }
+                };
+                let manual_nodes = match self.store.load_manual_nodes() {
+                    Ok(manual_nodes) => manual_nodes,
+                    Err(err) => {
+                        self.show_toast(&format!("Failed to load manual nodes: {err}"));
+                        return;
+                    }
+                };
+                let snapshot = match self.store.load_latency_snapshot() {
+                    Ok(snapshot) => snapshot,
+                    Err(err) => {
+                        self.show_toast(&format!("Failed to load latency data: {err}"));
+                        return;
+                    }
+                };
                 let planner = ConnectionPlanner::new(
                     self.settings.auto_resolve_strategy,
                     self.settings.last_success.clone(),
@@ -637,169 +811,55 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let rules = persistence::load_routing_rules(&self.paths).unwrap_or_default();
+                let rules = match self.store.load_routing_rules() {
+                    Ok(rules) => rules,
+                    Err(err) => {
+                        self.show_toast(&format!("Failed to load routing rules: {err}"));
+                        return;
+                    }
+                };
                 let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
 
-                self.runtime_snapshot =
-                    Some(RuntimeConfigSnapshot::new(RuntimeConfigSnapshotInput {
-                        backend_type: self.settings.backend.backend_type,
-                        binary_path: self.settings.backend.binary_path.clone(),
-                        socks_port: self.settings.socks_port,
-                        http_port: self.settings.http_port,
-                        dns: self.settings.dns.clone(),
-                        routing: rules,
-                        manual_nodes: manual_nodes.clone(),
-                        timestamp: chrono::Utc::now().timestamp(),
-                    }));
+                self.runtime_snapshot = Some(RuntimeConfigSnapshot {
+                    backend_type: self.settings.backend.backend_type,
+                    binary_path: self.settings.backend.binary_path.clone(),
+                    socks_port: self.settings.socks_port,
+                    http_port: self.settings.http_port,
+                    dns: self.settings.dns.clone(),
+                    routing: rules,
+                    manual_nodes: manual_nodes.clone(),
+                    subscriptions: subscriptions.clone(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                });
 
                 let writer = ConfigWriter::new(&self.settings, &self.paths);
-                let pid_path = self.paths.data_dir().join("backend.pid");
+                let pid_path = self.paths.pid_file_path();
                 let geodata_dir = self.paths.geodata_dir();
 
                 self.apply_state(&ProcessState::Starting);
                 self.logs_page.emit(LogsMsg::SetRunning(true));
                 self.logs_page.emit(LogsMsg::Clear);
 
-                let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::channel::<ProcessCmd>(4);
-                let input_sender = sender.input_sender().clone();
                 let settings = self.settings.clone();
-
-                tokio::spawn(async move {
-                    let mut connected_meta: Option<ConnectionMetadata> = None;
-                    let mut last_error: Option<String> = None;
-
-                    for candidate in candidates {
-                        let config_path = match writer.write_config(
-                            std::slice::from_ref(&candidate.node),
-                            &enabled_rules,
-                            &settings,
-                        ) {
-                            Ok(path) => path,
-                            Err(e) => {
-                                last_error = Some(format!("Config generation failed: {e}"));
-                                break;
-                            }
-                        };
-
-                        let node_name = candidate
-                            .node
-                            .remark()
-                            .unwrap_or(candidate.node.address())
-                            .to_string();
-                        let meta = ConnectionMetadata {
-                            node_ref: candidate.node_ref,
-                            source: candidate.source_name,
-                            source_id: match &candidate.node_ref {
-                                v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                                    subscription_id,
-                                    ..
-                                } => subscription_id.to_string(),
-                                v2ray_rs_core::models::ConnectionNodeRef::Manual { node_id } => {
-                                    node_id.to_string()
-                                }
-                            },
-                            node_name,
-                            node_address: candidate.node.address().to_string(),
-                            node_port: candidate.node.port(),
-                            backend: settings.backend.backend_type,
-                            strategy: settings.auto_resolve_strategy,
-                            latency_ms: candidate.latency_ms,
-                            connected_since: chrono::Utc::now(),
-                        };
-
-                        let mut mgr = v2ray_rs_process::ProcessManager::new(
-                            binary_path.clone(),
-                            config_path,
-                            pid_path.clone(),
-                            Some(geodata_dir.clone()),
-                        );
-
-                        match mgr.start_with_connection(Some(meta.clone())).await {
-                            Ok(()) => {
-                                input_sender.emit(AppMsg::ProcessStateConnection(
-                                    ProcessState::Running,
-                                    Some(meta.clone()),
-                                ));
-                                connected_meta = Some(meta);
-                            }
-                            Err(e) => {
-                                last_error = Some(e.to_string());
-                                mgr.shutdown().await;
-                                continue;
-                            }
-                        }
-
-                        let mut event_rx = mgr.subscribe();
-                        let log_sender = input_sender.clone();
-                        let mut log_rx = mgr.subscribe();
-                        tokio::spawn(async move {
-                            while let Ok(event) = log_rx.recv().await {
-                                if let ProcessEvent::LogLine(line) = event {
-                                    log_sender.emit(AppMsg::ProcessLogLine(line.content));
-                                }
-                            }
-                        });
-
-                        loop {
-                            tokio::select! {
-                                Some(cmd) = cmd_rx.recv() => {
-                                    match cmd {
-                                        ProcessCmd::Stop => {
-                                            mgr.shutdown().await;
-                                            input_sender.emit(AppMsg::ProcessStateConnection(
-                                                ProcessState::Stopped,
-                                                None,
-                                            ));
-                                            return;
-                                        }
-                                    }
-                                }
-                                result = event_rx.recv() => {
-                                    match result {
-                                        Ok(ProcessEvent::StateChanged { to, connection, .. }) => {
-                                            let is_error = matches!(to, ProcessState::Error(_));
-                                            input_sender.emit(AppMsg::ProcessStateConnection(to, connection));
-                                            if is_error {
-                                                break;
-                                            }
-                                        }
-                                        Ok(ProcessEvent::ProcessExited { .. }) => {
-                                            let _ = mgr.wait_and_handle_exit().await;
-                                            let state = mgr.state();
-                                            input_sender.emit(AppMsg::ProcessStateConnection(state, None));
-                                            if mgr.state() != ProcessState::Running {
-                                                break;
-                                            }
-                                        }
-                                        Ok(_) => {}
-                                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                        Err(broadcast::error::RecvError::Closed) => break,
-                                    }
-                                }
-                            }
-                        }
-
-                        if connected_meta.is_some() {
-                            break;
-                        }
-                    }
-
-                    if connected_meta.is_none() {
-                        let msg = last_error.unwrap_or_else(|| "All candidates failed".into());
-                        input_sender.emit(AppMsg::ProcessStateConnection(
-                            ProcessState::Error(msg),
-                            None,
-                        ));
-                    }
-                });
-
-                self.process_handle = Some(ProcessHandle { cmd_tx });
+                let handle = crate::connection::spawn(
+                    ConnectionRequest {
+                        binary_path,
+                        candidates,
+                        writer,
+                        pid_path,
+                        geodata_dir,
+                        settings,
+                        enabled_rules,
+                    },
+                    sender.input_sender().clone(),
+                );
+                self.process_handle = Some(handle);
             }
             AppMsg::Disconnect => {
                 self.clear_restart_flow();
                 if let Some(handle) = self.process_handle.take() {
                     self.apply_state(&ProcessState::Stopping);
-                    let _ = handle.cmd_tx.try_send(ProcessCmd::Stop);
+                    handle.stop();
                 } else {
                     self.show_toast("Not connected");
                 }
@@ -814,20 +874,26 @@ impl SimpleComponent for App {
                 if connection.is_some() {
                     self.connection_status = connection;
                     if let Some(meta) = &self.connection_status {
-                        self.settings.last_success = Some(LastSuccessMetadata {
-                            node_ref: meta.node_ref,
-                            connected_at: meta.connected_since,
+                        let node_ref = meta.node_ref;
+                        let connected_at = meta.connected_since;
+                        let mut settings = self.settings.clone();
+                        settings.last_success = Some(LastSuccessMetadata {
+                            node_ref,
+                            connected_at,
                         });
-                        if let Err(e) =
-                            v2ray_rs_core::persistence::save_settings(&self.paths, &self.settings)
-                        {
-                            log::error!("save settings: {e}");
+                        if let Err(err) = self.persist_settings(settings) {
+                            log::error!("save settings: {err}");
                         }
                     }
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
                     self.connection_status = None;
                 }
                 self.apply_state(&state);
+                if stopped && self.pending_exit {
+                    self.pending_exit = false;
+                    self.window.destroy();
+                    return;
+                }
                 if stopped && !self.reconnect_pending {
                     self.regenerate_config_disconnected();
                 }
@@ -840,12 +906,12 @@ impl SimpleComponent for App {
                 self.logs_page.emit(LogsMsg::AppendLine(line));
             }
             AppMsg::CloseRequested => {
-                if self.settings.minimize_to_tray {
+                if self.settings.minimize_to_tray && tray_available() {
                     self.window.set_visible(false);
+                } else if let Some(handle) = self.process_handle.take() {
+                    self.pending_exit = true;
+                    handle.stop();
                 } else {
-                    if let Some(handle) = self.process_handle.take() {
-                        let _ = handle.cmd_tx.try_send(ProcessCmd::Stop);
-                    }
                     self.window.destroy();
                 }
             }
@@ -855,9 +921,11 @@ impl SimpleComponent for App {
             }
             AppMsg::TrayQuit => {
                 if let Some(handle) = self.process_handle.take() {
-                    let _ = handle.cmd_tx.try_send(ProcessCmd::Stop);
+                    self.pending_exit = true;
+                    handle.stop();
+                } else {
+                    self.window.destroy();
                 }
-                self.window.destroy();
             }
             AppMsg::OpenPreferences => {
                 if let Some(dialog) = &self.preferences_dialog {
@@ -865,20 +933,19 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let paths = self.paths.clone();
                 let settings = self.settings.clone();
                 let window = self.window.clone();
                 let s = sender.input_sender().clone();
                 let s1 = s.clone();
                 let dialog = crate::preferences::show_preferences(
                     &window,
-                    &paths,
+                    &self.store,
                     &settings,
                     move |new_settings| {
                         s.emit(AppMsg::SettingsChanged(new_settings));
                     },
-                    move || {
-                        s1.emit(AppMsg::RoutingChanged);
+                    move |rules| {
+                        s1.emit(AppMsg::RoutingChanged(rules));
                     },
                 );
                 {
@@ -892,7 +959,42 @@ impl SimpleComponent for App {
             AppMsg::PreferencesClosed => {
                 self.preferences_dialog = None;
             }
-            AppMsg::RoutingChanged => {
+            AppMsg::ResetBrokenSettings => match std::fs::remove_file(self.paths.settings_path()) {
+                Ok(()) => {
+                    self.settings = AppSettings::default();
+                    self.settings_load_error = None;
+                    self.show_wizard = true;
+                    self.geodata_service
+                        .update(GeodataRefreshConfig::from_settings(
+                            &self.paths,
+                            &self.settings,
+                        ));
+                    self.subscriptions_page
+                        .emit(SubscriptionsMsg::SyncSettings {
+                            auto_update_enabled: self.settings.auto_update_subscriptions,
+                            auto_update_interval_secs: self
+                                .settings
+                                .subscription_update_interval_secs,
+                        });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    self.settings = AppSettings::default();
+                    self.settings_load_error = None;
+                    self.show_wizard = true;
+                }
+                Err(err) => {
+                    self.show_toast(&format!("Failed to reset settings: {err}"));
+                }
+            },
+            AppMsg::QuitAfterSettingsError => {
+                self.window.destroy();
+            }
+            AppMsg::RoutingChanged(rules) => {
+                if let Err(err) = self.store.save_routing_rules(&rules) {
+                    log::error!("save routing rules: {err}");
+                    self.show_toast(&format!("Failed to save routing rules: {err}"));
+                    return;
+                }
                 log::info!("Routing rules changed");
                 self.restart_required = self.check_restart_required();
                 if self.process_handle.is_none() {
@@ -903,42 +1005,13 @@ impl SimpleComponent for App {
                 self.refresh_has_active_nodes();
                 self.handle_manual_node_changed();
             }
+            AppMsg::SubscriptionsChanged => {
+                self.handle_subscription_changed();
+            }
             AppMsg::ApplyAndRestart => {
                 self.restart_required = false;
                 self.reconnect_pending = true;
                 sender.input(AppMsg::Disconnect);
-            }
-            AppMsg::DiscardChanges => {
-                self.close_preferences_dialog();
-
-                if let Some(snapshot) = self.runtime_snapshot.clone() {
-                    let mut settings = self.settings.clone();
-                    snapshot.restore_settings(&mut settings);
-
-                    if let Err(e) = persistence::save_settings(&self.paths, &settings) {
-                        log::error!("save settings: {e}");
-                    }
-
-                    if let Err(e) = persistence::save_routing_rules(&self.paths, &snapshot.routing)
-                    {
-                        log::error!("save routing: {e}");
-                    }
-
-                    let restored_manual_nodes = snapshot.restore_manual_nodes();
-                    if let Err(e) =
-                        persistence::save_manual_nodes(&self.paths, &restored_manual_nodes)
-                    {
-                        log::error!("save manual nodes: {e}");
-                    } else {
-                        self.nodes_page
-                            .emit(NodesMsg::ReplaceNodes(restored_manual_nodes));
-                    }
-
-                    self.settings = settings;
-                    self.refresh_has_active_nodes();
-                }
-
-                self.restart_required = false;
             }
             AppMsg::SwitchView(view_index) => {
                 self.current_view = view_index;
@@ -1017,28 +1090,28 @@ mod tests {
     }
 }
 
-fn setup_tray_polling(sender: relm4::Sender<AppMsg>) {
-    glib::timeout_add_local(TRAY_POLL_INTERVAL, move || {
-        if let Ok(guard) = TRAY_HANDLE.lock()
-            && let Some(ref handle) = *guard
-        {
-            while let Some(action) = handle.try_recv_action() {
-                match action {
-                    TrayAction::ShowWindow => sender.emit(AppMsg::TrayShowWindow),
-                    TrayAction::Quit => sender.emit(AppMsg::TrayQuit),
-                    TrayAction::Connect => sender.emit(AppMsg::Connect),
-                    TrayAction::Disconnect => sender.emit(AppMsg::Disconnect),
-                }
-            }
-        }
-        glib::ControlFlow::Continue
-    });
+fn tray_available() -> bool {
+    TRAY_HANDLE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.as_ref().map(|_| ()))
+        .is_some()
 }
 
-const APP_ID: &str = "com.github.v2ray-rs";
-const APP_ID_DEV: &str = "com.github.v2ray-rs.dev";
+fn update_tray_notification_setting(enabled: bool) {
+    if let Ok(mut guard) = TRAY_HANDLE.lock()
+        && let Some(handle) = guard.as_mut()
+    {
+        handle.set_notifications_enabled(enabled);
+    }
+}
 
-fn install_icon_for_compositor() {
+fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
+    let pid_file = PidFile::new(paths.pid_file_path());
+    pid_file.check_and_kill_orphaned()
+}
+
+fn install_icon_for_compositor(profile: &AppProfile) {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .or_else(|| {
@@ -1046,18 +1119,19 @@ fn install_icon_for_compositor() {
         });
 
     let Some(data_dir) = data_dir else { return };
-    let res_prefix = format!("/{}/icons/hicolor", APP_ID.replace('.', "/"));
+    let app_id = profile.app_id();
+    let res_prefix = format!("/{}/icons/hicolor", app_id.replace('.', "/"));
 
     let installed = install_resource_icon(
         &data_dir,
         &res_prefix,
         "scalable/apps",
-        &format!("{APP_ID}.svg"),
+        &format!("{app_id}.svg"),
     ) | install_resource_icon(
         &data_dir,
         &res_prefix,
         "symbolic/apps",
-        &format!("{APP_ID}-symbolic.svg"),
+        &format!("{app_id}-symbolic.svg"),
     );
 
     if installed {
@@ -1089,125 +1163,150 @@ fn install_resource_icon(
         return false;
     };
 
-    std::fs::create_dir_all(&icon_dir).is_ok() && std::fs::write(&icon_path, &svg).is_ok()
-}
-
-#[cfg(feature = "geodata-fetch")]
-fn spawn_geodata_refresh(paths: AppPaths, settings: AppSettings) {
-    if !settings.onboarding_complete && settings.backend.binary_path.is_none() {
-        return;
+    if let Err(err) = std::fs::create_dir_all(&icon_dir) {
+        log::debug!("create icon dir {icon_dir:?}: {err}");
+        return false;
     }
-
-    let interval = Duration::from_secs(settings.geodata_update_interval_secs.max(60));
-    let backend = settings.backend.backend_type;
-    let repeat = settings.auto_update_geodata;
-
-    tokio::spawn(async move {
-        run_geodata_refresh_pass(paths.clone(), backend, interval).await;
-        if !repeat {
-            return;
-        }
-
-        loop {
-            tokio::time::sleep(interval).await;
-            run_geodata_refresh_pass(paths.clone(), backend, interval).await;
-        }
-    });
-}
-
-#[cfg(not(feature = "geodata-fetch"))]
-fn spawn_geodata_refresh(_paths: AppPaths, _settings: AppSettings) {}
-
-#[cfg(feature = "geodata-fetch")]
-async fn run_geodata_refresh_pass(
-    paths: AppPaths,
-    backend: v2ray_rs_core::models::BackendType,
-    interval: Duration,
-) {
-    let result = tokio::task::spawn_blocking(move || -> Result<bool, String> {
-        let manager = GeodataManager::new(&paths);
-        match v2ray_rs_core::geodata::check_and_download(&manager, backend, interval) {
-            Ok(Some(_)) => {
-                if let Err(err) = manager.reindex(backend) {
-                    return Err(err.to_string());
-                }
-                Ok(true)
-            }
-            Ok(None) => Ok(false),
-            Err(err) => Err(err.to_string()),
-        }
-    })
-    .await;
-
-    match result {
-        Ok(Ok(true)) => log::info!("geodata refreshed for {}", backend),
-        Ok(Ok(false)) => log::debug!("geodata already up to date for {}", backend),
-        Ok(Err(err)) => log::warn!("geodata refresh failed for {}: {}", backend, err),
-        Err(join_err) => log::error!("geodata refresh task failed: {}", join_err),
+    if let Err(err) = std::fs::write(&icon_path, &svg) {
+        log::debug!("write icon {icon_path:?}: {err}");
+        return false;
     }
+    true
 }
 
 pub fn run() {
-    #[cfg(debug_assertions)]
-    let dev_mode = std::env::var_os("V2RAY_RS_DEV").is_some_and(|v| !v.is_empty());
-    #[cfg(not(debug_assertions))]
-    let dev_mode = false;
-
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls crypto provider");
-
-    let paths = if dev_mode {
-        AppPaths::new_dev()
-    } else {
-        AppPaths::new()
+    if let Err(err) = try_run() {
+        eprintln!("v2ray-rs startup failed: {err}");
+        std::process::exit(1);
     }
-    .expect("failed to determine XDG directories");
+}
 
-    let settings = v2ray_rs_core::persistence::load_settings(&paths).unwrap_or_default();
+fn try_run() -> Result<(), String> {
+    let cli_args = CliArgs::try_parse().map_err(|e: clap::error::Error| {
+        if e.use_stderr() {
+            let _ = e.print();
+            std::process::exit(e.exit_code());
+        }
+        e.to_string()
+    })?;
+
+    let profile = AppProfile::resolve(cli_args.profile.as_deref(), &StdEnv)
+        .map_err(|e| format!("invalid profile: {e}"))?;
+
+    let overrides = PathOverrides::resolve(&cli_args, &StdEnv);
+
+    let paths = AppPaths::with_overrides(profile.clone(), &overrides)
+        .map_err(|err| format!("failed to determine XDG directories: {err}"))?;
+
+    if cli_args.reset_instance {
+        reset_instance(&paths, &profile, cli_args.i_understand)
+            .map_err(|e| format!("failed to reset instance: {e}"))?;
+        println!("Instance reset successfully.");
+        return Ok(());
+    }
+
+    let _lock = InstanceLock::acquire(&paths).map_err(|e| {
+        if let v2ray_rs_core::instance::InstanceError::LockHeld { pid, profile: p } = e {
+            eprintln!("Another instance is already running (PID {pid}), profile '{p}' is locked.");
+            std::process::exit(75);
+        }
+        format!("failed to acquire instance lock: {e}")
+    })?;
+
+    let mut stamp = InstanceStamp::load_or_create(&paths)
+        .map_err(|e| format!("failed to load instance stamp: {e}"))?;
+
+    let compatibility = check_compatibility(&stamp, &profile);
+    match compatibility {
+        CompatibilityResult::Match => {
+            log::info!("Instance stamp is compatible");
+        }
+        CompatibilityResult::NeedsForwardMigration => {
+            log::warn!("Instance stamp needs forward migration (schema version {} < {}), continuing", stamp.schema_version, v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION);
+        }
+        CompatibilityResult::IncompatibleProfile => {
+            return Err(format!("Instance profile '{}' is incompatible with current profile '{}'. Reset instance with --reset-instance to continue.", stamp.profile, profile.qualifier()));
+        }
+        CompatibilityResult::IncompatibleAppId => {
+            return Err(format!("Instance app_id '{}' is incompatible with current app_id '{}'. Reset instance with --reset-instance to continue.", stamp.app_id, profile.app_id()));
+        }
+        CompatibilityResult::TooNew => {
+            return Err(format!("Instance schema version {} is newer than current {}. Downgrade the application or reset instance with --reset-instance to continue.", stamp.schema_version, v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION));
+        }
+    }
+
+    stamp.update_started(&paths)
+        .map_err(|e| format!("failed to update instance stamp: {e}"))?;
+
+    if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
+        log::debug!("rustls crypto provider already installed or unavailable: {err:?}");
+    }
+
+    let app_id = profile.app_id();
+
+    let settings = match v2ray_rs_core::persistence::load_settings(&paths) {
+        Ok(settings) => settings,
+        Err(err) => {
+            log::warn!("load settings during startup: {err}");
+            AppSettings::default()
+        }
+    };
     crate::i18n::init(settings.language);
 
-    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
     let _rt_guard = rt.enter();
-
-    spawn_geodata_refresh(paths.clone(), settings.clone());
 
     let (event_tx, event_rx) = broadcast::channel::<ProcessEvent>(EVENT_CHANNEL_CAPACITY);
     if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
         *guard = Some(event_tx);
     }
 
-    if !dev_mode {
-        let tray_handle = rt.block_on(async {
-            let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
-            v2ray_rs_tray::TrayService::spawn(event_rx, notifier)
-                .await
-                .ok()
-        });
-
-        if let Some(handle) = tray_handle
-            && let Ok(mut guard) = TRAY_HANDLE.lock()
-        {
-            *guard = Some(handle);
+    let should_install_icons = profile == AppProfile::Production || overrides.install_icons.unwrap_or(false);
+    let tray_action_rx = if should_install_icons {
+        let (tray_tx, tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayAction>();
+        let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
+        let data_dir = paths.data_dir().to_path_buf();
+        match rt.block_on(async {
+            v2ray_rs_tray::TrayService::spawn_with_data_dir(event_rx, notifier, move |action| {
+                let _ = tray_tx.send(action);
+            }, &data_dir)
+            .await
+        }) {
+            Ok(handle) => {
+                if let Ok(mut guard) = TRAY_HANDLE.lock() {
+                    *guard = Some(handle);
+                }
+                Some(tray_rx)
+            }
+            Err(err) => {
+                log::warn!("failed to start tray service: {err}");
+                None
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let resource_bytes =
         glib::Bytes::from_static(include_bytes!(concat!(env!("OUT_DIR"), "/icons.gresource")));
-    let resource =
-        gtk::gio::Resource::from_data(&resource_bytes).expect("failed to load icon resource");
+    let resource = gtk::gio::Resource::from_data(&resource_bytes)
+        .map_err(|err| format!("failed to load icon resource: {err}"))?;
     gtk::gio::resources_register(&resource);
 
-    let app_id = if dev_mode { APP_ID_DEV } else { APP_ID };
-    let app = adw::Application::builder().application_id(app_id).build();
+    let app = adw::Application::builder().application_id(&app_id).build();
 
+    let app_id_clone = app_id.clone();
+    let profile_clone = profile.clone();
     app.connect_startup(move |_| {
         if let Some(display) = gtk::gdk::Display::default() {
             let theme = gtk::IconTheme::for_display(&display);
             theme.add_resource_path("/com/github/v2ray-rs/icons");
         }
-        install_icon_for_compositor();
-        gtk::Window::set_default_icon_name(APP_ID);
+        if should_install_icons {
+            install_icon_for_compositor(&profile_clone);
+        }
+        gtk::Window::set_default_icon_name(&app_id_clone);
     });
 
     app.connect_activate(|app| {
@@ -1218,7 +1317,10 @@ pub fn run() {
     });
 
     let relm_app = RelmApp::from_app(app);
-    relm_app.run::<App>(paths);
+    relm_app.run::<App>(AppInit {
+        paths,
+        tray_action_rx,
+    });
 
     if let Ok(mut guard) = TRAY_HANDLE.lock()
         && let Some(handle) = guard.take()
@@ -1228,4 +1330,6 @@ pub fn run() {
     if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
         guard.take();
     }
+
+    Ok(())
 }

@@ -5,15 +5,11 @@
 ## ADDED Requirements
 
 ### Requirement: Global auto-resolve strategy setting
-The system SHALL allow users to select a global auto-resolve strategy that controls how enabled nodes are ordered for connection attempts.
+The current supported strategies SHALL be list order, lowest latency, random, and last successful.
 
-#### Scenario: Default strategy
-- **WHEN** the user has not changed the auto-resolve strategy
-- **THEN** the system SHALL default to list order selection
-
-#### Scenario: Change strategy
-- **WHEN** the user selects a different auto-resolve strategy
-- **THEN** the system SHALL persist the selection and use it for subsequent connections
+#### Scenario: Legacy geo-aware setting
+- **WHEN** persisted settings still contain `geo-aware`
+- **THEN** the app SHALL migrate that value to `last-successful` on load
 
 ### Requirement: Build ordered connection candidates
 The system SHALL build an ordered list of connection candidates from enabled subscription nodes and enabled manual nodes according to the selected strategy.
@@ -34,10 +30,6 @@ The system SHALL build an ordered list of connection candidates from enabled sub
 - **WHEN** the strategy is set to last successful
 - **THEN** the last successful node (if available and enabled) SHALL be first, followed by remaining candidates in list order
 
-#### Scenario: Geo-aware
-- **WHEN** the strategy is set to geo-aware
-- **THEN** candidates SHALL be ordered by geo preference rules with unspecified geo data falling back to list order
-
 #### Scenario: Manual node included in candidate list
 - **WHEN** a manual node is enabled
 - **THEN** it appears in the candidate list alongside enabled subscription nodes
@@ -45,6 +37,10 @@ The system SHALL build an ordered list of connection candidates from enabled sub
 #### Scenario: Last successful manual node remains stable
 - **WHEN** the last successful candidate was a manual node and another manual node is inserted or deleted
 - **THEN** the stored last-success reference still points to the same manual node by ID
+
+#### Scenario: Last successful subscription node remains stable
+- **WHEN** the last successful candidate was a subscription node and subscriptions are reordered or refreshed
+- **THEN** the stored last-success reference still points to the same subscription node by stable node ID
 
 ### Requirement: Sequential connection attempts
 The system SHALL attempt to connect using candidates in order until one succeeds or all fail.

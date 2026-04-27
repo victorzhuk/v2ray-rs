@@ -16,7 +16,7 @@ impl GeodataRefreshConfig {
         Self {
             paths: paths.clone(),
             backend_type: settings.backend.backend_type,
-            enabled: settings.auto_update_geodata,
+            enabled: settings.auto_update_geodata && settings.backend.binary_path.is_some(),
             interval_secs: settings.geodata_update_interval_secs.max(60),
         }
     }

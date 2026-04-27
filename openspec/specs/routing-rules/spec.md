@@ -49,14 +49,15 @@ The system SHALL validate routing rules and provide feedback on errors.
 - **THEN** the system SHALL reject the rule with an error message
 
 ### Requirement: Predefined rule templates
-The system SHALL offer predefined routing rule presets that users can apply with one action.
+The system SHALL support both built-in presets and user-defined custom presets.
 
-#### Scenario: Apply RU Bypass preset
-- **WHEN** the user applies the "RU Bypass" preset
-- **THEN** the system SHALL add a set of rules covering GeoIP:RU, private CIDRs, and Russian GeoSite categories (media, retail, gov, mail, etc.), all with direct action. Rules carry the preset name in their `group` field.
+#### Scenario: Save a custom preset
+- **WHEN** the user saves the current routing rules as a named preset
+- **THEN** the preset SHALL be persisted and available for later application
 
-#### Available presets
-Built-in presets: "RU Bypass", "CN Direct", "Proxy Popular", "Block Ads".
+#### Scenario: Delete a custom preset
+- **WHEN** the user deletes a saved custom preset
+- **THEN** it SHALL be removed from persisted storage without affecting built-in presets
 
 ### Requirement: GeoData autocomplete in rule input
 The rule editor SHALL provide autocomplete for both GeoIP and GeoSite values using the current backend's geodata index.

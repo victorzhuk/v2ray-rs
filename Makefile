@@ -8,7 +8,6 @@
 CARGO := cargo
 CARGO_FLAGS ?=
 RUSTFLAGS ?=
-CARGO_TARGET_DIR ?=
 
 # Colors for output
 BLUE := \033[34m
@@ -83,7 +82,7 @@ check-all:
 
 clippy:
 	@printf "$(BLUE)Running clippy...$(RESET)\n"
-	$(CARGO) clippy --all-features -- -D warnings $(CARGO_FLAGS)
+	$(CARGO) clippy --workspace --all-targets --all-features $(CARGO_FLAGS) -- -D warnings
 
 fmt:
 	@printf "$(BLUE)Checking formatting...$(RESET)\n"
@@ -101,7 +100,7 @@ fmt-fix:
 
 test:
 	@printf "$(BLUE)Running all tests...$(RESET)\n"
-	$(CARGO) test --workspace $(CARGO_FLAGS)
+	$(CARGO) test --workspace --all-targets $(CARGO_FLAGS)
 
 test-core:
 	@printf "$(BLUE)Testing core crate...$(RESET)\n"
@@ -178,7 +177,7 @@ fix:
 	@printf "$(GREEN)Auto-fixing code issues...$(RESET)\n"
 	$(CARGO) fix --allow-staged --allow-dirty $(CARGO_FLAGS)
 	$(CARGO) fmt
-	$(CARGO) clippy --all-features --fix --allow-staged --allow-dirty -- -D warnings $(CARGO_FLAGS)
+	$(CARGO) clippy --all-features --fix --allow-staged --allow-dirty $(CARGO_FLAGS) -- -D warnings
 
 # =============================================================================
 # Release Target
@@ -249,4 +248,3 @@ help:
 	@printf "$(YELLOW)Environment Variables:$(RESET)\n"
 	@echo "  CARGO_FLAGS         Additional flags for cargo"
 	@echo "  RUSTFLAGS           Additional flags for rustc"
-	@echo "  CARGO_TARGET_DIR    Override target directory"

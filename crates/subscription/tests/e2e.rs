@@ -6,14 +6,15 @@ use v2ray_rs_core::persistence::{
     AppPaths, add_subscription, get_subscription, load_subscriptions, remove_subscription,
     update_subscription,
 };
-use v2ray_rs_subscription::fetch::{decode_subscription_content, fetch_from_file};
-use v2ray_rs_subscription::parser::parse_subscription_uris;
-use v2ray_rs_subscription::update::reconcile_with_counts;
+use v2ray_rs_core::profile::AppProfile;
+use v2ray_rs_subscription::{
+    decode_subscription_content, fetch_from_file, parse_subscription_uris, reconcile_with_counts,
+};
 
 #[test]
 fn test_subscription_full_lifecycle() {
     let tmp = TempDir::new().unwrap();
-    let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+    let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
 
     let vmess_json = r#"{"add":"vmess.test.com","port":"443","id":"test-uuid","ps":"VMess Node"}"#;
     let vmess_uri = format!("vmess://{}", STANDARD.encode(vmess_json));

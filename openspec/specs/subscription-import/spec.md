@@ -1,26 +1,22 @@
 ## ADDED Requirements
 
 ### Requirement: Import subscription from URL
-The system SHALL fetch subscription content from a user-provided URL via HTTP(S), decode it, and parse it into proxy nodes.
+The system SHALL report partial parse failures while still importing valid nodes, and it SHALL avoid persisting a new subscription when no valid nodes are produced.
 
-#### Scenario: Base64-encoded subscription
-- **WHEN** the user provides a URL that returns a base64-encoded list of proxy URIs (one per line after decoding)
-- **THEN** the system SHALL decode the response, split by newline, and parse each URI into a proxy node
+#### Scenario: Partial success import
+- **WHEN** the source contains valid proxy URIs and invalid URIs together
+- **THEN** the system SHALL import the valid nodes, persist the subscription, and surface which entries were skipped
 
-#### Scenario: Network error
-- **WHEN** the subscription URL is unreachable or returns a non-200 status
-- **THEN** the system SHALL report a clear error to the user without crashing
-
-#### Scenario: Invalid content
-- **WHEN** the subscription URL returns content that cannot be parsed as proxy URIs
-- **THEN** the system SHALL report which URIs failed parsing and still import any valid ones
+#### Scenario: No valid nodes
+- **WHEN** a new import source yields zero valid proxy nodes
+- **THEN** the system SHALL report the failure and SHALL NOT persist an empty subscription
 
 ### Requirement: Import subscription from file
-The system SHALL import subscription data from a local file in the same formats as URL-based import.
+The system SHALL allow file-based imports from onboarding and the main subscriptions page.
 
-#### Scenario: Valid file import
-- **WHEN** the user selects a local file containing base64-encoded proxy URIs
-- **THEN** the system SHALL parse it identically to a URL response
+#### Scenario: File path entered during onboarding
+- **WHEN** the user provides a local subscription file path during onboarding
+- **THEN** the onboarding flow SHALL create a file-backed subscription source instead of requiring a URL
 
 ### Requirement: Parse VLESS URI
 The system SHALL parse `vless://` URIs into VLESS proxy node configurations.

@@ -11,7 +11,7 @@ use crate::models::BackendType;
 pub enum ConnectionNodeRef {
     Subscription {
         subscription_id: Uuid,
-        node_index: usize,
+        node_id: Uuid,
     },
     Manual {
         node_id: Uuid,

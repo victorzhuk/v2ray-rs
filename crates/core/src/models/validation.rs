@@ -86,7 +86,7 @@ pub fn validate_rule_match(m: &RuleMatch) -> Result<(), ValidationError> {
         RuleMatch::GeoIp { country_code } => validate_country_code(country_code),
         RuleMatch::GeoSite { category } => validate_geosite_category(category),
         RuleMatch::Domain { pattern } => validate_domain_pattern(pattern),
-        RuleMatch::IpCidr { cidr } => validate_ip_cidr(&cidr.to_string()),
+        RuleMatch::IpCidr { .. } => Ok(()),
     }
 }
 

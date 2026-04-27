@@ -6,7 +6,7 @@
 
 **A modern Linux desktop GUI for v2ray/xray/sing-box proxy management**
 
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/rust-1.93.1-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/victorzhuk/v2ray-rs/ci.yml)](https://github.com/victorzhuk/v2ray-rs/actions)
 
@@ -21,7 +21,7 @@
 - **Routing rules**: GeoIP, GeoSite, domain patterns, IP CIDR with proxy/direct/block actions
 - **Process management**: Async lifecycle with crash recovery, graceful shutdown, log capture
 - **GTK4/libadwaita UI**: Native Linux desktop experience with system tray integration
-- **XDG compliant**: Config in `~/.config/v2ray-rs/`, data in `~/.local/share/v2ray-rs/`
+- **XDG compliant**: Full XDG Base Directory layout with runtime profiles and per-directory overrides
 
 ---
 
@@ -56,7 +56,7 @@ You also need at least one proxy backend installed: `v2ray`, `xray`, or `sing-bo
 
 1. Launch the app (or `cargo run -p v2ray-rs-ui` from source)
 2. The onboarding wizard detects installed backends and guides initial setup
-3. Add a subscription URL — nodes are fetched and parsed automatically
+3. Add a subscription URL or local subscription file — nodes are fetched and parsed automatically
 4. Enable desired nodes, configure routing rules, click **Connect**
 
 ### Configuration
@@ -64,17 +64,58 @@ You also need at least one proxy backend installed: `v2ray`, `xray`, or `sing-bo
 Settings are stored in `~/.config/v2ray-rs/settings.toml`:
 
 ```toml
+version = 1
+socks_port = 1080
+http_port = 1081
+auto_resolve_strategy = "last-successful"
+auto_update_subscriptions = true
+subscription_update_interval_secs = 86400
+auto_update_geodata = true
+geodata_update_interval_secs = 604800
+language = "english"
+minimize_to_tray = true
+notifications_enabled = true
+onboarding_complete = true
+
 [backend]
-type = "xray"
+backend_type = "xray"
 binary_path = "/usr/bin/xray"
 
-[proxy]
-http_port = 10809
-socks_port = 10808
+[dns]
+enabled = false
+```
 
-[ui]
-language = "en"
-minimize_to_tray = true
+### Runtime Profiles
+
+The app supports isolated storage profiles so development, test, and production builds never share data:
+
+| Profile | Qualifier | App ID | Default |
+|---------|-----------|--------|---------|
+| `production` | `v2ray-rs` | `com.github.v2ray-rs` | Release builds |
+| `development` | `v2ray-rs-dev` | `com.github.v2ray-rs.dev` | Debug builds |
+| `test` | `v2ray-rs-test` | `com.github.v2ray-rs.test` | — |
+| `custom:<name>` | `v2ray-rs-<name>` | `com.github.v2ray-rs.<name>` | — |
+
+Resolution order: `--profile` flag > `V2RAY_RS_PROFILE` env > `V2RAY_RS_DEV` env (deprecated) > compile-time default.
+
+Per-directory overrides:
+
+```bash
+v2ray-rs --data-dir /tmp/scratch/data --cache-dir /tmp/scratch/cache
+```
+
+CLI flags and matching env vars: `--config-dir` (`V2RAY_RS_CONFIG_DIR`), `--data-dir`, `--cache-dir`, `--runtime-dir`, `--state-dir`.
+
+To wipe a non-production profile and start fresh:
+
+```bash
+v2ray-rs --profile development --reset-instance
+```
+
+Production profiles require explicit confirmation:
+
+```bash
+v2ray-rs --profile production --reset-instance --i-understand
 ```
 
 ---
@@ -82,10 +123,10 @@ minimize_to_tray = true
 ## Building & Testing
 
 ```bash
-cargo check --workspace       # type-check
+cargo check --workspace --all-targets       # type-check
 cargo build --release         # release build
-cargo test --workspace        # all tests
-cargo clippy --workspace      # lint
+cargo test --workspace --all-targets        # all tests
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo fmt --all               # format
 ```
 

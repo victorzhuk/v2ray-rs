@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use thiserror::Error;
 use v2ray_rs_core::models::{
-    GrpcSettings, H2Settings, ProxyNode, TlsSettings, TransportSettings, WsSettings,
+    GrpcSettings, H2Settings, ProxyNode, TlsSettings, TransportSettings, VmessConfig, WsSettings,
 };
 
 #[derive(Debug, Error)]
@@ -129,9 +129,8 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
 fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
-    use v2ray_rs_core::models::{
-        GrpcSettings, H2Settings, TlsSettings, TransportSettings, VmessConfig, WsSettings,
-    };
+
+    const MAX_VMESS_PAYLOAD: usize = 64 * 1024; // 64 KB
 
     let encoded = uri
         .strip_prefix("vmess://")
@@ -140,6 +139,14 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     let decoded = STANDARD
         .decode(encoded.trim())
         .map_err(|e| ParseError::InvalidFormat(format!("base64 decode failed: {e}")))?;
+
+    if decoded.len() > MAX_VMESS_PAYLOAD {
+        return Err(ParseError::InvalidFormat(format!(
+            "vmess payload too large: {} bytes",
+            decoded.len()
+        )));
+    }
+
     let json: serde_json::Value = serde_json::from_slice(&decoded)
         .map_err(|e| ParseError::InvalidFormat(format!("invalid JSON: {e}")))?;
 
@@ -238,12 +245,15 @@ fn parse_ss(uri: &str) -> Result<ProxyNode, ParseError> {
     let (host_port, fragment) = host_part.split_once('#').unzip();
     let host_port = host_port.unwrap_or(host_part);
 
-    let (address, port_str) = host_port
-        .rsplit_once(':')
-        .ok_or_else(|| ParseError::InvalidFormat("missing host:port".into()))?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| ParseError::InvalidFormat("invalid port".into()))?;
+    let parsed = url::Url::parse(&format!("ss://{host_port}"))
+        .map_err(|e| ParseError::InvalidFormat(format!("invalid host:port: {e}")))?;
+    let address = parsed
+        .host_str()
+        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
+        .to_owned();
+    let port = parsed
+        .port()
+        .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
 
     let remark = percent_decode_fragment(fragment);
 
@@ -315,11 +325,12 @@ pub fn parse_subscription_uris(uris: &[String]) -> ImportResult {
     for uri in uris {
         match parse_uri(uri) {
             Ok(proxy_node) => {
-                nodes.push(v2ray_rs_core::models::SubscriptionNode {
-                    node: proxy_node,
-                    enabled: true,
-                    last_latency_ms: None,
-                });
+                if let Err(e) = proxy_node.validate() {
+                    log::warn!("skipping invalid node: {e}");
+                    errors.push((uri.clone(), ParseError::InvalidFormat(e.to_string())));
+                } else {
+                    nodes.push(v2ray_rs_core::models::SubscriptionNode::new(proxy_node));
+                }
             }
             Err(e) => {
                 errors.push((uri.clone(), e));
@@ -332,10 +343,10 @@ pub fn parse_subscription_uris(uris: &[String]) -> ImportResult {
 
 fn percent_decode_fragment(fragment: Option<&str>) -> Option<String> {
     fragment.map(|f| {
-        url::form_urlencoded::parse(f.as_bytes())
-            .next()
-            .map(|(k, _)| k.into_owned())
-            .unwrap_or_else(|| f.to_owned())
+        percent_encoding::percent_decode_str(f)
+            .decode_utf8()
+            .map(|s| s.into_owned())
+            .unwrap_or_else(|_| f.to_owned())
     })
 }
 

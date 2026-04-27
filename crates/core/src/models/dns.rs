@@ -1,6 +1,8 @@
+use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use ipnet::IpNet;
+
+use super::settings::BackendType;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -58,6 +60,20 @@ impl DnsProtocol {
                 }
             }
         }
+    }
+
+    pub fn fallback_protocol_for_backend(self, backend: BackendType) -> Option<Self> {
+        match (backend, self) {
+            (BackendType::V2ray, DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3) => {
+                Some(DnsProtocol::Doh)
+            }
+            (BackendType::Xray, DnsProtocol::H3) => Some(DnsProtocol::Doh),
+            _ => None,
+        }
+    }
+
+    pub fn effective_for_backend(self, backend: BackendType) -> Self {
+        self.fallback_protocol_for_backend(backend).unwrap_or(self)
     }
 }
 
@@ -488,6 +504,38 @@ mod tests {
     fn test_dns_protocol_h3_custom_port() {
         let addr = DnsProtocol::H3.server_address("dns.google", Some(1443));
         assert_eq!(addr, "h3://dns.google:1443/dns-query");
+    }
+
+    #[test]
+    fn test_dns_protocol_v2ray_fallbacks() {
+        assert_eq!(
+            DnsProtocol::Dot.effective_for_backend(BackendType::V2ray),
+            DnsProtocol::Doh
+        );
+        assert_eq!(
+            DnsProtocol::Doq.effective_for_backend(BackendType::V2ray),
+            DnsProtocol::Doh
+        );
+        assert_eq!(
+            DnsProtocol::H3.effective_for_backend(BackendType::V2ray),
+            DnsProtocol::Doh
+        );
+    }
+
+    #[test]
+    fn test_dns_protocol_xray_only_falls_back_h3() {
+        assert_eq!(
+            DnsProtocol::Dot.effective_for_backend(BackendType::Xray),
+            DnsProtocol::Dot
+        );
+        assert_eq!(
+            DnsProtocol::Doq.effective_for_backend(BackendType::Xray),
+            DnsProtocol::Doq
+        );
+        assert_eq!(
+            DnsProtocol::H3.effective_for_backend(BackendType::Xray),
+            DnsProtocol::Doh
+        );
     }
 
     #[test]

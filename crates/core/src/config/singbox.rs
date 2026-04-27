@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -22,26 +21,21 @@ impl ConfigGenerator for SingboxGenerator {
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
-        geodata_dir: Option<&Path>,
     ) -> Result<Value, ConfigError> {
         if nodes.is_empty() {
             return Err(ConfigError::NoNodes);
         }
-        Ok(assemble(nodes, rules, settings, geodata_dir))
+        Ok(assemble(nodes, rules, settings))
     }
 }
 
-fn assemble(
-    nodes: &[ProxyNode],
-    rules: &[RoutingRule],
-    settings: &AppSettings,
-    geodata_dir: Option<&Path>,
-) -> Value {
+fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) -> Value {
+    let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let mut config = json!({
         "log": { "level": "warn" },
         "inbounds": build_inbounds(settings),
         "outbounds": build_outbounds(nodes),
-        "route": build_route(rules, geodata_dir),
+        "route": build_route(rules, &first_proxy_tag),
     });
 
     if settings.dns.enabled {
@@ -52,12 +46,20 @@ fn assemble(
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
-    json!([{
-        "type": "mixed",
-        "tag": "mixed-in",
-        "listen": "127.0.0.1",
-        "listen_port": settings.socks_port,
-    }])
+    json!([
+        {
+            "type": "mixed",
+            "tag": "mixed-in",
+            "listen": "127.0.0.1",
+            "listen_port": settings.socks_port,
+        },
+        {
+            "type": "http",
+            "tag": "http-in",
+            "listen": "127.0.0.1",
+            "listen_port": settings.http_port,
+        }
+    ])
 }
 
 fn build_outbounds(nodes: &[ProxyNode]) -> Value {
@@ -170,11 +172,12 @@ fn build_ws_transport(ws: &WsSettings) -> Value {
         "type": "ws",
         "path": ws.path,
     });
+    let mut headers = ws.headers.clone();
     if let Some(host) = &ws.host {
-        transport["headers"] = json!({ "Host": host });
+        headers.entry("Host".to_string()).or_insert_with(|| host.clone());
     }
-    if !ws.headers.is_empty() {
-        transport["headers"] = json!(ws.headers);
+    if !headers.is_empty() {
+        transport["headers"] = json!(headers);
     }
     transport
 }
@@ -232,7 +235,6 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
 fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     let mut dns_config = json!({});
 
-    // Task 3.3: Strategy mapping
     let strategy_str = match settings.dns.strategy {
         DnsStrategy::PreferIpv4 => "prefer_ipv4",
         DnsStrategy::PreferIpv6 => "prefer_ipv6",
@@ -241,10 +243,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     };
     dns_config["strategy"] = json!(strategy_str);
 
-    // Task 3.1: Typed server objects from DnsServerConfig
     let mut servers: Vec<Value> = Vec::new();
 
-    // Add hosts server if hosts are configured (Task 3.5)
     if !settings.dns.hosts.is_empty() {
         let mut entries = serde_json::Map::new();
         for host in &settings.dns.hosts {
@@ -262,7 +262,6 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         }));
     }
 
-    // Add real DNS servers
     for server_cfg in &settings.dns.servers {
         let port = server_cfg
             .port
@@ -308,12 +307,10 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
             }),
         };
 
-        // Add detour if configured
         if let Some(ref detour) = server_cfg.detour {
             server["detour"] = json!(detour);
         }
 
-        // Task 3.6: Add client_subnet if configured
         if let Some(ref client_subnet) = settings.dns.client_subnet {
             server["client_subnet"] = json!(client_subnet);
         }
@@ -321,7 +318,6 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         servers.push(server);
     }
 
-    // Task 3.4: FakeIP server and config section
     let mut final_server = None;
     if settings.dns.fakeip.enabled {
         servers.push(json!({
@@ -338,22 +334,13 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         final_server = Some("fakeip".to_string());
     }
 
-    // Set final to first real server if not set by FakeIP
-    let final_server = final_server.or_else(|| {
-        settings
-            .dns
-            .servers
-            .first()
-            .map(|s| s.tag.clone())
-            .or_else(|| Some("domestic".to_string()))
-    });
+    let final_server = final_server
+        .or_else(|| settings.dns.servers.first().map(|s| s.tag.clone()));
     dns_config["final"] = json!(final_server);
 
     dns_config["servers"] = json!(servers);
 
-    // Task 3.2: DNS rules generation
     let dns_rules = if settings.dns.use_custom_rules {
-        // Use custom DNS rules
         settings
             .dns
             .rules
@@ -370,7 +357,6 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
             })
             .collect()
     } else {
-        // Auto-derive from routing rules (existing behavior)
         let mut remote_geosite: Vec<String> = Vec::new();
         let mut domestic_geosite: Vec<String> = Vec::new();
         let mut remote_domains: Vec<String> = Vec::new();
@@ -414,7 +400,6 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
 
     dns_config["rules"] = json!(dns_rules);
 
-    // Task 3.6: disable_cache
     if settings.dns.disable_cache {
         dns_config["disable_cache"] = json!(true);
     }
@@ -422,7 +407,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     dns_config
 }
 
-fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
+fn build_route(rules: &[RoutingRule], first_proxy_tag: &str) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
     if enabled.is_empty() {
@@ -465,7 +450,10 @@ fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
         }));
     }
 
-    let route_rules: Vec<Value> = enabled.iter().map(|r| build_route_rule(r)).collect();
+    let route_rules: Vec<Value> = enabled
+        .iter()
+        .map(|r| build_route_rule(r, first_proxy_tag))
+        .collect();
 
     if rule_sets.is_empty() {
         json!({ "rules": route_rules })
@@ -477,9 +465,9 @@ fn build_route(rules: &[RoutingRule], _geodata_dir: Option<&Path>) -> Value {
     }
 }
 
-fn build_route_rule(rule: &RoutingRule) -> Value {
+fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
     let outbound = match rule.action {
-        RuleAction::Proxy => "proxy-0",
+        RuleAction::Proxy => first_proxy_tag,
         RuleAction::Direct => "direct",
         RuleAction::Block => "block",
     };
@@ -513,18 +501,14 @@ mod tests {
     #[test]
     fn test_singbox_error_on_empty() {
         let generator = SingboxGenerator;
-        assert!(
-            generator
-                .generate(&[], &[], &default_settings(), None)
-                .is_err()
-        );
+        assert!(generator.generate(&[], &[], &default_settings()).is_err());
     }
 
     #[test]
     fn test_singbox_basic_structure() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[ss_node()], &[], &default_settings(), None)
+            .generate(&[ss_node()], &[], &default_settings())
             .unwrap();
 
         assert!(config["log"].is_object());
@@ -537,20 +521,22 @@ mod tests {
     fn test_singbox_mixed_inbound() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[ss_node()], &[], &default_settings(), None)
+            .generate(&[ss_node()], &[], &default_settings())
             .unwrap();
 
         let inbounds = config["inbounds"].as_array().unwrap();
-        assert_eq!(inbounds.len(), 1);
+        assert_eq!(inbounds.len(), 2);
         assert_eq!(inbounds[0]["type"], "mixed");
         assert_eq!(inbounds[0]["listen_port"], 1080);
+        assert_eq!(inbounds[1]["type"], "http");
+        assert_eq!(inbounds[1]["listen_port"], 1081);
     }
 
     #[test]
     fn test_singbox_ss_outbound() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[ss_node()], &[], &default_settings(), None)
+            .generate(&[ss_node()], &[], &default_settings())
             .unwrap();
 
         let out = &config["outbounds"][0];
@@ -563,7 +549,7 @@ mod tests {
     fn test_singbox_vless_with_ws_tls() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[vless_node()], &[], &default_settings(), None)
+            .generate(&[vless_node()], &[], &default_settings())
             .unwrap();
 
         let out = &config["outbounds"][0];
@@ -578,7 +564,7 @@ mod tests {
     fn test_singbox_trojan_outbound() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[trojan_node()], &[], &default_settings(), None)
+            .generate(&[trojan_node()], &[], &default_settings())
             .unwrap();
 
         let out = &config["outbounds"][0];
@@ -591,7 +577,7 @@ mod tests {
     fn test_singbox_direct_block_outbounds() {
         let generator = SingboxGenerator;
         let config = generator
-            .generate(&[ss_node()], &[], &default_settings(), None)
+            .generate(&[ss_node()], &[], &default_settings())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
@@ -617,7 +603,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[ss_node()], &rules, &default_settings(), None)
+            .generate(&[ss_node()], &rules, &default_settings())
             .unwrap();
 
         let route_rules = config["route"]["rules"].as_array().unwrap();
@@ -653,7 +639,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[ss_node()], &rules, &default_settings(), None)
+            .generate(&[ss_node()], &rules, &default_settings())
             .unwrap();
 
         let route_rules = config["route"]["rules"].as_array().unwrap();
@@ -665,11 +651,10 @@ mod tests {
         let generator = SingboxGenerator;
         let nodes = vec![vless_node(), ss_node(), trojan_node()];
         let config = generator
-            .generate(&nodes, &[], &default_settings(), None)
+            .generate(&nodes, &[], &default_settings())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
-        // 3 proxy + direct + block = 5
         assert_eq!(outbounds.len(), 5);
     }
 
@@ -698,14 +683,12 @@ mod tests {
         ];
 
         let config = generator
-            .generate(&[ss_node()], &rules, &default_settings(), None)
+            .generate(&[ss_node()], &rules, &default_settings())
             .unwrap();
 
         let route_rules = config["route"]["rules"].as_array().unwrap();
         assert_eq!(route_rules.len(), 1);
     }
-
-    // Task 3.7: Integration tests for DNS config
 
     #[test]
     fn test_dns_udp_server() {
@@ -720,9 +703,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let udp_server = servers.iter().find(|s| s["tag"] == "dns-udp").unwrap();
@@ -744,9 +725,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let tcp_server = servers.iter().find(|s| s["tag"] == "dns-tcp").unwrap();
@@ -768,9 +747,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let doh_server = servers.iter().find(|s| s["tag"] == "dns-doh").unwrap();
@@ -793,9 +770,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let dot_server = servers.iter().find(|s| s["tag"] == "dns-dot").unwrap();
@@ -817,9 +792,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let doq_server = servers.iter().find(|s| s["tag"] == "dns-doq").unwrap();
@@ -841,9 +814,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let h3_server = servers.iter().find(|s| s["tag"] == "dns-h3").unwrap();
@@ -867,9 +838,7 @@ mod tests {
             settings.dns.strategy = strategy;
 
             let generator = SingboxGenerator;
-            let config = generator
-                .generate(&[ss_node()], &[], &settings, None)
-                .unwrap();
+            let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
             assert_eq!(config["dns"]["strategy"], expected_str);
         }
@@ -886,21 +855,16 @@ mod tests {
         };
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
-        // Check fakeip config section
         assert_eq!(config["dns"]["fakeip"]["enabled"], true);
         assert_eq!(config["dns"]["fakeip"]["inet4_range"], "198.18.0.0/16");
         assert_eq!(config["dns"]["fakeip"]["inet6_range"], "fc00::/16");
 
-        // Check fakeip server is added
         let servers = config["dns"]["servers"].as_array().unwrap();
         let fakeip_server = servers.iter().find(|s| s["tag"] == "fakeip").unwrap();
         assert_eq!(fakeip_server["type"], "fakeip");
 
-        // Check final server is set to fakeip
         assert_eq!(config["dns"]["final"], "fakeip");
     }
 
@@ -920,9 +884,7 @@ mod tests {
         ];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let hosts_server = servers.iter().find(|s| s["tag"] == "hosts").unwrap();
@@ -953,9 +915,7 @@ mod tests {
         ];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let rules = config["dns"]["rules"].as_array().unwrap();
         assert_eq!(rules.len(), 2);
@@ -974,9 +934,7 @@ mod tests {
         settings.dns.disable_cache = true;
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         assert_eq!(config["dns"]["disable_cache"], true);
     }
@@ -988,11 +946,8 @@ mod tests {
         settings.dns.client_subnet = Some("203.0.113.1".to_string());
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
-        // Check that all servers have client_subnet
         let servers = config["dns"]["servers"].as_array().unwrap();
         for server in servers {
             if server["type"] != "hosts" && server["type"] != "fakeip" {
@@ -1014,9 +969,7 @@ mod tests {
         }];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let proxy_dns = servers.iter().find(|s| s["tag"] == "proxy-dns").unwrap();
@@ -1060,9 +1013,7 @@ mod tests {
         settings.dns.use_custom_rules = false;
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &rules, &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &rules, &settings).unwrap();
 
         let dns_rules = config["dns"]["rules"].as_array().unwrap();
         assert!(!dns_rules.is_empty());
@@ -1123,23 +1074,17 @@ mod tests {
         ];
 
         let generator = SingboxGenerator;
-        let config = generator
-            .generate(&[ss_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
-        // Verify DNS config is present
         assert!(config.get("dns").is_some());
         let dns = &config["dns"];
 
-        // Verify all fields are present
         assert_eq!(dns["strategy"], "ipv6_only");
         assert_eq!(dns["disable_cache"], true);
 
-        // Verify servers including hosts and fakeip
         let servers = dns["servers"].as_array().unwrap();
-        assert!(servers.len() >= 3); // 2 real servers + 1 hosts server + 1 fakeip server
+        assert!(servers.len() >= 3);
 
-        // Verify hosts server
         let hosts_server = servers
             .iter()
             .find(|s| s["tag"] == "hosts")
@@ -1148,7 +1093,6 @@ mod tests {
         assert_eq!(hosts_server["entries"]["example.com"], json!(["192.0.2.1"]));
         assert_eq!(hosts_server["entries"]["test.local"], json!(["10.0.0.1"]));
 
-        // Verify fakeip server and config
         let fakeip_server = servers
             .iter()
             .find(|s| s["tag"] == "fakeip")
@@ -1160,7 +1104,6 @@ mod tests {
         assert_eq!(dns["fakeip"]["inet6_range"], "fc00::/16");
         assert_eq!(dns["final"], "fakeip");
 
-        // Verify client_subnet is set on servers
         let cloudflare = servers
             .iter()
             .find(|s| s["tag"] == "cloudflare")
@@ -1173,11 +1116,9 @@ mod tests {
             .expect("google server not found");
         assert_eq!(google["client_subnet"], "203.0.113.1");
 
-        // Verify DNS rules
         let dns_rules = dns["rules"].as_array().unwrap();
         assert_eq!(dns_rules.len(), 2);
 
-        // Verify JSON roundtrip
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
     }

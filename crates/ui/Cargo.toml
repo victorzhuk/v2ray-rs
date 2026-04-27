@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-v2ray-rs-core = { path = "../core" }
-v2ray-rs-process = { path = "../process" }
-v2ray-rs-subscription = { path = "../subscription" }
-v2ray-rs-tray = { path = "../tray" }
+v2ray-rs-core.workspace = true
+v2ray-rs-process.workspace = true
+v2ray-rs-subscription.workspace = true
+v2ray-rs-tray.workspace = true
 relm4.workspace = true
 tokio.workspace = true
 log.workspace = true
@@ -16,6 +16,7 @@ chrono.workspace = true
 gettext-rs.workspace = true
 ipnet.workspace = true
 rustls.workspace = true
+clap.workspace = true
 
 [features]
 default = ["geodata-fetch"]

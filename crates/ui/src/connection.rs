@@ -1,0 +1,184 @@
+use std::path::PathBuf;
+
+use tokio::sync::{broadcast, mpsc};
+use v2ray_rs_core::config::ConfigWriter;
+use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, ConnectionNodeRef, RoutingRule};
+use v2ray_rs_core::resolve::ConnectionCandidate;
+use v2ray_rs_process::{ProcessEvent, ProcessState};
+
+use crate::app::AppMsg;
+
+pub(super) struct ConnectionHandle {
+    cmd_tx: mpsc::Sender<ConnectionCmd>,
+}
+
+pub(super) struct ConnectionRequest {
+    pub binary_path: PathBuf,
+    pub candidates: Vec<ConnectionCandidate>,
+    pub writer: ConfigWriter,
+    pub pid_path: PathBuf,
+    pub geodata_dir: PathBuf,
+    pub settings: AppSettings,
+    pub enabled_rules: Vec<RoutingRule>,
+}
+
+enum ConnectionCmd {
+    Stop,
+}
+
+impl ConnectionHandle {
+    pub(super) fn stop(&self) {
+        let _ = self.cmd_tx.try_send(ConnectionCmd::Stop);
+    }
+}
+
+pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -> ConnectionHandle {
+    let ConnectionRequest {
+        binary_path,
+        candidates,
+        writer,
+        pid_path,
+        geodata_dir,
+        settings,
+        enabled_rules,
+    } = request;
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
+
+    tokio::spawn(async move {
+        let mut failures = Vec::new();
+
+        for candidate in candidates {
+            let candidate_label = candidate
+                .node
+                .remark()
+                .unwrap_or(candidate.node.address())
+                .to_string();
+            let config_path = match writer.write_config(
+                std::slice::from_ref(&candidate.node),
+                &enabled_rules,
+                &settings,
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    failures.push(format!("{candidate_label}: config generation failed: {e}"));
+                    continue;
+                }
+            };
+
+            let meta = ConnectionMetadata {
+                node_ref: candidate.node_ref,
+                source: candidate.source_name,
+                source_id: match &candidate.node_ref {
+                    ConnectionNodeRef::Subscription {
+                        subscription_id, ..
+                    } => subscription_id.to_string(),
+                    ConnectionNodeRef::Manual { node_id } => node_id.to_string(),
+                },
+                node_name: candidate_label.clone(),
+                node_address: candidate.node.address().to_string(),
+                node_port: candidate.node.port(),
+                backend: settings.backend.backend_type,
+                strategy: settings.auto_resolve_strategy,
+                latency_ms: candidate.latency_ms,
+                connected_since: chrono::Utc::now(),
+            };
+
+            let mut mgr = v2ray_rs_process::ProcessManager::new(
+                binary_path.clone(),
+                config_path,
+                pid_path.clone(),
+                Some(geodata_dir.clone()),
+            );
+
+            match mgr.start_with_connection(Some(meta.clone())).await {
+                Ok(()) => {
+                    sender.emit(AppMsg::ProcessStateConnection(
+                        ProcessState::Running,
+                        Some(meta.clone()),
+                    ));
+                }
+                Err(e) => {
+                    failures.push(format!("{candidate_label}: {e}"));
+                    mgr.shutdown().await;
+                    continue;
+                }
+            }
+
+            let state_sender = sender.clone();
+            let mut state_rx = mgr.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match state_rx.recv().await {
+                        Ok(ProcessEvent::StateChanged { to, connection, .. }) => {
+                            state_sender.emit(AppMsg::ProcessStateConnection(to, connection));
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            let log_sender = sender.clone();
+            let mut log_rx = mgr.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match log_rx.recv().await {
+                        Ok(ProcessEvent::LogLine(line)) => {
+                            log_sender.emit(AppMsg::ProcessLogLine(line.content));
+                        }
+                        Ok(_) => {}
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            });
+
+            loop {
+                tokio::select! {
+                    Some(cmd) = cmd_rx.recv() => {
+                        match cmd {
+                            ConnectionCmd::Stop => {
+                                mgr.shutdown().await;
+                                return;
+                            }
+                        }
+                    }
+                    result = mgr.wait_and_handle_exit() => {
+                        match result {
+                            Ok(Some(_)) if mgr.state() == ProcessState::Running => {}
+                            Ok(_) | Err(_) => return,
+                        }
+                    }
+                }
+            }
+        }
+
+        let msg = summarize_failures(&failures);
+        sender.emit(AppMsg::ProcessStateConnection(
+            ProcessState::Error(msg),
+            None,
+        ));
+    });
+
+    ConnectionHandle { cmd_tx }
+}
+
+fn summarize_failures(failures: &[String]) -> String {
+    if failures.is_empty() {
+        return "All candidates failed".into();
+    }
+
+    let preview = failures
+        .iter()
+        .take(3)
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if failures.len() > 3 {
+        format!("All candidates failed: {preview}; ...")
+    } else {
+        format!("All candidates failed: {preview}")
+    }
+}

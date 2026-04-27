@@ -4,10 +4,10 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-v2ray-rs-core = { path = "../core" }
-v2ray-rs-process = { path = "../process" }
-ksni = "0.3"
-notify-rust = "4"
+v2ray-rs-core.workspace = true
+v2ray-rs-process.workspace = true
+ksni.workspace = true
+notify-rust.workspace = true
 resvg.workspace = true
 tokio.workspace = true
 tempfile.workspace = true

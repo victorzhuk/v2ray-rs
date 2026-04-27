@@ -2,6 +2,7 @@ use std::fmt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -13,6 +14,8 @@ pub enum BackendError {
         "no supported backend found.\n\nInstall one of the following:\n  v2ray:    sudo pacman -S v2ray       (Arch) | sudo apt install v2ray (Debian/Ubuntu)\n  xray:     https://github.com/XTLS/Xray-core/releases\n  sing-box: sudo pacman -S sing-box    (Arch) | https://github.com/SagerNet/sing-box/releases"
     )]
     NoneFound,
+    #[error("multiple supported backends found; choose one explicitly")]
+    MultipleAvailable,
     #[error("binary not found at {path}")]
     NotFound { path: PathBuf },
     #[error("binary at {path} is not executable")]
@@ -28,15 +31,29 @@ pub struct DetectedBackend {
     pub backend_type: BackendType,
     pub binary_path: PathBuf,
     pub version: Option<String>,
+    pub version_error: Option<String>,
 }
 
 impl fmt::Display for DetectedBackend {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let name = backend_name(self.backend_type);
-        match &self.version {
-            Some(v) => write!(f, "{name} ({v}) at {}", self.binary_path.display()),
-            None => write!(f, "{name} at {}", self.binary_path.display()),
+        match (&self.version, &self.version_error) {
+            (Some(v), _) => write!(f, "{name} ({v}) at {}", self.binary_path.display()),
+            (None, Some(err)) => {
+                write!(
+                    f,
+                    "{name} unavailable at {}: {err}",
+                    self.binary_path.display()
+                )
+            }
+            (None, None) => write!(f, "{name} at {}", self.binary_path.display()),
         }
+    }
+}
+
+impl DetectedBackend {
+    pub fn is_available(&self) -> bool {
+        self.version_error.is_none()
     }
 }
 
@@ -48,13 +65,9 @@ pub fn backend_name(bt: BackendType) -> &'static str {
     }
 }
 
-fn binary_name(bt: BackendType) -> &'static str {
-    backend_name(bt)
-}
-
-fn well_known_paths(bt: BackendType) -> Vec<PathBuf> {
-    let name = binary_name(bt);
-    vec![
+fn well_known_paths(bt: BackendType) -> [PathBuf; 2] {
+    let name = backend_name(bt);
+    [
         PathBuf::from(format!("/usr/bin/{name}")),
         PathBuf::from(format!("/usr/local/bin/{name}")),
     ]
@@ -67,30 +80,51 @@ fn is_executable(path: &Path) -> bool {
 }
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
-    Command::new("which")
-        .arg(name)
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(s))
-            }
-        })
+    let path_var = std::env::var("PATH").ok()?;
+    path_var.split(':').find_map(|dir| {
+        let candidate = PathBuf::from(dir).join(name);
+        is_executable(&candidate).then_some(candidate)
+    })
 }
 
 fn detect_version(path: &Path) -> Result<String, BackendError> {
-    let output =
-        Command::new(path)
-            .arg("version")
-            .output()
-            .map_err(|e| BackendError::ExecutionFailed {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            })?;
+    const MAX_RETRIES: u32 = 5;
+    let output = {
+        let mut last_busy_error = None;
+        let mut command_result = None;
+        for attempt in 0..MAX_RETRIES {
+            match Command::new(path).arg("version").output() {
+                Ok(output) => {
+                    command_result = Some(output);
+                    break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    last_busy_error = Some(err);
+                    if attempt + 1 < MAX_RETRIES {
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+                Err(err) => {
+                    return Err(BackendError::ExecutionFailed {
+                        path: path.to_path_buf(),
+                        reason: err.to_string(),
+                    });
+                }
+            }
+        }
+        match command_result {
+            Some(output) => output,
+            None => {
+                let err = last_busy_error.unwrap_or_else(|| {
+                    std::io::Error::other("version detection failed without output")
+                });
+                return Err(BackendError::ExecutionFailed {
+                    path: path.to_path_buf(),
+                    reason: err.to_string(),
+                });
+            }
+        }
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -115,25 +149,45 @@ fn detect_version(path: &Path) -> Result<String, BackendError> {
     Ok(stdout.lines().next().unwrap_or(&stdout).to_string())
 }
 
+fn version_error_message(err: BackendError) -> String {
+    match err {
+        BackendError::ExecutionFailed { reason, .. }
+        | BackendError::VersionDetectionFailed { reason, .. } => reason,
+        other => other.to_string(),
+    }
+}
+
+fn detected_from_path(bt: BackendType, path: PathBuf) -> DetectedBackend {
+    match detect_version(&path) {
+        Ok(version) => DetectedBackend {
+            backend_type: bt,
+            binary_path: path,
+            version: Some(version),
+            version_error: None,
+        },
+        Err(err) => DetectedBackend {
+            backend_type: bt,
+            binary_path: path,
+            version: None,
+            version_error: Some(version_error_message(err)),
+        },
+    }
+}
+
 fn detect_binary(bt: BackendType) -> Option<PathBuf> {
     for path in well_known_paths(bt) {
         if path.exists() && is_executable(&path) {
             return Some(path);
         }
     }
-    find_in_path(binary_name(bt))
+    find_in_path(backend_name(bt))
 }
 
 pub fn detect_single(bt: BackendType) -> Result<DetectedBackend, BackendError> {
     let path = detect_binary(bt).ok_or(BackendError::NotFound {
-        path: PathBuf::from(binary_name(bt)),
+        path: PathBuf::from(backend_name(bt)),
     })?;
-    let version = detect_version(&path).ok();
-    Ok(DetectedBackend {
-        backend_type: bt,
-        binary_path: path,
-        version,
-    })
+    Ok(detected_from_path(bt, path))
 }
 
 pub fn detect_all() -> Vec<DetectedBackend> {
@@ -144,11 +198,14 @@ pub fn detect_all() -> Vec<DetectedBackend> {
 }
 
 pub fn auto_select() -> Result<DetectedBackend, BackendError> {
-    let available = detect_all();
+    let mut available: Vec<_> = detect_all()
+        .into_iter()
+        .filter(DetectedBackend::is_available)
+        .collect();
     match available.len() {
         0 => Err(BackendError::NoneFound),
-        1 => Ok(available.into_iter().next().unwrap()),
-        _ => Ok(available.into_iter().next().unwrap()),
+        1 => Ok(available.remove(0)),
+        _ => Err(BackendError::MultipleAvailable),
     }
 }
 
@@ -172,11 +229,12 @@ pub fn validate_custom_path(path: &Path, bt: BackendType) -> Result<DetectedBack
             path: path.to_path_buf(),
         });
     }
-    let version = detect_version(path).ok();
+    let version = detect_version(path)?;
     Ok(DetectedBackend {
         backend_type: bt,
         binary_path: path.to_path_buf(),
-        version,
+        version: Some(version),
+        version_error: None,
     })
 }
 
@@ -271,21 +329,11 @@ mod tests {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 
         let result = validate_custom_path(path, BackendType::Xray);
-        match result {
-            Ok(detected) => {
-                assert_eq!(detected.backend_type, BackendType::Xray);
-                assert_eq!(detected.binary_path, path);
-            }
-            Err(_) => {
-                // Also acceptable — empty file can't execute
-            }
-        }
+        assert!(result.is_err());
     }
 
     #[test]
     fn test_detect_single_nonexistent() {
-        // Unless v2ray is actually installed, this tests the not-found path
-        // We just verify the function doesn't panic
         let _ = detect_single(BackendType::V2ray);
     }
 
@@ -346,6 +394,7 @@ mod tests {
             backend_type: BackendType::Xray,
             binary_path: PathBuf::from("/usr/bin/xray"),
             version: Some("Xray 1.8.4".into()),
+            version_error: None,
         };
         let s = d.to_string();
         assert!(s.contains("xray"));
@@ -359,10 +408,24 @@ mod tests {
             backend_type: BackendType::SingBox,
             binary_path: PathBuf::from("/usr/local/bin/sing-box"),
             version: None,
+            version_error: None,
         };
         let s = d.to_string();
         assert!(s.contains("sing-box"));
         assert!(s.contains("/usr/local/bin/sing-box"));
+    }
+
+    #[test]
+    fn test_detected_backend_display_unavailable() {
+        let d = DetectedBackend {
+            backend_type: BackendType::V2ray,
+            binary_path: PathBuf::from("/usr/bin/v2ray"),
+            version: None,
+            version_error: Some("permission denied".into()),
+        };
+        let s = d.to_string();
+        assert!(s.contains("unavailable"));
+        assert!(s.contains("permission denied"));
     }
 
     #[test]
@@ -377,6 +440,7 @@ mod tests {
         assert_eq!(detected.backend_type, BackendType::V2ray);
         assert_eq!(detected.binary_path, script_path);
         assert_eq!(detected.version.as_deref(), Some("TestBackend v1.0.0"));
+        assert!(detected.version_error.is_none());
     }
 
     #[test]
@@ -387,7 +451,9 @@ mod tests {
         fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
 
         let result = validate_custom_path(&script_path, BackendType::Xray);
-        let detected = result.unwrap();
-        assert!(detected.version.is_none());
+        assert!(matches!(
+            result,
+            Err(BackendError::VersionDetectionFailed { .. })
+        ));
     }
 }

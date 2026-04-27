@@ -1,11 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: Manual subscription update
-The system SHALL allow the user to manually trigger a re-fetch and re-parse of any subscription.
+The system SHALL surface partial parse failures without discarding valid nodes.
 
-#### Scenario: Manual update success
-- **WHEN** the user clicks "Update" on a subscription
-- **THEN** the system SHALL re-fetch the URL, re-parse nodes, and replace the old node list while preserving per-node enable/disable preferences for nodes that still exist
+#### Scenario: Manual update with mixed valid and invalid URIs
+- **WHEN** an update source returns valid proxy URIs together with invalid entries
+- **THEN** the system SHALL keep the valid nodes, report the skipped entries, and persist the reconciled result
 
 ### Requirement: Automatic subscription update
 The system SHALL support automatic periodic updates of subscriptions based on a configurable interval.
@@ -19,14 +19,8 @@ The system SHALL support automatic periodic updates of subscriptions based on a 
 - **THEN** the system SHALL retry up to 3 times with exponential backoff and log the failure
 
 ### Requirement: Update node reconciliation
-**Note: Not yet implemented.** The current implementation replaces the node list entirely on update without reconciliation. The reconciliation behavior below is planned.
+The system SHALL reconcile updated subscription nodes with existing data, matching nodes by address, port, and protocol to preserve user preferences.
 
-The system SHOULD reconcile updated subscription nodes with existing data, matching nodes by their address+port+protocol to preserve user preferences.
-
-#### Scenario: Node added in update
-- **WHEN** a subscription update contains a new node not in the previous version
-- **THEN** the new node SHALL be added with enabled status by default
-
-#### Scenario: Node removed in update
-- **WHEN** a subscription update no longer contains a previously existing node
-- **THEN** that node SHALL be removed from the subscription
+#### Scenario: Matching node keeps enabled state
+- **WHEN** an updated subscription still contains a previously known node
+- **THEN** the system SHALL preserve that node's enabled state

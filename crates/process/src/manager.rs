@@ -28,6 +28,8 @@ pub enum ProcessError {
     ConfigMissing(PathBuf),
     #[error("spawn process: {0}")]
     Spawn(#[from] std::io::Error),
+    #[error("wait process: {0}")]
+    Wait(std::io::Error),
     #[error("{0}")]
     Transition(#[from] TransitionError),
 }
@@ -93,10 +95,22 @@ impl ProcessManager {
         connection: Option<ConnectionMetadata>,
     ) -> Result<(), ProcessError> {
         if !self.binary_path.exists() {
-            return Err(ProcessError::BinaryNotFound(self.binary_path.clone()));
+            self.state
+                .transition(ProcessState::Starting, connection.clone())?;
+            let error = ProcessError::BinaryNotFound(self.binary_path.clone());
+            let _ = self
+                .state
+                .transition(ProcessState::Error(error.to_string()), None);
+            return Err(error);
         }
         if !self.config_path.exists() {
-            return Err(ProcessError::ConfigMissing(self.config_path.clone()));
+            self.state
+                .transition(ProcessState::Starting, connection.clone())?;
+            let error = ProcessError::ConfigMissing(self.config_path.clone());
+            let _ = self
+                .state
+                .transition(ProcessState::Error(error.to_string()), None);
+            return Err(error);
         }
 
         if connection.is_some() {
@@ -150,13 +164,24 @@ impl ProcessManager {
         self.pid_file.check_and_kill_orphaned()
     }
 
-    pub async fn wait_and_handle_exit(&mut self) -> Option<i32> {
-        let child = self.child.as_mut()?;
-        let status = child.wait().await.ok()?;
+    pub async fn wait_and_handle_exit(&mut self) -> Result<Option<i32>, ProcessError> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(None);
+        };
+        let status = match child.wait().await {
+            Ok(status) => status,
+            Err(err) => {
+                self.cleanup_after_exit();
+                let error = ProcessError::Wait(err);
+                let _ = self
+                    .state
+                    .transition(ProcessState::Error(error.to_string()), None);
+                return Err(error);
+            }
+        };
         let exit_code = status.code();
 
-        self.child = None;
-        self.pid_file.remove().ok();
+        self.cleanup_after_exit();
 
         self.state.emit(ProcessEvent::ProcessExited { exit_code });
 
@@ -164,14 +189,18 @@ impl ProcessManager {
             self.handle_unexpected_exit(exit_code).await;
         }
 
-        exit_code
+        Ok(exit_code)
     }
 
     async fn spawn_process(&mut self) -> Result<(), ProcessError> {
         let mut child = self.try_spawn().await?;
 
-        if let Some(pid) = child.id() {
-            self.pid_file.write(pid).ok();
+        if let Some(pid) = child.id()
+            && let Err(err) = self
+                .pid_file
+                .write(pid, &self.binary_path, &self.config_path)
+        {
+            log::warn!("failed to write pid ownership record: {err}");
         }
 
         self.capture_output(&mut child);
@@ -219,10 +248,11 @@ impl ProcessManager {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let log_line = LogLine::stdout(&line);
-                    if let Ok(mut buf) = buffer.lock() {
-                        buf.push(log_line.clone());
-                    }
-                    let _ = tx.send(ProcessEvent::LogLine(log_line));
+                    let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
+                    buffer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(log_line);
                 }
             }));
         }
@@ -235,10 +265,11 @@ impl ProcessManager {
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let log_line = LogLine::stderr(&line);
-                    if let Ok(mut buf) = buffer.lock() {
-                        buf.push(log_line.clone());
-                    }
-                    let _ = tx.send(ProcessEvent::LogLine(log_line));
+                    let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
+                    buffer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push(log_line);
                 }
             }));
         }
@@ -260,11 +291,7 @@ impl ProcessManager {
             child.wait().await.ok();
         }
 
-        for handle in self.log_handles.drain(..) {
-            handle.abort();
-        }
-
-        self.child = None;
+        self.cleanup_after_exit();
     }
 
     async fn handle_unexpected_exit(&mut self, exit_code: Option<i32>) {
@@ -313,6 +340,30 @@ impl ProcessManager {
             let _ = self
                 .state
                 .transition(ProcessState::Error(format!("restart failed: {e}")), None);
+        }
+    }
+
+    fn cleanup_after_exit(&mut self) {
+        self.child = None;
+        self.pid_file.remove().ok();
+        for handle in self.log_handles.drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+impl Drop for ProcessManager {
+    fn drop(&mut self) {
+        if let Some(ref mut child) = self.child {
+            if let Some(pid) = child.id() {
+                log::warn!("ProcessManager dropped with live child (pid {pid}); sending SIGKILL");
+                let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
+                let _ = child.try_wait();
+            }
+            self.pid_file.remove().ok();
+            for handle in self.log_handles.drain(..) {
+                handle.abort();
+            }
         }
     }
 }

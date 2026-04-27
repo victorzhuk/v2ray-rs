@@ -1,5 +1,5 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 use ksni::Icon;
@@ -27,17 +27,8 @@ const STATUS_ICON_DIR: &str = "icons/hicolor/symbolic/apps";
 const HICOLOR_DIR: &str = "icons/hicolor";
 const HICOLOR_INDEX: &str = "icons/hicolor/index.theme";
 
-fn data_dir() -> Option<PathBuf> {
-    std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-}
-
-pub fn install_icons() -> bool {
-    let Some(data_dir) = data_dir() else {
-        return false;
-    };
-    ensure_hicolor_index(&data_dir);
+pub fn install_icons(data_dir: &Path) -> bool {
+    ensure_hicolor_index(data_dir);
     let status_dir = data_dir.join(STATUS_ICON_DIR);
     if fs::create_dir_all(&status_dir).is_err() {
         return false;
@@ -149,14 +140,21 @@ fn render_svg(svg_str: &str) -> Option<Icon> {
     })
 }
 
+static DISCONNECTED_PIXMAP: std::sync::LazyLock<Vec<Icon>> =
+    std::sync::LazyLock::new(|| render_svg(SVG_DISCONNECTED).into_iter().collect());
+static CONNECTED_PIXMAP: std::sync::LazyLock<Vec<Icon>> =
+    std::sync::LazyLock::new(|| render_svg(SVG_CONNECTED).into_iter().collect());
+static ERROR_PIXMAP: std::sync::LazyLock<Vec<Icon>> =
+    std::sync::LazyLock::new(|| render_svg(SVG_ERROR).into_iter().collect());
+
 pub fn disconnected_pixmap() -> Vec<Icon> {
-    render_svg(SVG_DISCONNECTED).into_iter().collect()
+    DISCONNECTED_PIXMAP.clone()
 }
 
 pub fn connected_pixmap() -> Vec<Icon> {
-    render_svg(SVG_CONNECTED).into_iter().collect()
+    CONNECTED_PIXMAP.clone()
 }
 
 pub fn error_pixmap() -> Vec<Icon> {
-    render_svg(SVG_ERROR).into_iter().collect()
+    ERROR_PIXMAP.clone()
 }

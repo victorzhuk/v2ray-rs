@@ -1,8 +1,6 @@
-use std::path::Path;
-
 use serde_json::Value;
 
-use crate::config::v2ray::V2rayGenerator;
+use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{AppSettings, ProxyNode, RoutingRule, VlessConfig};
 
@@ -14,10 +12,13 @@ impl ConfigGenerator for XrayGenerator {
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
-        _geodata_dir: Option<&Path>,
     ) -> Result<Value, ConfigError> {
-        let v2ray = V2rayGenerator;
-        let mut config = v2ray.generate(nodes, rules, settings, None)?;
+        if nodes.is_empty() {
+            return Err(ConfigError::NoNodes);
+        }
+
+        let mut config =
+            generate_v2ray_family_config(nodes, rules, settings, V2rayFamilyBackend::Xray);
 
         patch_xray_outbounds(&mut config, nodes);
         Ok(config)
@@ -98,12 +99,7 @@ mod tests {
     fn test_xray_xtls_flow_applied() {
         let generator = XrayGenerator;
         let config = generator
-            .generate(
-                &[xray_vless_with_xtls()],
-                &[],
-                &AppSettings::default(),
-                None,
-            )
+            .generate(&[xray_vless_with_xtls()], &[], &AppSettings::default())
             .unwrap();
 
         let outbound = &config["outbounds"][0];
@@ -116,11 +112,53 @@ mod tests {
     fn test_xray_non_xtls_unmodified() {
         let generator = XrayGenerator;
         let config = generator
-            .generate(&[vless_without_xtls()], &[], &AppSettings::default(), None)
+            .generate(&[vless_without_xtls()], &[], &AppSettings::default())
             .unwrap();
 
         let outbound = &config["outbounds"][0];
         assert_eq!(outbound["streamSettings"]["security"], "tls");
+    }
+
+    #[test]
+    fn test_xray_dns_accepts_dot_and_doq_and_falls_back_from_h3() {
+        let generator = XrayGenerator;
+        let mut settings = AppSettings::default();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "dot".into(),
+                protocol: DnsProtocol::Dot,
+                address: "dns.google".into(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "doq".into(),
+                protocol: DnsProtocol::Doq,
+                address: "dns.adguard.com".into(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "h3".into(),
+                protocol: DnsProtocol::H3,
+                address: "cloudflare-dns.com".into(),
+                port: None,
+                detour: None,
+            },
+        ];
+
+        let config = generator
+            .generate(&[vless_without_xtls()], &[], &settings)
+            .unwrap();
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers[0].as_str(), Some("tls://dns.google"));
+        assert_eq!(servers[1].as_str(), Some("quic://dns.adguard.com"));
+        assert_eq!(
+            servers[2].as_str(),
+            Some("https://cloudflare-dns.com/dns-query")
+        );
     }
 
     #[test]
@@ -139,11 +177,10 @@ mod tests {
         ];
 
         let config = generator
-            .generate(&nodes, &[], &AppSettings::default(), None)
+            .generate(&nodes, &[], &AppSettings::default())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
-        // 3 proxy + direct + block = 5
         assert_eq!(outbounds.len(), 5);
 
         assert_eq!(outbounds[0]["streamSettings"]["security"], "tls");
@@ -154,7 +191,7 @@ mod tests {
     #[test]
     fn test_xray_error_on_empty_nodes() {
         let generator = XrayGenerator;
-        let result = generator.generate(&[], &[], &AppSettings::default(), None);
+        let result = generator.generate(&[], &[], &AppSettings::default());
         assert!(result.is_err());
     }
 }

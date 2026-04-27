@@ -11,14 +11,25 @@ pub use v2ray::V2rayGenerator;
 pub use writer::ConfigWriter;
 pub use xray::XrayGenerator;
 
-use std::path::Path;
-
-use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule};
+use crate::models::{
+    AppSettings, BackendType, DnsProtocol, DnsValidationError, ProxyNode, ProxyNodeValidationError,
+    RoutingRule,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("no enabled proxy nodes")]
     NoNodes,
+    #[error(transparent)]
+    InvalidProxyNode(#[from] ProxyNodeValidationError),
+    #[error(transparent)]
+    InvalidDns(#[from] DnsValidationError),
+    #[error("dns protocol {protocol:?} is not supported by backend {backend} for server '{tag}'")]
+    UnsupportedDnsProtocol {
+        backend: BackendType,
+        protocol: DnsProtocol,
+        tag: String,
+    },
     #[error("serialize config: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("write config: {0}")]
@@ -31,7 +42,6 @@ pub trait ConfigGenerator {
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
-        geodata_dir: Option<&Path>,
     ) -> Result<serde_json::Value, ConfigError>;
 }
 

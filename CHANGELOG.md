@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Runtime profiles (`--profile`, `V2RAY_RS_PROFILE` env) with isolated storage for production, development, test, and custom profiles
+- Per-directory path overrides via CLI flags (`--config-dir`, `--data-dir`, `--cache-dir`, `--runtime-dir`, `--state-dir`) and matching env vars
+- Instance compatibility stamp (`state_dir/instance.json`) — refuses to start when profile, App ID, or schema version mismatch the running build
+- Single-instance lock per profile (`flock` on `runtime_dir/v2ray-rs.lock`) — second instance of same profile exits with code 75
+- `--reset-instance` flag to wipe a profile's data (production requires `--i-understand`)
+- `--install-icons` flag for non-production profiles
+
+### Changed
+- PID file moved from `data_dir/backend.pid` to `runtime_dir/backend.pid`
+- Generated backend configs moved from `data_dir/generated/` to `runtime_dir/generated/`
+- Geodata files moved from `data_dir/geodata/` to `cache_dir/geodata/`
+- Latency snapshot moved from `data_dir/latency_snapshot.json` to `state_dir/latency_snapshot.json`
+- Legacy files are automatically relocated on first launch (best-effort, logged)
+- `V2RAY_RS_DEV` env var is deprecated; use `V2RAY_RS_PROFILE=development` instead
+- `AppPaths::from_paths()` deprecated; use `AppPaths::for_profile_in(profile, root)` in tests
+- `AppPaths` now exposes `cache_dir()`, `runtime_dir()`, `state_dir()` alongside existing `config_dir()` and `data_dir()`
+- Tray icon installation skipped for non-production profiles unless `--install-icons` is set
+
 ---
 
 ## [0.6.2] - 2026-02-27

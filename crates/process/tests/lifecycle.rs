@@ -75,7 +75,7 @@ async fn binary_not_found() {
     let result = mgr.start().await;
 
     assert!(result.is_err());
-    assert_eq!(mgr.state(), ProcessState::Stopped);
+    assert!(matches!(mgr.state(), ProcessState::Error(_)));
 }
 
 #[tokio::test]
@@ -88,7 +88,7 @@ async fn config_missing() {
     let result = mgr.start().await;
 
     assert!(result.is_err());
-    assert_eq!(mgr.state(), ProcessState::Stopped);
+    assert!(matches!(mgr.state(), ProcessState::Error(_)));
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn crash_detection() {
     mgr.set_auto_restart(false);
     mgr.start().await.unwrap();
 
-    let exit_code = mgr.wait_and_handle_exit().await;
+    let exit_code = mgr.wait_and_handle_exit().await.unwrap();
     assert_eq!(exit_code, Some(1));
 
     match mgr.state() {

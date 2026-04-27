@@ -1,12 +1,14 @@
 use std::time::Duration;
 
 use base64::Engine;
+use futures_util::StreamExt;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use thiserror::Error;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION"));
+const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 
 #[derive(Debug, Error)]
 pub enum FetchError {
@@ -15,23 +17,22 @@ pub enum FetchError {
     #[error("HTTP {status}: {body}")]
     HttpError { status: u16, body: String },
     #[error("file error: {0}")]
-    FileError(String),
+    FileError(#[from] std::io::Error),
     #[error("request timed out")]
     Timeout,
 }
 
-pub async fn fetch_from_url(url: &str) -> Result<String, FetchError> {
-    let client = reqwest::Client::builder()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(REQUEST_TIMEOUT)
-        .user_agent(USER_AGENT)
-        .build()
-        .map_err(|e| FetchError::NetworkError(e.to_string()))?;
-
-    fetch_with_client(&client, url).await
-}
-
 pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(FetchError::NetworkError(
+            "only http:// and https:// URLs are supported".into(),
+        ));
+    }
+
+    if url.starts_with("http://") {
+        log::warn!("fetching subscription over plaintext HTTP — credentials may be exposed");
+    }
+
     let response = client.get(url).send().await.map_err(|e| {
         if e.is_timeout() {
             FetchError::Timeout
@@ -49,14 +50,31 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
         });
     }
 
-    response
-        .text()
-        .await
-        .map_err(|e| FetchError::NetworkError(e.to_string()))
+    if let Some(len) = response.content_length()
+        && len > MAX_SUBSCRIPTION_SIZE
+    {
+        return Err(FetchError::NetworkError(format!(
+            "response too large: {len} bytes (max {MAX_SUBSCRIPTION_SIZE})"
+        )));
+    }
+
+    let mut data = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| FetchError::NetworkError(e.to_string()))?;
+        data.extend_from_slice(&chunk);
+        if data.len() as u64 > MAX_SUBSCRIPTION_SIZE {
+            return Err(FetchError::NetworkError(format!(
+                "response too large: > {MAX_SUBSCRIPTION_SIZE} bytes"
+            )));
+        }
+    }
+
+    String::from_utf8(data).map_err(|e| FetchError::NetworkError(e.to_string()))
 }
 
 pub fn fetch_from_file(path: &str) -> Result<String, FetchError> {
-    std::fs::read_to_string(path).map_err(|e| FetchError::FileError(e.to_string()))
+    std::fs::read_to_string(path).map_err(FetchError::FileError)
 }
 
 pub fn decode_subscription_content(raw: &str) -> Vec<String> {

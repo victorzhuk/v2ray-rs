@@ -1,10 +1,6 @@
 use uuid::Uuid;
 
-use crate::config::{ConfigError, ConfigWriter};
-use crate::models::{
-    AppSettings, Preset, ProxyNode, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
-    ValidationError,
-};
+use crate::models::{Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch, ValidationError};
 use crate::persistence::{self, AppPaths, PersistenceError};
 
 #[derive(Debug, thiserror::Error)]
@@ -13,8 +9,6 @@ pub enum RoutingManagerError {
     Validation(#[from] ValidationError),
     #[error("persistence: {0}")]
     Persistence(#[from] PersistenceError),
-    #[error("config: {0}")]
-    Config(#[from] ConfigError),
 }
 
 pub struct RoutingManager {
@@ -70,8 +64,9 @@ impl RoutingManager {
     }
 
     pub fn reorder_rule(&mut self, from: usize, to: usize) -> Result<(), RoutingManagerError> {
-        self.rules.move_rule(from, to);
-        self.persist()?;
+        if self.rules.move_rule(from, to) {
+            self.persist()?;
+        }
         Ok(())
     }
 
@@ -81,15 +76,13 @@ impl RoutingManager {
         Ok(())
     }
 
-    pub fn write_config(
-        &self,
-        nodes: &[ProxyNode],
-        settings: &AppSettings,
-    ) -> Result<std::path::PathBuf, RoutingManagerError> {
-        let writer = ConfigWriter::new(settings, &self.paths);
-        let enabled: Vec<_> = self.rules.enabled_rules().cloned().collect();
-        let path = writer.write_config(nodes, &enabled, settings)?;
-        Ok(path)
+    pub fn replace_rules(&mut self, rules: RoutingRuleSet) -> Result<(), RoutingManagerError> {
+        for rule in rules.rules() {
+            crate::models::validate_rule_match(&rule.match_condition)?;
+        }
+        self.rules = rules;
+        self.persist()?;
+        Ok(())
     }
 
     fn persist(&self) -> Result<(), PersistenceError> {
@@ -101,11 +94,12 @@ impl RoutingManager {
 mod tests {
     use super::*;
     use crate::models::*;
+    use crate::profile::AppProfile;
     use tempfile::TempDir;
 
     fn setup() -> (TempDir, RoutingManager) {
         let tmp = TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let manager = RoutingManager::load(paths).unwrap();
         (tmp, manager)
     }
@@ -127,7 +121,7 @@ mod tests {
         let (tmp, mut mgr) = setup();
         mgr.add_rule(geoip_rule("RU", RuleAction::Direct)).unwrap();
 
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let loaded = persistence::load_routing_rules(&paths).unwrap();
         assert_eq!(loaded.rules().len(), 1);
     }
@@ -157,7 +151,7 @@ mod tests {
 
         assert!(mgr.delete_rule(&id).unwrap());
 
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let loaded = persistence::load_routing_rules(&paths).unwrap();
         assert!(loaded.rules().is_empty());
     }
@@ -171,7 +165,7 @@ mod tests {
 
         mgr.edit_rule(&id, None, Some(RuleAction::Block)).unwrap();
 
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let loaded = persistence::load_routing_rules(&paths).unwrap();
         assert_eq!(loaded.rules()[0].action, RuleAction::Block);
     }
@@ -197,26 +191,8 @@ mod tests {
         let expected = preset.rules().len();
         mgr.apply_preset(preset).unwrap();
 
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let loaded = persistence::load_routing_rules(&paths).unwrap();
         assert_eq!(loaded.rules().len(), expected);
-    }
-
-    #[test]
-    fn test_write_config() {
-        let (_tmp, mut mgr) = setup();
-        mgr.add_rule(geoip_rule("RU", RuleAction::Direct)).unwrap();
-
-        let nodes = vec![ProxyNode::Shadowsocks(ShadowsocksConfig {
-            address: "ss.example.com".into(),
-            port: 8388,
-            method: "aes-256-gcm".into(),
-            password: "secret".into(),
-            remark: Some("Test".into()),
-        })];
-
-        let settings = AppSettings::default();
-        let path = mgr.write_config(&nodes, &settings).unwrap();
-        assert!(path.exists());
     }
 }

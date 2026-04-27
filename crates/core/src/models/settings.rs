@@ -23,6 +23,25 @@ impl fmt::Display for BackendType {
     }
 }
 
+impl BackendType {
+    pub fn to_index(self) -> u32 {
+        match self {
+            BackendType::V2ray => 0,
+            BackendType::Xray => 1,
+            BackendType::SingBox => 2,
+        }
+    }
+
+    pub fn from_index(index: u32) -> Option<Self> {
+        match index {
+            0 => Some(BackendType::V2ray),
+            1 => Some(BackendType::Xray),
+            2 => Some(BackendType::SingBox),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BackendConfig {
     pub backend_type: BackendType,

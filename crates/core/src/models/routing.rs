@@ -53,18 +53,20 @@ impl RoutingRuleSet {
         }
     }
 
-    pub fn move_rule(&mut self, from: usize, to: usize) {
-        if from < self.rules.len() && to < self.rules.len() {
-            let rule = self.rules.remove(from);
-            self.rules.insert(to, rule);
+    pub fn move_rule(&mut self, from: usize, to: usize) -> bool {
+        if from == to || from >= self.rules.len() || to >= self.rules.len() {
+            return false;
         }
+        let rule = self.rules.remove(from);
+        self.rules.insert(to, rule);
+        true
     }
 
     pub fn rules(&self) -> &[RoutingRule] {
         &self.rules
     }
 
-    pub fn rules_mut(&mut self) -> &mut Vec<RoutingRule> {
+    pub fn rules_mut(&mut self) -> &mut [RoutingRule] {
         &mut self.rules
     }
 
@@ -359,7 +361,7 @@ mod tests {
 
         let result = set.edit_rule(&id, Some(new_match.clone()), None);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(set.rules()[0].match_condition, new_match);
         assert_eq!(set.rules()[0].action, RuleAction::Proxy);
     }
@@ -374,7 +376,7 @@ mod tests {
 
         let result = set.edit_rule(&id, None, Some(RuleAction::Block));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(set.rules()[0].match_condition, original_match);
         assert_eq!(set.rules()[0].action, RuleAction::Block);
     }
@@ -392,7 +394,7 @@ mod tests {
 
         let result = set.edit_rule(&id, Some(new_match.clone()), Some(RuleAction::Direct));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), true);
+        assert!(result.unwrap());
         assert_eq!(set.rules()[0].match_condition, new_match);
         assert_eq!(set.rules()[0].action, RuleAction::Direct);
     }
@@ -406,7 +408,7 @@ mod tests {
         let random_id = Uuid::new_v4();
         let result = set.edit_rule(&random_id, None, Some(RuleAction::Block));
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), false);
+        assert!(!result.unwrap());
     }
 
     #[test]

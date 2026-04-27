@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -8,6 +7,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::fs::atomic_write;
 use crate::geodata::GeodataError;
 use crate::models::BackendType;
 use crate::persistence::AppPaths;
@@ -46,6 +46,7 @@ impl GeodataIndex {
     }
 }
 
+#[derive(Debug)]
 pub struct GeodataIndexManager {
     geodata_dir: PathBuf,
 }
@@ -107,11 +108,7 @@ impl GeodataIndexManager {
             }
         }
 
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(json.as_bytes())?;
-        tmp.flush()?;
-        tmp.persist(&path)
-            .map_err(|e| GeodataIndexError::Io(e.error))?;
+        atomic_write(&path, json.as_bytes()).map_err(GeodataIndexError::Io)?;
         Ok(())
     }
 
@@ -137,7 +134,6 @@ impl GeodataIndexManager {
         self.save_index(backend, &index)?;
         Ok(index)
     }
-
 }
 
 fn parse_v2ray_geoip_dat(path: &Path) -> Result<Vec<String>, GeodataIndexError> {
@@ -209,10 +205,11 @@ mod v2ray_geosite {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use crate::profile::AppProfile;
 
     fn test_index_manager() -> (TempDir, GeodataIndexManager) {
         let tmp = TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let manager = GeodataIndexManager::new(&paths);
         (tmp, manager)
     }

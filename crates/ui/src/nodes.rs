@@ -7,18 +7,21 @@ use v2ray_rs_core::models::{
     GrpcSettings, H2Settings, ManualNode, ProxyNode, ShadowsocksConfig, TlsSettings,
     TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
 };
-use v2ray_rs_core::persistence::{self, AppPaths};
+
+use crate::workspace::WorkspaceStore;
 
 pub struct NodesPage {
-    paths: AppPaths,
+    store: WorkspaceStore,
     nodes: Vec<ManualNode>,
     list_container: gtk::ListBox,
+    load_error: Option<String>,
 }
 
 #[derive(Debug)]
 pub enum NodesOutput {
     ActiveNodesChanged(bool),
     NodesChanged,
+    Notice(String),
 }
 
 #[derive(Debug)]
@@ -28,7 +31,7 @@ pub enum NodesMsg {
     EditNode(Uuid),
     AddNode(ProxyNode),
     UpdateNode(Uuid, ProxyNode),
-    ReplaceNodes(Vec<ManualNode>),
+    ResetStorage,
 }
 
 #[derive(Clone, Copy)]
@@ -273,7 +276,7 @@ impl TlsRows {
                 .build(),
             alpn: adw::EntryRow::builder()
                 .title("ALPN")
-                .text(&tls.alpn.join(","))
+                .text(tls.alpn.join(","))
                 .build(),
             fingerprint: adw::EntryRow::builder()
                 .title("Fingerprint")
@@ -367,11 +370,11 @@ enum NodeForm {
     Shadowsocks {
         common: CommonRows,
         method: adw::EntryRow,
-        password: adw::EntryRow,
+        password: adw::PasswordEntryRow,
     },
     Trojan {
         common: CommonRows,
-        password: adw::EntryRow,
+        password: adw::PasswordEntryRow,
         transport: TransportRows,
         tls: TlsRows,
     },
@@ -465,7 +468,7 @@ impl NodeForm {
                     .title("Method")
                     .text(&cfg.method)
                     .build();
-                let password = adw::EntryRow::builder()
+                let password = adw::PasswordEntryRow::builder()
                     .title("Password")
                     .text(&cfg.password)
                     .build();
@@ -484,7 +487,7 @@ impl NodeForm {
             }
             ProxyNode::Trojan(cfg) => {
                 let common = CommonRows::from_node(node);
-                let password = adw::EntryRow::builder()
+                let password = adw::PasswordEntryRow::builder()
                     .title("Password")
                     .text(&cfg.password)
                     .build();
@@ -558,7 +561,7 @@ impl NodeForm {
                 address: common.address(),
                 port: common.port(),
                 method: trimmed_text(method),
-                password: trimmed_text(password),
+                password: trimmed_password_text(password),
                 remark: common.remark(),
             }),
             Self::Trojan {
@@ -569,7 +572,7 @@ impl NodeForm {
             } => ProxyNode::Trojan(TrojanConfig {
                 address: common.address(),
                 port: common.port(),
-                password: trimmed_text(password),
+                password: trimmed_password_text(password),
                 transport: transport.value(),
                 tls: tls.value(),
                 remark: common.remark(),
@@ -580,7 +583,7 @@ impl NodeForm {
 
 #[relm4::component(pub)]
 impl Component for NodesPage {
-    type Init = (AppPaths, v2ray_rs_core::models::AppSettings);
+    type Init = (WorkspaceStore, v2ray_rs_core::models::AppSettings);
     type Input = NodesMsg;
     type Output = NodesOutput;
     type CommandOutput = ();
@@ -589,6 +592,37 @@ impl Component for NodesPage {
         gtk::Box {
             set_orientation: gtk::Orientation::Vertical,
             set_spacing: 0,
+
+            gtk::Revealer {
+                #[watch]
+                set_reveal_child: model.load_error.is_some(),
+
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 12,
+                    set_margin_top: 6,
+                    set_margin_bottom: 6,
+                    set_margin_start: 12,
+                    set_margin_end: 12,
+
+                    gtk::Label {
+                        set_xalign: 0.0,
+                        set_hexpand: true,
+                        add_css_class: "warning",
+                        #[watch]
+                        set_label: model
+                            .load_error
+                            .as_deref()
+                            .unwrap_or("Failed to load manual nodes"),
+                    },
+
+                    gtk::Button {
+                        set_label: "Reset Data",
+                        add_css_class: "destructive-action",
+                        connect_clicked => NodesMsg::ResetStorage,
+                    },
+                },
+            },
 
             gtk::Box {
                 set_orientation: gtk::Orientation::Horizontal,
@@ -600,6 +634,8 @@ impl Component for NodesPage {
                     set_icon_name: "list-add-symbolic",
                     set_tooltip_text: Some("Add Manual Node"),
                     add_css_class: "flat",
+                    #[watch]
+                    set_sensitive: model.load_error.is_none(),
                     connect_clicked[sender] => move |_| {
                         show_protocol_picker(sender.clone());
                     },
@@ -621,8 +657,14 @@ impl Component for NodesPage {
         _root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let (paths, _settings) = init;
-        let nodes = persistence::load_manual_nodes_or_default(&paths);
+        let (store, _settings) = init;
+        let (nodes, load_error) = match store.load_manual_nodes() {
+            Ok(nodes) => (nodes, None),
+            Err(err) => (
+                Vec::new(),
+                Some(format!("Manual nodes are read-only: {err}")),
+            ),
+        };
 
         let list_container = gtk::ListBox::builder()
             .margin_top(12)
@@ -634,9 +676,10 @@ impl Component for NodesPage {
             .build();
 
         let model = NodesPage {
-            paths,
+            store,
             nodes,
             list_container: list_container.clone(),
+            load_error,
         };
 
         render_list(&model.nodes, &list_container, &sender);
@@ -653,11 +696,15 @@ impl Component for NodesPage {
 
         let mut changed = false;
 
+        if self.load_error.is_some() && !matches!(msg, NodesMsg::ResetStorage) {
+            return;
+        }
+
         match msg {
             NodesMsg::ToggleNode(id) => {
                 if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
                     self.nodes[pos].enabled = !self.nodes[pos].enabled;
-                    if persist_manual_nodes(&self.paths, &self.nodes) {
+                    if persist_manual_nodes(&self.store, &self.nodes) {
                         changed = true;
                     } else {
                         self.nodes[pos].enabled = !self.nodes[pos].enabled;
@@ -667,7 +714,7 @@ impl Component for NodesPage {
             NodesMsg::DeleteNode(id) => {
                 if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
                     let removed = self.nodes.remove(pos);
-                    if persist_manual_nodes(&self.paths, &self.nodes) {
+                    if persist_manual_nodes(&self.store, &self.nodes) {
                         changed = true;
                     } else {
                         self.nodes.insert(pos, removed);
@@ -682,28 +729,42 @@ impl Component for NodesPage {
                 show_edit_dialog(id, node, sender.clone());
             }
             NodesMsg::AddNode(node) => {
+                if let Err(err) = node.validate() {
+                    let _ = sender.output(NodesOutput::Notice(err.to_string()));
+                    return;
+                }
                 let manual = ManualNode::new(node);
                 self.nodes.push(manual);
-                if persist_manual_nodes(&self.paths, &self.nodes) {
+                if persist_manual_nodes(&self.store, &self.nodes) {
                     changed = true;
                 } else {
                     let _ = self.nodes.pop();
                 }
             }
             NodesMsg::UpdateNode(id, node) => {
+                if let Err(err) = node.validate() {
+                    let _ = sender.output(NodesOutput::Notice(err.to_string()));
+                    return;
+                }
                 if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
                     let previous = self.nodes[pos].node.clone();
                     self.nodes[pos].node = node;
-                    if persist_manual_nodes(&self.paths, &self.nodes) {
+                    if persist_manual_nodes(&self.store, &self.nodes) {
                         changed = true;
                     } else {
                         self.nodes[pos].node = previous;
                     }
                 }
             }
-            NodesMsg::ReplaceNodes(nodes) => {
-                self.nodes = nodes;
-            }
+            NodesMsg::ResetStorage => match self.store.reset_manual_nodes() {
+                Ok(()) => {
+                    self.nodes.clear();
+                    self.load_error = None;
+                }
+                Err(err) => {
+                    log::error!("reset manual nodes: {err}");
+                }
+            },
         }
 
         emit_active_nodes(&self.nodes, &sender);
@@ -714,8 +775,8 @@ impl Component for NodesPage {
     }
 }
 
-fn persist_manual_nodes(paths: &AppPaths, nodes: &[ManualNode]) -> bool {
-    match persistence::save_manual_nodes(paths, nodes) {
+fn persist_manual_nodes(store: &WorkspaceStore, nodes: &[ManualNode]) -> bool {
+    match store.save_manual_nodes(nodes) {
         Ok(()) => true,
         Err(e) => {
             log::error!("save manual nodes: {e}");
@@ -870,7 +931,7 @@ fn show_protocol_picker(sender: ComponentSender<NodesPage>) {
         }
     });
 
-    dialog.present(gtk::Window::NONE);
+    dialog.present(crate::active_window().as_ref());
 }
 
 fn show_edit_dialog(id: Uuid, node: ProxyNode, sender: ComponentSender<NodesPage>) {
@@ -917,7 +978,7 @@ fn show_node_form(edit_id: Option<Uuid>, node: ProxyNode, sender: ComponentSende
         }
     });
 
-    dialog.present(gtk::Window::NONE);
+    dialog.present(crate::active_window().as_ref());
 }
 
 fn show_delete_dialog(id: Uuid, sender: ComponentSender<NodesPage>) {
@@ -938,7 +999,7 @@ fn show_delete_dialog(id: Uuid, sender: ComponentSender<NodesPage>) {
         }
     });
 
-    dialog.present(gtk::Window::NONE);
+    dialog.present(crate::active_window().as_ref());
 }
 
 fn default_node_for_protocol(protocol: ProtocolKind) -> ProxyNode {
@@ -995,6 +1056,10 @@ fn spin_row(title: &str, value: f64, min: f64, max: f64) -> adw::SpinRow {
 }
 
 fn trimmed_text(row: &adw::EntryRow) -> String {
+    row.text().trim().to_string()
+}
+
+fn trimmed_password_text(row: &adw::PasswordEntryRow) -> String {
     row.text().trim().to_string()
 }
 

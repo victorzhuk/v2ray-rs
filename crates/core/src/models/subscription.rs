@@ -24,9 +24,11 @@ pub enum SubscriptionSource {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubscriptionNode {
+    #[serde(default = "Uuid::new_v4")]
+    pub id: Uuid,
     pub node: ProxyNode,
     pub enabled: bool,
-    #[serde(skip_serializing, default)]
+    #[serde(skip, default)]
     pub last_latency_ms: Option<u64>,
 }
 
@@ -59,7 +61,44 @@ impl Subscription {
         self.nodes.iter().filter(|n| n.enabled).map(|n| &n.node)
     }
 
+    #[must_use]
     pub fn has_enabled_nodes(&self) -> bool {
         self.enabled && self.nodes.iter().any(|n| n.enabled)
+    }
+
+    #[must_use]
+    pub fn runtime_state_eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.nodes.len() == other.nodes.len()
+            && self
+                .nodes
+                .iter()
+                .zip(&other.nodes)
+                .all(|(lhs, rhs)| lhs.runtime_state_eq(rhs))
+    }
+}
+
+impl SubscriptionNode {
+    pub fn new(node: ProxyNode) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            node,
+            enabled: true,
+            last_latency_ms: None,
+        }
+    }
+
+    pub fn with_id(id: Uuid, node: ProxyNode, enabled: bool) -> Self {
+        Self {
+            id,
+            node,
+            enabled,
+            last_latency_ms: None,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_state_eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.node == other.node && self.enabled == other.enabled
     }
 }

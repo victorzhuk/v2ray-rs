@@ -1,5 +1,3 @@
-use std::path::Path;
-
 use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
@@ -11,31 +9,47 @@ use crate::models::{
 
 pub struct V2rayGenerator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum V2rayFamilyBackend {
+    V2ray,
+    Xray,
+}
+
 impl ConfigGenerator for V2rayGenerator {
     fn generate(
         &self,
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
-        _geodata_dir: Option<&Path>,
     ) -> Result<Value, ConfigError> {
         if nodes.is_empty() {
             return Err(ConfigError::NoNodes);
         }
-        Ok(assemble(nodes, rules, settings))
+        Ok(generate_v2ray_family_config(
+            nodes,
+            rules,
+            settings,
+            V2rayFamilyBackend::V2ray,
+        ))
     }
 }
 
-fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) -> Value {
+pub(crate) fn generate_v2ray_family_config(
+    nodes: &[ProxyNode],
+    rules: &[RoutingRule],
+    settings: &AppSettings,
+    dns_backend: V2rayFamilyBackend,
+) -> Value {
+    let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let mut config = json!({
         "log": { "loglevel": "warning" },
         "inbounds": build_inbounds(settings),
         "outbounds": build_outbounds(nodes),
-        "routing": build_routing(rules),
+        "routing": build_routing(rules, &first_proxy_tag),
     });
 
     if settings.dns.enabled {
-        config["dns"] = build_dns(rules, settings);
+        config["dns"] = build_dns_for_backend(rules, settings, dns_backend);
     }
 
     config
@@ -259,7 +273,7 @@ fn build_h2_settings(h2: &H2Settings) -> Value {
     })
 }
 
-fn build_routing(rules: &[RoutingRule]) -> Value {
+fn build_routing(rules: &[RoutingRule], first_proxy_tag: &str) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
     if enabled.is_empty() {
@@ -269,7 +283,10 @@ fn build_routing(rules: &[RoutingRule]) -> Value {
         });
     }
 
-    let routing_rules: Vec<Value> = enabled.iter().map(|r| build_routing_rule(r)).collect();
+    let routing_rules: Vec<Value> = enabled
+        .iter()
+        .map(|r| build_routing_rule(r, first_proxy_tag))
+        .collect();
 
     json!({
         "domainStrategy": "IPIfNonMatch",
@@ -277,9 +294,9 @@ fn build_routing(rules: &[RoutingRule]) -> Value {
     })
 }
 
-fn build_routing_rule(rule: &RoutingRule) -> Value {
+fn build_routing_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
     let outbound_tag = match rule.action {
-        RuleAction::Proxy => first_proxy_tag(),
+        RuleAction::Proxy => first_proxy_tag.to_string(),
         RuleAction::Direct => "direct".to_string(),
         RuleAction::Block => "block".to_string(),
     };
@@ -308,32 +325,26 @@ fn build_routing_rule(rule: &RoutingRule) -> Value {
     }
 }
 
-fn first_proxy_tag() -> String {
-    "proxy-0".to_string()
-}
-
 fn udp_port_for_v2ray(server: &DnsServerConfig) -> Option<u16> {
     if server.protocol == DnsProtocol::Udp {
-        server.port.filter(|&p| p != DnsProtocol::Udp.default_port())
+        server
+            .port
+            .filter(|&p| p != DnsProtocol::Udp.default_port())
     } else {
         None
     }
 }
 
-fn v2ray_address_with_fallback(server: &DnsServerConfig) -> String {
-    match server.protocol {
-        DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3 => {
-            eprintln!(
-                "DNS protocol {:?} not supported by v2ray, falling back to DoH for server '{}'",
-                server.protocol, server.tag
-            );
-            DnsProtocol::Doh.server_address(&server.address, server.port)
-        }
-        _ => server.protocol.server_address(&server.address, server.port),
-    }
+#[cfg(test)]
+fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+    build_dns_for_backend(rules, settings, V2rayFamilyBackend::V2ray)
 }
 
-fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+fn build_dns_for_backend(
+    rules: &[RoutingRule],
+    settings: &AppSettings,
+    backend: V2rayFamilyBackend,
+) -> Value {
     let mut dns_config = json!({});
 
     let mut servers: Vec<Value> = Vec::new();
@@ -351,7 +362,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
                 })
                 .collect();
 
-            let address = v2ray_address_with_fallback(server);
+            let address = dns_server_address_for_backend(server, backend);
             let port = udp_port_for_v2ray(server);
 
             if domains.is_empty() {
@@ -387,7 +398,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         }
 
         for server in &settings.dns.servers {
-            let address = v2ray_address_with_fallback(server);
+            let address = dns_server_address_for_backend(server, backend);
             let port = udp_port_for_v2ray(server);
 
             if server.tag == "remote" && !remote_domains.is_empty() {
@@ -444,6 +455,29 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     dns_config
 }
 
+fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamilyBackend) -> String {
+    let backend_type = match backend {
+        V2rayFamilyBackend::V2ray => crate::models::BackendType::V2ray,
+        V2rayFamilyBackend::Xray => crate::models::BackendType::Xray,
+    };
+    let effective_protocol = server.protocol.effective_for_backend(backend_type);
+
+    if effective_protocol != server.protocol {
+        let backend_name = match backend {
+            V2rayFamilyBackend::V2ray => "v2ray",
+            V2rayFamilyBackend::Xray => "xray",
+        };
+        log::warn!(
+            "{backend_name} does not support {:?} DNS for '{}' directly; falling back to {:?}",
+            server.protocol,
+            server.tag,
+            effective_protocol
+        );
+    }
+
+    effective_protocol.server_address(&server.address, server.port)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -453,7 +487,7 @@ mod tests {
     #[test]
     fn test_generate_returns_error_on_empty_nodes() {
         let generator = V2rayGenerator;
-        let result = generator.generate(&[], &[], &default_settings(), None);
+        let result = generator.generate(&[], &[], &default_settings());
         assert!(result.is_err());
     }
 
@@ -461,7 +495,7 @@ mod tests {
     fn test_basic_vless_config_structure() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[vless_node()], &[], &default_settings(), None)
+            .generate(&[vless_node()], &[], &default_settings())
             .unwrap();
 
         assert!(config["log"].is_object());
@@ -474,7 +508,7 @@ mod tests {
     fn test_inbound_ports() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[vless_node()], &[], &default_settings(), None)
+            .generate(&[vless_node()], &[], &default_settings())
             .unwrap();
 
         let inbounds = config["inbounds"].as_array().unwrap();
@@ -489,7 +523,7 @@ mod tests {
     fn test_vless_outbound() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[vless_node()], &[], &default_settings(), None)
+            .generate(&[vless_node()], &[], &default_settings())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
@@ -508,7 +542,7 @@ mod tests {
     fn test_vmess_outbound() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[vmess_node()], &[], &default_settings(), None)
+            .generate(&[vmess_node()], &[], &default_settings())
             .unwrap();
 
         let proxy = &config["outbounds"][0];
@@ -524,7 +558,7 @@ mod tests {
     fn test_shadowsocks_outbound() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[ss_node()], &[], &default_settings(), None)
+            .generate(&[ss_node()], &[], &default_settings())
             .unwrap();
 
         let proxy = &config["outbounds"][0];
@@ -536,7 +570,7 @@ mod tests {
     fn test_trojan_outbound() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[trojan_node()], &[], &default_settings(), None)
+            .generate(&[trojan_node()], &[], &default_settings())
             .unwrap();
 
         let proxy = &config["outbounds"][0];
@@ -549,7 +583,7 @@ mod tests {
     fn test_direct_and_block_outbounds_present() {
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[vless_node()], &[], &default_settings(), None)
+            .generate(&[vless_node()], &[], &default_settings())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
@@ -566,11 +600,10 @@ mod tests {
         let generator = V2rayGenerator;
         let nodes = vec![vless_node(), vmess_node(), ss_node(), trojan_node()];
         let config = generator
-            .generate(&nodes, &[], &default_settings(), None)
+            .generate(&nodes, &[], &default_settings())
             .unwrap();
 
         let outbounds = config["outbounds"].as_array().unwrap();
-        // 4 proxy + direct + block = 6
         assert_eq!(outbounds.len(), 6);
     }
 
@@ -588,7 +621,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[vless_node()], &rules, &default_settings(), None)
+            .generate(&[vless_node()], &rules, &default_settings())
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
@@ -611,7 +644,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[vless_node()], &rules, &default_settings(), None)
+            .generate(&[vless_node()], &rules, &default_settings())
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
@@ -632,7 +665,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[vless_node()], &rules, &default_settings(), None)
+            .generate(&[vless_node()], &rules, &default_settings())
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
@@ -653,7 +686,7 @@ mod tests {
         }];
 
         let config = generator
-            .generate(&[vless_node()], &rules, &default_settings(), None)
+            .generate(&[vless_node()], &rules, &default_settings())
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
@@ -686,7 +719,7 @@ mod tests {
         ];
 
         let config = generator
-            .generate(&[vless_node()], &rules, &default_settings(), None)
+            .generate(&[vless_node()], &rules, &default_settings())
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
@@ -712,7 +745,7 @@ mod tests {
 
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[node], &[], &default_settings(), None)
+            .generate(&[node], &[], &default_settings())
             .unwrap();
 
         let stream = &config["outbounds"][0]["streamSettings"];
@@ -739,7 +772,7 @@ mod tests {
 
         let generator = V2rayGenerator;
         let config = generator
-            .generate(&[node], &[], &default_settings(), None)
+            .generate(&[node], &[], &default_settings())
             .unwrap();
 
         let stream = &config["outbounds"][0]["streamSettings"];
@@ -773,7 +806,7 @@ mod tests {
         ];
 
         let config = generator
-            .generate(&nodes, &rules, &default_settings(), None)
+            .generate(&nodes, &rules, &default_settings())
             .unwrap();
         let json_str = serde_json::to_string_pretty(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
@@ -864,7 +897,33 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_protocol_fallback() {
+    fn test_dns_supported_protocol_addresses_preserved() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+
+        let protocols = vec![
+            (DnsProtocol::Doh, "https://1.1.1.1/dns-query"),
+            (DnsProtocol::Tcp, "tcp://1.1.1.1:53"),
+            (DnsProtocol::Udp, "1.1.1.1"),
+        ];
+
+        for (protocol, expected_address) in protocols {
+            settings.dns.servers = vec![DnsServerConfig {
+                tag: "test".to_string(),
+                protocol,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            }];
+
+            let dns = build_dns(&[], &settings);
+            let servers = dns["servers"].as_array().unwrap();
+            assert_eq!(servers[0].as_str(), Some(expected_address));
+        }
+    }
+
+    #[test]
+    fn test_dns_v2ray_falls_back_to_doh_for_unsupported_protocols() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
 
@@ -872,7 +931,6 @@ mod tests {
             (DnsProtocol::Dot, "https://1.1.1.1/dns-query"),
             (DnsProtocol::Doq, "https://1.1.1.1/dns-query"),
             (DnsProtocol::H3, "https://1.1.1.1/dns-query"),
-            (DnsProtocol::Doh, "https://1.1.1.1/dns-query"),
         ];
 
         for (protocol, expected_address) in protocols {
@@ -1043,15 +1101,11 @@ mod tests {
         ];
 
         let generator = V2rayGenerator;
-        let config = generator
-            .generate(&[vless_node()], &[], &settings, None)
-            .unwrap();
+        let config = generator.generate(&[vless_node()], &[], &settings).unwrap();
 
-        // Verify DNS config is present
         assert!(config.get("dns").is_some());
         let dns = &config["dns"];
 
-        // Verify all fields are present
         assert_eq!(dns["queryStrategy"], "UseIPv4");
         assert_eq!(dns["disableCache"], true);
         assert_eq!(dns["clientIp"], "203.0.113.1");
@@ -1064,7 +1118,6 @@ mod tests {
         assert_eq!(hosts.get("example.com"), Some(&json!("192.0.2.1")));
         assert_eq!(hosts.get("test.local"), Some(&json!("10.0.0.1")));
 
-        // Verify JSON roundtrip
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
     }

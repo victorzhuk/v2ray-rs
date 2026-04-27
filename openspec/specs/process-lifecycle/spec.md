@@ -3,19 +3,15 @@
 ## ADDED Requirements
 
 ### Requirement: Start backend process
-The system SHALL launch the selected backend binary using the invocation `binary run -c <config_path>`.
-
-#### Scenario: Successful start
-- **WHEN** the user initiates a connection
-- **THEN** the system SHALL spawn the backend process, transition state to Running, and begin capturing output
+The system SHALL emit an `Error` process state when pre-launch validation fails.
 
 #### Scenario: Binary not found
 - **WHEN** the configured binary path does not exist
-- **THEN** the system SHALL transition to Error state with a descriptive message
+- **THEN** the process manager SHALL emit `Starting` followed by `Error`, then return the validation error
 
 #### Scenario: Config file missing
-- **WHEN** the config file does not exist at the expected path
-- **THEN** the system SHALL transition to Error state with a `ConfigMissing` error (config generation is the caller's responsibility before invoking `start()`)
+- **WHEN** the config file does not exist
+- **THEN** the process manager SHALL emit `Starting` followed by `Error`, then return the validation error
 
 ### Requirement: Stop backend process
 The system SHALL gracefully stop the running backend process using SIGTERM, falling back to SIGKILL after a timeout.
@@ -69,15 +65,19 @@ The system SHALL expose current process state and active connection metadata to 
 - **THEN** the system SHALL emit an event that includes connection metadata for the UI and tray to update their display
 
 ### Requirement: Cleanup on app exit
-The system SHALL ensure the backend process is terminated when the application exits.
+The system SHALL ensure the backend process is terminated when the application exits, using a profile-scoped PID file.
 
 #### Scenario: Normal app exit
 - **WHEN** the user quits the application
 - **THEN** the system SHALL send SIGTERM to the backend process and wait for it to exit before completing shutdown
 
 #### Scenario: PID file for crash recovery
-- **WHEN** the app starts and finds a PID file from a previous run
+- **WHEN** the app starts and finds a PID file from a previous run at `runtime_dir/backend.pid`
 - **THEN** the system SHALL check if that process is still running and kill it if so
+
+#### Scenario: PID file does not leak across profiles
+- **WHEN** the app launches with one profile while a backend from a different profile is running
+- **THEN** the system SHALL only inspect the PID file under the active profile's `runtime_dir` and SHALL NOT touch other profiles' processes
 
 ### Requirement: Capture launched runtime snapshot
 The system SHALL capture an immutable snapshot of the restart-relevant settings and routing rules that were actually used for the current connection attempt.
@@ -92,3 +92,18 @@ The system SHALL apply pending runtime configuration changes by reusing the norm
 #### Scenario: Apply and restart while connected
 - **WHEN** the user chooses "Apply & Restart" from the restart-required banner
 - **THEN** the system disconnects, reconnects with the already-persisted runtime config, and replaces the active runtime snapshot with the new launched snapshot
+
+### Requirement: Single-instance lock per profile
+The system SHALL acquire an exclusive advisory lock on `runtime_dir/v2ray-rs.lock` at startup, before initializing persistence or spawning the backend, and SHALL hold it for the lifetime of the process. Two instances of the same profile SHALL NOT run concurrently. Two instances of different profiles SHALL be able to run concurrently because their `runtime_dir`s differ.
+
+#### Scenario: Second instance of the same profile is refused
+- **WHEN** an instance is already running for a given profile and a second invocation targets the same profile
+- **THEN** the second invocation SHALL fail to acquire the lock, SHALL print the holder PID recorded in `instance.json`, and SHALL exit with code 75
+
+#### Scenario: Different profiles run side-by-side
+- **WHEN** an instance is running with `--profile production` and another is started with `--profile development`
+- **THEN** both instances SHALL run concurrently without contending for the same lock file
+
+#### Scenario: Lock is released on shutdown
+- **WHEN** an instance exits cleanly or is killed
+- **THEN** the kernel SHALL release the advisory lock and a subsequent invocation of the same profile SHALL be able to acquire it

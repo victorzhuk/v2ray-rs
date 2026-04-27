@@ -72,3 +72,10 @@ The system SHALL support minimizing the main window to the system tray instead o
 #### Scenario: Restore from tray
 - **WHEN** the user clicks "Open Main Window" in the tray menu
 - **THEN** the main window SHALL be shown and focused
+
+### Requirement: Tray notifications
+The system SHALL support optional desktop notifications for tray-visible connection state changes.
+
+#### Scenario: Notifications enabled
+- **WHEN** notifications are enabled and the connection state changes to Running or Error
+- **THEN** the tray integration SHALL emit a desktop notification describing the state change

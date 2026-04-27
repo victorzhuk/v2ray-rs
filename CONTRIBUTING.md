@@ -56,6 +56,28 @@ cargo watch -x check -x test -x run
 cargo nextest run
 ```
 
+### Local Development Profiles
+
+By default, `cargo run` uses the `development` profile, which stores all data under `~/.config/v2ray-rs-dev/` and `~/.local/share/v2ray-rs-dev/` — completely isolated from any production install.
+
+```bash
+# Run with development profile (default for debug builds)
+cargo run -p v2ray-rs-ui
+
+# Run with a custom throwaway profile
+cargo run -p v2ray-rs-ui -- --profile test
+
+# Reset a profile to clean state
+cargo run -p v2ray-rs-ui -- --profile development --reset-instance
+
+# Override just the cache and runtime dirs for CI-like testing
+cargo run -p v2ray-rs-ui -- --cache-dir /tmp/v2ray-test/cache --runtime-dir /tmp/v2ray-test/runtime
+```
+
+Integration tests use `AppPaths::for_profile_in(AppProfile::Test, tmp.path())` to create isolated directory trees under a temp directory. No feature flags are needed — the constructor is always available.
+
+The legacy `V2RAY_RS_DEV=1` environment variable still maps to the development profile but is deprecated and will be removed in a future release. Use `--profile development` or `V2RAY_RS_PROFILE=development` instead.
+
 ---
 
 ## Development Workflow

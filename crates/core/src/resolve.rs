@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
@@ -16,28 +18,57 @@ pub struct ConnectionCandidate {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LatencyEntry {
-    pub node_ref: ConnectionNodeRef,
-    pub sample: LatencySample,
+struct LatencyEntryWire {
+    node_ref: ConnectionNodeRef,
+    sample: LatencySample,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct LatencySnapshotWire {
+    samples: Vec<LatencyEntryWire>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct LatencySnapshot {
-    pub samples: Vec<LatencyEntry>,
+    samples: HashMap<ConnectionNodeRef, LatencySample>,
+}
+
+impl Serialize for LatencySnapshot {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let entries: Vec<LatencyEntryWire> = self
+            .samples
+            .iter()
+            .map(|(node_ref, sample)| LatencyEntryWire {
+                node_ref: *node_ref,
+                sample: sample.clone(),
+            })
+            .collect();
+        let wire = LatencySnapshotWire { samples: entries };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for LatencySnapshot {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = LatencySnapshotWire::deserialize(deserializer)?;
+        let samples = wire
+            .samples
+            .into_iter()
+            .map(|entry| (entry.node_ref, entry.sample))
+            .collect();
+        Ok(LatencySnapshot { samples })
+    }
 }
 
 impl LatencySnapshot {
     pub fn new() -> Self {
         Self {
-            samples: Vec::new(),
+            samples: HashMap::new(),
         }
     }
 
     pub fn get(&self, node_ref: ConnectionNodeRef) -> Option<&LatencySample> {
-        self.samples
-            .iter()
-            .find(|entry| entry.node_ref == node_ref)
-            .map(|entry| &entry.sample)
+        self.samples.get(&node_ref)
     }
 
     pub fn upsert(
@@ -46,24 +77,21 @@ impl LatencySnapshot {
         latency_ms: u64,
         measured_at: DateTime<Utc>,
     ) {
-        if let Some(entry) = self
-            .samples
-            .iter_mut()
-            .find(|entry| entry.node_ref == node_ref)
-        {
-            entry.sample = LatencySample {
-                latency_ms,
-                measured_at,
-            };
-            return;
-        }
-        self.samples.push(LatencyEntry {
+        self.samples.insert(
             node_ref,
-            sample: LatencySample {
+            LatencySample {
                 latency_ms,
                 measured_at,
             },
-        });
+        );
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
     }
 }
 
@@ -100,13 +128,13 @@ impl ConnectionPlanner {
         let mut candidates = Vec::new();
 
         for sub in subscriptions.iter().filter(|s| s.enabled) {
-            for (idx, node) in sub.nodes.iter().enumerate() {
+            for node in &sub.nodes {
                 if !node.enabled {
                     continue;
                 }
                 let node_ref = ConnectionNodeRef::Subscription {
                     subscription_id: sub.id,
-                    node_index: idx,
+                    node_id: node.id,
                 };
                 let latency_ms = self
                     .latency_snapshot
@@ -165,6 +193,25 @@ impl ConnectionPlanner {
             }
         }
     }
+
+    pub fn runtime_candidate(
+        &self,
+        subscriptions: &[Subscription],
+        manual_nodes: &[ManualNode],
+    ) -> Option<ConnectionCandidate> {
+        match self.strategy {
+            // Keep disconnected config regeneration deterministic.
+            AutoResolveStrategy::Random => ConnectionPlanner::new(
+                AutoResolveStrategy::ListOrder,
+                self.last_success.clone(),
+                self.latency_snapshot.clone(),
+            )
+            .plan(subscriptions, manual_nodes)
+            .into_iter()
+            .next(),
+            _ => self.plan(subscriptions, manual_nodes).into_iter().next(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -180,10 +227,11 @@ mod tests {
         let mut sub = Subscription::new_from_url(name, "https://example.com");
         sub.nodes = nodes
             .into_iter()
-            .map(|(node, enabled, latency)| SubscriptionNode {
-                node,
-                enabled,
-                last_latency_ms: latency,
+            .map(|(node, enabled, latency)| {
+                let mut subscription_node = SubscriptionNode::new(node);
+                subscription_node.enabled = enabled;
+                subscription_node.last_latency_ms = latency;
+                subscription_node
             })
             .collect();
         sub
@@ -253,10 +301,11 @@ mod tests {
                 (vless_node("b.com", "B"), true, Some(20)),
             ],
         );
+        let target_node_id = sub.nodes[1].id;
         let last = LastSuccessMetadata {
             node_ref: ConnectionNodeRef::Subscription {
                 subscription_id: sub.id,
-                node_index: 1,
+                node_id: target_node_id,
             },
             connected_at: Utc::now(),
         };
@@ -272,6 +321,24 @@ mod tests {
     }
 
     #[test]
+    fn runtime_candidate_uses_stable_order_for_random_strategy() {
+        let sub1 =
+            subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), true, Some(50))]);
+        let sub2 =
+            subscription_with_nodes("Beta", vec![(vless_node("b.com", "B"), true, Some(10))]);
+        let planner = ConnectionPlanner::new(
+            AutoResolveStrategy::Random,
+            None,
+            LatencySnapshot::default(),
+        );
+
+        let candidate = planner.runtime_candidate(&[sub1, sub2], &[]).unwrap();
+
+        assert_eq!(candidate.source_name, "Alpha");
+        assert_eq!(candidate.node.address(), "a.com");
+    }
+
+    #[test]
     fn test_latency_stable_after_manual_node_insert() {
         let snapshot = LatencySnapshot::new();
         let node_id = uuid::Uuid::new_v4();
@@ -282,7 +349,6 @@ mod tests {
         let mut snapshot = snapshot;
         snapshot.upsert(node_ref, 100, now);
 
-        // Insert another node
         snapshot.upsert(
             ConnectionNodeRef::Manual {
                 node_id: uuid::Uuid::new_v4(),
@@ -291,7 +357,6 @@ mod tests {
             now,
         );
 
-        // Original latency should still be accessible
         let latency = snapshot.get(node_ref);
         assert!(latency.is_some());
         assert_eq!(latency.unwrap().latency_ms, 100);
@@ -305,7 +370,6 @@ mod tests {
             connected_at: Utc::now(),
         };
 
-        // Serialize and deserialize to simulate persistence
         let json = serde_json::to_string(&last).unwrap();
         let loaded: LastSuccessMetadata = serde_json::from_str(&json).unwrap();
 

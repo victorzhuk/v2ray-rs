@@ -1,5 +1,4 @@
 use adw::prelude::*;
-use relm4::adw;
 use relm4::prelude::*;
 
 const MAX_LOG_LINES: i32 = 10_000;
@@ -42,33 +41,43 @@ impl SimpleComponent for LogsPage {
                 },
             },
 
-            gtk::Stack {
-                set_vexpand: true,
-                set_transition_type: gtk::StackTransitionType::Crossfade,
-                set_transition_duration: 200,
+            gtk::Revealer {
+                set_transition_type: gtk::RevealerTransitionType::SlideDown,
                 #[watch]
-                set_visible_child_name: if model.running { "logs" } else { "empty" },
+                set_reveal_child: !model.running,
 
-                add_named[Some("empty")] = &adw::StatusPage {
-                    set_title: "Process Not Running",
-                    set_description: Some("Start the proxy to see logs"),
-                    set_icon_name: Some("network-vpn-disconnected-symbolic"),
-                },
+                gtk::Box {
+                    set_orientation: gtk::Orientation::Horizontal,
+                    set_spacing: 6,
+                    set_margin_start: 12,
+                    set_margin_end: 12,
+                    set_margin_bottom: 6,
+                    set_margin_top: 6,
 
-                add_named[Some("logs")] = &gtk::ScrolledWindow {
-                    set_vexpand: true,
-
-                    #[local_ref]
-                    text_view -> gtk::TextView {
-                        set_editable: false,
-                        set_cursor_visible: false,
-                        set_monospace: true,
-                        set_left_margin: 12,
-                        set_right_margin: 12,
-                        set_top_margin: 12,
-                        set_bottom_margin: 12,
-                        set_wrap_mode: gtk::WrapMode::Word,
+                    gtk::Image {
+                        set_icon_name: Some("network-vpn-disconnected-symbolic"),
                     },
+
+                    gtk::Label {
+                        set_halign: gtk::Align::Start,
+                        set_label: "Process not running. Showing the most recent logs from this session.",
+                        add_css_class: "dim-label",
+                    },
+                },
+            },
+
+            gtk::ScrolledWindow {
+                set_vexpand: true,
+                #[local_ref]
+                text_view -> gtk::TextView {
+                    set_editable: false,
+                    set_cursor_visible: false,
+                    set_monospace: true,
+                    set_left_margin: 12,
+                    set_right_margin: 12,
+                    set_top_margin: 12,
+                    set_bottom_margin: 12,
+                    set_wrap_mode: gtk::WrapMode::Word,
                 },
             },
         }
@@ -76,7 +85,7 @@ impl SimpleComponent for LogsPage {
 
     fn init(
         _init: Self::Init,
-        root: Self::Root,
+        _root: Self::Root,
         _sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let log_buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);

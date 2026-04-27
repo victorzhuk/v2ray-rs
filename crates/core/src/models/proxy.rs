@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "protocol", rename_all = "lowercase")]
@@ -10,6 +11,7 @@ pub enum ProxyNode {
 }
 
 impl ProxyNode {
+    #[must_use]
     pub fn remark(&self) -> Option<&str> {
         match self {
             Self::Vless(c) => c.remark.as_deref(),
@@ -19,6 +21,7 @@ impl ProxyNode {
         }
     }
 
+    #[must_use]
     pub fn address(&self) -> &str {
         match self {
             Self::Vless(c) => &c.address,
@@ -28,6 +31,7 @@ impl ProxyNode {
         }
     }
 
+    #[must_use]
     pub fn port(&self) -> u16 {
         match self {
             Self::Vless(c) => c.port,
@@ -36,6 +40,103 @@ impl ProxyNode {
             Self::Trojan(c) => c.port,
         }
     }
+
+    #[must_use]
+    pub fn protocol_name(&self) -> &'static str {
+        match self {
+            Self::Vless(_) => "vless",
+            Self::Vmess(_) => "vmess",
+            Self::Shadowsocks(_) => "shadowsocks",
+            Self::Trojan(_) => "trojan",
+        }
+    }
+
+    pub fn validate(&self) -> Result<(), ProxyNodeValidationError> {
+        validate_common(self.protocol_name(), self.address(), self.port())?;
+
+        match self {
+            Self::Vless(c) => {
+                require_non_empty("vless", "uuid", &c.uuid)?;
+            }
+            Self::Vmess(c) => {
+                require_non_empty("vmess", "uuid", &c.uuid)?;
+                require_non_empty("vmess", "security", &c.security)?;
+            }
+            Self::Shadowsocks(c) => {
+                require_non_empty("shadowsocks", "method", &c.method)?;
+                require_non_empty("shadowsocks", "password", &c.password)?;
+            }
+            Self::Trojan(c) => {
+                require_non_empty("trojan", "password", &c.password)?;
+            }
+        }
+
+        if let Some(tls) = self.tls() {
+            validate_tls(self.protocol_name(), tls)?;
+        }
+
+        Ok(())
+    }
+
+    fn tls(&self) -> Option<&TlsSettings> {
+        match self {
+            Self::Vless(c) => c.tls.as_ref(),
+            Self::Vmess(c) => c.tls.as_ref(),
+            Self::Shadowsocks(_) => None,
+            Self::Trojan(c) => c.tls.as_ref(),
+        }
+    }
+}
+
+fn validate_common(
+    protocol: &'static str,
+    address: &str,
+    port: u16,
+) -> Result<(), ProxyNodeValidationError> {
+    require_non_empty(protocol, "address", address)?;
+    if port == 0 {
+        return Err(ProxyNodeValidationError::InvalidPort {
+            protocol,
+            field: "port",
+        });
+    }
+    Ok(())
+}
+
+fn validate_tls(protocol: &'static str, tls: &TlsSettings) -> Result<(), ProxyNodeValidationError> {
+    if tls.reality {
+        require_non_empty(
+            protocol,
+            "tls.public_key",
+            tls.public_key.as_deref().unwrap_or(""),
+        )?;
+    }
+    Ok(())
+}
+
+fn require_non_empty(
+    protocol: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), ProxyNodeValidationError> {
+    if value.trim().is_empty() {
+        return Err(ProxyNodeValidationError::MissingField { protocol, field });
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ProxyNodeValidationError {
+    #[error("{protocol} node requires non-empty field '{field}'")]
+    MissingField {
+        protocol: &'static str,
+        field: &'static str,
+    },
+    #[error("{protocol} node requires a non-zero '{field}'")]
+    InvalidPort {
+        protocol: &'static str,
+        field: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -76,7 +177,7 @@ fn default_vmess_security() -> String {
     "auto".to_string()
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShadowsocksConfig {
     pub address: String,
     pub port: u16,
@@ -86,7 +187,19 @@ pub struct ShadowsocksConfig {
     pub remark: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl std::fmt::Debug for ShadowsocksConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ShadowsocksConfig")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("method", &self.method)
+            .field("password", &"***")
+            .field("remark", &self.remark)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct TrojanConfig {
     pub address: String,
     pub port: u16,
@@ -97,6 +210,19 @@ pub struct TrojanConfig {
     pub tls: Option<TlsSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
+}
+
+impl std::fmt::Debug for TrojanConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrojanConfig")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("password", &"***")
+            .field("transport", &self.transport)
+            .field("tls", &self.tls)
+            .field("remark", &self.remark)
+            .finish()
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
@@ -285,5 +411,91 @@ mod tests {
     #[test]
     fn test_default_transport() {
         assert_eq!(TransportSettings::default(), TransportSettings::Tcp);
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_required_fields() {
+        let node = ProxyNode::Trojan(TrojanConfig {
+            address: "example.com".into(),
+            port: 443,
+            password: String::new(),
+            transport: TransportSettings::Tcp,
+            tls: None,
+            remark: None,
+        });
+
+        assert_eq!(
+            node.validate(),
+            Err(ProxyNodeValidationError::MissingField {
+                protocol: "trojan",
+                field: "password",
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_empty_address() {
+        let node = ProxyNode::Shadowsocks(ShadowsocksConfig {
+            address: "   ".into(),
+            port: 8388,
+            method: "aes-256-gcm".into(),
+            password: "secret".into(),
+            remark: None,
+        });
+
+        assert_eq!(
+            node.validate(),
+            Err(ProxyNodeValidationError::MissingField {
+                protocol: "shadowsocks",
+                field: "address",
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_port() {
+        let node = ProxyNode::Vmess(VmessConfig {
+            address: "example.com".into(),
+            port: 0,
+            uuid: "123e4567-e89b-12d3-a456-426614174000".into(),
+            alter_id: 0,
+            security: "auto".into(),
+            transport: TransportSettings::Tcp,
+            tls: None,
+            remark: None,
+        });
+
+        assert_eq!(
+            node.validate(),
+            Err(ProxyNodeValidationError::InvalidPort {
+                protocol: "vmess",
+                field: "port",
+            })
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_reality_without_public_key() {
+        let node = ProxyNode::Vless(VlessConfig {
+            address: "example.com".into(),
+            port: 443,
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            encryption: Some("none".into()),
+            flow: None,
+            transport: TransportSettings::Tcp,
+            tls: Some(TlsSettings {
+                reality: true,
+                ..Default::default()
+            }),
+            remark: None,
+        });
+
+        assert_eq!(
+            node.validate(),
+            Err(ProxyNodeValidationError::MissingField {
+                protocol: "vless",
+                field: "tls.public_key",
+            })
+        );
     }
 }

@@ -1,10 +1,10 @@
 ### Requirement: Drag-and-Drop List Reordering
-The system SHALL allow users to reorder routing rules via drag-and-drop interactions inside the existing Preferences page.
+The system SHALL allow drag-and-drop reordering for routing rules, subscriptions, and subscription nodes.
 
-#### Scenario: Drag rule to change precedence
-- **WHEN** a user clicks and drags a routing rule row up or down in the list
-- **THEN** the rule is visually reordered and the underlying configuration updates its position
+#### Scenario: Drag subscription to reorder sources
+- **WHEN** a user drags a subscription row to a new position
+- **THEN** the subscription order SHALL update immediately and persist
 
-#### Scenario: Drag-and-drop persists and regenerates
-- **WHEN** a drag-and-drop reorder completes
-- **THEN** the system saves the updated routing rules and triggers the same config-regeneration path used by the existing move buttons
+#### Scenario: Drag node within a subscription
+- **WHEN** a user drags a node row within a subscription
+- **THEN** the node order SHALL update immediately and persist

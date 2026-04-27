@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,11 +5,13 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::fs::atomic_write;
 use crate::geodata_index::GeodataIndexManager;
 use crate::models::BackendType;
 use crate::persistence::AppPaths;
 
 const GEODATA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_GEODATA_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
 #[derive(Debug, Error)]
 pub enum GeodataError {
@@ -29,11 +30,13 @@ pub struct GeodataMetadata {
     pub geosite_version: Option<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct GeodataDownload {
     pub url: String,
     pub filename: String,
 }
 
+#[derive(Debug)]
 pub struct GeodataManager {
     geodata_dir: PathBuf,
     metadata_path: PathBuf,
@@ -100,17 +103,7 @@ impl GeodataManager {
     pub fn save_metadata(&self, metadata: &GeodataMetadata) -> Result<(), GeodataError> {
         self.ensure_dir()?;
         let json = serde_json::to_string_pretty(metadata)?;
-        let dir = self.metadata_path.parent().ok_or_else(|| {
-            GeodataError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "metadata path has no parent",
-            ))
-        })?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(json.as_bytes())?;
-        tmp.flush()?;
-        tmp.persist(&self.metadata_path)
-            .map_err(|e| GeodataError::Io(e.error))?;
+        atomic_write(&self.metadata_path, json.as_bytes()).map_err(GeodataError::Io)?;
         Ok(())
     }
 
@@ -122,7 +115,11 @@ impl GeodataManager {
                     .num_seconds();
                 elapsed >= interval.as_secs() as i64
             }
-            _ => true,
+            Ok(None) => true,
+            Err(e) => {
+                log::warn!("failed to load geodata metadata, assuming update needed: {e}");
+                true
+            }
         }
     }
 
@@ -167,12 +164,7 @@ impl GeodataManager {
 
         index_manager
             .build_index(backend, &geoip_path, &geosite_path)
-            .map_err(|e| {
-                GeodataError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    e.to_string(),
-                ))
-            })?;
+            .map_err(|e| GeodataError::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
     }
 }
@@ -188,6 +180,9 @@ pub fn check_and_download(
     }
     download_geodata(manager, backend).map(Some)
 }
+
+#[cfg(feature = "geodata-fetch")]
+use std::io::Write;
 
 #[cfg(feature = "geodata-fetch")]
 pub fn download_geodata(
@@ -225,6 +220,16 @@ pub fn download_geodata(
             reason: e.to_string(),
         })?;
 
+        if bytes.len() as u64 > MAX_GEODATA_SIZE {
+            return Err(GeodataError::Download {
+                url: dl.url,
+                reason: format!(
+                    "response too large: {} bytes (max {MAX_GEODATA_SIZE})",
+                    bytes.len()
+                ),
+            });
+        }
+
         let dir = target.parent().ok_or_else(|| {
             GeodataError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -233,6 +238,8 @@ pub fn download_geodata(
         })?;
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         tmp.write_all(&bytes)?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
         tmp.persist(&target)
             .map_err(|e| GeodataError::Io(e.error))?;
     }
@@ -250,10 +257,11 @@ pub fn download_geodata(
 mod tests {
     use super::*;
     use tempfile::TempDir;
+    use crate::profile::AppProfile;
 
     fn test_manager() -> (TempDir, GeodataManager) {
         let tmp = TempDir::new().unwrap();
-        let paths = AppPaths::from_paths(tmp.path().join("config"), tmp.path().join("data"));
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let manager = GeodataManager::new(&paths);
         (tmp, manager)
     }

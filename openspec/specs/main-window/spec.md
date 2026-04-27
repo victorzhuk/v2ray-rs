@@ -40,15 +40,11 @@ The system SHALL provide routing rule management and settings via the hamburger 
 - **THEN** the system SHALL show an `adw::PreferencesDialog` with pages: System, Network, Routing, DNS
 
 ### Requirement: Logs page
-The system SHALL provide a page for viewing backend process logs.
+The system SHALL keep the current-session log buffer visible even while the backend is stopped.
 
-#### Scenario: Live log display
-- **WHEN** the backend process is running and the Logs tab is active
-- **THEN** the system SHALL display log lines in real-time, auto-scrolling to the latest entry
-
-#### Scenario: Log when stopped
+#### Scenario: Log view while stopped
 - **WHEN** no backend process is running
-- **THEN** the Logs page SHALL show the last session's logs (if any) with a "Process not running" indicator
+- **THEN** the Logs page SHALL continue showing the most recent in-memory logs together with a "Process not running" indicator
 
 ### Requirement: Connection status bar
 The system SHALL display a persistent status bar showing current connection state with a connect or disconnect button and active connection details for both subscription and manual nodes.
