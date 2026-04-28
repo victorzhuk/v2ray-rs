@@ -138,7 +138,8 @@ pub(crate) fn clear_preferences_group(group: &adw::PreferencesGroup) {
             || c.is::<adw::EntryRow>()
             || c.is::<adw::SpinRow>()
             || c.is::<adw::ExpanderRow>()
-            || c.is::<adw::ComboRow>() {
+            || c.is::<adw::ComboRow>()
+        {
             group.remove(&c);
         }
         child = next;

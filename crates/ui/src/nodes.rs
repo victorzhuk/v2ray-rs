@@ -768,26 +768,25 @@ impl Component for NodesPage {
                     }
                 }
             }
-            NodesMsg::ImportFromUrl(uri) => {
-                match v2ray_rs_subscription::parse_uri(&uri) {
-                    Ok(node) => {
-                        if let Err(err) = node.validate() {
-                            let _ = sender.output(NodesOutput::Notice(format!("Invalid node: {err}")));
-                            return;
-                        }
-                        let manual = ManualNode::new(node);
-                        self.nodes.push(manual);
-                        if persist_manual_nodes(&self.store, &self.nodes) {
-                            changed = true;
-                        } else {
-                            let _ = self.nodes.pop();
-                        }
+            NodesMsg::ImportFromUrl(uri) => match v2ray_rs_subscription::parse_uri(&uri) {
+                Ok(node) => {
+                    if let Err(err) = node.validate() {
+                        let _ = sender.output(NodesOutput::Notice(format!("Invalid node: {err}")));
+                        return;
                     }
-                    Err(err) => {
-                        let _ = sender.output(NodesOutput::Notice(format!("Failed to parse URI: {err}")));
+                    let manual = ManualNode::new(node);
+                    self.nodes.push(manual);
+                    if persist_manual_nodes(&self.store, &self.nodes) {
+                        changed = true;
+                    } else {
+                        let _ = self.nodes.pop();
                     }
                 }
-            }
+                Err(err) => {
+                    let _ =
+                        sender.output(NodesOutput::Notice(format!("Failed to parse URI: {err}")));
+                }
+            },
             NodesMsg::ResetStorage => match self.store.reset_manual_nodes() {
                 Ok(()) => {
                     self.nodes.clear();

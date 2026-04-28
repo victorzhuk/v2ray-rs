@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use base64::Engine;
-use futures_util::StreamExt;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+use futures_util::StreamExt;
 use thiserror::Error;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);

@@ -47,27 +47,27 @@ fn migrate_latency_snapshot_legacy_refs(
 
     samples.retain_mut(|entry| {
         // Pre-migration: wrap old flat format into node_ref
-        if let Some(obj) = entry.as_object_mut() {
-            if !obj.contains_key("node_ref") {
-                if obj.contains_key("subscription_id") && obj.contains_key("node_index") {
-                    // Old subscription format
-                    let sub_id = obj.remove("subscription_id").unwrap();
-                    let node_idx = obj.remove("node_index").unwrap();
-                    let mut node_ref_obj = serde_json::Map::new();
-                    node_ref_obj.insert("type".into(), JsonValue::String("subscription".into()));
-                    node_ref_obj.insert("subscription_id".into(), sub_id);
-                    node_ref_obj.insert("node_index".into(), node_idx);
-                    obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
-                    changed = true;
-                } else if obj.contains_key("node_id") {
-                    // Old manual format
-                    let node_id = obj.remove("node_id").unwrap();
-                    let mut node_ref_obj = serde_json::Map::new();
-                    node_ref_obj.insert("type".into(), JsonValue::String("manual".into()));
-                    node_ref_obj.insert("node_id".into(), node_id);
-                    obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
-                    changed = true;
-                }
+        if let Some(obj) = entry.as_object_mut()
+            && !obj.contains_key("node_ref")
+        {
+            if obj.contains_key("subscription_id") && obj.contains_key("node_index") {
+                // Old subscription format
+                let sub_id = obj.remove("subscription_id").unwrap();
+                let node_idx = obj.remove("node_index").unwrap();
+                let mut node_ref_obj = serde_json::Map::new();
+                node_ref_obj.insert("type".into(), JsonValue::String("subscription".into()));
+                node_ref_obj.insert("subscription_id".into(), sub_id);
+                node_ref_obj.insert("node_index".into(), node_idx);
+                obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
+                changed = true;
+            } else if obj.contains_key("node_id") {
+                // Old manual format
+                let node_id = obj.remove("node_id").unwrap();
+                let mut node_ref_obj = serde_json::Map::new();
+                node_ref_obj.insert("type".into(), JsonValue::String("manual".into()));
+                node_ref_obj.insert("node_id".into(), node_id);
+                obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
+                changed = true;
             }
         }
 
@@ -273,7 +273,9 @@ mod tests {
             node_id: subscription.nodes[0].id,
         };
         assert!(snapshot.get(node_ref).is_some());
-        let manual_ref = ConnectionNodeRef::Manual { node_id: manual_node_id };
+        let manual_ref = ConnectionNodeRef::Manual {
+            node_id: manual_node_id,
+        };
         assert!(snapshot.get(manual_ref).is_some());
     }
 }

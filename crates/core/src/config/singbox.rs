@@ -174,7 +174,9 @@ fn build_ws_transport(ws: &WsSettings) -> Value {
     });
     let mut headers = ws.headers.clone();
     if let Some(host) = &ws.host {
-        headers.entry("Host".to_string()).or_insert_with(|| host.clone());
+        headers
+            .entry("Host".to_string())
+            .or_insert_with(|| host.clone());
     }
     if !headers.is_empty() {
         transport["headers"] = json!(headers);
@@ -334,8 +336,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         final_server = Some("fakeip".to_string());
     }
 
-    let final_server = final_server
-        .or_else(|| settings.dns.servers.first().map(|s| s.tag.clone()));
+    let final_server = final_server.or_else(|| settings.dns.servers.first().map(|s| s.tag.clone()));
     dns_config["final"] = json!(final_server);
 
     dns_config["servers"] = json!(servers);

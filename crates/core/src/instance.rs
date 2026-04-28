@@ -165,6 +165,7 @@ impl InstanceLock {
 
         let file = std_fs::OpenOptions::new()
             .create(true)
+            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -351,10 +352,7 @@ mod tests {
         paths.ensure_dirs().unwrap();
 
         let result = reset_instance(&paths, &AppProfile::Production, false);
-        assert!(matches!(
-            result,
-            Err(InstanceError::ResetProductionDenied)
-        ));
+        assert!(matches!(result, Err(InstanceError::ResetProductionDenied)));
     }
 
     #[test]

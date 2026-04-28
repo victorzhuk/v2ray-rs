@@ -256,8 +256,8 @@ pub fn download_geodata(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use crate::profile::AppProfile;
+    use tempfile::TempDir;
 
     fn test_manager() -> (TempDir, GeodataManager) {
         let tmp = TempDir::new().unwrap();

@@ -204,8 +204,8 @@ mod v2ray_geosite {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::TempDir;
     use crate::profile::AppProfile;
+    use tempfile::TempDir;
 
     fn test_index_manager() -> (TempDir, GeodataIndexManager) {
         let tmp = TempDir::new().unwrap();

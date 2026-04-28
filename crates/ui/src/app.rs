@@ -9,7 +9,9 @@ use tokio::sync::broadcast;
 
 use v2ray_rs_core::cli::{CliArgs, PathOverrides};
 use v2ray_rs_core::config::ConfigWriter;
-use v2ray_rs_core::instance::{check_compatibility, InstanceLock, InstanceStamp, reset_instance, CompatibilityResult};
+use v2ray_rs_core::instance::{
+    CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
+};
 use v2ray_rs_core::models::{
     AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, RoutingRuleSet, Subscription,
     SubscriptionSource,
@@ -1198,7 +1200,8 @@ fn try_run() -> Result<(), String> {
     let paths = AppPaths::with_overrides(profile.clone(), &overrides)
         .map_err(|err| format!("failed to determine XDG directories: {err}"))?;
 
-    paths.ensure_dirs()
+    paths
+        .ensure_dirs()
         .map_err(|err| format!("failed to create directories: {err}"))?;
 
     if cli_args.reset_instance {
@@ -1225,20 +1228,37 @@ fn try_run() -> Result<(), String> {
             log::info!("Instance stamp is compatible");
         }
         CompatibilityResult::NeedsForwardMigration => {
-            log::warn!("Instance stamp needs forward migration (schema version {} < {}), continuing", stamp.schema_version, v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION);
+            log::warn!(
+                "Instance stamp needs forward migration (schema version {} < {}), continuing",
+                stamp.schema_version,
+                v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION
+            );
         }
         CompatibilityResult::IncompatibleProfile => {
-            return Err(format!("Instance profile '{}' is incompatible with current profile '{}'. Reset instance with --reset-instance to continue.", stamp.profile, profile.qualifier()));
+            return Err(format!(
+                "Instance profile '{}' is incompatible with current profile '{}'. Reset instance with --reset-instance to continue.",
+                stamp.profile,
+                profile.qualifier()
+            ));
         }
         CompatibilityResult::IncompatibleAppId => {
-            return Err(format!("Instance app_id '{}' is incompatible with current app_id '{}'. Reset instance with --reset-instance to continue.", stamp.app_id, profile.app_id()));
+            return Err(format!(
+                "Instance app_id '{}' is incompatible with current app_id '{}'. Reset instance with --reset-instance to continue.",
+                stamp.app_id,
+                profile.app_id()
+            ));
         }
         CompatibilityResult::TooNew => {
-            return Err(format!("Instance schema version {} is newer than current {}. Downgrade the application or reset instance with --reset-instance to continue.", stamp.schema_version, v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION));
+            return Err(format!(
+                "Instance schema version {} is newer than current {}. Downgrade the application or reset instance with --reset-instance to continue.",
+                stamp.schema_version,
+                v2ray_rs_core::instance::CURRENT_SCHEMA_VERSION
+            ));
         }
     }
 
-    stamp.update_started(&paths)
+    stamp
+        .update_started(&paths)
         .map_err(|e| format!("failed to update instance stamp: {e}"))?;
 
     if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
@@ -1265,15 +1285,21 @@ fn try_run() -> Result<(), String> {
         *guard = Some(event_tx);
     }
 
-    let should_install_icons = profile == AppProfile::Production || overrides.install_icons.unwrap_or(false);
+    let should_install_icons =
+        profile == AppProfile::Production || overrides.install_icons.unwrap_or(false);
     let tray_action_rx = if should_install_icons {
         let (tray_tx, tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayAction>();
         let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
         let data_dir = paths.data_dir().to_path_buf();
         match rt.block_on(async {
-            v2ray_rs_tray::TrayService::spawn_with_data_dir(event_rx, notifier, move |action| {
-                let _ = tray_tx.send(action);
-            }, &data_dir)
+            v2ray_rs_tray::TrayService::spawn_with_data_dir(
+                event_rx,
+                notifier,
+                move |action| {
+                    let _ = tray_tx.send(action);
+                },
+                &data_dir,
+            )
             .await
         }) {
             Ok(handle) => {

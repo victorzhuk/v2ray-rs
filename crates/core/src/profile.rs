@@ -59,13 +59,13 @@ impl AppProfile {
             return Self::parse(&env_val);
         }
 
-        if let Some(dev_val) = env.get("V2RAY_RS_DEV") {
-            if !dev_val.is_empty() {
-                log::warn!(
-                    "V2RAY_RS_DEV is deprecated, use V2RAY_RS_PROFILE=development instead; will be removed in 0.8.0"
-                );
-                return Ok(AppProfile::Development);
-            }
+        if let Some(dev_val) = env.get("V2RAY_RS_DEV")
+            && !dev_val.is_empty()
+        {
+            log::warn!(
+                "V2RAY_RS_DEV is deprecated, use V2RAY_RS_PROFILE=development instead; will be removed in 0.8.0"
+            );
+            return Ok(AppProfile::Development);
         }
 
         let default = if cfg!(debug_assertions) {
@@ -164,10 +164,7 @@ mod tests {
     #[test]
     fn test_app_id() {
         assert_eq!(AppProfile::Production.app_id(), "com.github.v2ray-rs");
-        assert_eq!(
-            AppProfile::Development.app_id(),
-            "com.github.v2ray-rs.dev"
-        );
+        assert_eq!(AppProfile::Development.app_id(), "com.github.v2ray-rs.dev");
         assert_eq!(AppProfile::Test.app_id(), "com.github.v2ray-rs.test");
         assert_eq!(
             AppProfile::Custom("qa".to_string()).app_id(),
@@ -193,10 +190,7 @@ mod tests {
             AppProfile::parse("development").unwrap(),
             AppProfile::Development
         );
-        assert_eq!(
-            AppProfile::parse("test").unwrap(),
-            AppProfile::Test
-        );
+        assert_eq!(AppProfile::parse("test").unwrap(), AppProfile::Test);
     }
 
     #[test]
@@ -312,10 +306,7 @@ mod tests {
         env.set("V2RAY_RS_PROFILE", "staging");
 
         let result = AppProfile::resolve(None, &env);
-        assert_eq!(
-            result.unwrap(),
-            AppProfile::Custom("staging".to_string())
-        );
+        assert_eq!(result.unwrap(), AppProfile::Custom("staging".to_string()));
     }
 
     #[test]

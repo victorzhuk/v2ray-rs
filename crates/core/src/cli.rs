@@ -46,24 +46,30 @@ pub struct PathOverrides {
 impl PathOverrides {
     pub fn resolve(cli: &CliArgs, env: &dyn Env) -> Self {
         Self {
-            config_dir: cli.config_dir.clone().or_else(|| {
-                env.get("V2RAY_RS_CONFIG_DIR").map(PathBuf::from)
+            config_dir: cli
+                .config_dir
+                .clone()
+                .or_else(|| env.get("V2RAY_RS_CONFIG_DIR").map(PathBuf::from)),
+            data_dir: cli
+                .data_dir
+                .clone()
+                .or_else(|| env.get("V2RAY_RS_DATA_DIR").map(PathBuf::from)),
+            cache_dir: cli
+                .cache_dir
+                .clone()
+                .or_else(|| env.get("V2RAY_RS_CACHE_DIR").map(PathBuf::from)),
+            runtime_dir: cli
+                .runtime_dir
+                .clone()
+                .or_else(|| env.get("V2RAY_RS_RUNTIME_DIR").map(PathBuf::from)),
+            state_dir: cli
+                .state_dir
+                .clone()
+                .or_else(|| env.get("V2RAY_RS_STATE_DIR").map(PathBuf::from)),
+            install_icons: Some(cli.install_icons).filter(|&v| v).or_else(|| {
+                env.get("V2RAY_RS_INSTALL_ICONS")
+                    .and_then(|v| parse_bool(&v))
             }),
-            data_dir: cli.data_dir.clone().or_else(|| {
-                env.get("V2RAY_RS_DATA_DIR").map(PathBuf::from)
-            }),
-            cache_dir: cli.cache_dir.clone().or_else(|| {
-                env.get("V2RAY_RS_CACHE_DIR").map(PathBuf::from)
-            }),
-            runtime_dir: cli.runtime_dir.clone().or_else(|| {
-                env.get("V2RAY_RS_RUNTIME_DIR").map(PathBuf::from)
-            }),
-            state_dir: cli.state_dir.clone().or_else(|| {
-                env.get("V2RAY_RS_STATE_DIR").map(PathBuf::from)
-            }),
-            install_icons: Some(cli.install_icons)
-                .filter(|&v| v)
-                .or_else(|| env.get("V2RAY_RS_INSTALL_ICONS").and_then(|v| parse_bool(&v))),
         }
     }
 }
@@ -126,26 +132,14 @@ mod tests {
 
         let overrides = PathOverrides::resolve(&cli, &env);
 
-        assert_eq!(
-            overrides.config_dir,
-            Some(PathBuf::from("/from/cli"))
-        );
-        assert_eq!(
-            overrides.data_dir,
-            Some(PathBuf::from("/from/cli/data"))
-        );
-        assert_eq!(
-            overrides.cache_dir,
-            Some(PathBuf::from("/from/cli/cache"))
-        );
+        assert_eq!(overrides.config_dir, Some(PathBuf::from("/from/cli")));
+        assert_eq!(overrides.data_dir, Some(PathBuf::from("/from/cli/data")));
+        assert_eq!(overrides.cache_dir, Some(PathBuf::from("/from/cli/cache")));
         assert_eq!(
             overrides.runtime_dir,
             Some(PathBuf::from("/from/cli/runtime"))
         );
-        assert_eq!(
-            overrides.state_dir,
-            Some(PathBuf::from("/from/cli/state"))
-        );
+        assert_eq!(overrides.state_dir, Some(PathBuf::from("/from/cli/state")));
         assert_eq!(overrides.install_icons, Some(true));
     }
 
@@ -173,26 +167,14 @@ mod tests {
 
         let overrides = PathOverrides::resolve(&cli, &env);
 
-        assert_eq!(
-            overrides.config_dir,
-            Some(PathBuf::from("/from/env"))
-        );
-        assert_eq!(
-            overrides.data_dir,
-            Some(PathBuf::from("/from/env/data"))
-        );
-        assert_eq!(
-            overrides.cache_dir,
-            Some(PathBuf::from("/from/env/cache"))
-        );
+        assert_eq!(overrides.config_dir, Some(PathBuf::from("/from/env")));
+        assert_eq!(overrides.data_dir, Some(PathBuf::from("/from/env/data")));
+        assert_eq!(overrides.cache_dir, Some(PathBuf::from("/from/env/cache")));
         assert_eq!(
             overrides.runtime_dir,
             Some(PathBuf::from("/from/env/runtime"))
         );
-        assert_eq!(
-            overrides.state_dir,
-            Some(PathBuf::from("/from/env/state"))
-        );
+        assert_eq!(overrides.state_dir, Some(PathBuf::from("/from/env/state")));
         assert_eq!(overrides.install_icons, Some(true));
     }
 

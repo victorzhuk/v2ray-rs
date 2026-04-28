@@ -279,7 +279,11 @@ mod tests {
         let settings = AppSettings::default();
 
         let writer = ConfigWriter::new(&settings, &paths);
-        let expected = dir.path().join("runtime").join("generated").join("xray.json");
+        let expected = dir
+            .path()
+            .join("runtime")
+            .join("generated")
+            .join("xray.json");
         assert_eq!(writer.output_path(BackendType::Xray), expected);
     }
 

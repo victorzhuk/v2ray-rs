@@ -116,7 +116,10 @@ impl AppPaths {
         }
     }
 
-    #[deprecated(since = "0.6.0", note = "Use for_profile_in(AppProfile::Test, root) instead")]
+    #[deprecated(
+        since = "0.6.0",
+        note = "Use for_profile_in(AppProfile::Test, root) instead"
+    )]
     pub fn from_paths(config_dir: PathBuf, data_dir: PathBuf) -> Self {
         // For backward compatibility, cache/runtime/state are derived from data_dir
         Self {
@@ -267,7 +270,12 @@ impl AppPaths {
 
         match move_file_best_effort(&legacy_path, &new_path) {
             Ok(()) => log::info!("relocated PID file: {:?} -> {:?}", legacy_path, new_path),
-            Err(e) => log::warn!("failed to relocate PID file {:?} to {:?}: {}", legacy_path, new_path, e),
+            Err(e) => log::warn!(
+                "failed to relocate PID file {:?} to {:?}: {}",
+                legacy_path,
+                new_path,
+                e
+            ),
         }
     }
 
@@ -286,14 +294,22 @@ impl AppPaths {
                     if src.is_file() {
                         let dst = new_dir.join(entry.file_name());
                         match move_file_best_effort(&src, &dst) {
-                            Ok(()) => log::info!("relocated generated config: {:?} -> {:?}", src, dst),
-                            Err(e) => log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e),
+                            Ok(()) => {
+                                log::info!("relocated generated config: {:?} -> {:?}", src, dst)
+                            }
+                            Err(e) => {
+                                log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e)
+                            }
                         }
                     }
                 }
                 let _ = fs::remove_dir(&legacy_dir);
             }
-            Err(e) => log::warn!("failed to read legacy generated dir {:?}: {}", legacy_dir, e),
+            Err(e) => log::warn!(
+                "failed to read legacy generated dir {:?}: {}",
+                legacy_dir,
+                e
+            ),
         }
     }
 
@@ -313,7 +329,9 @@ impl AppPaths {
                         let dst = new_dir.join(entry.file_name());
                         match move_file_best_effort(&src, &dst) {
                             Ok(()) => log::info!("relocated geodata file: {:?} -> {:?}", src, dst),
-                            Err(e) => log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e),
+                            Err(e) => {
+                                log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e)
+                            }
                         }
                     }
                 }
@@ -332,40 +350,48 @@ impl AppPaths {
         }
 
         match move_file_best_effort(&legacy_path, &new_path) {
-            Ok(()) => log::info!("relocated latency snapshot: {:?} -> {:?}", legacy_path, new_path),
-            Err(e) => log::warn!("failed to relocate latency snapshot {:?} to {:?}: {}", legacy_path, new_path, e),
+            Ok(()) => log::info!(
+                "relocated latency snapshot: {:?} -> {:?}",
+                legacy_path,
+                new_path
+            ),
+            Err(e) => log::warn!(
+                "failed to relocate latency snapshot {:?} to {:?}: {}",
+                legacy_path,
+                new_path,
+                e
+            ),
         }
     }
 }
 
-fn expand_home(path: &PathBuf) -> Result<PathBuf, PersistenceError> {
-    let path_str = path.to_str().ok_or_else(|| PersistenceError::Io(std::io::Error::new(
-        std::io::ErrorKind::InvalidInput,
-        "path contains invalid UTF-8",
-    )))?;
+fn expand_home(path: &Path) -> Result<PathBuf, PersistenceError> {
+    let path_str = path.to_str().ok_or_else(|| {
+        PersistenceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "path contains invalid UTF-8",
+        ))
+    })?;
 
-    if let Some(rest) = path_str.strip_prefix('~') {
-        if rest.is_empty() || rest.starts_with('/') {
-            let home = directories::BaseDirs::new()
-                .ok_or(PersistenceError::NoDirs)?
-                .home_dir()
-                .to_path_buf();
+    if let Some(rest) = path_str.strip_prefix('~')
+        && (rest.is_empty() || rest.starts_with('/'))
+    {
+        let home = directories::BaseDirs::new()
+            .ok_or(PersistenceError::NoDirs)?
+            .home_dir()
+            .to_path_buf();
 
-            return Ok(if rest.is_empty() {
-                home
-            } else {
-                home.join(&rest[1..])
-            });
-        }
+        return Ok(if rest.is_empty() {
+            home
+        } else {
+            home.join(&rest[1..])
+        });
     }
 
-    Ok(path.clone())
+    Ok(path.to_path_buf())
 }
 
-fn validate_absolute_path(
-    field: &str,
-    path: &Path,
-) -> Result<(), PersistenceError> {
+fn validate_absolute_path(field: &str, path: &Path) -> Result<(), PersistenceError> {
     if !path.is_absolute() {
         return Err(PersistenceError::InvalidOverridePath {
             field: field.to_string(),
@@ -385,7 +411,9 @@ pub(crate) fn create_dir_with_permissions(path: &Path) -> Result<(), Persistence
 }
 
 fn is_dir_empty(dir: &Path) -> bool {
-    fs::read_dir(dir).map(|mut entries| entries.next().is_none()).unwrap_or(true)
+    fs::read_dir(dir)
+        .map(|mut entries| entries.next().is_none())
+        .unwrap_or(true)
 }
 
 fn move_file_best_effort(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
@@ -484,15 +512,9 @@ mod tests {
             paths.runtime_dir().join("backend.pid")
         );
 
-        assert_eq!(
-            paths.generated_dir(),
-            paths.runtime_dir().join("generated")
-        );
+        assert_eq!(paths.generated_dir(), paths.runtime_dir().join("generated"));
 
-        assert_eq!(
-            paths.geodata_dir(),
-            paths.cache_dir().join("geodata")
-        );
+        assert_eq!(paths.geodata_dir(), paths.cache_dir().join("geodata"));
 
         assert_eq!(
             paths.geodata_index_dir(),
@@ -649,10 +671,7 @@ mod tests {
 
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(matches!(
-            err,
-            PersistenceError::InvalidOverridePath { .. }
-        ));
+        assert!(matches!(err, PersistenceError::InvalidOverridePath { .. }));
     }
 
     #[test]
@@ -749,10 +768,22 @@ mod tests {
         assert!(paths.runtime_dir().exists());
         assert!(paths.state_dir().exists());
 
-        let dirs = [paths.config_dir(), paths.data_dir(), paths.cache_dir(), paths.runtime_dir(), paths.state_dir()];
+        let dirs = [
+            paths.config_dir(),
+            paths.data_dir(),
+            paths.cache_dir(),
+            paths.runtime_dir(),
+            paths.state_dir(),
+        ];
         for i in 0..dirs.len() {
-            for j in (i+1)..dirs.len() {
-                assert_ne!(dirs[i], dirs[j], "{} and {} should be distinct", dirs[i].display(), dirs[j].display());
+            for j in (i + 1)..dirs.len() {
+                assert_ne!(
+                    dirs[i],
+                    dirs[j],
+                    "{} and {} should be distinct",
+                    dirs[i].display(),
+                    dirs[j].display()
+                );
             }
         }
     }
@@ -801,18 +832,9 @@ mod tests {
         let test_paths_isolated = AppPaths::for_profile_in(AppProfile::Test, &test_root);
 
         // Each should have its own distinct config directory
-        assert_eq!(
-            prod_paths_isolated.config_dir(),
-            prod_root.join("config")
-        );
-        assert_eq!(
-            dev_paths_isolated.config_dir(),
-            dev_root.join("config")
-        );
-        assert_eq!(
-            test_paths_isolated.config_dir(),
-            test_root.join("config")
-        );
+        assert_eq!(prod_paths_isolated.config_dir(), prod_root.join("config"));
+        assert_eq!(dev_paths_isolated.config_dir(), dev_root.join("config"));
+        assert_eq!(test_paths_isolated.config_dir(), test_root.join("config"));
 
         assert_ne!(
             prod_paths_isolated.config_dir(),
@@ -848,8 +870,14 @@ mod tests {
         println!("  cache_dir:  {}", dev_paths.cache_dir().display());
         println!("  runtime_dir: {}", dev_paths.runtime_dir().display());
         println!("  state_dir:  {}", dev_paths.state_dir().display());
-        println!("  instance_stamp: {}", dev_paths.instance_stamp_path().display());
-        println!("  lock_path:   {}", dev_paths.instance_lock_path().display());
+        println!(
+            "  instance_stamp: {}",
+            dev_paths.instance_stamp_path().display()
+        );
+        println!(
+            "  lock_path:   {}",
+            dev_paths.instance_lock_path().display()
+        );
         println!();
 
         // Scenario 2: cargo test → Test profile (isolated temp dir)
@@ -862,8 +890,14 @@ mod tests {
         println!("  cache_dir:  {}", test_paths.cache_dir().display());
         println!("  runtime_dir: {}", test_paths.runtime_dir().display());
         println!("  state_dir:  {}", test_paths.state_dir().display());
-        println!("  instance_stamp: {}", test_paths.instance_stamp_path().display());
-        println!("  lock_path:   {}", test_paths.instance_lock_path().display());
+        println!(
+            "  instance_stamp: {}",
+            test_paths.instance_stamp_path().display()
+        );
+        println!(
+            "  lock_path:   {}",
+            test_paths.instance_lock_path().display()
+        );
         println!();
 
         // Scenario 3: cargo run --release (no args) → Production profile
@@ -876,8 +910,14 @@ mod tests {
         println!("  cache_dir:  {}", prod_paths.cache_dir().display());
         println!("  runtime_dir: {}", prod_paths.runtime_dir().display());
         println!("  state_dir:  {}", prod_paths.state_dir().display());
-        println!("  instance_stamp: {}", prod_paths.instance_stamp_path().display());
-        println!("  lock_path:   {}", prod_paths.instance_lock_path().display());
+        println!(
+            "  instance_stamp: {}",
+            prod_paths.instance_stamp_path().display()
+        );
+        println!(
+            "  lock_path:   {}",
+            prod_paths.instance_lock_path().display()
+        );
         println!();
 
         // Scenario 4: cargo run -- --profile qa → Custom("qa") profile
@@ -890,7 +930,10 @@ mod tests {
         println!("  cache_dir:  {}", qa_paths.cache_dir().display());
         println!("  runtime_dir: {}", qa_paths.runtime_dir().display());
         println!("  state_dir:  {}", qa_paths.state_dir().display());
-        println!("  instance_stamp: {}", qa_paths.instance_stamp_path().display());
+        println!(
+            "  instance_stamp: {}",
+            qa_paths.instance_stamp_path().display()
+        );
         println!("  lock_path:   {}", qa_paths.instance_lock_path().display());
         println!();
 
@@ -984,7 +1027,10 @@ mod tests {
         println!();
 
         // Count unique qualifiers
-        let qualifiers: Vec<_> = profiles.iter().map(|(_, p)| p.profile().qualifier()).collect();
+        let qualifiers: Vec<_> = profiles
+            .iter()
+            .map(|(_, p)| p.profile().qualifier())
+            .collect();
         let unique_qualifiers: std::collections::HashSet<_> = qualifiers.iter().collect();
         assert_eq!(
             unique_qualifiers.len(),
