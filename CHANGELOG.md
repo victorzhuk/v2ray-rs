@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.7.0] - 2026-04-28
+
 ### Added
 - Runtime profiles (`--profile`, `V2RAY_RS_PROFILE` env) with isolated storage for production, development, test, and custom profiles
 - Per-directory path overrides via CLI flags (`--config-dir`, `--data-dir`, `--cache-dir`, `--runtime-dir`, `--state-dir`) and matching env vars
@@ -342,7 +346,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.2...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.2...v0.7.0
 [0.6.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.1...v0.6.2
 [0.6.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.5.3...v0.6.0
