@@ -148,7 +148,7 @@ run:
 
 run-dev:
 	@printf "$(GREEN)Running UI application (dev mode, no tray, separate data)...$(RESET)\n"
-	V2RAY_RS_DEV=1 $(CARGO) run -p $(UI) $(CARGO_FLAGS)
+	$(CARGO) run -p $(UI) $(CARGO_FLAGS) -- --profile development
 
 # =============================================================================
 # Documentation Targets

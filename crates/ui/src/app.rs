@@ -1198,6 +1198,9 @@ fn try_run() -> Result<(), String> {
     let paths = AppPaths::with_overrides(profile.clone(), &overrides)
         .map_err(|err| format!("failed to determine XDG directories: {err}"))?;
 
+    paths.ensure_dirs()
+        .map_err(|err| format!("failed to create directories: {err}"))?;
+
     if cli_args.reset_instance {
         reset_instance(&paths, &profile, cli_args.i_understand)
             .map_err(|e| format!("failed to reset instance: {e}"))?;
