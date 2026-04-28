@@ -31,6 +31,7 @@ pub enum NodesMsg {
     EditNode(Uuid),
     AddNode(ProxyNode),
     UpdateNode(Uuid, ProxyNode),
+    ImportFromUrl(String),
     ResetStorage,
 }
 
@@ -631,6 +632,17 @@ impl Component for NodesPage {
                 set_margin_end: 6,
 
                 gtk::Button {
+                    set_icon_name: "document-open-recent-symbolic",
+                    set_tooltip_text: Some("Import from URL"),
+                    add_css_class: "flat",
+                    #[watch]
+                    set_sensitive: model.load_error.is_none(),
+                    connect_clicked[sender] => move |_| {
+                        show_import_dialog(sender.clone());
+                    },
+                },
+
+                gtk::Button {
                     set_icon_name: "list-add-symbolic",
                     set_tooltip_text: Some("Add Manual Node"),
                     add_css_class: "flat",
@@ -753,6 +765,26 @@ impl Component for NodesPage {
                         changed = true;
                     } else {
                         self.nodes[pos].node = previous;
+                    }
+                }
+            }
+            NodesMsg::ImportFromUrl(uri) => {
+                match v2ray_rs_subscription::parse_uri(&uri) {
+                    Ok(node) => {
+                        if let Err(err) = node.validate() {
+                            let _ = sender.output(NodesOutput::Notice(format!("Invalid node: {err}")));
+                            return;
+                        }
+                        let manual = ManualNode::new(node);
+                        self.nodes.push(manual);
+                        if persist_manual_nodes(&self.store, &self.nodes) {
+                            changed = true;
+                        } else {
+                            let _ = self.nodes.pop();
+                        }
+                    }
+                    Err(err) => {
+                        let _ = sender.output(NodesOutput::Notice(format!("Failed to parse URI: {err}")));
                     }
                 }
             }
@@ -997,6 +1029,36 @@ fn show_delete_dialog(id: Uuid, sender: ComponentSender<NodesPage>) {
         if response == "delete" {
             sender.input(NodesMsg::DeleteNode(id));
         }
+    });
+
+    dialog.present(crate::active_window().as_ref());
+}
+
+fn show_import_dialog(sender: ComponentSender<NodesPage>) {
+    let entry = gtk::Entry::builder()
+        .placeholder_text("vless://uuid@example.com:443#remark")
+        .build();
+
+    let dialog = adw::AlertDialog::builder()
+        .heading("Import from URL")
+        .body("Paste a proxy URI. Supported formats: vless://, vmess://, ss://, trojan://")
+        .extra_child(&entry)
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("import", "Import");
+    dialog.set_response_appearance("import", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("import"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |dlg, response| {
+        if response == "import" {
+            let uri = entry.text().to_string();
+            if !uri.is_empty() {
+                sender.input(NodesMsg::ImportFromUrl(uri));
+            }
+        }
+        dlg.close();
     });
 
     dialog.present(crate::active_window().as_ref());
