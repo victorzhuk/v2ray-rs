@@ -129,8 +129,19 @@ pub(crate) fn current_backend_status(
 }
 
 pub(crate) fn clear_preferences_group(group: &adw::PreferencesGroup) {
-    while let Some(child) = group.first_child() {
-        group.remove(&child);
+    let mut child = group.first_child();
+    while let Some(c) = child {
+        let next = c.next_sibling();
+        // Only remove user-added rows, not internal GTK widgets (header box, etc.)
+        if c.is::<adw::ActionRow>()
+            || c.is::<adw::SwitchRow>()
+            || c.is::<adw::EntryRow>()
+            || c.is::<adw::SpinRow>()
+            || c.is::<adw::ExpanderRow>()
+            || c.is::<adw::ComboRow>() {
+            group.remove(&c);
+        }
+        child = next;
     }
 }
 
