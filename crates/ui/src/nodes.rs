@@ -632,7 +632,7 @@ impl Component for NodesPage {
                 set_margin_end: 6,
 
                 gtk::Button {
-                    set_icon_name: "document-open-recent-symbolic",
+                    set_icon_name: "edit-paste-symbolic",
                     set_tooltip_text: Some("Import from URL"),
                     add_css_class: "flat",
                     #[watch]
