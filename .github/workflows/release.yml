@@ -24,7 +24,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release
-        run: cargo build --locked --release -p v2ray-rs-ui
+        run: cargo build --release -p v2ray-rs-ui
       - name: Prepare release assets
         run: |
           cp target/release/v2ray-rs-ui target/release/v2ray-rs
