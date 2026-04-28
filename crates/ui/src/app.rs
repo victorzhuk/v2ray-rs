@@ -1299,6 +1299,80 @@ fn try_run() -> Result<(), String> {
 
     let app = adw::Application::builder().application_id(&app_id).build();
 
+    // Register our CLI options with GTK so it doesn't complain about "unknown options"
+    app.add_main_option(
+        "profile",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Runtime profile (production, development, test, custom:name)",
+        Some("PROFILE"),
+    );
+    app.add_main_option(
+        "config-dir",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Override config directory",
+        Some("PATH"),
+    );
+    app.add_main_option(
+        "data-dir",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Override data directory",
+        Some("PATH"),
+    );
+    app.add_main_option(
+        "cache-dir",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Override cache directory",
+        Some("PATH"),
+    );
+    app.add_main_option(
+        "runtime-dir",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Override runtime directory",
+        Some("PATH"),
+    );
+    app.add_main_option(
+        "state-dir",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::String,
+        "Override state directory",
+        Some("PATH"),
+    );
+    app.add_main_option(
+        "reset-instance",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Reset instance data for current profile",
+        None,
+    );
+    app.add_main_option(
+        "install-icons",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Install icons even for non-production profiles",
+        None,
+    );
+    app.add_main_option(
+        "i-understand",
+        glib::Char(0),
+        glib::OptionFlags::NONE,
+        glib::OptionArg::None,
+        "Confirm destructive operations",
+        None,
+    );
+
     let app_id_clone = app_id.clone();
     let profile_clone = profile.clone();
     app.connect_startup(move |_| {
