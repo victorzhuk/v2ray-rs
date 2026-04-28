@@ -385,6 +385,8 @@ mod tests {
         let (mut child, config_path) = spawn_backend_like_process(&dir);
         let pid = child.id();
 
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
         pid_file
             .write(pid, Path::new("/bin/sh"), &config_path)
             .unwrap();
