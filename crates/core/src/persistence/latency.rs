@@ -46,6 +46,31 @@ fn migrate_latency_snapshot_legacy_refs(
     let mut changed = false;
 
     samples.retain_mut(|entry| {
+        // Pre-migration: wrap old flat format into node_ref
+        if let Some(obj) = entry.as_object_mut() {
+            if !obj.contains_key("node_ref") {
+                if obj.contains_key("subscription_id") && obj.contains_key("node_index") {
+                    // Old subscription format
+                    let sub_id = obj.remove("subscription_id").unwrap();
+                    let node_idx = obj.remove("node_index").unwrap();
+                    let mut node_ref_obj = serde_json::Map::new();
+                    node_ref_obj.insert("type".into(), JsonValue::String("subscription".into()));
+                    node_ref_obj.insert("subscription_id".into(), sub_id);
+                    node_ref_obj.insert("node_index".into(), node_idx);
+                    obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
+                    changed = true;
+                } else if obj.contains_key("node_id") {
+                    // Old manual format
+                    let node_id = obj.remove("node_id").unwrap();
+                    let mut node_ref_obj = serde_json::Map::new();
+                    node_ref_obj.insert("type".into(), JsonValue::String("manual".into()));
+                    node_ref_obj.insert("node_id".into(), node_id);
+                    obj.insert("node_ref".into(), JsonValue::Object(node_ref_obj));
+                    changed = true;
+                }
+            }
+        }
+
         let Some(node_ref) = entry.get_mut("node_ref") else {
             return true;
         };
@@ -174,5 +199,81 @@ mod tests {
             node_id: subscription.nodes[0].id,
         };
         assert!(snapshot.get(node_ref).is_some());
+    }
+
+    #[test]
+    fn test_load_latency_snapshot_migrates_old_flat_format() {
+        let (_tmp, paths) = super::super::test_paths();
+        let mut subscription = Subscription::new_from_url("Old Format", "https://example.com/sub");
+        subscription.nodes = vec![
+            SubscriptionNode::new(ProxyNode::Vless(VlessConfig {
+                address: "one.example.com".into(),
+                port: 443,
+                uuid: "node-1".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: None,
+            })),
+            SubscriptionNode::new(ProxyNode::Vless(VlessConfig {
+                address: "two.example.com".into(),
+                port: 443,
+                uuid: "node-2".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: None,
+            })),
+        ];
+        super::super::save_subscriptions(&paths, &[subscription.clone()]).unwrap();
+
+        let manual_node_id = uuid::Uuid::new_v4();
+
+        let raw = serde_json::json!({
+            "samples": [
+                {
+                    "subscription_id": subscription.id,
+                    "node_index": 0,
+                    "sample": {
+                        "latency_ms": 1224,
+                        "measured_at": "2025-01-01T00:00:00Z"
+                    }
+                },
+                {
+                    "subscription_id": subscription.id,
+                    "node_index": 99,
+                    "sample": {
+                        "latency_ms": 99,
+                        "measured_at": "2025-01-01T00:00:00Z"
+                    }
+                },
+                {
+                    "node_id": manual_node_id,
+                    "sample": {
+                        "latency_ms": 55,
+                        "measured_at": "2025-01-01T00:00:00Z"
+                    }
+                }
+            ]
+        });
+        paths.ensure_dirs().unwrap();
+        fs::write(
+            paths.latency_snapshot_path(),
+            serde_json::to_string_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = load_latency_snapshot(&paths).unwrap();
+
+        assert_eq!(snapshot.len(), 2);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: subscription.id,
+            node_id: subscription.nodes[0].id,
+        };
+        assert!(snapshot.get(node_ref).is_some());
+        let manual_ref = ConnectionNodeRef::Manual { node_id: manual_node_id };
+        assert!(snapshot.get(manual_ref).is_some());
     }
 }
