@@ -10,6 +10,7 @@ pub struct RuntimeConfigSnapshot {
     pub binary_path: Option<PathBuf>,
     pub socks_port: u16,
     pub http_port: u16,
+    pub listen_address: String,
     pub dns: DnsConfig,
     pub routing: RoutingRuleSet,
     pub manual_nodes: Vec<ManualNode>,
@@ -29,6 +30,7 @@ impl RuntimeConfigSnapshot {
             || self.binary_path != settings.backend.binary_path
             || self.socks_port != settings.socks_port
             || self.http_port != settings.http_port
+            || self.listen_address != settings.listen_address
             || self.dns != settings.dns
             || self.routing != *routing
             || self.manual_nodes != manual_nodes
@@ -40,6 +42,7 @@ impl RuntimeConfigSnapshot {
         settings.backend.binary_path = self.binary_path.clone();
         settings.socks_port = self.socks_port;
         settings.http_port = self.http_port;
+        settings.listen_address = self.listen_address.clone();
         settings.dns = self.dns.clone();
     }
 
@@ -71,6 +74,7 @@ mod tests {
             binary_path: Some(PathBuf::from(binary_path)),
             socks_port: 1080,
             http_port: 1081,
+            listen_address: "127.0.0.1".to_string(),
             dns: DnsConfig::default(),
             routing: RoutingRuleSet::new(),
             manual_nodes: Vec::new(),
@@ -87,6 +91,7 @@ mod tests {
         assert_eq!(snapshot.binary_path, Some(PathBuf::from("/usr/bin/xray")));
         assert_eq!(snapshot.socks_port, 1080);
         assert_eq!(snapshot.http_port, 1081);
+        assert_eq!(snapshot.listen_address, "127.0.0.1");
         assert_eq!(snapshot.timestamp, 1234567890);
     }
 
@@ -123,6 +128,9 @@ mod tests {
 
         settings.http_port = 2081;
         assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.listen_address = "0.0.0.0".to_string();
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
     }
 
     #[test]
@@ -132,6 +140,7 @@ mod tests {
             binary_path: Some(PathBuf::from("/usr/bin/sing-box")),
             socks_port: 2080,
             http_port: 2081,
+            listen_address: "0.0.0.0".to_string(),
             dns: DnsConfig::default(),
             routing: RoutingRuleSet::new(),
             manual_nodes: Vec::new(),
@@ -154,6 +163,7 @@ mod tests {
         );
         assert_eq!(settings.socks_port, 2080);
         assert_eq!(settings.http_port, 2081);
+        assert_eq!(settings.listen_address, "0.0.0.0");
         assert_eq!(settings.language, Language::Russian);
         assert!(!settings.minimize_to_tray);
     }
@@ -167,6 +177,7 @@ mod tests {
             binary_path: Some(PathBuf::from("/usr/bin/xray")),
             socks_port: 1080,
             http_port: 1081,
+            listen_address: "127.0.0.1".to_string(),
             dns: DnsConfig::default(),
             routing: RoutingRuleSet::new(),
             manual_nodes: vec![ManualNode::with_id(
@@ -245,6 +256,7 @@ mod tests {
             binary_path: Some(PathBuf::from("/usr/bin/xray")),
             socks_port: 1080,
             http_port: 1081,
+            listen_address: "127.0.0.1".to_string(),
             dns: DnsConfig::default(),
             routing: RoutingRuleSet::new(),
             manual_nodes: manual_nodes.clone(),

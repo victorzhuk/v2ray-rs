@@ -1,9 +1,11 @@
 use std::fmt;
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::models::{AutoResolveStrategy, DnsConfig, LastSuccessMetadata};
+use crate::models::{AutoResolveStrategy, DnsConfig, LastSuccessMetadata, ValidationError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -73,6 +75,8 @@ pub struct AppSettings {
     pub backend: BackendConfig,
     pub socks_port: u16,
     pub http_port: u16,
+    #[serde(default = "default_listen_address")]
+    pub listen_address: String,
     #[serde(default, deserialize_with = "deserialize_auto_resolve_strategy")]
     pub auto_resolve_strategy: AutoResolveStrategy,
     #[serde(default)]
@@ -87,6 +91,23 @@ pub struct AppSettings {
     pub onboarding_complete: bool,
     #[serde(default)]
     pub dns: DnsConfig,
+}
+
+pub fn default_listen_address() -> String {
+    "127.0.0.1".to_string()
+}
+
+impl AppSettings {
+    /// Validates a listen-address string: must be a parseable IPv4 or IPv6 literal.
+    /// Hostnames and empty strings are rejected.
+    pub fn validate_listen_address(addr: &str) -> Result<(), ValidationError> {
+        if addr.is_empty() {
+            return Err(ValidationError::InvalidListenAddress(addr.to_string()));
+        }
+        IpAddr::from_str(addr)
+            .map(|_| ())
+            .map_err(|_| ValidationError::InvalidListenAddress(addr.to_string()))
+    }
 }
 
 fn deserialize_auto_resolve_strategy<'de, D>(
@@ -115,6 +136,7 @@ impl Default for AppSettings {
             backend: BackendConfig::default(),
             socks_port: 1080,
             http_port: 1081,
+            listen_address: default_listen_address(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             last_success: None,
             auto_update_subscriptions: true,
@@ -172,6 +194,50 @@ mod tests {
         let json = serde_json::to_string(&settings).unwrap();
         let deserialized: AppSettings = serde_json::from_str(&json).unwrap();
         assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_default_listen_address() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.listen_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_legacy_settings_toml_missing_listen_address_defaults_to_loopback() {
+        let toml_str = "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n";
+        let settings: AppSettings = toml::from_str(toml_str).unwrap();
+        assert_eq!(settings.listen_address, "127.0.0.1");
+    }
+
+    #[test]
+    fn test_listen_address_round_trip() {
+        let mut settings = AppSettings::default();
+        settings.listen_address = "0.0.0.0".to_string();
+        let toml_str = toml::to_string(&settings).unwrap();
+        let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.listen_address, "0.0.0.0");
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_validate_listen_address() {
+        let valid = ["127.0.0.1", "0.0.0.0", "::", "::1", "192.168.1.10"];
+        for addr in valid {
+            assert!(
+                AppSettings::validate_listen_address(addr).is_ok(),
+                "expected {addr} to be valid"
+            );
+        }
+
+        let invalid = ["", "localhost", "not-an-ip"];
+        for addr in invalid {
+            let result = AppSettings::validate_listen_address(addr);
+            assert!(result.is_err(), "expected {addr} to be invalid");
+            assert!(matches!(
+                result,
+                Err(ValidationError::InvalidListenAddress(_))
+            ));
+        }
     }
 
     #[test]

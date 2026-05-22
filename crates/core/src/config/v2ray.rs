@@ -60,14 +60,14 @@ fn build_inbounds(settings: &AppSettings) -> Value {
         {
             "tag": "socks-in",
             "protocol": "socks",
-            "listen": "127.0.0.1",
+            "listen": settings.listen_address,
             "port": settings.socks_port,
             "settings": { "udp": true },
         },
         {
             "tag": "http-in",
             "protocol": "http",
-            "listen": "127.0.0.1",
+            "listen": settings.listen_address,
             "port": settings.http_port,
         },
     ])
@@ -517,6 +517,62 @@ mod tests {
         assert_eq!(inbounds[0]["protocol"], "socks");
         assert_eq!(inbounds[1]["port"], 1081);
         assert_eq!(inbounds[1]["protocol"], "http");
+    }
+
+    #[test]
+    fn test_inbound_listen_address_default_loopback() {
+        let generator = V2rayGenerator;
+        let config = generator
+            .generate(&[vless_node()], &[], &default_settings())
+            .unwrap();
+
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds[0]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[1]["listen"], "127.0.0.1");
+    }
+
+    #[test]
+    fn test_inbound_listen_address_from_settings() {
+        let generator = V2rayGenerator;
+        let mut settings = default_settings();
+        settings.listen_address = "0.0.0.0".to_string();
+        let config = generator.generate(&[vless_node()], &[], &settings).unwrap();
+
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds[0]["listen"], "0.0.0.0");
+        assert_eq!(inbounds[1]["listen"], "0.0.0.0");
+        // ports unchanged
+        assert_eq!(inbounds[0]["port"], 1080);
+        assert_eq!(inbounds[1]["port"], 1081);
+    }
+
+    #[test]
+    fn test_socks_inbound_udp_enabled() {
+        let generator = V2rayGenerator;
+        let config = generator
+            .generate(&[vless_node()], &[], &default_settings())
+            .unwrap();
+
+        assert_eq!(config["inbounds"][0]["settings"]["udp"], true);
+    }
+
+    #[test]
+    fn test_xray_inbound_listen_address_from_settings() {
+        // The xray generator reuses the v2ray family code path; assert the
+        // setting propagates when generating an xray-flavoured config.
+        let mut settings = default_settings();
+        settings.listen_address = "0.0.0.0".to_string();
+        let config = generate_v2ray_family_config(
+            &[vless_node()],
+            &[],
+            &settings,
+            V2rayFamilyBackend::Xray,
+        );
+
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds[0]["listen"], "0.0.0.0");
+        assert_eq!(inbounds[1]["listen"], "0.0.0.0");
+        assert_eq!(inbounds[0]["settings"]["udp"], true);
     }
 
     #[test]

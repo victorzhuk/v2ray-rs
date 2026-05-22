@@ -12,8 +12,9 @@ use v2ray_rs_core::models::{AppSettings, AutoResolveStrategy, BackendConfig, Bac
 use v2ray_rs_core::persistence::AppPaths;
 
 use super::{
-    SettingsCallback, SettingsObservers, clear_preferences_group, current_backend_status, emit,
-    render_detected_backends, set_current_backend_status, subscribe_settings,
+    SettingsCallback, SettingsObservers, ToastCallback, clear_preferences_group,
+    current_backend_status, emit, render_detected_backends, set_current_backend_status,
+    subscribe_settings,
 };
 
 pub(super) fn build_network_page(
@@ -21,6 +22,7 @@ pub(super) fn build_network_page(
     cb: &SettingsCallback,
     settings_observers: &SettingsObservers,
     paths: &AppPaths,
+    toast_cb: &ToastCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Network")
@@ -121,6 +123,17 @@ pub(super) fn build_network_page(
         ))
         .build();
     ports_group.add(&http_row);
+
+    let listen_address_row = adw::EntryRow::builder()
+        .title("Listen address")
+        .text(s.listen_address.as_str())
+        .build();
+    let listen_address_status = adw::ActionRow::builder()
+        .title("Listen address status")
+        .subtitle(listen_address_status_text(&s.listen_address))
+        .build();
+    ports_group.add(&listen_address_row);
+    ports_group.add(&listen_address_status);
     page.add(&ports_group);
 
     let sub_group = adw::PreferencesGroup::builder()
@@ -414,6 +427,36 @@ pub(super) fn build_network_page(
     {
         let st = state.clone();
         let cb = cb.clone();
+        let status_row = listen_address_status.clone();
+        let toast_cb = toast_cb.clone();
+        listen_address_row.connect_apply(move |row| {
+            let value = row.text().trim().to_string();
+            match AppSettings::validate_listen_address(&value) {
+                Ok(()) => {
+                    row.remove_css_class("error");
+                    let previous = st.borrow().listen_address.clone();
+                    st.borrow_mut().listen_address = value.clone();
+                    status_row.set_subtitle(&listen_address_status_text(&value));
+                    emit(&st, &cb);
+                    if previous != value && !is_loopback_listen_address(&value) {
+                        toast_cb(
+                            "Proxy now reachable from other hosts on this network.",
+                        );
+                    }
+                }
+                Err(err) => {
+                    row.add_css_class("error");
+                    status_row.set_subtitle(&format!("Invalid: {err}"));
+                    // Reset entry to the last known good value.
+                    let current = st.borrow().listen_address.clone();
+                    row.set_text(&current);
+                }
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
         let interval = interval_row.clone();
         auto_update_row.connect_active_notify(move |row| {
             st.borrow_mut().auto_update_subscriptions = row.is_active();
@@ -465,6 +508,20 @@ pub(super) fn build_network_page(
     }
 
     page
+}
+
+fn is_loopback_listen_address(addr: &str) -> bool {
+    matches!(addr, "127.0.0.1" | "::1")
+}
+
+fn listen_address_status_text(addr: &str) -> String {
+    if is_loopback_listen_address(addr) {
+        "Loopback only (default). Proxy reachable from this machine only.".to_string()
+    } else if AppSettings::validate_listen_address(addr).is_ok() {
+        "Non-loopback. Proxy reachable from other hosts on this network.".to_string()
+    } else {
+        format!("Invalid: {addr}")
+    }
 }
 
 fn geodata_status_text(index_manager: &GeodataIndexManager, backend_type: BackendType) -> String {

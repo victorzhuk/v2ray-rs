@@ -20,6 +20,7 @@ use system::build_system_page;
 
 pub(crate) type SettingsCallback = Rc<dyn Fn(AppSettings)>;
 pub(crate) type RoutingCallback = Rc<dyn Fn(RoutingRuleSet)>;
+pub(crate) type ToastCallback = Rc<dyn Fn(&str)>;
 pub(crate) type SettingsObserver = Rc<dyn Fn(&AppSettings)>;
 pub(crate) type SettingsObservers = Rc<RefCell<Vec<SettingsObserver>>>;
 
@@ -29,6 +30,7 @@ pub fn show_preferences(
     settings: &AppSettings,
     on_settings_changed: impl Fn(AppSettings) + 'static,
     on_routing_changed: impl Fn(RoutingRuleSet) + 'static,
+    on_toast: impl Fn(&str) + 'static,
 ) -> adw::PreferencesDialog {
     let dialog = adw::PreferencesDialog::new();
     dialog.set_title("Preferences");
@@ -53,6 +55,7 @@ pub fn show_preferences(
         })
     };
     let routing_cb: RoutingCallback = Rc::new(on_routing_changed);
+    let toast_cb: ToastCallback = Rc::new(on_toast);
 
     let system_page = build_system_page(&settings_state, &settings_cb);
     dialog.add(&system_page);
@@ -62,6 +65,7 @@ pub fn show_preferences(
         &settings_cb,
         &settings_observers,
         store.paths(),
+        &toast_cb,
     );
     dialog.add(&network_page);
 

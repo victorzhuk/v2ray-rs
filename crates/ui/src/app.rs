@@ -827,6 +827,7 @@ impl SimpleComponent for App {
                     binary_path: self.settings.backend.binary_path.clone(),
                     socks_port: self.settings.socks_port,
                     http_port: self.settings.http_port,
+                    listen_address: self.settings.listen_address.clone(),
                     dns: self.settings.dns.clone(),
                     routing: rules,
                     manual_nodes: manual_nodes.clone(),
@@ -939,6 +940,7 @@ impl SimpleComponent for App {
                 let window = self.window.clone();
                 let s = sender.input_sender().clone();
                 let s1 = s.clone();
+                let toast_overlay = self.toast_overlay.clone();
                 let dialog = crate::preferences::show_preferences(
                     &window,
                     &self.store,
@@ -948,6 +950,9 @@ impl SimpleComponent for App {
                     },
                     move |rules| {
                         s1.emit(AppMsg::RoutingChanged(rules));
+                    },
+                    move |msg| {
+                        toast_overlay.add_toast(adw::Toast::new(msg));
                     },
                 );
                 {

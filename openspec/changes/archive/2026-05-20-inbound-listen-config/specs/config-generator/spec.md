@@ -82,67 +82,11 @@ The system SHALL generate a valid JSON configuration file in sing-box's configur
 - **WHEN** DNS is enabled with strategy Ipv6Only and client_subnet "2001:db8::1"
 - **THEN** the sing-box config dns section SHALL include "strategy": "ipv6_only" and "client_subnet": "2001:db8::1"
 
+## ADDED Requirements
+
 ### Requirement: Defensive listen-address validation in writer
 The config writer SHALL validate `AppSettings::listen_address` before invoking any generator. If the value is not a parseable IPv4 or IPv6 literal, the writer SHALL substitute `127.0.0.1`, log a warning, and proceed; it SHALL NOT abort writing.
 
 #### Scenario: Invalid listen address falls back to loopback
 - **WHEN** `AppSettings::listen_address` is `"not-an-ip"` and the user triggers a config regeneration
 - **THEN** the generated config SHALL contain `"listen": "127.0.0.1"` on every inbound and the writer SHALL log a warning identifying the invalid value
-
-### Requirement: Embed routing rules in config
-The system SHALL translate the user's routing rules into the backend-specific routing section of the generated config.
-
-#### Scenario: GeoIP direct rule in v2ray config
-- **WHEN** the user has a rule "GeoIP:RU → direct"
-- **THEN** the v2ray config routing section SHALL contain a rule matching geoip "ru" pointing to the direct outbound tag
-
-#### Scenario: GeoSite proxy rule in sing-box config
-- **WHEN** the user has a rule "GeoSite:google → proxy"
-- **THEN** the sing-box config route section SHALL contain a rule matching geosite "google" pointing to the proxy outbound tag
-
-### Requirement: Atomic config file writes
-The system SHALL write generated config files atomically (write to temp file, then rename) to prevent corruption.
-
-#### Scenario: Crash during write
-- **WHEN** the app crashes during config generation
-- **THEN** the previously valid config file SHALL remain intact
-
-### Requirement: Reactive config regeneration
-The system SHALL automatically regenerate the config file when subscription data, manual nodes, routing rules, or DNS settings change, with behavior depending on connection state.
-- When the backend is stopped, changes SHALL regenerate the config immediately.
-- When the backend is starting or running, changes SHALL be persisted but SHALL NOT replace the active runtime config until the user applies restart or reconnects.
-
-#### Scenario: Subscription update triggers regen
-- **WHEN** a subscription is updated with new nodes
-- **THEN** the system SHALL regenerate the config within 1 second
-
-#### Scenario: Disconnected routing change triggers regen
-- **WHEN** the backend is stopped and the user changes a routing rule
-- **THEN** the system regenerates the config immediately
-
-#### Scenario: Connected DNS change waits for restart
-- **WHEN** the backend is connected and the user changes DNS settings
-- **THEN** the new settings are persisted, the active runtime config is marked as restart-required, and the running backend continues using the previous launched config
-
-#### Scenario: Disconnected manual node change triggers regen
-- **WHEN** the backend is stopped and the user adds, edits, deletes, or toggles the enabled state of a manual node
-- **THEN** the system SHALL regenerate the config immediately
-
-#### Scenario: Connected manual node change waits for restart
-- **WHEN** the backend is connected and the user adds, edits, deletes, or toggles the enabled state of a manual node
-- **THEN** the change is persisted, but the active runtime config is not replaced until the user applies restart or reconnects later
-
-### Requirement: Generated configs live in runtime directory
-The system SHALL write generated backend config files to the active profile's `runtime_dir/generated/` by default. The existing `backend.config_output_dir` user setting SHALL continue to override the output directory when set.
-
-#### Scenario: Default output path
-- **WHEN** the user has not set `backend.config_output_dir` and the active profile is `Production`
-- **THEN** the generated `xray.json`/`v2ray.json`/`sing-box.json` SHALL be written under `runtime_dir/generated/`
-
-#### Scenario: User override still wins
-- **WHEN** the user has set `backend.config_output_dir` to `/etc/v2ray-rs/configs`
-- **THEN** the generated config SHALL be written under `/etc/v2ray-rs/configs/`
-
-#### Scenario: Generated configs are profile-isolated
-- **WHEN** the same user runs the binary with `--profile production` and `--profile development` at different times
-- **THEN** each profile SHALL maintain its own generated config files in its own `runtime_dir/generated/`

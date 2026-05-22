@@ -50,13 +50,13 @@ fn build_inbounds(settings: &AppSettings) -> Value {
         {
             "type": "mixed",
             "tag": "mixed-in",
-            "listen": "127.0.0.1",
+            "listen": settings.listen_address,
             "listen_port": settings.socks_port,
         },
         {
             "type": "http",
             "tag": "http-in",
-            "listen": "127.0.0.1",
+            "listen": settings.listen_address,
             "listen_port": settings.http_port,
         }
     ])
@@ -531,6 +531,51 @@ mod tests {
         assert_eq!(inbounds[0]["listen_port"], 1080);
         assert_eq!(inbounds[1]["type"], "http");
         assert_eq!(inbounds[1]["listen_port"], 1081);
+    }
+
+    #[test]
+    fn test_singbox_inbound_listen_address_default_loopback() {
+        let generator = SingboxGenerator;
+        let config = generator
+            .generate(&[ss_node()], &[], &default_settings())
+            .unwrap();
+
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds[0]["listen"], "127.0.0.1");
+        assert_eq!(inbounds[1]["listen"], "127.0.0.1");
+    }
+
+    #[test]
+    fn test_singbox_inbound_listen_address_from_settings() {
+        let generator = SingboxGenerator;
+        let mut settings = default_settings();
+        settings.listen_address = "192.168.1.10".to_string();
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds[0]["listen"], "192.168.1.10");
+        assert_eq!(inbounds[1]["listen"], "192.168.1.10");
+        // ports unchanged
+        assert_eq!(inbounds[0]["listen_port"], 1080);
+        assert_eq!(inbounds[1]["listen_port"], 1081);
+    }
+
+    #[test]
+    fn test_singbox_mixed_inbound_udp_enabled() {
+        let generator = SingboxGenerator;
+        let config = generator
+            .generate(&[ss_node()], &[], &default_settings())
+            .unwrap();
+
+        assert_eq!(config["inbounds"][0]["type"], "mixed");
+        // sing-box `mixed` inbound supports UDP implicitly; assert we did not
+        // emit `udp_disabled: true` which would silently break UDP-over-SOCKS.
+        let disabled = config["inbounds"][0].get("udp_disabled");
+        assert!(
+            !matches!(disabled, Some(v) if v == &json!(true)),
+            "udp_disabled must not be true on mixed inbound, got {:?}",
+            disabled
+        );
     }
 
     #[test]

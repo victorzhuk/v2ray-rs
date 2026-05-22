@@ -47,7 +47,26 @@ impl ConfigWriter {
 
         let backend = settings.backend.backend_type;
         let generator = generator_for(backend);
-        let config = generator.generate(nodes, rules, settings)?;
+
+        let effective_settings: AppSettings;
+        let settings_for_generate =
+            match AppSettings::validate_listen_address(&settings.listen_address) {
+                Ok(()) => settings,
+                Err(err) => {
+                    log::warn!(
+                        "invalid listen_address {:?}: {}; falling back to 127.0.0.1",
+                        settings.listen_address,
+                        err
+                    );
+                    effective_settings = AppSettings {
+                        listen_address: "127.0.0.1".to_string(),
+                        ..settings.clone()
+                    };
+                    &effective_settings
+                }
+            };
+
+        let config = generator.generate(nodes, rules, settings_for_generate)?;
         let json = serde_json::to_string(&config)?;
 
         std::fs::create_dir_all(&self.output_dir)?;
@@ -285,6 +304,44 @@ mod tests {
             .join("generated")
             .join("xray.json");
         assert_eq!(writer.output_path(BackendType::Xray), expected);
+    }
+
+    #[test]
+    fn test_write_config_falls_back_when_listen_address_invalid() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.listen_address = "not-an-ip".to_string();
+
+        let path = writer
+            .write_config(&sample_nodes(), &[], &settings)
+            .expect("invalid listen_address should fall back, not fail");
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let inbounds = parsed["inbounds"].as_array().unwrap();
+        for inbound in inbounds {
+            assert_eq!(inbound["listen"], "127.0.0.1");
+        }
+    }
+
+    #[test]
+    fn test_write_config_preserves_valid_listen_address() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.listen_address = "0.0.0.0".to_string();
+
+        let path = writer
+            .write_config(&sample_nodes(), &[], &settings)
+            .unwrap();
+
+        let contents = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
+        let inbounds = parsed["inbounds"].as_array().unwrap();
+        for inbound in inbounds {
+            assert_eq!(inbound["listen"], "0.0.0.0");
+        }
     }
 
     #[test]

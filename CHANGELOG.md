@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-05-22
+
+### Added
+- `listen_address` setting (default `127.0.0.1`) controlling the inbound bind address for the SOCKS5/mixed and HTTP proxies; surfaced as a Settings → Network entry with validation and a one-shot warning toast when set to a non-loopback address.
+- Per-backend regression tests asserting UDP on the SOCKS-capable inbound (v2ray/xray: `settings.udp = true`; sing-box: `mixed` type with no `udp_disabled: true`).
+
+### Changed
+- Inbound listen address is now configurable (default `127.0.0.1`) instead of hard-coded; applies to both SOCKS and HTTP inbounds for v2ray, xray, and sing-box.
+- `ConfigWriter` defensively validates `listen_address` before generation and falls back to `127.0.0.1` (with a `log::warn`) for malformed values, so backends never start with a broken bind string.
+
+---
+
 ## [0.7.4] - 2026-04-28
 
 ### Fixed
@@ -375,6 +387,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.0...HEAD
+[0.8.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.4...v0.8.0
 [0.7.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.1...v0.7.2

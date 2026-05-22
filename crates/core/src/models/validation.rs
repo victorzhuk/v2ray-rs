@@ -14,6 +14,8 @@ pub enum ValidationError {
     InvalidGeoSiteCategory(String),
     #[error("index out of bounds: {0}")]
     IndexOutOfBounds(usize),
+    #[error("invalid listen address: {0}")]
+    InvalidListenAddress(String),
 }
 
 /// Validates a GeoIP country code or extended tag.
