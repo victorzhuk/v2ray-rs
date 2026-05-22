@@ -562,12 +562,8 @@ mod tests {
         // setting propagates when generating an xray-flavoured config.
         let mut settings = default_settings();
         settings.listen_address = "0.0.0.0".to_string();
-        let config = generate_v2ray_family_config(
-            &[vless_node()],
-            &[],
-            &settings,
-            V2rayFamilyBackend::Xray,
-        );
+        let config =
+            generate_v2ray_family_config(&[vless_node()], &[], &settings, V2rayFamilyBackend::Xray);
 
         let inbounds = config["inbounds"].as_array().unwrap();
         assert_eq!(inbounds[0]["listen"], "0.0.0.0");

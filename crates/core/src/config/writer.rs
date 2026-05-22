@@ -310,8 +310,10 @@ mod tests {
     fn test_write_config_falls_back_when_listen_address_invalid() {
         let dir = tempfile::TempDir::new().unwrap();
         let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
-        let mut settings = AppSettings::default();
-        settings.listen_address = "not-an-ip".to_string();
+        let settings = AppSettings {
+            listen_address: "not-an-ip".to_string(),
+            ..AppSettings::default()
+        };
 
         let path = writer
             .write_config(&sample_nodes(), &[], &settings)
@@ -329,8 +331,10 @@ mod tests {
     fn test_write_config_preserves_valid_listen_address() {
         let dir = tempfile::TempDir::new().unwrap();
         let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
-        let mut settings = AppSettings::default();
-        settings.listen_address = "0.0.0.0".to_string();
+        let settings = AppSettings {
+            listen_address: "0.0.0.0".to_string(),
+            ..AppSettings::default()
+        };
 
         let path = writer
             .write_config(&sample_nodes(), &[], &settings)

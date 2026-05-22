@@ -439,9 +439,7 @@ pub(super) fn build_network_page(
                     status_row.set_subtitle(&listen_address_status_text(&value));
                     emit(&st, &cb);
                     if previous != value && !is_loopback_listen_address(&value) {
-                        toast_cb(
-                            "Proxy now reachable from other hosts on this network.",
-                        );
+                        toast_cb("Proxy now reachable from other hosts on this network.");
                     }
                 }
                 Err(err) => {

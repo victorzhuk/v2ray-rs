@@ -211,8 +211,10 @@ mod tests {
 
     #[test]
     fn test_listen_address_round_trip() {
-        let mut settings = AppSettings::default();
-        settings.listen_address = "0.0.0.0".to_string();
+        let settings = AppSettings {
+            listen_address: "0.0.0.0".to_string(),
+            ..AppSettings::default()
+        };
         let toml_str = toml::to_string(&settings).unwrap();
         let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.listen_address, "0.0.0.0");
