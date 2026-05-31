@@ -22,6 +22,7 @@
 - **Process management**: Async lifecycle with crash recovery, graceful shutdown, log capture
 - **GTK4/libadwaita UI**: Native Linux desktop experience with system tray integration
 - **XDG compliant**: Full XDG Base Directory layout with runtime profiles and per-directory overrides
+- **Real Delay testing**: End-to-end latency probes through each proxy node. Supports sing-box with Clash API and xray/v2ray with ObservatoryService.
 
 ---
 
@@ -58,6 +59,17 @@ You also need at least one proxy backend installed: `v2ray`, `xray`, or `sing-bo
 2. The onboarding wizard detects installed backends and guides initial setup
 3. Add a subscription URL or local subscription file — nodes are fetched and parsed automatically
 4. Enable desired nodes, configure routing rules, click **Connect**
+
+### Real Delay
+
+Real Delay measures the full proxy path by sending the configured test URL through each tested node. It is distinct from TCP ping and can be used for manual sorting or the Lowest Latency strategy.
+
+Supported backends:
+- sing-box with Clash API
+- xray with ObservatoryService
+- v2fly/v2ray-core with ObservatoryService
+
+Privacy details: [`docs/real-delay-privacy.md`](docs/real-delay-privacy.md).
 
 ### Configuration
 

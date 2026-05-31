@@ -2,15 +2,18 @@ use adw::prelude::*;
 use gtk::gdk;
 use relm4::adw;
 use relm4::prelude::*;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
-use v2ray_rs_core::models::{AppSettings, Subscription, SubscriptionSource};
-use v2ray_rs_core::persistence::PersistenceError;
+use v2ray_rs_core::models::{
+    AppSettings, BackendType, RealDelayCapability, RealDelaySettings, Subscription,
+    SubscriptionSource,
+};
+use v2ray_rs_core::persistence::{AppPaths, PersistenceError};
 use v2ray_rs_core::runtime_snapshot::subscriptions_runtime_state_eq;
 use v2ray_rs_subscription::{
-    SubscriptionError, SubscriptionImportOutcome, SubscriptionService, UpdateError, UpdateResult,
-    reconcile_nodes,
+    RealDelayReport, SubscriptionError, SubscriptionImportOutcome, SubscriptionService,
+    UpdateError, UpdateResult, reconcile_nodes,
 };
 
 use crate::workspace::WorkspaceStore;
@@ -25,8 +28,15 @@ pub struct SubscriptionsPage {
     auto_update_interval_secs: u64,
     auto_update_generation: u64,
     testing_latency: HashSet<Uuid>,
+    testing_real_delay: HashMap<Uuid, u64>,
+    real_delay_run_token: u64,
     expanded_subs: HashSet<Uuid>,
     locked: bool,
+    backend_type: BackendType,
+    binary_path: Option<std::path::PathBuf>,
+    real_delay_settings: RealDelaySettings,
+    real_delay_capability: RealDelayCapability,
+    paths: AppPaths,
 }
 
 enum RenderHint {
@@ -34,6 +44,15 @@ enum RenderHint {
     NodeToggle(Uuid, usize),
     SubscriptionToggle(Uuid),
     SubscriptionRename(Uuid),
+}
+
+struct RenderState<'a> {
+    expanded_subs: &'a HashSet<Uuid>,
+    testing_latency: &'a HashSet<Uuid>,
+    testing_real_delay: &'a HashMap<Uuid, u64>,
+    real_delay_available: bool,
+    real_delay_capability: &'a RealDelayCapability,
+    locked: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -64,6 +83,8 @@ pub enum SubscriptionsMsg {
     UpdateSubscription(Uuid),
     TestLatency(Uuid),
     SortByLatency(Uuid),
+    TestRealDelay(Uuid),
+    SortByRealDelay(Uuid),
     EnableAllNodes(Uuid),
     DisableAllNodes(Uuid),
     DragDropSubscription(usize, usize),
@@ -72,6 +93,9 @@ pub enum SubscriptionsMsg {
     SyncSettings {
         auto_update_enabled: bool,
         auto_update_interval_secs: u64,
+        backend_type: BackendType,
+        binary_path: Option<std::path::PathBuf>,
+        real_delay_settings: RealDelaySettings,
     },
     ResetStorage,
     SetLocked(bool),
@@ -83,6 +107,7 @@ pub enum SubscriptionsCmdOutput {
     AddDone(SubscriptionImportOutcome),
     RefreshDone(Subscription, UpdateResult),
     LatencyResult(Uuid, Vec<Option<u64>>),
+    RealDelayResult(Uuid, u64, RealDelayReport),
     RefreshFailed(Uuid, SubscriptionError),
     AddFailed(SubscriptionError),
     AutoUpdateDone(AutoUpdateRefreshBatch),
@@ -209,7 +234,8 @@ impl Component for SubscriptionsPage {
                         node_id: node.id,
                     };
                     if let Some(sample) = snapshot.get(node_ref) {
-                        node.last_latency_ms = Some(sample.latency_ms);
+                        node.last_latency_ms = sample.latency_ms;
+                        node.last_real_delay_ms = sample.real_delay_ms;
                     }
                 }
             }
@@ -225,7 +251,7 @@ impl Component for SubscriptionsPage {
             .build();
 
         let model = SubscriptionsPage {
-            store,
+            store: store.clone(),
             service,
             subscriptions,
             list_container: list_container.clone(),
@@ -234,17 +260,33 @@ impl Component for SubscriptionsPage {
             auto_update_interval_secs: settings.subscription_update_interval_secs,
             auto_update_generation: 0,
             testing_latency: HashSet::new(),
+            testing_real_delay: HashMap::new(),
+            real_delay_run_token: 0,
             expanded_subs: HashSet::new(),
             locked: false,
+            backend_type: settings.backend.backend_type,
+            binary_path: settings.backend.binary_path.clone(),
+            real_delay_settings: settings.real_delay.clone(),
+            real_delay_capability: settings
+                .backend
+                .backend_type
+                .default_real_delay_capability(),
+            paths: store.paths().clone(),
         };
 
         render_list(
             &model.subscriptions,
             &list_container,
             &sender,
-            &model.expanded_subs,
-            &model.testing_latency,
-            model.locked || model.load_error.is_some(),
+            RenderState {
+                expanded_subs: &model.expanded_subs,
+                testing_latency: &model.testing_latency,
+                testing_real_delay: &model.testing_real_delay,
+                real_delay_available: model.real_delay_settings.enabled
+                    && model.backend_type.supports_real_delay(),
+                real_delay_capability: &model.real_delay_capability,
+                locked: model.locked || model.load_error.is_some(),
+            },
         );
 
         if settings.auto_update_subscriptions {
@@ -469,6 +511,84 @@ impl Component for SubscriptionsPage {
                     Err(err) => report_subscription_persist_error(&sender, &err),
                 }
             }
+            SubscriptionsMsg::TestRealDelay(id) => {
+                if self.testing_real_delay.contains_key(&id) {
+                    return;
+                }
+                if !self.real_delay_settings.enabled {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "Real Delay testing is disabled in Preferences".to_string(),
+                    ));
+                    return;
+                }
+                let sub = match self.subscriptions.iter().find(|s| s.id == id) {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let Some(binary) = &self.binary_path else {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "No backend binary configured".to_string(),
+                    ));
+                    return;
+                };
+                let node_refs: Vec<v2ray_rs_core::models::SubscriptionNode> = sub.nodes.clone();
+                let backend_type = self.backend_type;
+                let binary = binary.clone();
+                let real_delay_settings = self.real_delay_settings.clone();
+                let paths = self.paths.clone();
+                let node_count = node_refs.len();
+                self.real_delay_run_token = self.real_delay_run_token.wrapping_add(1);
+                let run_token = self.real_delay_run_token;
+                self.testing_real_delay.insert(id, run_token);
+                sender.oneshot_command(async move {
+                    let timeout = std::time::Duration::from_millis(
+                        u64::from(real_delay_settings.timeout_ms) + 15_000,
+                    );
+                    let report = match tokio::time::timeout(timeout, async {
+                        let node_ref_ptrs: Vec<&v2ray_rs_core::models::SubscriptionNode> =
+                            node_refs.iter().collect();
+                        v2ray_rs_subscription::measure_real_delay(
+                            backend_type,
+                            &binary,
+                            &node_ref_ptrs,
+                            &real_delay_settings,
+                            &paths,
+                        )
+                        .await
+                    })
+                    .await
+                    {
+                        Ok(report) => report,
+                        Err(_) => RealDelayReport {
+                            results: vec![None; node_count],
+                            diagnostic: Some("Real Delay probe timed out".to_string()),
+                        },
+                    };
+                    SubscriptionsCmdOutput::RealDelayResult(id, run_token, report)
+                });
+                return;
+            }
+            SubscriptionsMsg::SortByRealDelay(id) => {
+                match commit_subscriptions_mutation(
+                    &self.store,
+                    &mut self.subscriptions,
+                    |subscriptions| {
+                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                        sub.nodes.sort_by(|a, b| {
+                            let la = a.last_real_delay_ms.unwrap_or(u64::MAX);
+                            let lb = b.last_real_delay_ms.unwrap_or(u64::MAX);
+                            la.cmp(&lb)
+                        });
+                        Some(())
+                    },
+                ) {
+                    Ok(Some(())) => {
+                        subscriptions_changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => report_subscription_persist_error(&sender, &err),
+                }
+            }
             SubscriptionsMsg::EnableAllNodes(id) => {
                 match commit_subscriptions_mutation(
                     &self.store,
@@ -578,11 +698,26 @@ impl Component for SubscriptionsPage {
             SubscriptionsMsg::SyncSettings {
                 auto_update_enabled,
                 auto_update_interval_secs,
+                backend_type,
+                binary_path,
+                real_delay_settings,
             } => {
+                let backend_changed = self.backend_type != backend_type;
+                let binary_changed = self.binary_path != binary_path;
                 let changed = self.auto_update_enabled != auto_update_enabled
                     || self.auto_update_interval_secs != auto_update_interval_secs;
                 self.auto_update_enabled = auto_update_enabled;
                 self.auto_update_interval_secs = auto_update_interval_secs;
+                self.backend_type = backend_type;
+                self.binary_path = binary_path;
+                self.real_delay_settings = real_delay_settings;
+                if backend_changed || binary_changed {
+                    self.real_delay_run_token = self.real_delay_run_token.wrapping_add(1);
+                    self.testing_real_delay.clear();
+                    self.real_delay_capability = backend_type.default_real_delay_capability();
+                    render_hint = RenderHint::Full;
+                }
+
                 if changed {
                     self.auto_update_generation = self.auto_update_generation.wrapping_add(1);
                     if self.auto_update_enabled {
@@ -632,9 +767,15 @@ impl Component for SubscriptionsPage {
             &self.subscriptions,
             &self.list_container,
             &sender,
-            &self.expanded_subs,
-            &self.testing_latency,
-            self.locked || self.load_error.is_some(),
+            RenderState {
+                expanded_subs: &self.expanded_subs,
+                testing_latency: &self.testing_latency,
+                testing_real_delay: &self.testing_real_delay,
+                real_delay_available: self.real_delay_settings.enabled
+                    && self.backend_type.supports_real_delay(),
+                real_delay_capability: &self.real_delay_capability,
+                locked: self.locked || self.load_error.is_some(),
+            },
         );
     }
 
@@ -717,6 +858,58 @@ impl Component for SubscriptionsPage {
                     }
                 }
             }
+            SubscriptionsCmdOutput::RealDelayResult(id, run_token, report) => {
+                if self.testing_real_delay.get(&id).copied() != Some(run_token) {
+                    return;
+                }
+                self.testing_real_delay.remove(&id);
+                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
+                    for (node, delay) in sub.nodes.iter_mut().zip(report.results.iter()) {
+                        node.last_real_delay_ms = *delay;
+                    }
+                    if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
+                        let now = chrono::Utc::now();
+                        for (node, delay) in sub.nodes.iter().zip(report.results.iter()) {
+                            if let Some(value) = delay {
+                                let node_ref =
+                                    v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                                        subscription_id: sub.id,
+                                        node_id: node.id,
+                                    };
+                                snapshot.upsert_real_delay(node_ref, *value, now);
+                            }
+                        }
+                        if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
+                            log::error!("save latency snapshot: {e}");
+                        }
+                    }
+                }
+
+                // Update capability based on results for Xray/V2ray backends
+                if matches!(self.backend_type, BackendType::Xray | BackendType::V2ray) {
+                    let has_any_result = report.results.iter().any(|r| r.is_some());
+                    self.real_delay_capability = if has_any_result {
+                        RealDelayCapability::Supported
+                    } else {
+                        // If we have a diagnostic about missing service, mark as unsupported
+                        if let Some(diag) = &report.diagnostic {
+                            if diag.contains("ObservatoryService") {
+                                RealDelayCapability::Unsupported {
+                                    reason: diag.clone(),
+                                }
+                            } else {
+                                self.real_delay_capability.clone()
+                            }
+                        } else {
+                            self.real_delay_capability.clone()
+                        }
+                    };
+                }
+
+                if let Some(diagnostic) = report.diagnostic {
+                    let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
+                }
+            }
             SubscriptionsCmdOutput::RefreshFailed(id, error) => {
                 log::error!("failed to update subscription {id}: {error}");
                 let _ = sender.output(SubscriptionsOutput::Notice(format_subscription_error(
@@ -796,9 +989,15 @@ impl Component for SubscriptionsPage {
             &self.subscriptions,
             &self.list_container,
             &sender,
-            &self.expanded_subs,
-            &self.testing_latency,
-            self.locked || self.load_error.is_some(),
+            RenderState {
+                expanded_subs: &self.expanded_subs,
+                testing_latency: &self.testing_latency,
+                testing_real_delay: &self.testing_real_delay,
+                real_delay_available: self.real_delay_settings.enabled
+                    && self.backend_type.supports_real_delay(),
+                real_delay_capability: &self.real_delay_capability,
+                locked: self.locked || self.load_error.is_some(),
+            },
         );
     }
 }
@@ -1050,9 +1249,7 @@ fn render_list(
     subs: &[Subscription],
     container: &gtk::ListBox,
     sender: &ComponentSender<SubscriptionsPage>,
-    expanded_subs: &HashSet<Uuid>,
-    testing_latency: &HashSet<Uuid>,
-    locked: bool,
+    state: RenderState<'_>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -1074,8 +1271,7 @@ fn render_list(
     }
 
     for (idx, sub) in subs.iter().enumerate() {
-        let expander =
-            build_subscription_group(sub, idx, sender, expanded_subs, testing_latency, locked);
+        let expander = build_subscription_group(sub, idx, sender, &state);
         container.append(&expander);
     }
 }
@@ -1084,18 +1280,23 @@ fn build_subscription_group(
     sub: &Subscription,
     sub_idx: usize,
     sender: &ComponentSender<SubscriptionsPage>,
-    expanded_subs: &HashSet<Uuid>,
-    testing_latency: &HashSet<Uuid>,
-    locked: bool,
+    state: &RenderState<'_>,
 ) -> adw::ExpanderRow {
-    let expander = build_expander_header(sub, expanded_subs.contains(&sub.id), sender);
-    attach_drag_handle(&expander, sub_idx, sender, locked);
-    attach_subscription_toggle(&expander, sub.id, sub.enabled, sender, locked);
-    let menu = build_subscription_menu(sub, sender, testing_latency.contains(&sub.id));
+    let expander = build_expander_header(sub, state.expanded_subs.contains(&sub.id), sender);
+    attach_drag_handle(&expander, sub_idx, sender, state.locked);
+    attach_subscription_toggle(&expander, sub.id, sub.enabled, sender, state.locked);
+    let menu = build_subscription_menu(
+        sub,
+        sender,
+        state.testing_latency.contains(&sub.id),
+        state.testing_real_delay.contains_key(&sub.id),
+        state.real_delay_available,
+        state.real_delay_capability,
+    );
     expander.add_suffix(&menu);
 
     for (idx, node) in sub.nodes.iter().enumerate() {
-        expander.add_row(&build_node_row(sub.id, idx, node, sender, locked));
+        expander.add_row(&build_node_row(sub.id, idx, node, sender, state.locked));
     }
 
     expander
@@ -1213,6 +1414,9 @@ fn build_subscription_menu(
     sub: &Subscription,
     sender: &ComponentSender<SubscriptionsPage>,
     is_testing: bool,
+    is_testing_real_delay: bool,
+    real_delay_available: bool,
+    real_delay_capability: &RealDelayCapability,
 ) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
@@ -1360,6 +1564,63 @@ fn build_subscription_menu(
     popover_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     popover_box.append(&test_latency_btn);
     popover_box.append(&sort_latency_btn);
+
+    let has_real_delay = sub.nodes.iter().any(|n| n.last_real_delay_ms.is_some());
+
+    // Determine button sensitivity and tooltip based on capability
+    let (btn_sensitive, btn_tooltip) = match real_delay_capability {
+        RealDelayCapability::Supported => (true, None),
+        RealDelayCapability::PotentiallySupported { requirement } => (
+            true,
+            Some(format!(
+                "{} availability is checked when the probe runs",
+                requirement
+            )),
+        ),
+        RealDelayCapability::Unsupported { reason } => (false, Some(reason.clone())),
+    };
+
+    let test_real_delay_btn = gtk::Button::builder()
+        .label(if is_testing_real_delay {
+            "Testing Real Delay..."
+        } else {
+            "Test Real Delay"
+        })
+        .has_frame(false)
+        .sensitive(!is_testing_real_delay && real_delay_available && btn_sensitive)
+        .build();
+    if let Some(tooltip) = btn_tooltip {
+        test_real_delay_btn.set_tooltip_text(Some(&tooltip));
+    } else if !real_delay_available {
+        test_real_delay_btn.set_tooltip_text(Some(
+            "Real Delay is not available (check settings and backend)",
+        ));
+    }
+    {
+        let s = sender.clone();
+        let p = popover.clone();
+        test_real_delay_btn.connect_clicked(move |_| {
+            p.popdown();
+            s.input(SubscriptionsMsg::TestRealDelay(id));
+        });
+    }
+    popover_box.append(&test_real_delay_btn);
+
+    let sort_real_delay_btn = gtk::Button::builder()
+        .label("Sort by Real Delay")
+        .has_frame(false)
+        .sensitive(has_real_delay)
+        .build();
+    {
+        let s = sender.clone();
+        let p = popover.clone();
+        sort_real_delay_btn.connect_clicked(move |_| {
+            p.popdown();
+            s.input(SubscriptionsMsg::SortByRealDelay(id));
+        });
+    }
+    popover_box.append(&sort_real_delay_btn);
+
     popover_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     popover_box.append(&enable_all_btn);
     popover_box.append(&disable_all_btn);
@@ -1465,6 +1726,24 @@ fn build_node_row(
             latency_label.add_css_class("error");
         }
         row.add_suffix(&latency_label);
+    }
+
+    if let Some(ms) = node.last_real_delay_ms {
+        let real_label = gtk::Label::builder()
+            .label(format!("· {ms}ms"))
+            .valign(gtk::Align::Center)
+            .build();
+        real_label.add_css_class("caption");
+        const LATENCY_GOOD_MS: u64 = 200;
+        const LATENCY_WARN_MS: u64 = 500;
+        if ms < LATENCY_GOOD_MS {
+            real_label.add_css_class("success");
+        } else if ms < LATENCY_WARN_MS {
+            real_label.add_css_class("warning");
+        } else {
+            real_label.add_css_class("error");
+        }
+        row.add_suffix(&real_label);
     }
 
     let move_box = gtk::Box::builder()

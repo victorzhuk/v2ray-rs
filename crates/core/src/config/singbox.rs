@@ -93,6 +93,13 @@ fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
     }
 }
 
+/// Builds a single sing-box outbound for the given node and tag. Shared with
+/// the Real Delay probe config generator so probes dial through the exact same
+/// outbound shape as a normal run.
+pub(crate) fn build_singbox_outbound(node: &ProxyNode, tag: &str) -> Value {
+    build_outbound(node, tag)
+}
+
 fn build_vless(c: &VlessConfig, tag: &str) -> Value {
     let mut out = json!({
         "type": "vless",

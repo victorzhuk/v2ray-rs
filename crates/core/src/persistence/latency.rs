@@ -278,4 +278,48 @@ mod tests {
         };
         assert!(snapshot.get(manual_ref).is_some());
     }
+
+    #[test]
+    fn test_load_legacy_snapshot_without_real_delay_field() {
+        let (_tmp, paths) = super::super::test_paths();
+        let manual_node_id = uuid::Uuid::new_v4();
+        let raw = serde_json::json!({
+            "samples": [{
+                "node_ref": { "type": "manual", "node_id": manual_node_id },
+                "sample": { "latency_ms": 77, "measured_at": "2025-01-01T00:00:00Z" }
+            }]
+        });
+        paths.ensure_dirs().unwrap();
+        fs::write(
+            paths.latency_snapshot_path(),
+            serde_json::to_string_pretty(&raw).unwrap(),
+        )
+        .unwrap();
+
+        let snapshot = load_latency_snapshot(&paths).unwrap();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: manual_node_id,
+        };
+        let sample = snapshot.get(node_ref).unwrap();
+        assert_eq!(sample.latency_ms, Some(77));
+        assert_eq!(sample.real_delay_ms, None);
+    }
+
+    #[test]
+    fn test_save_and_reload_snapshot_with_real_delay() {
+        let (_tmp, paths) = super::super::test_paths();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        let now = chrono::Utc::now();
+        let mut snapshot = crate::resolve::LatencySnapshot::new();
+        snapshot.upsert(node_ref, 42, now);
+        snapshot.upsert_real_delay(node_ref, 412, now);
+        save_latency_snapshot(&paths, &snapshot).unwrap();
+
+        let reloaded = load_latency_snapshot(&paths).unwrap();
+        let sample = reloaded.get(node_ref).unwrap();
+        assert_eq!(sample.latency_ms, Some(42));
+        assert_eq!(sample.real_delay_ms, Some(412));
+    }
 }

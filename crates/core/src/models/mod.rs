@@ -22,9 +22,11 @@ pub use resolve::{
     AutoResolveStrategy, ConnectionMetadata, ConnectionNodeRef, LastSuccessMetadata, LatencySample,
 };
 pub use routing::{RoutingRule, RoutingRuleSet, RuleAction, RuleMatch};
-pub use settings::{AppSettings, BackendConfig, BackendType, Language};
+pub use settings::{
+    AppSettings, BackendConfig, BackendType, Language, RealDelayCapability, RealDelaySettings,
+};
 pub use subscription::{Subscription, SubscriptionNode, SubscriptionSource};
 pub use validation::{
     ValidationError, validate_country_code, validate_domain_pattern, validate_geosite_category,
-    validate_ip_cidr, validate_rule_match,
+    validate_ip_cidr, validate_rule_match, validate_test_url,
 };

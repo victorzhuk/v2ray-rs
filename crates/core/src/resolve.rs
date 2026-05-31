@@ -15,6 +15,7 @@ pub struct ConnectionCandidate {
     pub source_name: String,
     pub node: ProxyNode,
     pub latency_ms: Option<u64>,
+    pub real_delay_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -77,13 +78,34 @@ impl LatencySnapshot {
         latency_ms: u64,
         measured_at: DateTime<Utc>,
     ) {
-        self.samples.insert(
-            node_ref,
-            LatencySample {
-                latency_ms,
+        let entry = self
+            .samples
+            .entry(node_ref)
+            .or_insert_with(|| LatencySample {
+                latency_ms: None,
                 measured_at,
-            },
-        );
+                real_delay_ms: None,
+            });
+        entry.latency_ms = Some(latency_ms);
+        entry.measured_at = measured_at;
+    }
+
+    pub fn upsert_real_delay(
+        &mut self,
+        node_ref: ConnectionNodeRef,
+        real_delay_ms: u64,
+        measured_at: DateTime<Utc>,
+    ) {
+        let entry = self
+            .samples
+            .entry(node_ref)
+            .or_insert_with(|| LatencySample {
+                latency_ms: None,
+                measured_at,
+                real_delay_ms: None,
+            });
+        entry.real_delay_ms = Some(real_delay_ms);
+        entry.measured_at = measured_at;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -105,6 +127,7 @@ pub struct ConnectionPlanner {
     strategy: AutoResolveStrategy,
     last_success: Option<LastSuccessMetadata>,
     latency_snapshot: LatencySnapshot,
+    use_real_delay_for_lowest_latency: bool,
 }
 
 impl ConnectionPlanner {
@@ -117,7 +140,16 @@ impl ConnectionPlanner {
             strategy,
             last_success,
             latency_snapshot,
+            use_real_delay_for_lowest_latency: false,
         }
+    }
+
+    /// Enables ranking the Lowest Latency strategy by Real Delay samples when
+    /// available, falling back to TCP samples otherwise.
+    #[must_use]
+    pub fn with_real_delay_for_lowest_latency(mut self, enabled: bool) -> Self {
+        self.use_real_delay_for_lowest_latency = enabled;
+        self
     }
 
     pub fn plan(
@@ -136,38 +168,51 @@ impl ConnectionPlanner {
                     subscription_id: sub.id,
                     node_id: node.id,
                 };
-                let latency_ms = self
-                    .latency_snapshot
-                    .get(node_ref)
-                    .map(|sample| sample.latency_ms)
+                let sample = self.latency_snapshot.get(node_ref);
+                let latency_ms = sample
+                    .and_then(|sample| sample.latency_ms)
                     .or(node.last_latency_ms);
+                let real_delay_ms = sample
+                    .and_then(|sample| sample.real_delay_ms)
+                    .or(node.last_real_delay_ms);
                 candidates.push(ConnectionCandidate {
                     node_ref,
                     source_name: sub.name.clone(),
                     node: node.node.clone(),
                     latency_ms,
+                    real_delay_ms,
                 });
             }
         }
 
         for manual in manual_nodes.iter().filter(|n| n.enabled) {
             let node_ref = ConnectionNodeRef::Manual { node_id: manual.id };
-            let latency_ms = self
-                .latency_snapshot
-                .get(node_ref)
-                .map(|sample| sample.latency_ms);
+            let sample = self.latency_snapshot.get(node_ref);
+            let latency_ms = sample.and_then(|sample| sample.latency_ms);
+            let real_delay_ms = sample.and_then(|sample| sample.real_delay_ms);
             candidates.push(ConnectionCandidate {
                 node_ref,
                 source_name: "Manual".to_string(),
                 node: manual.node.clone(),
                 latency_ms,
+                real_delay_ms,
             });
         }
 
         match self.strategy {
             AutoResolveStrategy::ListOrder => candidates,
             AutoResolveStrategy::LowestLatency => {
-                candidates.sort_by_key(|c| c.latency_ms.unwrap_or(u64::MAX));
+                if self.use_real_delay_for_lowest_latency {
+                    // Nodes with a Real Delay sample first (ascending), then
+                    // nodes with only a TCP sample (ascending), then unknown.
+                    candidates.sort_by_key(|c| match (c.real_delay_ms, c.latency_ms) {
+                        (Some(real), _) => (0u8, real),
+                        (None, Some(tcp)) => (1u8, tcp),
+                        (None, None) => (2u8, u64::MAX),
+                    });
+                } else {
+                    candidates.sort_by_key(|c| c.latency_ms.unwrap_or(u64::MAX));
+                }
                 candidates
             }
             AutoResolveStrategy::Random => {
@@ -359,7 +404,101 @@ mod tests {
 
         let latency = snapshot.get(node_ref);
         assert!(latency.is_some());
-        assert_eq!(latency.unwrap().latency_ms, 100);
+        assert_eq!(latency.unwrap().latency_ms, Some(100));
+    }
+
+    #[test]
+    fn plan_lowest_latency_by_real_delay_ranks_real_then_tcp_then_unknown() {
+        let mut sub = subscription_with_nodes(
+            "Alpha",
+            vec![
+                (vless_node("a.com", "A"), true, Some(50)),
+                (vless_node("b.com", "B"), true, Some(999)),
+                (vless_node("c.com", "C"), true, Some(40)),
+                (vless_node("d.com", "D"), true, None),
+            ],
+        );
+        sub.nodes[0].last_real_delay_ms = Some(300);
+        sub.nodes[1].last_real_delay_ms = Some(100);
+
+        let planner = ConnectionPlanner::new(
+            AutoResolveStrategy::LowestLatency,
+            None,
+            LatencySnapshot::default(),
+        )
+        .with_real_delay_for_lowest_latency(true);
+
+        let planned = planner.plan(std::slice::from_ref(&sub), &[]);
+
+        // Real-delay nodes first (ascending), then TCP-only, then unknown.
+        assert_eq!(planned[0].node.address(), "b.com");
+        assert_eq!(planned[1].node.address(), "a.com");
+        assert_eq!(planned[2].node.address(), "c.com");
+        assert_eq!(planned[3].node.address(), "d.com");
+    }
+
+    #[test]
+    fn plan_lowest_latency_default_ignores_real_delay() {
+        let mut sub = subscription_with_nodes(
+            "Alpha",
+            vec![
+                (vless_node("a.com", "A"), true, Some(50)),
+                (vless_node("b.com", "B"), true, Some(10)),
+            ],
+        );
+        // A has the best real delay, but the default strategy must ignore it.
+        sub.nodes[0].last_real_delay_ms = Some(1);
+
+        let planner = ConnectionPlanner::new(
+            AutoResolveStrategy::LowestLatency,
+            None,
+            LatencySnapshot::default(),
+        );
+
+        let planned = planner.plan(std::slice::from_ref(&sub), &[]);
+        assert_eq!(planned[0].node.address(), "b.com");
+    }
+
+    #[test]
+    fn snapshot_upsert_preserves_other_sample_field() {
+        let mut snapshot = LatencySnapshot::new();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        let now = Utc::now();
+
+        snapshot.upsert(node_ref, 42, now);
+        snapshot.upsert_real_delay(node_ref, 412, now);
+
+        let sample = snapshot.get(node_ref).unwrap();
+        assert_eq!(sample.latency_ms, Some(42));
+        assert_eq!(sample.real_delay_ms, Some(412));
+    }
+
+    #[test]
+    fn snapshot_round_trips_real_delay_and_legacy_loads() {
+        let mut snapshot = LatencySnapshot::new();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        snapshot.upsert(node_ref, 42, Utc::now());
+        snapshot.upsert_real_delay(node_ref, 412, Utc::now());
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: LatencySnapshot = serde_json::from_str(&json).unwrap();
+        let sample = reloaded.get(node_ref).unwrap();
+        assert_eq!(sample.latency_ms, Some(42));
+        assert_eq!(sample.real_delay_ms, Some(412));
+
+        // Legacy snapshot without the real-delay field still loads.
+        let legacy = serde_json::json!({
+            "samples": [{
+                "node_ref": { "type": "manual", "node_id": uuid::Uuid::new_v4() },
+                "sample": { "latency_ms": 50, "measured_at": "2025-01-01T00:00:00Z" }
+            }]
+        });
+        let legacy_snapshot: LatencySnapshot = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy_snapshot.len(), 1);
     }
 
     #[test]

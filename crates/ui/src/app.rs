@@ -305,7 +305,8 @@ impl App {
             self.settings.auto_resolve_strategy,
             self.settings.last_success.clone(),
             self.load_latency_snapshot_or_default(),
-        );
+        )
+        .with_real_delay_for_lowest_latency(self.settings.real_delay.use_for_lowest_latency);
         let candidate = planner
             .runtime_candidate(subscriptions, manual_nodes)
             .map(|candidate| candidate.node);
@@ -699,6 +700,9 @@ impl SimpleComponent for App {
                     .emit(SubscriptionsMsg::SyncSettings {
                         auto_update_enabled: self.settings.auto_update_subscriptions,
                         auto_update_interval_secs: self.settings.subscription_update_interval_secs,
+                        backend_type: self.settings.backend.backend_type,
+                        binary_path: self.settings.backend.binary_path.clone(),
+                        real_delay_settings: self.settings.real_delay.clone(),
                     });
 
                 if let Some((name, source)) = subscription {
@@ -738,6 +742,9 @@ impl SimpleComponent for App {
                     .emit(SubscriptionsMsg::SyncSettings {
                         auto_update_enabled: self.settings.auto_update_subscriptions,
                         auto_update_interval_secs: self.settings.subscription_update_interval_secs,
+                        backend_type: self.settings.backend.backend_type,
+                        binary_path: self.settings.backend.binary_path.clone(),
+                        real_delay_settings: self.settings.real_delay.clone(),
                     });
                 self.restart_required = self.check_restart_required();
                 if was_connected && strategy_changed {
@@ -803,6 +810,9 @@ impl SimpleComponent for App {
                     self.settings.auto_resolve_strategy,
                     self.settings.last_success.clone(),
                     snapshot,
+                )
+                .with_real_delay_for_lowest_latency(
+                    self.settings.real_delay.use_for_lowest_latency,
                 );
                 let candidates = planner.plan(&subscriptions, &manual_nodes);
 
@@ -982,6 +992,9 @@ impl SimpleComponent for App {
                             auto_update_interval_secs: self
                                 .settings
                                 .subscription_update_interval_secs,
+                            backend_type: self.settings.backend.backend_type,
+                            binary_path: self.settings.backend.binary_path.clone(),
+                            real_delay_settings: self.settings.real_delay.clone(),
                         });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {

@@ -72,6 +72,7 @@ pub fn reconcile_with_counts(
             let old = &old_nodes[idx];
             let mut subscription_node = SubscriptionNode::with_id(old.id, new_node, old.enabled);
             subscription_node.last_latency_ms = old.last_latency_ms;
+            subscription_node.last_real_delay_ms = old.last_real_delay_ms;
             result.push(subscription_node);
         } else {
             added += 1;
@@ -300,6 +301,21 @@ mod tests {
         assert_eq!(result.added, 1);
         assert_eq!(result.removed, 1);
         assert_eq!(result.unchanged, 1);
+    }
+
+    #[test]
+    fn test_reconcile_preserves_real_delay_sample() {
+        let mut old_node = SubscriptionNode::new(vless_node("example.com", 443));
+        old_node.last_latency_ms = Some(38);
+        old_node.last_real_delay_ms = Some(412);
+        let old = vec![old_node];
+
+        let new_parsed = vec![vless_node("example.com", 443)];
+        let result = reconcile_nodes(&old, new_parsed);
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].last_latency_ms, Some(38));
+        assert_eq!(result[0].last_real_delay_ms, Some(412));
     }
 
     #[test]

@@ -211,32 +211,24 @@ impl ProcessManager {
     // Retry on ETXTBSY which can occur on overlayfs (Docker containers)
     // when a binary is written and immediately executed
     async fn try_spawn(&self) -> Result<Child, std::io::Error> {
-        const MAX_RETRIES: u32 = 5;
-        for attempt in 0..MAX_RETRIES {
-            let mut cmd = Command::new(&self.binary_path);
+        let binary_path = self.binary_path.clone();
+        let config_path = self.config_path.clone();
+        let geodata_dir = self.geodata_dir.clone();
+        crate::spawn::spawn_with_etxtbsy_retry(move || {
+            let mut cmd = Command::new(&binary_path);
             cmd.arg("run")
                 .arg("-c")
-                .arg(&self.config_path)
+                .arg(&config_path)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped());
 
-            if let Some(dir) = &self.geodata_dir {
+            if let Some(dir) = &geodata_dir {
                 cmd.env("V2RAY_LOCATION_ASSET", dir);
                 cmd.env("XRAY_LOCATION_ASSET", dir);
             }
-
-            match cmd.spawn() {
-                Ok(child) => return Ok(child),
-                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                    if attempt == MAX_RETRIES - 1 {
-                        return Err(e);
-                    }
-                    sleep(Duration::from_millis(50)).await;
-                }
-                Err(e) => return Err(e),
-            }
-        }
-        unreachable!()
+            cmd
+        })
+        .await
     }
 
     fn capture_output(&mut self, child: &mut Child) {

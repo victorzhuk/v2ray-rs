@@ -298,6 +298,56 @@ pub(super) fn build_network_page(
     resolve_group.add(&resolve_row);
     page.add(&resolve_group);
 
+    let real_delay_group = adw::PreferencesGroup::builder()
+        .title("Real Delay")
+        .description("End-to-end latency probe through an ephemeral backend instance")
+        .build();
+
+    let real_delay_enabled_row = adw::SwitchRow::builder()
+        .title("Enabled")
+        .active(s.real_delay.enabled)
+        .build();
+    real_delay_group.add(&real_delay_enabled_row);
+
+    let real_delay_url_row = adw::EntryRow::builder()
+        .title("Test URL")
+        .text(&s.real_delay.test_url)
+        .show_apply_button(true)
+        .build();
+    real_delay_group.add(&real_delay_url_row);
+
+    let real_delay_timeout_row = adw::SpinRow::builder()
+        .title("Timeout (ms)")
+        .adjustment(&gtk::Adjustment::new(
+            s.real_delay.timeout_ms as f64,
+            500.0,
+            60000.0,
+            500.0,
+            0.0,
+            0.0,
+        ))
+        .build();
+    real_delay_group.add(&real_delay_timeout_row);
+
+    let real_delay_use_for_lowest_row = adw::SwitchRow::builder()
+        .title("Use for Lowest Latency strategy")
+        .subtitle("Prefer real delay over TCP ping when sorting by latency")
+        .active(s.real_delay.use_for_lowest_latency)
+        .build();
+    real_delay_group.add(&real_delay_use_for_lowest_row);
+
+    let real_delay_preset_row = adw::ComboRow::builder()
+        .title("Test URL Preset")
+        .model(&gtk::StringList::new(&[
+            "Google (gstatic.com)",
+            "Cloudflare",
+            "Apple",
+        ]))
+        .build();
+    real_delay_group.add(&real_delay_preset_row);
+
+    page.add(&real_delay_group);
+
     drop(s);
 
     {
@@ -483,7 +533,64 @@ pub(super) fn build_network_page(
             emit(&st, &cb);
         });
     }
-
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        real_delay_enabled_row.connect_active_notify(move |row| {
+            st.borrow_mut().real_delay.enabled = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
+        real_delay_url_row.connect_apply(move |row| {
+            let value = row.text().trim().to_string();
+            match AppSettings::validate_real_delay_url(&value) {
+                Ok(()) => {
+                    row.remove_css_class("error");
+                    st.borrow_mut().real_delay.test_url = value;
+                    emit(&st, &cb);
+                }
+                Err(err) => {
+                    row.add_css_class("error");
+                    toast_cb(&format!("Invalid Real Delay test URL: {err}"));
+                    let current = st.borrow().real_delay.test_url.clone();
+                    row.set_text(&current);
+                }
+            }
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        real_delay_timeout_row.connect_changed(move |row| {
+            st.borrow_mut().real_delay.timeout_ms = row.value() as u32;
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        real_delay_use_for_lowest_row.connect_active_notify(move |row| {
+            st.borrow_mut().real_delay.use_for_lowest_latency = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        let real_delay_url_row = real_delay_url_row.clone();
+        real_delay_preset_row.connect_selected_notify(move |row| {
+            let Some(url) = real_delay_preset_url(row.selected()) else {
+                return;
+            };
+            real_delay_url_row.set_text(url);
+            st.borrow_mut().real_delay.test_url = url.to_string();
+            emit(&st, &cb);
+        });
+    }
     {
         let custom_type_row = custom_type_row.clone();
         let custom_status_row = custom_status_row.clone();
@@ -539,5 +646,14 @@ fn geodata_status_text(index_manager: &GeodataIndexManager, backend_type: Backen
         }
         Ok(None) => "Not indexed".to_string(),
         Err(_) => "Error loading index".to_string(),
+    }
+}
+
+fn real_delay_preset_url(index: u32) -> Option<&'static str> {
+    match index {
+        0 => Some("https://www.gstatic.com/generate_204"),
+        1 => Some("https://cp.cloudflare.com/generate_204"),
+        2 => Some("https://www.apple.com/library/test/success.html"),
+        _ => None,
     }
 }

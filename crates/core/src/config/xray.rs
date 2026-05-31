@@ -39,6 +39,17 @@ fn patch_xray_outbounds(config: &mut Value, nodes: &[ProxyNode]) {
     }
 }
 
+/// Builds a single xray outbound (v2ray-family outbound plus xray-specific
+/// XTLS flow extensions) for the given node and tag. Shared with the Real Delay
+/// probe config generator.
+pub(crate) fn build_xray_outbound(node: &ProxyNode, tag: &str) -> Value {
+    let mut outbound = crate::config::v2ray::build_family_outbound(node, tag);
+    if let ProxyNode::Vless(c) = node {
+        apply_xray_vless_extensions(&mut outbound, c);
+    }
+    outbound
+}
+
 fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
     if let Some(ref flow) = c.flow
         && is_xtls_flow(flow)

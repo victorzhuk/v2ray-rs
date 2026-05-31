@@ -1,11 +1,16 @@
 mod common;
-mod singbox;
+mod probe;
+pub(crate) mod singbox;
 #[cfg(test)]
 mod test_fixtures;
 pub(crate) mod v2ray;
 mod writer;
-mod xray;
+pub(crate) mod xray;
 
+pub use probe::{
+    PROBE_TAG_PREFIX, ProbeConfigGenerator, SingboxProbeGenerator, V2rayProbeGenerator,
+    XrayProbeGenerator, probe_generator_for, probe_tag,
+};
 pub use singbox::SingboxGenerator;
 pub use v2ray::V2rayGenerator;
 pub use writer::ConfigWriter;

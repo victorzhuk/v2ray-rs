@@ -16,6 +16,19 @@ pub enum ValidationError {
     IndexOutOfBounds(usize),
     #[error("invalid listen address: {0}")]
     InvalidListenAddress(String),
+    #[error("invalid test URL: {0} (must be an http:// or https:// URL)")]
+    InvalidTestUrl(String),
+}
+
+/// Validates a Real Delay test URL: must parse as a URL with an `http` or
+/// `https` scheme. Other schemes and unparseable inputs are rejected.
+pub fn validate_test_url(url_str: &str) -> Result<(), ValidationError> {
+    let parsed = url::Url::parse(url_str)
+        .map_err(|_| ValidationError::InvalidTestUrl(url_str.to_string()))?;
+    match parsed.scheme() {
+        "http" | "https" => Ok(()),
+        _ => Err(ValidationError::InvalidTestUrl(url_str.to_string())),
+    }
 }
 
 /// Validates a GeoIP country code or extended tag.

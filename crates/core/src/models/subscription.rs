@@ -30,6 +30,8 @@ pub struct SubscriptionNode {
     pub enabled: bool,
     #[serde(skip, default)]
     pub last_latency_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_real_delay_ms: Option<u64>,
 }
 
 impl Subscription {
@@ -85,6 +87,7 @@ impl SubscriptionNode {
             node,
             enabled: true,
             last_latency_ms: None,
+            last_real_delay_ms: None,
         }
     }
 
@@ -94,11 +97,57 @@ impl SubscriptionNode {
             node,
             enabled,
             last_latency_ms: None,
+            last_real_delay_ms: None,
         }
     }
 
     #[must_use]
     pub fn runtime_state_eq(&self, other: &Self) -> bool {
         self.id == other.id && self.node == other.node && self.enabled == other.enabled
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{TransportSettings, VlessConfig};
+
+    fn vless_node() -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "example.com".into(),
+            port: 443,
+            uuid: "test-uuid".into(),
+            encryption: None,
+            flow: None,
+            transport: TransportSettings::Tcp,
+            tls: None,
+            remark: None,
+        })
+    }
+
+    #[test]
+    fn new_subscription_node_has_no_real_delay() {
+        let node = SubscriptionNode::new(vless_node());
+        assert_eq!(node.last_real_delay_ms, None);
+    }
+
+    #[test]
+    fn real_delay_round_trips_json() {
+        let mut node = SubscriptionNode::new(vless_node());
+        node.last_real_delay_ms = Some(412);
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: SubscriptionNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.last_real_delay_ms, Some(412));
+    }
+
+    #[test]
+    fn missing_real_delay_field_deserializes_to_none() {
+        let json = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "node": vless_node(),
+            "enabled": true
+        });
+        let node: SubscriptionNode = serde_json::from_value(json).unwrap();
+        assert_eq!(node.last_real_delay_ms, None);
     }
 }

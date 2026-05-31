@@ -106,6 +106,12 @@ fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
     }
 }
 
+/// Builds a single v2ray-family outbound for the given node and tag. Shared
+/// with the xray probe config generator.
+pub(crate) fn build_family_outbound(node: &ProxyNode, tag: &str) -> Value {
+    build_outbound(node, tag)
+}
+
 fn build_vless_outbound(c: &VlessConfig, tag: &str) -> Value {
     let mut user = json!({
         "id": c.uuid,

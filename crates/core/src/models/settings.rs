@@ -5,7 +5,9 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::models::{AutoResolveStrategy, DnsConfig, LastSuccessMetadata, ValidationError};
+use crate::models::{
+    AutoResolveStrategy, DnsConfig, LastSuccessMetadata, ValidationError, validate_test_url,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -42,6 +44,44 @@ impl BackendType {
             _ => None,
         }
     }
+
+    /// Whether this backend can perform a Real Delay probe.
+    ///
+    /// sing-box uses its Clash API; xray and v2ray use their ObservatoryService
+    /// over gRPC. All three backends have probe config generators registered.
+    #[must_use]
+    pub fn supports_real_delay(self) -> bool {
+        true // All supported backends have probe generators
+    }
+
+    /// Returns the default Real Delay capability state for this backend type.
+    ///
+    /// For xray and v2ray, capability is checked on first run (PotentiallySupported).
+    /// For sing-box, we assume support (Supported) as it uses the standard Clash API.
+    #[must_use]
+    pub const fn default_real_delay_capability(self) -> RealDelayCapability {
+        match self {
+            BackendType::V2ray | BackendType::Xray => RealDelayCapability::PotentiallySupported {
+                requirement: "ObservatoryService",
+            },
+            BackendType::SingBox => RealDelayCapability::Supported,
+        }
+    }
+}
+
+/// Runtime capability state for Real Delay, tracked per-session.
+///
+/// This is runtime-only state, not persisted to disk. It tracks whether
+/// the backend actually supports the required probe surface (ObservatoryService
+/// for xray/v2ray, Clash API for sing-box).
+#[derive(Debug, Clone, PartialEq)]
+pub enum RealDelayCapability {
+    /// Backend type supports Real Delay in principle; capability will be checked on first run.
+    PotentiallySupported { requirement: &'static str },
+    /// A previous run confirmed the backend has the required probe surface.
+    Supported,
+    /// A previous run found the backend lacks the required probe surface.
+    Unsupported { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -69,6 +109,30 @@ pub enum Language {
     Russian,
 }
 
+/// User preferences for the on-demand Real Delay latency probe.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RealDelaySettings {
+    pub enabled: bool,
+    pub test_url: String,
+    pub timeout_ms: u32,
+    pub use_for_lowest_latency: bool,
+}
+
+pub fn default_real_delay_test_url() -> String {
+    "https://www.gstatic.com/generate_204".to_string()
+}
+
+impl Default for RealDelaySettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            test_url: default_real_delay_test_url(),
+            timeout_ms: 5000,
+            use_for_lowest_latency: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub version: u32,
@@ -91,6 +155,8 @@ pub struct AppSettings {
     pub onboarding_complete: bool,
     #[serde(default)]
     pub dns: DnsConfig,
+    #[serde(default)]
+    pub real_delay: RealDelaySettings,
 }
 
 pub fn default_listen_address() -> String {
@@ -107,6 +173,12 @@ impl AppSettings {
         IpAddr::from_str(addr)
             .map(|_| ())
             .map_err(|_| ValidationError::InvalidListenAddress(addr.to_string()))
+    }
+
+    /// Validates a Real Delay test URL: must be a syntactically valid
+    /// `http://` or `https://` URL. Other schemes are rejected.
+    pub fn validate_real_delay_url(url: &str) -> Result<(), ValidationError> {
+        validate_test_url(url)
     }
 }
 
@@ -148,6 +220,7 @@ impl Default for AppSettings {
             notifications_enabled: true,
             onboarding_complete: false,
             dns: DnsConfig::default(),
+            real_delay: RealDelaySettings::default(),
         }
     }
 }
@@ -239,6 +312,70 @@ mod tests {
                 result,
                 Err(ValidationError::InvalidListenAddress(_))
             ));
+        }
+    }
+
+    #[test]
+    fn test_default_real_delay_settings() {
+        let settings = AppSettings::default();
+        assert!(settings.real_delay.enabled);
+        assert_eq!(
+            settings.real_delay.test_url,
+            "https://www.gstatic.com/generate_204"
+        );
+        assert_eq!(settings.real_delay.timeout_ms, 5000);
+        assert!(!settings.real_delay.use_for_lowest_latency);
+    }
+
+    #[test]
+    fn test_legacy_settings_toml_missing_real_delay_defaults() {
+        let toml_str = "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n";
+        let settings: AppSettings = toml::from_str(toml_str).unwrap();
+        assert!(settings.real_delay.enabled);
+        assert_eq!(
+            settings.real_delay.test_url,
+            "https://www.gstatic.com/generate_204"
+        );
+        assert_eq!(settings.real_delay.timeout_ms, 5000);
+        assert!(!settings.real_delay.use_for_lowest_latency);
+    }
+
+    #[test]
+    fn test_real_delay_settings_round_trip() {
+        let settings = AppSettings {
+            real_delay: RealDelaySettings {
+                enabled: true,
+                test_url: "https://cp.cloudflare.com/generate_204".to_string(),
+                timeout_ms: 3000,
+                use_for_lowest_latency: true,
+            },
+            ..AppSettings::default()
+        };
+        let toml_str = toml::to_string(&settings).unwrap();
+        let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.real_delay, settings.real_delay);
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_validate_real_delay_url() {
+        let valid = [
+            "https://www.gstatic.com/generate_204",
+            "http://cp.cloudflare.com/generate_204",
+            "https://www.apple.com/library/test/success.html",
+        ];
+        for url in valid {
+            assert!(
+                AppSettings::validate_real_delay_url(url).is_ok(),
+                "expected {url} to be valid"
+            );
+        }
+
+        let invalid = ["not-a-url", "ftp://example.com/", "", "example.com"];
+        for url in invalid {
+            let result = AppSettings::validate_real_delay_url(url);
+            assert!(result.is_err(), "expected {url} to be invalid");
+            assert!(matches!(result, Err(ValidationError::InvalidTestUrl(_))));
         }
     }
 
