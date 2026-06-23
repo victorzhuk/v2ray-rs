@@ -6,6 +6,12 @@ use crate::models::{AppSettings, ProxyNode, RoutingRule, VlessConfig};
 
 pub struct XrayGenerator;
 
+/// fwmark stamped on xray's own outbound sockets in TUN mode. The privileged
+/// route helper installs a matching policy rule that diverts marked packets past
+/// the TUN table, so `direct` traffic egresses the real interface instead of
+/// looping back into the tunnel. Must match `XRAY_FWMARK` in the netctl crate.
+const XRAY_TUN_FWMARK: u32 = 255;
+
 impl ConfigGenerator for XrayGenerator {
     fn generate(
         &self,
@@ -21,7 +27,27 @@ impl ConfigGenerator for XrayGenerator {
             generate_v2ray_family_config(nodes, rules, settings, V2rayFamilyBackend::Xray);
 
         patch_xray_outbounds(&mut config, nodes);
+
+        if settings.tun.enabled {
+            apply_tun_fwmark(&mut config);
+        }
+
         Ok(config)
+    }
+}
+
+/// Stamps every dialing outbound with the TUN fwmark via `streamSettings.sockopt.mark`
+/// so the route helper's policy rules exempt xray's own traffic from the tunnel.
+/// The blackhole `block` outbound never dials, so it is skipped.
+fn apply_tun_fwmark(config: &mut Value) {
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
+        return;
+    };
+    for outbound in outbounds {
+        if outbound["protocol"] == "blackhole" {
+            continue;
+        }
+        outbound["streamSettings"]["sockopt"]["mark"] = Value::from(XRAY_TUN_FWMARK);
     }
 }
 
@@ -223,5 +249,34 @@ mod tests {
             .expect("xray tun inbound missing");
         assert_eq!(tun["settings"]["autoOutboundsInterface"], "auto");
         assert_eq!(tun["sniffing"]["enabled"], true);
+    }
+
+    #[test]
+    fn test_xray_tun_marks_dialing_outbounds() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &settings)
+            .unwrap();
+
+        for outbound in config["outbounds"].as_array().unwrap() {
+            if outbound["protocol"] == "blackhole" {
+                assert!(outbound["streamSettings"]["sockopt"]["mark"].is_null());
+            } else {
+                assert_eq!(outbound["streamSettings"]["sockopt"]["mark"], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn test_xray_no_fwmark_when_tun_disabled() {
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &AppSettings::default())
+            .unwrap();
+
+        for outbound in config["outbounds"].as_array().unwrap() {
+            assert!(outbound["streamSettings"]["sockopt"]["mark"].is_null());
+        }
     }
 }
