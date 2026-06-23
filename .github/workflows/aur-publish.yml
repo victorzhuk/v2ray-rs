@@ -20,7 +20,10 @@ jobs:
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
-          # Keep off: `assets` makes the action `git add --all`, which would sweep
-          # the tarball updpkgsums downloads into the AUR repo (exceeds its blob
-          # limit). `sha256sums=('SKIP')` is correct for GitHub archive sources.
-          updpkgsums: false
+          updpkgsums: true
+          # `assets` makes the action `git add --all`, and updpkgsums downloads
+          # the source tarball into the repo dir (which exceeds AUR's blob-size
+          # limit). Remove the tarball after checksums are computed but before the
+          # commit, so the real sha256sums stay in the PKGBUILD without the tarball
+          # being published.
+          post_process: rm -f ./*.tar.gz
