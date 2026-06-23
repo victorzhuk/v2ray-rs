@@ -24,6 +24,12 @@ pub enum BackendError {
     ExecutionFailed { path: PathBuf, reason: String },
     #[error("failed to detect version for {path}: {reason}")]
     VersionDetectionFailed { path: PathBuf, reason: String },
+    #[error("binary at {path} reports {detected} but {expected} was selected")]
+    BackendMismatch {
+        path: PathBuf,
+        expected: BackendType,
+        detected: BackendType,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -218,6 +224,22 @@ pub fn detect_all_or_error() -> Result<Vec<DetectedBackend>, BackendError> {
     }
 }
 
+/// Infers the backend from a binary's `version` banner. Returns `None` for
+/// unrecognized output (custom forks, wrappers) so those keep the caller's
+/// chosen type instead of being rejected.
+fn identify_backend(version: &str) -> Option<BackendType> {
+    let lower = version.to_ascii_lowercase();
+    if lower.contains("sing-box") {
+        Some(BackendType::SingBox)
+    } else if lower.contains("xray") {
+        Some(BackendType::Xray)
+    } else if lower.contains("v2ray") {
+        Some(BackendType::V2ray)
+    } else {
+        None
+    }
+}
+
 pub fn validate_custom_path(path: &Path, bt: BackendType) -> Result<DetectedBackend, BackendError> {
     if !path.exists() {
         return Err(BackendError::NotFound {
@@ -230,6 +252,15 @@ pub fn validate_custom_path(path: &Path, bt: BackendType) -> Result<DetectedBack
         });
     }
     let version = detect_version(path)?;
+    if let Some(detected) = identify_backend(&version)
+        && detected != bt
+    {
+        return Err(BackendError::BackendMismatch {
+            path: path.to_path_buf(),
+            expected: bt,
+            detected,
+        });
+    }
     Ok(DetectedBackend {
         backend_type: bt,
         binary_path: path.to_path_buf(),
@@ -441,6 +472,64 @@ mod tests {
         assert_eq!(detected.binary_path, script_path);
         assert_eq!(detected.version.as_deref(), Some("TestBackend v1.0.0"));
         assert!(detected.version_error.is_none());
+    }
+
+    #[test]
+    fn test_identify_backend_from_version_banner() {
+        assert_eq!(
+            identify_backend("Xray 26.3.27 (Xray, Penetrates Everything.)"),
+            Some(BackendType::Xray)
+        );
+        assert_eq!(
+            identify_backend("sing-box version 1.9.0"),
+            Some(BackendType::SingBox)
+        );
+        assert_eq!(
+            identify_backend("V2Ray 5.16.1 (V2Fly, a community-driven edition)"),
+            Some(BackendType::V2ray)
+        );
+        assert_eq!(identify_backend("TestBackend v1.0.0"), None);
+    }
+
+    #[test]
+    fn test_validate_custom_path_rejects_backend_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script_path = dir.path().join("xray-mislabelled");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho \"Xray 26.3.27 (Xray, Penetrates Everything.)\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let result = validate_custom_path(&script_path, BackendType::SingBox);
+        assert!(matches!(
+            result,
+            Err(BackendError::BackendMismatch {
+                expected: BackendType::SingBox,
+                detected: BackendType::Xray,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_custom_path_accepts_matching_backend() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script_path = dir.path().join("xray-real");
+        fs::write(
+            &script_path,
+            "#!/bin/sh\necho \"Xray 26.3.27 (Xray, Penetrates Everything.)\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let detected = validate_custom_path(&script_path, BackendType::Xray).unwrap();
+        assert_eq!(detected.backend_type, BackendType::Xray);
+        assert_eq!(
+            detected.version.as_deref(),
+            Some("Xray 26.3.27 (Xray, Penetrates Everything.)")
+        );
     }
 
     #[test]
