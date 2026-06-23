@@ -2,6 +2,7 @@ name: AUR Publish
 
 on:
   workflow_call:
+  workflow_dispatch:
 
 jobs:
   aur:
@@ -14,6 +15,8 @@ jobs:
         with:
           pkgname: v2ray-rs
           pkgbuild: pkg/archlinux/PKGBUILD
+          assets: |
+            pkg/archlinux/v2ray-rs.install
           commit_username: ${{ secrets.AUR_USERNAME }}
           commit_email: ${{ secrets.AUR_EMAIL }}
           ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
