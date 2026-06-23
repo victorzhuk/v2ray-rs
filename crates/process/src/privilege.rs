@@ -93,7 +93,7 @@ fn grant_argv(backend: &Path, helper: &Path) -> Vec<OsString> {
 }
 
 fn getcap_has_cap(getcap_output: &str, cap: &str) -> bool {
-    let lower = getcap_output.to_ascii_lowercase();
+    let lower = getcap_output.trim().to_ascii_lowercase();
     // getcap prints `<path> <capset>`; match the cap as a whole token in the
     // trailing capset so a path component like `.../cap_net_admin/...` cannot
     // produce a false positive.
@@ -154,6 +154,12 @@ mod tests {
         ));
         assert!(getcap_has_cap(
             "/usr/bin/xray cap_net_admin+ep",
+            "cap_net_admin"
+        ));
+        // getcap terminates its line with a newline; the trailing whitespace
+        // must not swallow the capset.
+        assert!(getcap_has_cap(
+            "/usr/bin/xray cap_net_bind_service,cap_net_admin,cap_net_raw=ep\n",
             "cap_net_admin"
         ));
     }
