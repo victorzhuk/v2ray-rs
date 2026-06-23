@@ -23,6 +23,7 @@
 - **GTK4/libadwaita UI**: Native Linux desktop experience with system tray integration
 - **XDG compliant**: Full XDG Base Directory layout with runtime profiles and per-directory overrides
 - **Real Delay testing**: End-to-end latency probes through each proxy node. Supports sing-box with Clash API and xray/v2ray with ObservatoryService.
+- **TUN mode**: System-wide transparent proxying for sing-box and xray via a virtual interface — no per-app setup. One-time `setcap` privilege grant, with automatic route recovery after an unclean shutdown.
 
 ---
 
@@ -70,6 +71,12 @@ Supported backends:
 - v2fly/v2ray-core with ObservatoryService
 
 Privacy details: [`docs/real-delay-privacy.md`](docs/real-delay-privacy.md).
+
+### TUN mode
+
+TUN mode creates a virtual network interface that becomes the system default route, transparently proxying **all** traffic with no per-app configuration. It is available for **sing-box** (self-routes via `auto_route`) and **xray** (a minimal `v2ray-rs-netctl` helper programs the address and split routes); v2ray-core has no native TUN inbound and is excluded.
+
+TUN requires `CAP_NET_ADMIN` on the backend binary. The TUN preferences page offers a one-time **Grant TUN privileges** action (`setcap` via `pkexec`) and re-checks capabilities before each start. The Arch package installs `v2ray-rs-netctl` and grants it `cap_net_admin` via its install hook; from source, build the workspace so the helper sits alongside the UI binary.
 
 ### Configuration
 

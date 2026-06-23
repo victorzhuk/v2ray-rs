@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.10.0] - 2026-06-23
+
 ### Added
 - TUN mode for sing-box and xray: a virtual interface becomes the default route, transparently proxying all system traffic. sing-box self-routes via `auto_route`; xray uses a minimal privileged route helper (`v2ray-rs-netctl`) for the address and split routes. v2ray is excluded (no native TUN).
 - `[tun]` settings section (`enabled`, `interface_name`, `mtu`, `address_v4`, `address_v6`, `stack`, `strict_route`, `dns_hijack`, `exclude_routes`) with a TUN preferences page, backend/capability gating, and a system-wide-routing warning.
@@ -420,7 +424,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...HEAD
+[0.10.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.0...v0.8.1
 [0.8.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.7.4...v0.8.0
