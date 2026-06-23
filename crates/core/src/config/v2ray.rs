@@ -4,7 +4,7 @@ use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
     AppSettings, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings,
     ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
-    TrojanConfig, VlessConfig, VmessConfig, WsSettings,
+    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 pub struct V2rayGenerator;
@@ -43,7 +43,7 @@ pub(crate) fn generate_v2ray_family_config(
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let mut config = json!({
         "log": { "loglevel": "warning" },
-        "inbounds": build_inbounds(settings),
+        "inbounds": build_inbounds(settings, dns_backend),
         "outbounds": build_outbounds(nodes),
         "routing": build_routing(rules, &first_proxy_tag),
     });
@@ -55,22 +55,46 @@ pub(crate) fn generate_v2ray_family_config(
     config
 }
 
-fn build_inbounds(settings: &AppSettings) -> Value {
-    json!([
-        {
+fn build_inbounds(settings: &AppSettings, backend: V2rayFamilyBackend) -> Value {
+    let mut inbounds = vec![
+        json!({
             "tag": "socks-in",
             "protocol": "socks",
             "listen": settings.listen_address,
             "port": settings.socks_port,
             "settings": { "udp": true },
-        },
-        {
+        }),
+        json!({
             "tag": "http-in",
             "protocol": "http",
             "listen": settings.listen_address,
             "port": settings.http_port,
+        }),
+    ];
+
+    // Only xray has a native `tun` inbound; v2ray-core has none.
+    if backend == V2rayFamilyBackend::Xray && settings.tun.enabled {
+        inbounds.push(build_xray_tun_inbound(&settings.tun));
+    }
+
+    Value::Array(inbounds)
+}
+
+fn build_xray_tun_inbound(tun: &TunConfig) -> Value {
+    json!({
+        "tag": "tun-in",
+        "protocol": "tun",
+        "settings": {
+            "name": tun.interface_name,
+            "mtu": tun.mtu,
+            "gateway": tun.addresses(),
+            "autoOutboundsInterface": "auto",
         },
-    ])
+        "sniffing": {
+            "enabled": true,
+            "destOverride": ["http", "tls", "quic"],
+        },
+    })
 }
 
 fn build_outbounds(nodes: &[ProxyNode]) -> Value {
@@ -508,6 +532,57 @@ mod tests {
         assert!(config["inbounds"].is_array());
         assert!(config["outbounds"].is_array());
         assert!(config["routing"].is_object());
+    }
+
+    fn find_tun_inbound(config: &Value) -> Option<&Value> {
+        config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["protocol"] == "tun")
+    }
+
+    #[test]
+    fn test_xray_tun_inbound_emitted_when_enabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.address_v4 = "198.18.0.1/30".to_string();
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let tun = find_tun_inbound(&config).expect("xray tun inbound missing");
+        assert_eq!(tun["protocol"], "tun");
+        assert_eq!(tun["settings"]["name"], "tun0");
+        assert_eq!(tun["settings"]["mtu"], 1500);
+        assert_eq!(tun["settings"]["gateway"], json!(["198.18.0.1/30"]));
+        assert_eq!(tun["settings"]["autoOutboundsInterface"], "auto");
+        assert_eq!(tun["sniffing"]["enabled"], true);
+    }
+
+    #[test]
+    fn test_xray_no_tun_inbound_when_disabled() {
+        let config = generate_v2ray_family_config(
+            &[ss_node()],
+            &[],
+            &default_settings(),
+            V2rayFamilyBackend::Xray,
+        );
+        assert!(find_tun_inbound(&config).is_none());
+    }
+
+    #[test]
+    fn test_v2ray_never_emits_tun_even_when_enabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config = V2rayGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert!(find_tun_inbound(&config).is_none());
+        let inbounds = config["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
     }
 
     #[test]

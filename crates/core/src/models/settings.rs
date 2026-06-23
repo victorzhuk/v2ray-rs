@@ -6,7 +6,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
-    AutoResolveStrategy, DnsConfig, LastSuccessMetadata, ValidationError, validate_test_url,
+    AutoResolveStrategy, DnsConfig, LastSuccessMetadata, TunConfig, ValidationError,
+    validate_test_url,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -156,6 +157,8 @@ pub struct AppSettings {
     #[serde(default)]
     pub dns: DnsConfig,
     #[serde(default)]
+    pub tun: TunConfig,
+    #[serde(default)]
     pub real_delay: RealDelaySettings,
 }
 
@@ -220,6 +223,7 @@ impl Default for AppSettings {
             notifications_enabled: true,
             onboarding_complete: false,
             dns: DnsConfig::default(),
+            tun: TunConfig::default(),
             real_delay: RealDelaySettings::default(),
         }
     }
@@ -377,6 +381,39 @@ mod tests {
             assert!(result.is_err(), "expected {url} to be invalid");
             assert!(matches!(result, Err(ValidationError::InvalidTestUrl(_))));
         }
+    }
+
+    #[test]
+    fn test_legacy_settings_toml_missing_tun_defaults_to_disabled() {
+        let toml_str = "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n";
+        let settings: AppSettings = toml::from_str(toml_str).unwrap();
+        assert!(!settings.tun.enabled);
+        assert_eq!(settings.tun.interface_name, "tun0");
+        assert_eq!(settings.tun.mtu, 1500);
+        assert_eq!(settings.tun.address_v4, "172.19.0.1/30");
+        assert_eq!(settings.tun.stack, crate::models::TunStack::System);
+    }
+
+    #[test]
+    fn test_tun_settings_round_trip() {
+        let settings = AppSettings {
+            tun: crate::models::TunConfig {
+                enabled: true,
+                interface_name: "vpn-tun".to_string(),
+                mtu: 1400,
+                address_v4: "198.18.0.1/30".to_string(),
+                address_v6: None,
+                stack: crate::models::TunStack::Gvisor,
+                strict_route: false,
+                dns_hijack: crate::models::DnsHijackMode::Native,
+                exclude_routes: vec!["10.0.0.0/8".to_string()],
+            },
+            ..AppSettings::default()
+        };
+        let toml_str = toml::to_string(&settings).unwrap();
+        let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.tun, settings.tun);
+        assert_eq!(settings, deserialized);
     }
 
     #[test]

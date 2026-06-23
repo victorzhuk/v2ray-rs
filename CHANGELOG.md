@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- TUN mode for sing-box and xray: a virtual interface becomes the default route, transparently proxying all system traffic. sing-box self-routes via `auto_route`; xray uses a minimal privileged route helper (`v2ray-rs-netctl`) for the address and split routes. v2ray is excluded (no native TUN).
+- `[tun]` settings section (`enabled`, `interface_name`, `mtu`, `address_v4`, `address_v6`, `stack`, `strict_route`, `dns_hijack`, `exclude_routes`) with a TUN preferences page, backend/capability gating, and a system-wide-routing warning.
+- One-time TUN privilege grant: `setcap` via `pkexec` grants `cap_net_admin` to the backend binary and the route helper; capabilities are re-checked before each TUN start and re-prompted if lost (e.g. after a package upgrade).
+- Route recovery after an unclean shutdown removes a leftover TUN device and flushes stale routes; orphan cleanup now escalates SIGTERM to SIGKILL.
+
 ---
 
 ## [0.9.0] - 2026-05-31

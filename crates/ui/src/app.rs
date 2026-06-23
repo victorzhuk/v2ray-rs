@@ -581,6 +581,7 @@ impl SimpleComponent for App {
         {
             log::warn!("failed to clean orphaned backend process: {err}");
         }
+        recover_tun_session(&paths);
 
         let show_wizard = settings_load_error.is_none() && !settings.onboarding_complete;
 
@@ -883,6 +884,7 @@ impl SimpleComponent for App {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
+                    let _ = v2ray_rs_core::persistence::clear_tun_session(&self.paths);
                 }
                 if connection.is_some() {
                     self.connection_status = connection;
@@ -896,6 +898,21 @@ impl SimpleComponent for App {
                         });
                         if let Err(err) = self.persist_settings(settings) {
                             log::error!("save settings: {err}");
+                        }
+                    }
+                    if matches!(state, ProcessState::Running)
+                        && self.settings.tun.enabled
+                        && self.settings.backend.backend_type
+                            != v2ray_rs_core::models::BackendType::V2ray
+                    {
+                        let session = v2ray_rs_core::persistence::TunSession {
+                            backend: self.settings.backend.backend_type,
+                            iface: self.settings.tun.interface_name.clone(),
+                        };
+                        if let Err(err) =
+                            v2ray_rs_core::persistence::save_tun_session(&self.paths, &session)
+                        {
+                            log::warn!("save tun session marker: {err}");
                         }
                     }
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
@@ -1129,6 +1146,32 @@ fn update_tray_notification_setting(enabled: bool) {
 fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
     let pid_file = PidFile::new(paths.pid_file_path());
     pid_file.check_and_kill_orphaned()
+}
+
+/// On startup, if the previous run left a TUN session marker (an unclean
+/// shutdown), run the route helper's recovery pass and clear the marker.
+fn recover_tun_session(paths: &AppPaths) {
+    let Some(session) = v2ray_rs_core::persistence::load_tun_session(paths) else {
+        return;
+    };
+    let backend_flag = match session.backend {
+        v2ray_rs_core::models::BackendType::SingBox => "--singbox",
+        _ => "--xray",
+    };
+    match std::process::Command::new(v2ray_rs_process::helper_path())
+        .arg("recover")
+        .arg(backend_flag)
+        .arg("--iface")
+        .arg(&session.iface)
+        .status()
+    {
+        Ok(status) if status.success() => {
+            log::info!("recovered leftover TUN state on {}", session.iface)
+        }
+        Ok(status) => log::warn!("tun recover exited with {status}"),
+        Err(err) => log::warn!("failed to run tun recover: {err}"),
+    }
+    let _ = v2ray_rs_core::persistence::clear_tun_session(paths);
 }
 
 fn install_icon_for_compositor(profile: &AppProfile) {

@@ -13,6 +13,7 @@ use tokio::time::sleep;
 use crate::log_buffer::{LogBuffer, LogLine};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
+use crate::tun::{self, TunRuntime};
 use v2ray_rs_core::models::ConnectionMetadata;
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,6 +33,14 @@ pub enum ProcessError {
     Wait(std::io::Error),
     #[error("{0}")]
     Transition(#[from] TransitionError),
+    #[error("backend {0} lacks CAP_NET_ADMIN required for TUN mode; grant TUN privileges first")]
+    TunCapabilityMissing(PathBuf),
+    #[error("could not verify TUN capabilities: {0}")]
+    TunCapabilityProbe(String),
+    #[error("TUN device {0} did not appear")]
+    TunDeviceTimeout(String),
+    #[error("TUN route helper failed: {0}")]
+    TunHelper(String),
 }
 
 pub struct ProcessManager {
@@ -46,6 +55,7 @@ pub struct ProcessManager {
     auto_restart: bool,
     log_handles: Vec<tokio::task::JoinHandle<()>>,
     current_connection: Option<ConnectionMetadata>,
+    tun: Option<TunRuntime>,
 }
 
 impl ProcessManager {
@@ -67,7 +77,14 @@ impl ProcessManager {
             auto_restart: true,
             log_handles: Vec::new(),
             current_connection: None,
+            tun: None,
         }
+    }
+
+    /// Attaches TUN runtime details so start/stop become TUN-aware.
+    pub fn with_tun(mut self, tun: Option<TunRuntime>) -> Self {
+        self.tun = tun;
+        self
     }
 
     pub fn state(&self) -> ProcessState {
@@ -113,6 +130,25 @@ impl ProcessManager {
             return Err(error);
         }
 
+        if self.tun.is_some() {
+            match crate::privilege::has_net_admin(&self.binary_path) {
+                Ok(true) => {}
+                other => {
+                    self.state
+                        .transition(ProcessState::Starting, connection.clone())?;
+                    let error = match other {
+                        Ok(false) => ProcessError::TunCapabilityMissing(self.binary_path.clone()),
+                        Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
+                        Ok(true) => unreachable!(),
+                    };
+                    let _ = self
+                        .state
+                        .transition(ProcessState::Error(error.to_string()), None);
+                    return Err(error);
+                }
+            }
+        }
+
         if connection.is_some() {
             self.current_connection = connection.clone();
         }
@@ -141,6 +177,15 @@ impl ProcessManager {
 
         self.state.transition(ProcessState::Stopping, None)?;
         self.graceful_stop().await;
+
+        // SIGTERM already let xray close its TUN fd (the kernel drops the
+        // device-scoped routes); run the helper teardown as a safeguard.
+        if let Some(rt) = self.tun.clone()
+            && rt.needs_helper()
+        {
+            let _ = tun::xray_down(&rt).await;
+        }
+
         self.state.transition(ProcessState::Stopped, None)?;
         self.pid_file.remove().ok();
         Ok(())
@@ -205,6 +250,29 @@ impl ProcessManager {
 
         self.capture_output(&mut child);
         self.child = Some(child);
+
+        // xray creates the device but does not program routes on Linux: wait for
+        // the device, then drive the privileged helper. sing-box self-routes.
+        if let Some(rt) = self.tun.clone()
+            && rt.needs_helper()
+        {
+            if !tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await {
+                self.graceful_stop().await;
+                return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
+            }
+            match tun::xray_up(&rt).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.graceful_stop().await;
+                    return Err(ProcessError::TunHelper("xray-up reported failure".into()));
+                }
+                Err(e) => {
+                    self.graceful_stop().await;
+                    return Err(ProcessError::TunHelper(e.to_string()));
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -357,5 +425,47 @@ impl Drop for ProcessManager {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tun::TunRuntime;
+    use v2ray_rs_core::models::BackendType;
+
+    #[tokio::test]
+    async fn tun_start_refuses_without_capability() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        // /bin/sh exists but has no cap_net_admin, so the TUN gate must refuse
+        // to start (whether getcap reports it missing or cannot be run).
+        let mut mgr = ProcessManager::new(
+            PathBuf::from("/bin/sh"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        )
+        .with_tun(Some(TunRuntime {
+            backend: BackendType::Xray,
+            iface: "tun0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: PathBuf::from("v2ray-rs-netctl"),
+        }));
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(
+                result,
+                Err(ProcessError::TunCapabilityMissing(_))
+                    | Err(ProcessError::TunCapabilityProbe(_))
+            ),
+            "expected a TUN capability error, got {result:?}"
+        );
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
     }
 }

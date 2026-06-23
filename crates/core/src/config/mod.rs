@@ -18,7 +18,7 @@ pub use xray::XrayGenerator;
 
 use crate::models::{
     AppSettings, BackendType, DnsProtocol, DnsValidationError, ProxyNode, ProxyNodeValidationError,
-    RoutingRule,
+    RoutingRule, ValidationError,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +29,8 @@ pub enum ConfigError {
     InvalidProxyNode(#[from] ProxyNodeValidationError),
     #[error(transparent)]
     InvalidDns(#[from] DnsValidationError),
+    #[error("invalid tun config: {0}")]
+    InvalidTun(#[from] ValidationError),
     #[error("dns protocol {protocol:?} is not supported by backend {backend} for server '{tag}'")]
     UnsupportedDnsProtocol {
         backend: BackendType,

@@ -18,6 +18,10 @@ pub enum ValidationError {
     InvalidListenAddress(String),
     #[error("invalid test URL: {0} (must be an http:// or https:// URL)")]
     InvalidTestUrl(String),
+    #[error("invalid tun interface name: {0}")]
+    InvalidTunInterface(String),
+    #[error("invalid tun mtu: {0} (must be 576-9000)")]
+    InvalidTunMtu(u16),
 }
 
 /// Validates a Real Delay test URL: must parse as a URL with an `http` or
@@ -47,6 +51,21 @@ pub fn validate_ip_cidr(cidr: &str) -> Result<(), ValidationError> {
     cidr.parse::<IpNet>()
         .map(|_| ())
         .map_err(|_| ValidationError::InvalidIpCidr(cidr.to_string()))
+}
+
+/// Validates a TUN interface name: non-empty, at most 15 characters (IFNAMSIZ
+/// minus the NUL terminator), restricted to lowercase letters, digits, `_` and `-`.
+pub fn validate_tun_interface_name(name: &str) -> Result<(), ValidationError> {
+    if name.is_empty() || name.len() > 15 {
+        return Err(ValidationError::InvalidTunInterface(name.to_string()));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    {
+        return Err(ValidationError::InvalidTunInterface(name.to_string()));
+    }
+    Ok(())
 }
 
 pub fn validate_domain_pattern(pattern: &str) -> Result<(), ValidationError> {

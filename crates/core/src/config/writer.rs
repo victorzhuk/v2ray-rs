@@ -89,6 +89,10 @@ fn validate_runtime_inputs(nodes: &[ProxyNode], settings: &AppSettings) -> Resul
         settings.dns.validate()?;
     }
 
+    if settings.tun.enabled {
+        settings.tun.validate()?;
+    }
+
     Ok(())
 }
 

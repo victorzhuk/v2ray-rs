@@ -205,4 +205,23 @@ mod tests {
         let result = generator.generate(&[], &[], &AppSettings::default());
         assert!(result.is_err());
     }
+
+    #[test]
+    fn test_xray_generator_emits_tun_inbound_when_enabled() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &settings)
+            .unwrap();
+
+        let tun = config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["protocol"] == "tun")
+            .expect("xray tun inbound missing");
+        assert_eq!(tun["settings"]["autoOutboundsInterface"], "auto");
+        assert_eq!(tun["sniffing"]["enabled"], true);
+    }
 }

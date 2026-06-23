@@ -1,0 +1,18 @@
+[package]
+name = "v2ray-rs-netctl"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "v2ray-rs-netctl"
+path = "src/main.rs"
+
+[dependencies]
+rtnetlink.workspace = true
+tokio = { workspace = true }
+futures.workspace = true
+clap.workspace = true
+
+[features]
+# Privileged integration tests (network namespace); skipped by default and in `-short`.
+privileged-tests = []

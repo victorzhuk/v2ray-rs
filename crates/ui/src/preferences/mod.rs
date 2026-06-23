@@ -12,11 +12,13 @@ mod dns;
 mod network;
 mod routing;
 mod system;
+mod tun;
 
 use dns::build_dns_page;
 use network::build_network_page;
 use routing::{build_routing_error_page, build_routing_page};
 use system::build_system_page;
+use tun::build_tun_page;
 
 pub(crate) type SettingsCallback = Rc<dyn Fn(AppSettings)>;
 pub(crate) type RoutingCallback = Rc<dyn Fn(RoutingRuleSet)>;
@@ -77,6 +79,14 @@ pub fn show_preferences(
 
     let dns_page = build_dns_page(&settings_state, &settings_cb, &settings_observers);
     dialog.add(&dns_page);
+
+    let tun_page = build_tun_page(
+        &settings_state,
+        &settings_cb,
+        &settings_observers,
+        &toast_cb,
+    );
+    dialog.add(&tun_page);
 
     dialog.present(Some(parent));
     dialog

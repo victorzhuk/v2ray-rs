@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop GUI wrapper for v2ray/xray/sing-box CLI proxy tools. The app manages subscriptions, generates config files, handles process lifecycle, and provides geo-routing rules — all without implementing any protocol logic. The protocol work is delegated entirely to the system-installed CLI binaries.
 
-UI: Relm4 (GTK4) with libadwaita. Five crates: core, subscription, process, tray, ui.
+UI: Relm4 (GTK4) with libadwaita. Six crates: core, subscription, process, netctl, tray, ui.
 
 ## Commands
 
@@ -34,11 +34,12 @@ Domain models and infrastructure:
   - `routing.rs` — `RoutingRuleSet` with ordered `RoutingRule`s. Match conditions: GeoIP, GeoSite, Domain pattern, IP CIDR. Actions: Proxy/Direct/Block. Rule ordering matters (priority by position). CRUD with validation: `add_validated()`, `add_at()`, `edit_rule()`, `remove()`, `move_rule()`, `apply_preset()`.
   - `validation.rs` — `ValidationError` enum and validators for country codes (extended: ISO 3166-1 + GeoIP tags like GOOGLE/NETFLIX), IP CIDR, domain patterns (wildcard syntax), GeoSite categories.
   - `presets.rs` — `Preset` struct and `builtin_presets()` returning 4 presets: RU Bypass, CN Direct, Proxy Popular, Block Ads.
-  - `settings.rs` — `AppSettings` with backend config, proxy ports, `listen_address` (default `127.0.0.1`, validated as an IPv4/IPv6 literal via `AppSettings::validate_listen_address`), update intervals, language, tray behavior, `auto_resolve_strategy`, `last_success: Option<LastSuccessMetadata>`, and `dns: DnsConfig`. Serializes to TOML.
+  - `settings.rs` — `AppSettings` with backend config, proxy ports, `listen_address` (default `127.0.0.1`, validated as an IPv4/IPv6 literal via `AppSettings::validate_listen_address`), update intervals, language, tray behavior, `auto_resolve_strategy`, `last_success: Option<LastSuccessMetadata>`, `dns: DnsConfig`, and `tun: TunConfig`. Serializes to TOML.
+  - `tun.rs` — `TunConfig` (enabled, interface_name, mtu, address_v4, address_v6, stack, strict_route, dns_hijack, exclude_routes) with `validate()` and a `TunConfigWire` forward-compat wire struct. `TunStack` (System/Gvisor/Mixed) and `DnsHijackMode` (Hijack/Native/Disabled) enums serialize to backend literals. Default is TUN disabled.
   - `dns.rs` — `DnsConfig` (enabled, strategy, servers, rules, fakeip, disable_cache, client_subnet, hosts, use_custom_rules). `DnsServerConfig` (tag, protocol, address, port, detour). `DnsProtocol` enum (UDP/TCP/DoH/DoT/DoQ/H3) with `server_address()` and `default_port()`. `DnsStrategy` (PreferIpv4/PreferIpv6/Ipv4Only/Ipv6Only). `DnsRule`, `FakeIpConfig`, `HostOverride`. `builtin_dns_presets()` returns 8 presets (Cloudflare, Google, AdGuard, Quad9, Ali DNS, Yandex DNS variants). `DnsConfigWire` for backward-compat migration from the old two-field format.
   - `resolve.rs` — `AutoResolveStrategy` enum (ListOrder/LowestLatency/Random/LastSuccessful/GeoAware). `ConnectionMetadata` for active connection details. `LastSuccessMetadata` and `LatencySample`.
 
-- **`persistence.rs`** — XDG-compliant file storage via `directories` crate. Settings in TOML (`~/.config/v2ray-rs/settings.toml`), subscriptions and routing rules in JSON (`~/.local/share/v2ray-rs/`). Also persists `connection_state.json`, `latency_snapshot.json`, and custom presets. Uses atomic writes via `tempfile::NamedTempFile` + persist. Directories created with 0o700 permissions. `AppPaths::new_dev()` isolates dev mode under a `v2ray-rs-dev` qualifier. `AppPaths::from_paths()` is gated on `cfg(any(test, feature = "test-utils"))`.
+- **`persistence.rs`** — XDG-compliant file storage via `directories` crate. Settings in TOML (`~/.config/v2ray-rs/settings.toml`), subscriptions and routing rules in JSON (`~/.local/share/v2ray-rs/`). Also persists `latency_snapshot.json`, a `tun_session.json` TUN-active marker (written at TUN connect, removed on clean stop; its presence at startup triggers a route-recovery pass), and custom presets. Uses atomic writes via `tempfile::NamedTempFile` + persist. Directories created with 0o700 permissions. `AppPaths::new_dev()` isolates dev mode under a `v2ray-rs-dev` qualifier. `AppPaths::from_paths()` is gated on `cfg(any(test, feature = "test-utils"))`.
 
 - **`backend.rs`** — Detects installed v2ray/xray/sing-box binaries by checking well-known paths (`/usr/bin/`, `/usr/local/bin/`) and `$PATH` via `which`. Validates executability, extracts version strings. Provides install guidance strings per backend.
 
@@ -74,7 +75,15 @@ Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle manageme
 
 - **`pid.rs`** — `PidFile` for writing/reading/removing PID files. `check_and_kill_orphaned()` detects stale processes from previous runs using `kill(pid, 0)` signal probe.
 
-- **`manager.rs`** — `ProcessManager` orchestrator. Spawns backend via `tokio::process::Command` with ETXTBSY retry (handles overlayfs race in containers), pipes stdout/stderr through async line readers into shared `Arc<Mutex<LogBuffer>>` + broadcast channel. Graceful stop (SIGTERM → 5s → SIGKILL). Crash recovery with 2s delay, max 3 crashes per minute before Error state. PID file lifecycle.
+- **`manager.rs`** — `ProcessManager` orchestrator. Spawns backend via `tokio::process::Command` with ETXTBSY retry (handles overlayfs race in containers), pipes stdout/stderr through async line readers into shared `Arc<Mutex<LogBuffer>>` + broadcast channel. Graceful stop (SIGTERM → 5s → SIGKILL). Crash recovery with 2s delay, max 3 crashes per minute before Error state. PID file lifecycle. `with_tun(Option<TunRuntime>)` makes start/stop TUN-aware: a `CAP_NET_ADMIN` gate before start, an xray device-wait + `netctl xray-up`, and an `xray-down` safeguard on stop.
+
+- **`privilege.rs`** — TUN capability model. `has_net_admin()` reads a binary's file capabilities via `getcap` (the `caps` crate only handles live process caps, not file xattrs); `grant()` runs a single `pkexec` elevation applying `setcap` to the backend binary and the route helper; `file_caps_supported()` detects a `nosuid` mount and surfaces the manual `setcap` command.
+
+- **`tun.rs`** — `TunRuntime` (backend, iface, addresses, helper path), `helper_path()` resolution (sibling of the running exe, else `$PATH`), `wait_for_device()` polling `/sys/class/net/<iface>`, and `xray_up`/`xray_down` helper invocations.
+
+### `crates/netctl` (`v2ray-rs-netctl`)
+
+Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `futures`) invoked by the process layer for xray TUN, since xray creates the device but does not program routes on Linux. Subcommands, all idempotent and argument-validated before any netlink call: `xray-up` (link up, assign address, add `0.0.0.0/1` + `128.0.0.0/1` split routes, plus `::/1` + `8000::/1` with `--addr6`), `xray-down` (delete device), and `recover --singbox|--xray` (remove a leftover device; for sing-box flush its `auto_route` table/rules). Kept dependency-light on purpose: it is `setcap`'d with `cap_net_admin` and invokable by any local process. Privileged netns tests are gated behind the `privileged-tests` feature.
 
 ### `crates/tray` (`v2ray-rs-tray`)
 

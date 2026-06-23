@@ -15,6 +15,7 @@ mod presets;
 mod routing;
 mod settings;
 mod subscriptions;
+mod tun_session;
 
 pub use latency::{load_latency_snapshot, save_latency_snapshot};
 pub use manual_nodes::{
@@ -28,6 +29,7 @@ pub use subscriptions::{
     add_subscription, get_subscription, load_subscriptions, remove_subscription,
     save_subscriptions, update_subscription,
 };
+pub use tun_session::{TunSession, clear_tun_session, load_tun_session, save_tun_session};
 
 #[derive(Error, Debug)]
 pub enum PersistenceError {
@@ -229,6 +231,10 @@ impl AppPaths {
 
     pub fn instance_stamp_path(&self) -> PathBuf {
         self.state_dir.join("instance.json")
+    }
+
+    pub fn tun_session_path(&self) -> PathBuf {
+        self.state_dir.join("tun_session.json")
     }
 
     pub fn instance_lock_path(&self) -> PathBuf {

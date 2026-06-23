@@ -158,6 +158,15 @@ impl PidFile {
                         break;
                     }
                 }
+                if process_exists(record.pid) {
+                    let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGKILL);
+                    for _ in 0..5 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if !process_exists(record.pid) {
+                            break;
+                        }
+                    }
+                }
                 self.remove()?;
                 Ok(true)
             }
@@ -375,6 +384,40 @@ mod tests {
         child.wait().ok();
 
         assert!(!found_orphan);
+        assert!(!pid_file.path.exists());
+    }
+
+    #[test]
+    fn check_and_kill_orphaned_escalates_to_sigkill() {
+        let dir = TempDir::new().unwrap();
+        let pid_file = PidFile::new(test_pid_path(&dir));
+
+        // A backend that ignores SIGTERM forces the SIGKILL fallback.
+        let script_path = dir.path().join("stubborn-backend.sh");
+        fs::write(&script_path, "#!/bin/sh\ntrap '' TERM\nsleep 60\n").unwrap();
+        fs::set_permissions(&script_path, fs::Permissions::from_mode(0o755)).unwrap();
+        let config_path = dir.path().join("config.json");
+        fs::write(&config_path, "{}").unwrap();
+        let mut child = Command::new("/bin/sh")
+            .arg(&script_path)
+            .arg("run")
+            .arg("-c")
+            .arg(&config_path)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        pid_file
+            .write(pid, Path::new("/bin/sh"), &config_path)
+            .unwrap();
+
+        let found_orphan = pid_file.check_and_kill_orphaned().unwrap();
+        let status = child.wait().unwrap();
+
+        assert!(found_orphan);
+        assert!(!status.success());
+        assert!(!process_exists(pid));
         assert!(!pid_file.path.exists());
     }
 

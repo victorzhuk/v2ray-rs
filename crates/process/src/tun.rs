@@ -1,0 +1,117 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use tokio::process::Command;
+use tokio::time::sleep;
+
+use v2ray_rs_core::models::BackendType;
+
+/// How long to wait for an xray TUN device to appear after spawn before giving up.
+pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
+
+const HELPER_BIN: &str = "v2ray-rs-netctl";
+
+/// Everything the process manager needs to drive TUN mode for a connection.
+#[derive(Debug, Clone)]
+pub struct TunRuntime {
+    pub backend: BackendType,
+    pub iface: String,
+    pub addr_v4: String,
+    pub addr_v6: Option<String>,
+    pub helper_path: PathBuf,
+}
+
+impl TunRuntime {
+    /// xray creates the TUN device but does not program routes on Linux, so it
+    /// needs the privileged helper. sing-box self-routes via `auto_route`.
+    pub fn needs_helper(&self) -> bool {
+        self.backend == BackendType::Xray
+    }
+}
+
+/// Resolves the route helper: a sibling of the running executable (dev /
+/// `cargo run`), otherwise the bare name resolved via `$PATH` at exec time.
+pub fn helper_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(HELPER_BIN);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(HELPER_BIN)
+}
+
+/// Polls `/sys/class/net/<iface>` until the device exists or the timeout elapses.
+pub async fn wait_for_device(iface: &str, timeout: Duration) -> bool {
+    let path = device_path(iface);
+    let deadline = Instant::now() + timeout;
+    loop {
+        if Path::new(&path).exists() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn device_path(iface: &str) -> String {
+    format!("/sys/class/net/{iface}")
+}
+
+/// Runs `netctl xray-up` to assign the address and split routes.
+pub async fn xray_up(rt: &TunRuntime) -> std::io::Result<bool> {
+    let mut cmd = Command::new(&rt.helper_path);
+    cmd.arg("xray-up")
+        .arg("--iface")
+        .arg(&rt.iface)
+        .arg("--addr")
+        .arg(&rt.addr_v4);
+    if let Some(v6) = &rt.addr_v6 {
+        cmd.arg("--addr6").arg(v6);
+    }
+    Ok(cmd.status().await?.success())
+}
+
+/// Runs `netctl xray-down` to remove the device (idempotent).
+pub async fn xray_down(rt: &TunRuntime) -> std::io::Result<bool> {
+    Ok(Command::new(&rt.helper_path)
+        .arg("xray-down")
+        .arg("--iface")
+        .arg(&rt.iface)
+        .status()
+        .await?
+        .success())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wait_for_existing_device_returns_immediately() {
+        // `lo` always exists on Linux.
+        assert!(wait_for_device("lo", Duration::from_secs(1)).await);
+    }
+
+    #[tokio::test]
+    async fn wait_for_missing_device_times_out() {
+        assert!(!wait_for_device("nonexistent-tun-xyz", Duration::from_millis(250)).await);
+    }
+
+    #[test]
+    fn xray_needs_helper_singbox_does_not() {
+        let mk = |backend| TunRuntime {
+            backend,
+            iface: "tun0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: PathBuf::from("v2ray-rs-netctl"),
+        };
+        assert!(mk(BackendType::Xray).needs_helper());
+        assert!(!mk(BackendType::SingBox).needs_helper());
+    }
+}

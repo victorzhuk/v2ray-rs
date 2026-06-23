@@ -6,7 +6,7 @@ use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
     AppSettings, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
     RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
-    VlessConfig, VmessConfig, WsSettings,
+    TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -42,24 +42,55 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
         config["dns"] = build_dns(rules, settings);
     }
 
+    if settings.tun.enabled {
+        config["route"]["auto_detect_interface"] = json!(true);
+    }
+
     config
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
-    json!([
-        {
+    let mut inbounds = vec![
+        json!({
             "type": "mixed",
             "tag": "mixed-in",
             "listen": settings.listen_address,
             "listen_port": settings.socks_port,
-        },
-        {
+        }),
+        json!({
             "type": "http",
             "tag": "http-in",
             "listen": settings.listen_address,
             "listen_port": settings.http_port,
-        }
-    ])
+        }),
+    ];
+
+    if settings.tun.enabled {
+        inbounds.push(build_tun_inbound(&settings.tun));
+    }
+
+    Value::Array(inbounds)
+}
+
+fn build_tun_inbound(tun: &TunConfig) -> Value {
+    let mut inbound = json!({
+        "type": "tun",
+        "tag": "tun-in",
+        "interface_name": tun.interface_name,
+        "address": tun.addresses(),
+        "mtu": tun.mtu,
+        "auto_route": true,
+        "strict_route": tun.strict_route,
+        "stack": tun.stack,
+        "dns_mode": tun.dns_hijack,
+        "sniff": true,
+    });
+
+    if !tun.exclude_routes.is_empty() {
+        inbound["route_exclude_address"] = json!(tun.exclude_routes);
+    }
+
+    inbound
 }
 
 fn build_outbounds(nodes: &[ProxyNode]) -> Value {
@@ -583,6 +614,74 @@ mod tests {
             "udp_disabled must not be true on mixed inbound, got {:?}",
             disabled
         );
+    }
+
+    fn tun_inbound(config: &Value) -> Option<&Value> {
+        config["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["type"] == "tun")
+    }
+
+    #[test]
+    fn test_singbox_tun_inbound_emitted_when_enabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let tun = tun_inbound(&config).expect("tun inbound missing");
+        assert_eq!(tun["auto_route"], true);
+        assert_eq!(tun["address"], json!(["172.19.0.1/30"]));
+        assert_eq!(tun["mtu"], 1500);
+        assert_eq!(tun["stack"], "system");
+        assert_eq!(tun["strict_route"], true);
+        assert_eq!(tun["interface_name"], "tun0");
+        assert_eq!(tun["dns_mode"], "hijack");
+        assert_eq!(tun["sniff"], true);
+
+        assert_eq!(config["route"]["auto_detect_interface"], true);
+    }
+
+    #[test]
+    fn test_singbox_tun_includes_ipv6_address() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.address_v6 = Some("fd00::1/126".to_string());
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let tun = tun_inbound(&config).unwrap();
+        assert_eq!(tun["address"], json!(["172.19.0.1/30", "fd00::1/126"]));
+    }
+
+    #[test]
+    fn test_singbox_tun_excluded_routes_mapped() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_routes = vec!["192.168.0.0/16".to_string()];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let tun = tun_inbound(&config).unwrap();
+        assert_eq!(tun["route_exclude_address"], json!(["192.168.0.0/16"]));
+    }
+
+    #[test]
+    fn test_singbox_no_tun_inbound_when_disabled() {
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &default_settings())
+            .unwrap();
+
+        assert!(tun_inbound(&config).is_none());
+        assert!(config["route"].get("auto_detect_interface").is_none());
     }
 
     #[test]

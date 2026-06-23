@@ -2,9 +2,11 @@ use std::path::PathBuf;
 
 use tokio::sync::{broadcast, mpsc};
 use v2ray_rs_core::config::ConfigWriter;
-use v2ray_rs_core::models::{AppSettings, ConnectionMetadata, ConnectionNodeRef, RoutingRule};
+use v2ray_rs_core::models::{
+    AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, RoutingRule,
+};
 use v2ray_rs_core::resolve::ConnectionCandidate;
-use v2ray_rs_process::{ProcessEvent, ProcessState};
+use v2ray_rs_process::{ProcessEvent, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
 
@@ -88,7 +90,8 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 config_path,
                 pid_path.clone(),
                 Some(geodata_dir.clone()),
-            );
+            )
+            .with_tun(build_tun_runtime(&settings));
 
             match mgr.start_with_connection(Some(meta.clone())).await {
                 Ok(()) => {
@@ -162,6 +165,25 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
     });
 
     ConnectionHandle { cmd_tx }
+}
+
+/// Builds the TUN runtime from settings, or `None` when TUN is off or the
+/// backend is v2ray (which has no native TUN inbound).
+fn build_tun_runtime(settings: &AppSettings) -> Option<TunRuntime> {
+    if !settings.tun.enabled {
+        return None;
+    }
+    let backend = settings.backend.backend_type;
+    if backend == BackendType::V2ray {
+        return None;
+    }
+    Some(TunRuntime {
+        backend,
+        iface: settings.tun.interface_name.clone(),
+        addr_v4: settings.tun.address_v4.clone(),
+        addr_v6: settings.tun.address_v6.clone(),
+        helper_path: v2ray_rs_process::helper_path(),
+    })
 }
 
 fn summarize_failures(failures: &[String]) -> String {

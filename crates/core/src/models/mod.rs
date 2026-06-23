@@ -6,6 +6,7 @@ mod resolve;
 mod routing;
 mod settings;
 mod subscription;
+mod tun;
 mod validation;
 
 pub use dns::{
@@ -26,7 +27,8 @@ pub use settings::{
     AppSettings, BackendConfig, BackendType, Language, RealDelayCapability, RealDelaySettings,
 };
 pub use subscription::{Subscription, SubscriptionNode, SubscriptionSource};
+pub use tun::{DnsHijackMode, TunConfig, TunStack};
 pub use validation::{
     ValidationError, validate_country_code, validate_domain_pattern, validate_geosite_category,
-    validate_ip_cidr, validate_rule_match, validate_test_url,
+    validate_ip_cidr, validate_rule_match, validate_test_url, validate_tun_interface_name,
 };
