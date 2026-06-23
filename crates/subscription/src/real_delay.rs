@@ -459,10 +459,10 @@ mod tests {
         ) -> Vec<Option<u64>> {
             let mut results = vec![None; count];
             for status in statuses {
-                if let Some(idx) = parse_probe_index(&status.outbound_tag) {
-                    if idx < count {
-                        results[idx] = status.delay_ms;
-                    }
+                if let Some(idx) = parse_probe_index(&status.outbound_tag)
+                    && idx < count
+                {
+                    results[idx] = status.delay_ms;
                 }
             }
             results

@@ -251,7 +251,7 @@ mod tests {
         let decoded = OutboundStatus::decode(&mut buf.as_slice()).unwrap();
 
         assert_eq!(decoded.outbound_tag, original.outbound_tag);
-        assert_eq!(decoded.alive, true);
+        assert!(decoded.alive);
         assert_eq!(decoded.delay, 0);
         assert_eq!(decoded.last_error_reason, "");
         assert_eq!(decoded.last_seen_time, 3000);
@@ -276,7 +276,7 @@ mod tests {
 
         let decoded = OutboundStatus::decode(&mut buf.as_slice()).unwrap();
 
-        assert_eq!(decoded.alive, false);
+        assert!(!decoded.alive);
         assert_eq!(decoded.delay, 5000);
         assert_eq!(decoded.last_seen_time, 4000);
         assert_eq!(decoded.last_try_time, 5000);
@@ -356,17 +356,17 @@ mod tests {
 
         // First: alive with delay
         assert_eq!(result.status[0].outbound_tag, "proxy-alive");
-        assert_eq!(result.status[0].alive, true);
+        assert!(result.status[0].alive);
         assert_eq!(result.status[0].delay, 200);
 
         // Second: dead with error
         assert_eq!(result.status[1].outbound_tag, "proxy-dead");
-        assert_eq!(result.status[1].alive, false);
+        assert!(!result.status[1].alive);
         assert_eq!(result.status[1].last_error_reason, "network unreachable");
 
         // Third: alive but zero delay
         assert_eq!(result.status[2].outbound_tag, "proxy-alive-zero");
-        assert_eq!(result.status[2].alive, true);
+        assert!(result.status[2].alive);
         assert_eq!(result.status[2].delay, 0);
     }
 
