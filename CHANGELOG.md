@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.1] - 2026-06-23
+
+### Fixed
+- TUN mode no longer reports "backend lacks CAP_NET_ADMIN" when the backend binary already holds the capability. `getcap` output is trimmed before parsing, so its trailing newline can no longer blank out the capability set and cause every candidate to be rejected. The same fix corrects the Preferences → TUN capability-status indicator.
+
+---
+
 ## [0.10.0] - 2026-06-23
 
 ### Added
@@ -424,7 +431,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...HEAD
+[0.10.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.0...v0.8.1
