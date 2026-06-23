@@ -10,6 +10,7 @@ use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder, new_connecti
 const SINGBOX_ROUTE_TABLE: u32 = 2022;
 
 const EEXIST: i32 = -17;
+const ENODEV: i32 = -19;
 
 pub fn connect() -> Result<Handle, String> {
     let (connection, handle, _) =
@@ -58,12 +59,13 @@ pub async fn xray_up(
 /// no-op when the device is already absent.
 pub async fn xray_down(handle: &Handle, iface: &str) -> Result<(), String> {
     if let Some(index) = link_index(handle, iface).await? {
-        handle
-            .link()
-            .del(index)
-            .execute()
-            .await
-            .map_err(|e| format!("delete link {iface}: {e}"))?;
+        match handle.link().del(index).execute().await {
+            Ok(()) => {}
+            // The device may vanish between the lookup and the delete (e.g. the
+            // proxy exits); "already gone" is the desired outcome.
+            Err(e) if is_no_such_device(&e) => {}
+            Err(e) => return Err(format!("delete link {iface}: {e}")),
+        }
     }
     Ok(())
 }
@@ -86,7 +88,11 @@ async fn link_index(handle: &Handle, iface: &str) -> Result<Option<u32>, String>
     let mut links = handle.link().get().match_name(iface.to_string()).execute();
     match links.try_next().await {
         Ok(Some(link)) => Ok(Some(link.header.index)),
+        // A name-filtered link lookup answers with ENODEV (not an empty dump)
+        // when the device is absent; treat that as "not found" so xray-down and
+        // recover stay idempotent.
         Ok(None) => Ok(None),
+        Err(e) if is_no_such_device(&e) => Ok(None),
         Err(e) => Err(format!("look up interface {iface}: {e}")),
     }
 }
@@ -183,4 +189,8 @@ fn rule_table(rule: &RuleMessage) -> u32 {
 
 fn is_exists(err: &rtnetlink::Error) -> bool {
     matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(EEXIST))
+}
+
+fn is_no_such_device(err: &rtnetlink::Error) -> bool {
+    matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(ENODEV))
 }
