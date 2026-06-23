@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.10.2] - 2026-06-23
+
+### Fixed
+- Choosing a custom backend path (or finishing the first-run wizard) now verifies the binary's reported identity against the selected backend type instead of trusting the dropdown. This stops, for example, the xray binary from being saved under a "sing-box" selection — a mismatch that fed the wrong-schema config to the backend and crashed it with a nil-pointer SIGSEGV on connect.
+- xray TUN mode no longer floods the logs with a `[tun-in -> direct]` connection storm. xray's own outbound sockets are marked (`sockopt.mark`) and the route helper installs policy rules that send marked traffic past the tunnel, so `direct`-routed connections egress the real interface instead of looping back into the TUN device. LAN and link routes are preserved, and the rules are torn down on disconnect and recovery.
+
+---
+
 ## [0.10.1] - 2026-06-23
 
 ### Fixed
@@ -431,7 +439,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...HEAD
+[0.10.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.8.1...v0.9.0
