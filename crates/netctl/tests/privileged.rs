@@ -1,50 +1,87 @@
-//! Privileged idempotency tests. Require root and are gated behind the
-//! `privileged-tests` feature, so they never run under `cargo test`/`-short`.
+//! Privileged idempotency test for the route helper. Requires root and is gated
+//! behind the `privileged-tests` feature, so it never runs under `cargo test`/
+//! `-short`. Everything runs inside a throwaway network namespace, so the split
+//! routes the helper installs never touch the host routing table.
 //! Run with: `sudo -E cargo test -p v2ray-rs-netctl --features privileged-tests`.
 #![cfg(feature = "privileged-tests")]
 
 use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_v2ray-rs-netctl");
+const NS: &str = "nctl-test-ns";
 const IFACE: &str = "nctltest0";
 const ADDR: &str = "172.31.255.1/30";
 
-fn netctl(args: &[&str]) -> bool {
-    Command::new(BIN)
+fn run(cmd: &str, args: &[&str]) -> bool {
+    Command::new(cmd)
         .args(args)
         .status()
-        .expect("spawn netctl")
-        .success()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
-fn ip(args: &[&str]) {
-    let _ = Command::new("ip").args(args).status();
+/// Runs `ip <args>` inside the test network namespace.
+fn ip_in_ns(args: &[&str]) -> bool {
+    let mut full = vec!["netns", "exec", NS, "ip"];
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// Runs the netctl binary inside the test namespace, so its netlink socket
+/// operates on the namespace's network stack rather than the host's.
+fn netctl(args: &[&str]) -> bool {
+    let mut full = vec!["netns", "exec", NS, BIN];
+    full.extend_from_slice(args);
+    run("ip", &full)
+}
+
+/// Whether the test device currently exists inside the namespace.
+fn device_exists() -> bool {
+    ip_in_ns(&["link", "show", IFACE])
+}
+
+/// Deletes the namespace (and everything in it) on drop, so a panicking
+/// assertion can never leak the namespace or the test device.
+struct NsGuard;
+impl Drop for NsGuard {
+    fn drop(&mut self) {
+        let _ = run("ip", &["netns", "del", NS]);
+    }
 }
 
 #[test]
 fn up_down_is_idempotent_in_namespace() {
-    // A dummy device stands in for the TUN device xray would create.
-    ip(&["link", "del", IFACE]);
-    let created = Command::new("ip")
-        .args(["link", "add", IFACE, "type", "dummy"])
-        .status()
-        .expect("ip link add")
-        .success();
-    assert!(
-        created,
-        "needs root / CAP_NET_ADMIN to create the test device"
-    );
+    let _ = run("ip", &["netns", "del", NS]); // best-effort pre-clean from a prior run
+    if !run("ip", &["netns", "add", NS]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard; // from here, any return or panic deletes the namespace
 
-    // Running up twice must succeed (address EEXIST + route present are ignored).
+    // A `tun` device stands in for the one xray creates (the `dummy` driver is
+    // not universally installed; the feature requires `tun` regardless).
+    if !ip_in_ns(&["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+
+    // up twice: an already-assigned address (EEXIST) and existing routes are
+    // ignored, so the second call must also succeed.
     assert!(netctl(&["xray-up", "--iface", IFACE, "--addr", ADDR]));
     assert!(netctl(&["xray-up", "--iface", IFACE, "--addr", ADDR]));
 
-    // Down deletes the device; a second down is a clean no-op.
+    // down deletes the live device; a second down is a clean no-op.
     assert!(netctl(&["xray-down", "--iface", IFACE]));
+    assert!(!device_exists(), "xray-down must remove the device");
     assert!(netctl(&["xray-down", "--iface", IFACE]));
 
-    // Recover is a no-op once the device is gone.
+    // recover must remove a *live* leftover device, not merely succeed once it is
+    // already gone: recreate it, bring it up, then recover and confirm removal.
+    assert!(ip_in_ns(&["tuntap", "add", "dev", IFACE, "mode", "tun"]));
+    assert!(netctl(&["xray-up", "--iface", IFACE, "--addr", ADDR]));
     assert!(netctl(&["recover", "--xray", "--iface", IFACE]));
+    assert!(!device_exists(), "recover must remove the leftover device");
 
-    ip(&["link", "del", IFACE]);
+    // recover is a clean no-op once the device is already gone.
+    assert!(netctl(&["recover", "--xray", "--iface", IFACE]));
 }
