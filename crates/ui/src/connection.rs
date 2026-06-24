@@ -177,12 +177,17 @@ fn build_tun_runtime(settings: &AppSettings) -> Option<TunRuntime> {
     if backend == BackendType::V2ray {
         return None;
     }
+    let bypass_uid = nix::unistd::User::from_name(v2ray_rs_process::BYPASS_USER)
+        .ok()
+        .flatten()
+        .map(|u| u.uid.as_raw());
     Some(TunRuntime {
         backend,
         iface: settings.tun.interface_name.clone(),
         addr_v4: settings.tun.address_v4.clone(),
         addr_v6: settings.tun.address_v6.clone(),
         helper_path: v2ray_rs_process::helper_path(),
+        bypass_uid,
     })
 }
 

@@ -1,0 +1,11 @@
+[package]
+name = "v2ray-rs-run"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "v2ray-rs-run"
+path = "src/main.rs"
+
+[dependencies]
+libc.workspace = true

@@ -10,6 +10,9 @@ use v2ray_rs_core::models::BackendType;
 pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
 
 const HELPER_BIN: &str = "v2ray-rs-netctl";
+const RUN_BIN: &str = "v2ray-rs-run";
+/// Name of the dedicated unprivileged system user used for xray TUN bypass.
+pub const BYPASS_USER: &str = "v2ray-rs-bypass";
 
 /// Everything the process manager needs to drive TUN mode for a connection.
 #[derive(Debug, Clone)]
@@ -19,6 +22,7 @@ pub struct TunRuntime {
     pub addr_v4: String,
     pub addr_v6: Option<String>,
     pub helper_path: PathBuf,
+    pub bypass_uid: Option<u32>,
 }
 
 impl TunRuntime {
@@ -41,6 +45,20 @@ pub fn helper_path() -> PathBuf {
         }
     }
     PathBuf::from(HELPER_BIN)
+}
+
+/// Resolves the SUID run wrapper: a sibling of the running executable (dev /
+/// `cargo run`), otherwise the bare name resolved via `$PATH` at exec time.
+pub fn run_path() -> PathBuf {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(RUN_BIN);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    PathBuf::from(RUN_BIN)
 }
 
 /// Polls `/sys/class/net/<iface>` until the device exists or the timeout elapses.
@@ -72,6 +90,9 @@ pub async fn xray_up(rt: &TunRuntime) -> std::io::Result<bool> {
         .arg(&rt.addr_v4);
     if let Some(v6) = &rt.addr_v6 {
         cmd.arg("--addr6").arg(v6);
+    }
+    if let Some(uid) = rt.bypass_uid {
+        cmd.arg("--bypass-uid").arg(uid.to_string());
     }
     Ok(cmd.status().await?.success())
 }
@@ -110,6 +131,7 @@ mod tests {
             addr_v4: "172.19.0.1/30".into(),
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
+            bypass_uid: None,
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());

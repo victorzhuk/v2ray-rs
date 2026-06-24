@@ -25,6 +25,8 @@ enum Command {
         addr: String,
         #[arg(long)]
         addr6: Option<String>,
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        bypass_uid: Option<u32>,
     },
     /// Remove the xray TUN device (no-op if absent).
     XrayDown {
@@ -62,12 +64,17 @@ fn main() -> ExitCode {
 #[tokio::main(flavor = "current_thread")]
 async fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
-        Command::XrayUp { iface, addr, addr6 } => {
+        Command::XrayUp {
+            iface,
+            addr,
+            addr6,
+            bypass_uid,
+        } => {
             validate::validate_iface(&iface)?;
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             let handle = net::connect()?;
-            net::xray_up(&handle, &iface, v4, v6).await
+            net::xray_up(&handle, &iface, v4, v6, bypass_uid).await
         }
         Command::XrayDown { iface } => {
             validate::validate_iface(&iface)?;

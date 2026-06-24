@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Per-process TUN bypass for xray: a dedicated `v2ray-rs-bypass` system user, a setuid-root `v2ray-rs-run` wrapper, and a `uidrange` policy rule (priority 8998) programmed by `v2ray-rs-netctl xray-up --bypass-uid`. App-launched tools can exit the tunnel via the *Run with bypass* action in TUN preferences; sing-box already excludes processes natively. Packaging creates the user and installs the wrapper setuid on Arch.
+
 ---
 
 ## [0.10.2] - 2026-06-23

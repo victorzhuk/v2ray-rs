@@ -3705,6 +3705,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "v2ray-rs-run"
+version = "0.10.2"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "v2ray-rs-subscription"
 version = "0.10.2"
 dependencies = [
@@ -3755,6 +3762,7 @@ dependencies = [
  "glib-build-tools",
  "ipnet",
  "log",
+ "nix 0.31.1",
  "relm4",
  "rustls",
  "tokio",

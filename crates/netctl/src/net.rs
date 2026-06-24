@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::route::{RouteAttribute, RouteScope};
-use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage};
+use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage, RuleUidRange};
 use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder, new_connection};
 
 /// Route table sing-box uses for its `auto_route` policy routing. Used by the
@@ -21,6 +21,10 @@ const XRAY_ROUTE_TABLE: u32 = 2023;
 const XRAY_FWMARK: u32 = 255;
 
 const RT_TABLE_MAIN: u32 = 254;
+
+/// Per-UID bypass: traffic owned by the bypass UID reaches `main` ahead of the
+/// capture rules, so it egresses the real interface instead of the tunnel.
+const RULE_PREF_BYPASS_UID: u32 = 8998;
 
 /// Policy-rule priorities, evaluated after `local` (0) and before `main` (32766).
 const RULE_PREF_BYPASS: u32 = 9000;
@@ -47,6 +51,7 @@ pub async fn xray_up(
     iface: &str,
     v4: (IpAddr, u8),
     v6: Option<(IpAddr, u8)>,
+    bypass_uid: Option<u32>,
 ) -> Result<(), String> {
     let index = link_index(handle, iface)
         .await?
@@ -66,9 +71,15 @@ pub async fn xray_up(
 
     add_default_route_v4(handle, index).await?;
     add_xray_rules(handle, AddressFamily::Inet).await?;
+    if let Some(uid) = bypass_uid {
+        add_bypass_uid_rule(handle, AddressFamily::Inet, uid).await?;
+    }
     if v6.is_some() {
         add_default_route_v6(handle, index).await?;
         add_xray_rules(handle, AddressFamily::Inet6).await?;
+        if let Some(uid) = bypass_uid {
+            add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
+        }
     }
 
     Ok(())
@@ -216,6 +227,36 @@ async fn add_rule(
     }
 }
 
+/// Diverts traffic owned by `uid` to `main` at [`RULE_PREF_BYPASS_UID`], ahead of
+/// the capture rules, so the bypass user's sockets reach the real default
+/// instead of the tunnel. Installed per family when `--bypass-uid` is set.
+async fn add_bypass_uid_rule(
+    handle: &Handle,
+    family: AddressFamily,
+    uid: u32,
+) -> Result<(), String> {
+    let mut req = handle.rule().add();
+    {
+        let msg = req.message_mut();
+        msg.header.family = family;
+        msg.header.action = RuleAction::ToTable;
+        msg.header.table = RT_TABLE_MAIN as u8;
+        msg.attributes
+            .push(RuleAttribute::Priority(RULE_PREF_BYPASS_UID));
+        msg.attributes.push(RuleAttribute::UidRange(RuleUidRange {
+            start: uid,
+            end: uid,
+        }));
+    }
+    match req.execute().await {
+        Ok(()) => Ok(()),
+        Err(e) if is_exists(&e) => Ok(()),
+        Err(e) => Err(format!(
+            "add bypass-uid rule (pref {RULE_PREF_BYPASS_UID}): {e}"
+        )),
+    }
+}
+
 /// Deletes the policy rules `xray_up` installs, across both families. Matches on
 /// our reserved priorities so unrelated rules are left untouched.
 async fn del_xray_rules(handle: &Handle) {
@@ -234,7 +275,7 @@ fn is_xray_rule(rule: &RuleMessage) -> bool {
         matches!(
             attr,
             RuleAttribute::Priority(p)
-                if [RULE_PREF_BYPASS, RULE_PREF_MAIN, RULE_PREF_TUN].contains(p)
+                if [RULE_PREF_BYPASS_UID, RULE_PREF_BYPASS, RULE_PREF_MAIN, RULE_PREF_TUN].contains(p)
         )
     })
 }

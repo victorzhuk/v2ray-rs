@@ -56,7 +56,9 @@ pub fn grant(backend: &Path, helper: &Path) -> Result<(), PrivilegeError> {
         });
     }
 
-    let argv = grant_argv(backend, helper);
+    let wrapper_path = crate::tun::run_path();
+    let wrapper = wrapper_path.exists().then_some(wrapper_path.as_path());
+    let argv = grant_argv(backend, helper, wrapper);
     let status = Command::new("pkexec")
         .args(&argv)
         .status()
@@ -76,20 +78,32 @@ pub fn manual_command(path: &Path, caps: &str) -> String {
 }
 
 /// Builds the `pkexec` argument vector: a single elevation running both
-/// `setcap` calls. The binary paths are passed as positional parameters
-/// (`$1`..`$4`) so the shell never parses them as code — a user-controlled
-/// backend path containing shell metacharacters cannot inject commands.
-fn grant_argv(backend: &Path, helper: &Path) -> Vec<OsString> {
-    vec![
+/// `setcap` calls and, when a SUID wrapper is present, additionally chowning
+/// it to root and setting the setuid bit. All binary paths are passed as
+/// positional parameters (`$1`..`$5`) so the shell never parses them as code
+/// — a user-controlled path containing shell metacharacters cannot inject
+/// commands.
+fn grant_argv(backend: &Path, helper: &Path, wrapper: Option<&Path>) -> Vec<OsString> {
+    let script = match wrapper {
+        Some(_) => {
+            "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\" && chown root:root \"$5\" && chmod u+s \"$5\""
+        }
+        None => "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\"",
+    };
+    let mut argv = vec![
         OsString::from("/bin/sh"),
         OsString::from("-c"),
-        OsString::from("setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\""),
+        OsString::from(script),
         OsString::from("sh"),
         OsString::from(BACKEND_CAPS),
         backend.as_os_str().to_os_string(),
         OsString::from(HELPER_CAPS),
         helper.as_os_str().to_os_string(),
-    ]
+    ];
+    if let Some(wp) = wrapper {
+        argv.push(wp.as_os_str().to_os_string());
+    }
+    argv
 }
 
 fn getcap_has_cap(getcap_output: &str, cap: &str) -> bool {
@@ -192,6 +206,7 @@ mod tests {
         let argv = grant_argv(
             Path::new("/usr/bin/xray"),
             Path::new("/usr/bin/v2ray-rs-netctl"),
+            None,
         );
         let argv: Vec<&str> = argv.iter().map(|a| a.to_str().unwrap()).collect();
         assert_eq!(
@@ -216,12 +231,64 @@ mod tests {
         let argv = grant_argv(
             Path::new("/tmp/x'; touch /pwned; '"),
             Path::new("/usr/bin/helper"),
+            None,
         );
         assert_eq!(
             argv[2].to_str().unwrap(),
             "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\""
         );
         assert_eq!(argv[5].to_str().unwrap(), "/tmp/x'; touch /pwned; '");
+    }
+
+    #[test]
+    fn grant_argv_includes_wrapper_step_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper = dir.path().join("v2ray-rs-run");
+        std::fs::write(&wrapper, b"#!/bin/sh\n").unwrap();
+        let argv = grant_argv(
+            Path::new("/usr/bin/xray"),
+            Path::new("/usr/bin/v2ray-rs-netctl"),
+            Some(&wrapper),
+        );
+        let argv: Vec<&str> = argv.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            argv[2],
+            "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\" && chown root:root \"$5\" && chmod u+s \"$5\""
+        );
+        // The wrapper survives verbatim as the trailing positional argument ($5).
+        assert_eq!(argv[argv.len() - 1], wrapper.to_str().unwrap());
+    }
+
+    #[test]
+    fn grant_argv_omits_wrapper_step_when_absent() {
+        let argv = grant_argv(
+            Path::new("/usr/bin/xray"),
+            Path::new("/usr/bin/v2ray-rs-netctl"),
+            None,
+        );
+        let argv: Vec<&str> = argv.iter().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(argv[2], "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\"");
+        assert_eq!(argv.len(), 8);
+    }
+
+    #[test]
+    fn grant_argv_keeps_metachar_wrapper_positional() {
+        let wrapper = Path::new("/tmp/run; chmod 777 /etc; #");
+        let argv = grant_argv(
+            Path::new("/usr/bin/xray"),
+            Path::new("/usr/bin/v2ray-rs-netctl"),
+            Some(wrapper),
+        );
+        // The script literal contains no interpolation of the path.
+        assert_eq!(
+            argv[2].to_str().unwrap(),
+            "setcap \"$1\" \"$2\" && setcap \"$3\" \"$4\" && chown root:root \"$5\" && chmod u+s \"$5\""
+        );
+        // The dangerous path survives verbatim as the final positional argument.
+        assert_eq!(
+            argv[argv.len() - 1].to_str().unwrap(),
+            "/tmp/run; chmod 777 /etc; #"
+        );
     }
 
     #[test]

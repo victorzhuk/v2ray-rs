@@ -15,4 +15,4 @@ pub use privilege::{
 };
 pub use probe::{ProbeError, ProbeRunner};
 pub use state::{ProcessEvent, ProcessState};
-pub use tun::{TunRuntime, helper_path};
+pub use tun::{BYPASS_USER, TunRuntime, helper_path, run_path};

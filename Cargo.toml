@@ -22,12 +22,13 @@ reqwest = { version = "0.13", features = ["rustls-no-provider", "stream"], defau
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["full"] }
 log = "0.4"
-nix = { version = "0.31", features = ["signal", "process"] }
+nix = { version = "0.31", features = ["signal", "process", "user"] }
 relm4 = { version = "0.10", features = ["gnome_48", "libadwaita"] }
 gettext-rs = { version = "0.7", features = ["gettext-system"] }
 resvg = "0.47"
 tempfile = "3"
 glib-build-tools = "0.21"
+libc = "0.2"
 v2ray-rs-core = { path = "crates/core" }
 v2ray-rs-process = { path = "crates/process" }
 v2ray-rs-subscription = { path = "crates/subscription" }

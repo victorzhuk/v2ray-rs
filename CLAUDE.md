@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Linux desktop GUI wrapper for v2ray/xray/sing-box CLI proxy tools. The app manages subscriptions, generates config files, handles process lifecycle, and provides geo-routing rules — all without implementing any protocol logic. The protocol work is delegated entirely to the system-installed CLI binaries.
 
-UI: Relm4 (GTK4) with libadwaita. Six crates: core, subscription, process, netctl, tray, ui.
+UI: Relm4 (GTK4) with libadwaita. Seven crates: core, subscription, process, netctl, tray, ui, run.
 
 ## Commands
 
@@ -22,7 +22,7 @@ cargo test -p v2ray-rs-core -- test_name # run a single test by name
 
 ## Architecture
 
-Rust workspace with five crates:
+Rust workspace with seven crates:
 
 ### `crates/core` (`v2ray-rs-core`)
 
@@ -77,13 +77,18 @@ Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle manageme
 
 - **`manager.rs`** — `ProcessManager` orchestrator. Spawns backend via `tokio::process::Command` with ETXTBSY retry (handles overlayfs race in containers), pipes stdout/stderr through async line readers into shared `Arc<Mutex<LogBuffer>>` + broadcast channel. Graceful stop (SIGTERM → 5s → SIGKILL). Crash recovery with 2s delay, max 3 crashes per minute before Error state. PID file lifecycle. `with_tun(Option<TunRuntime>)` makes start/stop TUN-aware: a `CAP_NET_ADMIN` gate before start, an xray device-wait + `netctl xray-up`, and an `xray-down` safeguard on stop.
 
-- **`privilege.rs`** — TUN capability model. `has_net_admin()` reads a binary's file capabilities via `getcap` (the `caps` crate only handles live process caps, not file xattrs); `grant()` runs a single `pkexec` elevation applying `setcap` to the backend binary and the route helper; `file_caps_supported()` detects a `nosuid` mount and surfaces the manual `setcap` command.
+- **`privilege.rs`** — TUN capability model. `has_net_admin()` reads a binary's file capabilities via `getcap`; `grant()` runs a single `pkexec` elevation applying `setcap` to the backend binary and the route helper, and also sets root ownership + the setuid bit on the `v2ray-rs-run` wrapper when it is present; `file_caps_supported()` detects a `nosuid` mount and surfaces the manual `setcap` command.
 
-- **`tun.rs`** — `TunRuntime` (backend, iface, addresses, helper path), `helper_path()` resolution (sibling of the running exe, else `$PATH`), `wait_for_device()` polling `/sys/class/net/<iface>`, and `xray_up`/`xray_down` helper invocations.
+- **`tun.rs`** — `TunRuntime` (backend, iface, addresses, helper path, optional bypass UID), `helper_path()` and `run_path()` resolution (sibling of the running exe, else `$PATH`), `wait_for_device()` polling `/sys/class/net/<iface>`, and `xray_up`/`xray_down` helper invocations. `bypass_uid`, when set, is passed to `netctl xray-up --bypass-uid` so traffic from the `v2ray-rs-bypass` user skips the tunnel.
+
+### `crates/run` (`v2ray-rs-run`)
+
+Minimal setuid-root wrapper binary (deps: `libc`). It resolves the `v2ray-rs-bypass` system user, drops real/effective/saved UID and GID to it, clears supplementary groups, sanitizes the environment, and `execvp`s the requested command. Used only for the xray TUN *Run with bypass* action so app-launched tools can exit the tunnel by UID via the `ip rule uidrange` policy rule.
 
 ### `crates/netctl` (`v2ray-rs-netctl`)
 
-Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `futures`) invoked by the process layer for xray TUN, since xray creates the device but does not program routes on Linux. Subcommands, all idempotent and argument-validated before any netlink call: `xray-up` (link up, assign address, add `0.0.0.0/1` + `128.0.0.0/1` split routes, plus `::/1` + `8000::/1` with `--addr6`), `xray-down` (delete device), and `recover --singbox|--xray` (remove a leftover device; for sing-box flush its `auto_route` table/rules). Kept dependency-light on purpose: it is `setcap`'d with `cap_net_admin` and invokable by any local process. Privileged netns tests are gated behind the `privileged-tests` feature.
+Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `futures`) invoked by the process layer for xray TUN, since xray creates the device but does not program routes on Linux. Subcommands, all idempotent and argument-validated before any netlink call: `xray-up` (link up, assign address, add `0.0.0.0/1` + `128.0.0.0/1` split routes, plus `::/1` + `8000::/1` with `--addr6`; installs a `uidrange` policy rule at priority 8998 when `--bypass-uid` is given), `xray-down` (delete device), and `recover --singbox|--xray` (remove a leftover device; for sing-box flush its `auto_route` table/rules). Kept dependency-light on purpose: it is `setcap`'d with `cap_net_admin` and invokable by any local process. Privileged netns tests are gated behind the `privileged-tests` feature.
+
 
 ### `crates/tray` (`v2ray-rs-tray`)
 

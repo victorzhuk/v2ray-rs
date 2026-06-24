@@ -413,6 +413,61 @@ pub(super) fn build_tun_page(
         });
     }
 
+    // --- Run with bypass (xray only) ----------------------------------------
+    let run_group = adw::PreferencesGroup::builder()
+        .title("Run with bypass")
+        .description("Launch a command routed outside the xray TUN")
+        .visible(backend == BackendType::Xray)
+        .build();
+
+    let run_bin = v2ray_rs_process::run_path();
+    let wrapper_available = run_bin.is_file()
+        || std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .any(|dir| dir.join(&run_bin).is_file());
+
+    let run_note = adw::ActionRow::builder()
+        .title("Wrapper not found")
+        .subtitle("Install v2ray-rs-run and grant privileges first")
+        .visible(!wrapper_available)
+        .build();
+    run_group.add(&run_note);
+
+    let run_entry = adw::EntryRow::builder()
+        .title("Command (e.g. cloudflared tunnel run)")
+        .sensitive(wrapper_available)
+        .build();
+    let launch_button = gtk::Button::builder()
+        .label("Launch")
+        .valign(gtk::Align::Center)
+        .sensitive(wrapper_available)
+        .css_classes(["suggested-action"])
+        .build();
+    run_entry.add_suffix(&launch_button);
+    run_group.add(&run_entry);
+    page.add(&run_group);
+
+    {
+        let toast_cb = toast_cb.clone();
+        let run_entry = run_entry.clone();
+        launch_button.connect_clicked(move |_| {
+            let text = run_entry.text().trim().to_string();
+            if text.is_empty() {
+                return;
+            }
+            let mut cmd = tokio::process::Command::new(v2ray_rs_process::run_path());
+            cmd.args(text.split_whitespace());
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    tokio::spawn(async move {
+                        let _ = child.wait().await;
+                    });
+                    toast_cb("Launched via bypass wrapper.");
+                }
+                Err(err) => toast_cb(&format!("Launch failed: {err}")),
+            }
+        });
+    }
+
     // --- Capabilities -------------------------------------------------------
     let cap_group = adw::PreferencesGroup::builder().title("Privileges").build();
     let cap_row = adw::ActionRow::builder().title("Capability status").build();
@@ -585,6 +640,7 @@ pub(super) fn build_tun_page(
         let hijack_row = hijack_row.clone();
         let routes_group = routes_group.clone();
         let domains_group = domains_group.clone();
+        let run_group = run_group.clone();
         let apps_group = apps_group.clone();
         let refresh_caps = refresh_caps.clone();
         subscribe_settings(observers, move |settings| {
@@ -593,6 +649,7 @@ pub(super) fn build_tun_page(
             enable_row.set_sensitive(backend != BackendType::V2ray);
             backend_note.set_visible(backend == BackendType::V2ray);
             advanced_note.set_visible(backend == BackendType::Xray);
+            run_group.set_visible(backend == BackendType::Xray);
             apps_note.set_visible(backend == BackendType::Xray);
             stack_row.set_sensitive(singbox_only);
             strict_row.set_sensitive(singbox_only);

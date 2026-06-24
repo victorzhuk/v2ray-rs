@@ -17,6 +17,7 @@ gettext-rs.workspace = true
 ipnet.workspace = true
 rustls.workspace = true
 clap.workspace = true
+nix.workspace = true
 
 [features]
 default = ["geodata-fetch"]

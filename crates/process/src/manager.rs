@@ -454,6 +454,7 @@ mod tests {
             addr_v4: "172.19.0.1/30".into(),
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
+            bypass_uid: None,
         }));
 
         let result = mgr.start_with_connection(None).await;

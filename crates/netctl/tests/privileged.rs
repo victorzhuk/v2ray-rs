@@ -11,6 +11,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_v2ray-rs-netctl");
 const NS: &str = "nctl-test-ns";
 const IFACE: &str = "nctltest0";
 const ADDR: &str = "172.31.255.1/30";
+const ADDR6: &str = "fd00:ffff::1/64";
 
 fn run(cmd: &str, args: &[&str]) -> bool {
     Command::new(cmd)
@@ -92,6 +93,10 @@ fn up_down_is_idempotent_in_namespace() {
         rules.contains("9001:") && rules.contains("9002:"),
         "capture policy rules missing: {rules}"
     );
+    assert!(
+        !rules.contains("8998:"),
+        "bypass-uid rule present without --bypass-uid: {rules}"
+    );
     let tun_table = ip_in_ns_output(&["route", "show", "table", "2023"]);
     assert!(
         tun_table.contains(IFACE),
@@ -122,4 +127,60 @@ fn up_down_is_idempotent_in_namespace() {
 
     // recover is a clean no-op once the device is already gone.
     assert!(netctl(&["recover", "--xray", "--iface", IFACE]));
+
+    // `--bypass-uid` installs a pref-8998 uidrange rule per family, which is
+    // torn down alongside the capture rules on down/recover.
+    assert!(ip_in_ns(&["tuntap", "add", "dev", IFACE, "mode", "tun"]));
+    assert!(netctl(&[
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--addr6",
+        ADDR6,
+        "--bypass-uid",
+        "999990",
+    ]));
+
+    let v4_rules = ip_in_ns_output(&["rule", "show"]);
+    assert!(
+        v4_rules.contains("8998:") && v4_rules.contains("uidrange 999990-999990"),
+        "bypass-uid rule missing for IPv4: {v4_rules}"
+    );
+    let v6_rules = ip_in_ns_output(&["-6", "rule", "show"]);
+    assert!(
+        v6_rules.contains("8998:") && v6_rules.contains("uidrange 999990-999990"),
+        "bypass-uid rule missing for IPv6: {v6_rules}"
+    );
+
+    assert!(netctl(&["xray-down", "--iface", IFACE]));
+    let v4_after = ip_in_ns_output(&["rule", "show"]);
+    assert!(
+        !v4_after.contains("8998:"),
+        "bypass-uid rule leaked after xray-down (v4): {v4_after}"
+    );
+    let v6_after = ip_in_ns_output(&["-6", "rule", "show"]);
+    assert!(
+        !v6_after.contains("8998:"),
+        "bypass-uid rule leaked after xray-down (v6): {v6_after}"
+    );
+
+    // recover --xray must also clear the bypass rule from a live device.
+    assert!(ip_in_ns(&["tuntap", "add", "dev", IFACE, "mode", "tun"]));
+    assert!(netctl(&[
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--bypass-uid",
+        "999990",
+    ]));
+    assert!(netctl(&["recover", "--xray", "--iface", IFACE]));
+    let recovered = ip_in_ns_output(&["rule", "show"]);
+    assert!(
+        !recovered.contains("8998:"),
+        "bypass-uid rule leaked after recover --xray: {recovered}"
+    );
 }
