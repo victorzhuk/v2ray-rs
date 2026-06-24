@@ -22,6 +22,8 @@ pub enum ValidationError {
     InvalidTunInterface(String),
     #[error("invalid tun mtu: {0} (must be 576-9000)")]
     InvalidTunMtu(u16),
+    #[error("invalid process name: {0}")]
+    InvalidProcessName(String),
 }
 
 /// Validates a Real Delay test URL: must parse as a URL with an `http` or

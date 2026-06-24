@@ -407,6 +407,8 @@ mod tests {
                 strict_route: false,
                 dns_hijack: crate::models::DnsHijackMode::Native,
                 exclude_routes: vec!["10.0.0.0/8".to_string()],
+                exclude_processes: vec![],
+                exclude_domains: vec![],
             },
             ..AppSettings::default()
         };

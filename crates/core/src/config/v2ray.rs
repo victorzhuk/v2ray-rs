@@ -45,7 +45,7 @@ pub(crate) fn generate_v2ray_family_config(
         "log": { "loglevel": "warning" },
         "inbounds": build_inbounds(settings, dns_backend),
         "outbounds": build_outbounds(nodes),
-        "routing": build_routing(rules, &first_proxy_tag),
+        "routing": build_routing(rules, &first_proxy_tag, settings, dns_backend),
     });
 
     if settings.dns.enabled {
@@ -303,20 +303,45 @@ fn build_h2_settings(h2: &H2Settings) -> Value {
     })
 }
 
-fn build_routing(rules: &[RoutingRule], first_proxy_tag: &str) -> Value {
+fn build_routing(
+    rules: &[RoutingRule],
+    first_proxy_tag: &str,
+    settings: &AppSettings,
+    backend: V2rayFamilyBackend,
+) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
-    if enabled.is_empty() {
+    let mut routing_rules: Vec<Value> = Vec::new();
+
+    if backend == V2rayFamilyBackend::Xray && settings.tun.enabled {
+        if !settings.tun.exclude_routes.is_empty() {
+            routing_rules.push(json!({
+                "type": "field",
+                "ip": &settings.tun.exclude_routes,
+                "outboundTag": "direct",
+            }));
+        }
+        if !settings.tun.exclude_domains.is_empty() {
+            routing_rules.push(json!({
+                "type": "field",
+                "domain": &settings.tun.exclude_domains,
+                "outboundTag": "direct",
+            }));
+        }
+    }
+
+    if enabled.is_empty() && routing_rules.is_empty() {
         return json!({
             "domainStrategy": "AsIs",
             "rules": [],
         });
     }
 
-    let routing_rules: Vec<Value> = enabled
+    let user_rules: Vec<Value> = enabled
         .iter()
         .map(|r| build_routing_rule(r, first_proxy_tag))
         .collect();
+    routing_rules.extend(user_rules);
 
     json!({
         "domainStrategy": "IPIfNonMatch",
@@ -427,6 +452,15 @@ fn build_dns_for_backend(
             }
         }
 
+        if backend == V2rayFamilyBackend::Xray
+            && settings.tun.enabled
+            && !settings.tun.exclude_domains.is_empty()
+        {
+            for d in &settings.tun.exclude_domains {
+                domestic_domains.push(d.clone());
+            }
+        }
+
         for server in &settings.dns.servers {
             let address = dns_server_address_for_backend(server, backend);
             let port = udp_port_for_v2ray(server);
@@ -449,6 +483,43 @@ fn build_dns_for_backend(
                     None => servers.push(json!(address)),
                 }
             }
+        }
+    }
+
+    if backend == V2rayFamilyBackend::Xray
+        && settings.tun.enabled
+        && !settings.tun.exclude_domains.is_empty()
+        && settings.dns.use_custom_rules
+    {
+        let non_detour = settings.dns.servers.iter().find(|s| s.detour.is_none());
+        if let Some(target) = non_detour {
+            let target_addr = dns_server_address_for_backend(target, backend);
+            if let Some(entry) = servers.iter_mut().find(|s| {
+                s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
+                    s.get("address")
+                        .and_then(|a| a.as_str())
+                        .map(|a| a == target_addr)
+                        .unwrap_or(false)
+                })
+            }) {
+                if entry.is_string() {
+                    let addr = entry.as_str().unwrap().to_string();
+                    *entry = json!({ "address": addr, "domains": &settings.tun.exclude_domains });
+                } else if let Some(arr) = entry.get_mut("domains") {
+                    if let Some(arr) = arr.as_array_mut() {
+                        for d in &settings.tun.exclude_domains {
+                            arr.push(json!(d));
+                        }
+                    }
+                } else {
+                    entry["domains"] = json!(&settings.tun.exclude_domains);
+                }
+            }
+        } else {
+            servers.push(json!({
+                "address": "localhost",
+                "domains": &settings.tun.exclude_domains,
+            }));
         }
     }
 
@@ -1253,5 +1324,87 @@ mod tests {
 
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
+    }
+
+    #[test]
+    fn test_xray_tun_exclusion_ip_and_domain() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_routes = vec!["104.16.0.0/13".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert!(rules.len() >= 2);
+
+        let ip_rule = rules
+            .iter()
+            .find(|r| r.get("ip").is_some())
+            .expect("ip exclusion rule not found");
+        assert_eq!(ip_rule["type"], "field");
+        assert_eq!(ip_rule["ip"], json!(["104.16.0.0/13"]));
+        assert_eq!(ip_rule["outboundTag"], "direct");
+
+        let domain_rule = rules
+            .iter()
+            .find(|r| r.get("domain").is_some())
+            .expect("domain exclusion rule not found");
+        assert_eq!(domain_rule["type"], "field");
+        assert_eq!(domain_rule["domain"], json!(["example.com"]));
+        assert_eq!(domain_rule["outboundTag"], "direct");
+    }
+
+    #[test]
+    fn test_xray_tun_exclusion_dns() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+        settings.dns.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let domestic = servers
+            .iter()
+            .find(|s| s.get("domains").is_some())
+            .expect("server with domains not found");
+        let domains = domestic["domains"].as_array().unwrap();
+        assert!(domains.contains(&json!("example.com")));
+    }
+
+    #[test]
+    fn test_xray_no_exclusion_when_tun_disabled() {
+        let mut settings = default_settings();
+        settings.tun.exclude_routes = vec!["104.16.0.0/13".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        for rule in rules {
+            assert!(rule.get("ip").is_none());
+            assert!(rule.get("domain").is_none());
+        }
+    }
+
+    #[test]
+    fn test_v2ray_never_emits_exclusion() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_routes = vec!["104.16.0.0/13".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::V2ray);
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        for rule in rules {
+            assert!(rule.get("ip").is_none());
+            assert!(rule.get("domain").is_none());
+        }
     }
 }

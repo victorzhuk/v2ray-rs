@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 
-use super::validation::{ValidationError, validate_ip_cidr, validate_tun_interface_name};
+use super::validation::{
+    ValidationError, validate_domain_pattern, validate_ip_cidr, validate_tun_interface_name,
+};
 
 /// Network stack used by the TUN inbound. Serializes to the backend literals
 /// (`system`, `gvisor`, `mixed`).
@@ -38,6 +40,10 @@ pub struct TunConfig {
     pub dns_hijack: DnsHijackMode,
     #[serde(default)]
     pub exclude_routes: Vec<String>,
+    #[serde(default)]
+    pub exclude_processes: Vec<String>,
+    #[serde(default)]
+    pub exclude_domains: Vec<String>,
 }
 
 fn default_interface_name() -> String {
@@ -68,6 +74,8 @@ impl Default for TunConfig {
             strict_route: true,
             dns_hijack: DnsHijackMode::Hijack,
             exclude_routes: Vec::new(),
+            exclude_processes: Vec::new(),
+            exclude_domains: Vec::new(),
         }
     }
 }
@@ -94,6 +102,14 @@ impl TunConfig {
         for route in &self.exclude_routes {
             validate_ip_cidr(route)?;
         }
+        for domain in &self.exclude_domains {
+            validate_domain_pattern(domain)?;
+        }
+        for proc in &self.exclude_processes {
+            if proc.is_empty() || proc.contains('/') || proc.contains('\\') {
+                return Err(ValidationError::InvalidProcessName(proc.clone()));
+            }
+        }
         Ok(())
     }
 }
@@ -118,6 +134,10 @@ struct TunConfigWire {
     dns_hijack: DnsHijackMode,
     #[serde(default)]
     exclude_routes: Vec<String>,
+    #[serde(default)]
+    exclude_processes: Vec<String>,
+    #[serde(default)]
+    exclude_domains: Vec<String>,
 }
 
 impl From<TunConfigWire> for TunConfig {
@@ -132,6 +152,8 @@ impl From<TunConfigWire> for TunConfig {
             strict_route: wire.strict_route,
             dns_hijack: wire.dns_hijack,
             exclude_routes: wire.exclude_routes,
+            exclude_processes: wire.exclude_processes,
+            exclude_domains: wire.exclude_domains,
         }
     }
 }
@@ -152,6 +174,8 @@ mod tests {
         assert!(tun.strict_route);
         assert_eq!(tun.dns_hijack, DnsHijackMode::Hijack);
         assert!(tun.exclude_routes.is_empty());
+        assert!(tun.exclude_processes.is_empty());
+        assert!(tun.exclude_domains.is_empty());
     }
 
     #[test]
@@ -198,6 +222,8 @@ mod tests {
             strict_route: false,
             dns_hijack: DnsHijackMode::Native,
             exclude_routes: vec!["192.168.0.0/16".to_string()],
+            exclude_processes: vec!["cloudflared".to_string()],
+            exclude_domains: vec!["example.com".to_string()],
         };
         let toml_str = toml::to_string(&tun).unwrap();
         let parsed: TunConfig = toml::from_str(&toml_str).unwrap();
@@ -298,6 +324,49 @@ mod tests {
         assert!(matches!(
             bad_exclude.validate(),
             Err(ValidationError::InvalidIpCidr(_))
+        ));
+    }
+
+    #[test]
+    fn test_legacy_section_without_new_fields_loads_empty() {
+        let tun: TunConfig = toml::from_str("enabled = true\ninterface_name = \"utun\"\n").unwrap();
+        assert!(tun.enabled);
+        assert_eq!(tun.interface_name, "utun");
+        assert!(tun.exclude_routes.is_empty());
+        assert!(tun.exclude_processes.is_empty());
+        assert!(tun.exclude_domains.is_empty());
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_domains() {
+        let bad = TunConfig {
+            exclude_domains: vec!["example.com".to_string(), "no-dot".to_string()],
+            ..TunConfig::default()
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(ValidationError::InvalidDomainPattern(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_bad_process_names() {
+        let bad = TunConfig {
+            exclude_processes: vec!["cloudflared".to_string(), "bad/name".to_string()],
+            ..TunConfig::default()
+        };
+        assert!(matches!(
+            bad.validate(),
+            Err(ValidationError::InvalidProcessName(_))
+        ));
+
+        let empty = TunConfig {
+            exclude_processes: vec!["".to_string()],
+            ..TunConfig::default()
+        };
+        assert!(matches!(
+            empty.validate(),
+            Err(ValidationError::InvalidProcessName(_))
         ));
     }
 }

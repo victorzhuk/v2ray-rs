@@ -35,7 +35,7 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
         "log": { "level": "warn" },
         "inbounds": build_inbounds(settings),
         "outbounds": build_outbounds(nodes),
-        "route": build_route(rules, &first_proxy_tag),
+        "route": build_route(rules, &first_proxy_tag, settings),
     });
 
     if settings.dns.enabled {
@@ -379,8 +379,31 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
 
     dns_config["servers"] = json!(servers);
 
-    let dns_rules = if settings.dns.use_custom_rules {
-        settings
+    let mut tun_exclusion_rules: Vec<Value> = Vec::new();
+    if settings.tun.enabled
+        && let Some(direct_tag) = settings
+            .dns
+            .servers
+            .iter()
+            .find(|s| s.detour.is_none())
+            .map(|s| s.tag.clone())
+    {
+        if !settings.tun.exclude_processes.is_empty() {
+            tun_exclusion_rules.push(json!({
+                "process_name": &settings.tun.exclude_processes,
+                "server": &direct_tag,
+            }));
+        }
+        if !settings.tun.exclude_domains.is_empty() {
+            tun_exclusion_rules.push(json!({
+                "domain_suffix": &settings.tun.exclude_domains,
+                "server": &direct_tag,
+            }));
+        }
+    }
+
+    let dns_rules: Vec<Value> = if settings.dns.use_custom_rules {
+        let custom: Vec<Value> = settings
             .dns
             .rules
             .iter()
@@ -394,7 +417,10 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
                     "server": rule.server_tag,
                 }),
             })
-            .collect()
+            .collect();
+        let mut all = tun_exclusion_rules;
+        all.extend(custom);
+        all
     } else {
         let mut remote_geosite: Vec<String> = Vec::new();
         let mut domestic_geosite: Vec<String> = Vec::new();
@@ -434,7 +460,9 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
             derived_rules.push(json!({ "domain_suffix": domestic_domains, "server": "domestic" }));
         }
 
-        derived_rules
+        let mut all = tun_exclusion_rules;
+        all.extend(derived_rules);
+        all
     };
 
     dns_config["rules"] = json!(dns_rules);
@@ -446,10 +474,27 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     dns_config
 }
 
-fn build_route(rules: &[RoutingRule], first_proxy_tag: &str) -> Value {
+fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSettings) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
-    if enabled.is_empty() {
+    let mut route_rules: Vec<Value> = Vec::new();
+
+    if settings.tun.enabled {
+        if !settings.tun.exclude_processes.is_empty() {
+            route_rules.push(json!({
+                "process_name": &settings.tun.exclude_processes,
+                "outbound": "direct",
+            }));
+        }
+        if !settings.tun.exclude_domains.is_empty() {
+            route_rules.push(json!({
+                "domain_suffix": &settings.tun.exclude_domains,
+                "outbound": "direct",
+            }));
+        }
+    }
+
+    if enabled.is_empty() && route_rules.is_empty() {
         return json!({ "rules": [] });
     }
 
@@ -489,10 +534,11 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str) -> Value {
         }));
     }
 
-    let route_rules: Vec<Value> = enabled
+    let user_rules: Vec<Value> = enabled
         .iter()
         .map(|r| build_route_rule(r, first_proxy_tag))
         .collect();
+    route_rules.extend(user_rules);
 
     if rule_sets.is_empty() {
         json!({ "rules": route_rules })
@@ -1273,5 +1319,99 @@ mod tests {
 
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
+    }
+
+    #[test]
+    fn test_singbox_tun_exclusion_process_name() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_processes = vec!["cloudflared".to_string()];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let rules = config["route"]["rules"].as_array().unwrap();
+        let first = &rules[0];
+        assert_eq!(first["process_name"], json!(["cloudflared"]));
+        assert_eq!(first["outbound"], "direct");
+    }
+
+    #[test]
+    fn test_singbox_tun_exclusion_domain() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+        settings.dns.enabled = true;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let rules = config["route"]["rules"].as_array().unwrap();
+        let first = &rules[0];
+        assert_eq!(first["domain_suffix"], json!(["example.com"]));
+        assert_eq!(first["outbound"], "direct");
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let dns_first = dns_rules
+            .iter()
+            .find(|r| r.get("domain_suffix").is_some())
+            .expect("domain_suffix DNS rule not found");
+        assert_eq!(dns_first["domain_suffix"], json!(["example.com"]));
+    }
+
+    #[test]
+    fn test_singbox_tun_exclusion_dns_process() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_processes = vec!["cloudflared".to_string()];
+        settings.dns.enabled = true;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let proc_rule = dns_rules
+            .iter()
+            .find(|r| r.get("process_name").is_some())
+            .expect("process_name DNS rule not found");
+        assert_eq!(proc_rule["process_name"], json!(["cloudflared"]));
+    }
+
+    #[test]
+    fn test_singbox_no_exclusion_when_tun_disabled() {
+        let mut settings = default_settings();
+        settings.tun.exclude_processes = vec!["cloudflared".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+        settings.dns.enabled = true;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let rules = config["route"]["rules"].as_array().unwrap();
+        for rule in rules {
+            assert!(rule.get("process_name").is_none());
+            assert!(rule.get("domain_suffix").is_none());
+        }
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        for rule in dns_rules {
+            assert!(rule.get("process_name").is_none());
+        }
+    }
+
+    #[test]
+    fn test_singbox_no_exclusion_when_lists_empty() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let rules = config["route"]["rules"].as_array().unwrap();
+        for rule in rules {
+            assert!(rule.get("process_name").is_none());
+            assert!(rule.get("domain_suffix").is_none());
+        }
     }
 }

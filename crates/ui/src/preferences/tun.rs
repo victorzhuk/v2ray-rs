@@ -5,7 +5,7 @@ use adw::prelude::*;
 use relm4::{adw, gtk};
 
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, DnsHijackMode, TunStack, validate_ip_cidr,
+    AppSettings, BackendType, DnsHijackMode, TunStack, validate_domain_pattern, validate_ip_cidr,
     validate_tun_interface_name,
 };
 
@@ -211,6 +211,208 @@ pub(super) fn build_tun_page(
         });
     }
 
+    // --- Excluded domains ---------------------------------------------------
+    let domains_group = adw::PreferencesGroup::builder()
+        .title("Excluded domains")
+        .description("Domain suffixes that bypass the tunnel")
+        .build();
+    let add_domain_row = adw::ActionRow::builder()
+        .title("Add excluded domain")
+        .activatable(true)
+        .build();
+    add_domain_row.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
+    domains_group.add(&add_domain_row);
+    page.add(&domains_group);
+
+    let domains_added_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let domains_render_slot: Rc<RefCell<Option<RenderFn>>> = Rc::new(RefCell::new(None));
+    let render_domains: RenderFn = {
+        let domains_group = domains_group.clone();
+        let state = state.clone();
+        let cb = cb.clone();
+        let added_rows = domains_added_rows.clone();
+        let render_slot = domains_render_slot.clone();
+        Rc::new(move || {
+            for row in added_rows.borrow().iter() {
+                domains_group.remove(row);
+            }
+            added_rows.borrow_mut().clear();
+            let domains = state.borrow().tun.exclude_domains.clone();
+            for (index, domain) in domains.into_iter().enumerate() {
+                let row = adw::ActionRow::builder().title(&domain).build();
+                let delete = gtk::Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["flat"])
+                    .build();
+                {
+                    let state = state.clone();
+                    let cb = cb.clone();
+                    let render_slot = render_slot.clone();
+                    delete.connect_clicked(move |_| {
+                        let _ = apply_tun_mutation(&state, &cb, |s| {
+                            if index < s.tun.exclude_domains.len() {
+                                s.tun.exclude_domains.remove(index);
+                            }
+                            Ok(())
+                        });
+                        if let Some(render) = render_slot.borrow().as_ref() {
+                            render();
+                        }
+                    });
+                }
+                row.add_suffix(&delete);
+                domains_group.add(&row);
+                added_rows.borrow_mut().push(row);
+            }
+        })
+    };
+    *domains_render_slot.borrow_mut() = Some(render_domains.clone());
+    render_domains();
+
+    {
+        let state = state.clone();
+        let cb = cb.clone();
+        let render_domains = render_domains.clone();
+        add_domain_row.connect_activated(move |_| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Add excluded domain")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("add", "Add");
+            dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("add"));
+            dialog.set_close_response("cancel");
+
+            let entry = adw::EntryRow::builder()
+                .title("Domain suffix (e.g. example.com)")
+                .build();
+            let group = adw::PreferencesGroup::new();
+            group.add(&entry);
+            dialog.set_extra_child(Some(&group));
+
+            let state = state.clone();
+            let cb = cb.clone();
+            let render_domains = render_domains.clone();
+            let entry = entry.clone();
+            dialog.connect_response(Some("add"), move |_, _| {
+                let value = entry.text().trim().to_string();
+                if validate_domain_pattern(&value).is_ok() {
+                    let _ = apply_tun_mutation(&state, &cb, |s| {
+                        s.tun.exclude_domains.push(value.clone());
+                        Ok(())
+                    });
+                    render_domains();
+                }
+            });
+            dialog.present(crate::active_window().as_ref());
+        });
+    }
+
+    // --- Excluded applications ----------------------------------------------
+    let apps_group = adw::PreferencesGroup::builder()
+        .title("Excluded applications")
+        .description("Process names that bypass the tunnel (sing-box only)")
+        .build();
+    let apps_note = adw::ActionRow::builder()
+        .title("xray cannot match TUN traffic by process name")
+        .sensitive(false)
+        .visible(backend == BackendType::Xray)
+        .build();
+    apps_group.add(&apps_note);
+    let add_app_row = adw::ActionRow::builder()
+        .title("Add excluded application")
+        .activatable(true)
+        .build();
+    add_app_row.add_prefix(&gtk::Image::from_icon_name("list-add-symbolic"));
+    apps_group.add(&add_app_row);
+    page.add(&apps_group);
+
+    let apps_added_rows: Rc<RefCell<Vec<adw::ActionRow>>> = Rc::new(RefCell::new(Vec::new()));
+    let apps_render_slot: Rc<RefCell<Option<RenderFn>>> = Rc::new(RefCell::new(None));
+    let render_apps: RenderFn = {
+        let apps_group = apps_group.clone();
+        let state = state.clone();
+        let cb = cb.clone();
+        let added_rows = apps_added_rows.clone();
+        let render_slot = apps_render_slot.clone();
+        Rc::new(move || {
+            for row in added_rows.borrow().iter() {
+                apps_group.remove(row);
+            }
+            added_rows.borrow_mut().clear();
+            let processes = state.borrow().tun.exclude_processes.clone();
+            for (index, process) in processes.into_iter().enumerate() {
+                let row = adw::ActionRow::builder().title(&process).build();
+                let delete = gtk::Button::builder()
+                    .icon_name("user-trash-symbolic")
+                    .valign(gtk::Align::Center)
+                    .css_classes(["flat"])
+                    .build();
+                {
+                    let state = state.clone();
+                    let cb = cb.clone();
+                    let render_slot = render_slot.clone();
+                    delete.connect_clicked(move |_| {
+                        let _ = apply_tun_mutation(&state, &cb, |s| {
+                            if index < s.tun.exclude_processes.len() {
+                                s.tun.exclude_processes.remove(index);
+                            }
+                            Ok(())
+                        });
+                        if let Some(render) = render_slot.borrow().as_ref() {
+                            render();
+                        }
+                    });
+                }
+                row.add_suffix(&delete);
+                apps_group.add(&row);
+                added_rows.borrow_mut().push(row);
+            }
+        })
+    };
+    *apps_render_slot.borrow_mut() = Some(render_apps.clone());
+    render_apps();
+
+    {
+        let state = state.clone();
+        let cb = cb.clone();
+        let render_apps = render_apps.clone();
+        add_app_row.connect_activated(move |_| {
+            let dialog = adw::AlertDialog::builder()
+                .heading("Add excluded application")
+                .build();
+            dialog.add_response("cancel", "Cancel");
+            dialog.add_response("add", "Add");
+            dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
+            dialog.set_default_response(Some("add"));
+            dialog.set_close_response("cancel");
+
+            let entry = adw::EntryRow::builder()
+                .title("Process name (e.g. cloudflared)")
+                .build();
+            let group = adw::PreferencesGroup::new();
+            group.add(&entry);
+            dialog.set_extra_child(Some(&group));
+
+            let state = state.clone();
+            let cb = cb.clone();
+            let render_apps = render_apps.clone();
+            let entry = entry.clone();
+            dialog.connect_response(Some("add"), move |_, _| {
+                let value = entry.text().trim().to_string();
+                if !value.is_empty() && !value.contains('/') && !value.contains('\\') {
+                    let _ = apply_tun_mutation(&state, &cb, |s| {
+                        s.tun.exclude_processes.push(value.clone());
+                        Ok(())
+                    });
+                    render_apps();
+                }
+            });
+            dialog.present(crate::active_window().as_ref());
+        });
+    }
+
     // --- Capabilities -------------------------------------------------------
     let cap_group = adw::PreferencesGroup::builder().title("Privileges").build();
     let cap_row = adw::ActionRow::builder().title("Capability status").build();
@@ -377,10 +579,13 @@ pub(super) fn build_tun_page(
         let enable_row = enable_row.clone();
         let backend_note = backend_note.clone();
         let advanced_note = advanced_note.clone();
+        let apps_note = apps_note.clone();
         let stack_row = stack_row.clone();
         let strict_row = strict_row.clone();
         let hijack_row = hijack_row.clone();
         let routes_group = routes_group.clone();
+        let domains_group = domains_group.clone();
+        let apps_group = apps_group.clone();
         let refresh_caps = refresh_caps.clone();
         subscribe_settings(observers, move |settings| {
             let backend = settings.backend.backend_type;
@@ -388,10 +593,13 @@ pub(super) fn build_tun_page(
             enable_row.set_sensitive(backend != BackendType::V2ray);
             backend_note.set_visible(backend == BackendType::V2ray);
             advanced_note.set_visible(backend == BackendType::Xray);
+            apps_note.set_visible(backend == BackendType::Xray);
             stack_row.set_sensitive(singbox_only);
             strict_row.set_sensitive(singbox_only);
             hijack_row.set_sensitive(singbox_only);
-            routes_group.set_sensitive(singbox_only);
+            routes_group.set_sensitive(backend != BackendType::V2ray);
+            domains_group.set_sensitive(backend != BackendType::V2ray);
+            apps_group.set_sensitive(singbox_only);
             refresh_caps();
         });
     }
@@ -400,7 +608,9 @@ pub(super) fn build_tun_page(
     stack_row.set_sensitive(singbox_only);
     strict_row.set_sensitive(singbox_only);
     hijack_row.set_sensitive(singbox_only);
-    routes_group.set_sensitive(singbox_only);
+    routes_group.set_sensitive(backend != BackendType::V2ray);
+    domains_group.set_sensitive(backend != BackendType::V2ray);
+    apps_group.set_sensitive(singbox_only);
 
     page
 }
