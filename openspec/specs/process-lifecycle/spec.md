@@ -1,6 +1,6 @@
 # Spec: Process Lifecycle
 
-## ADDED Requirements
+## Requirements
 
 ### Requirement: Start backend process
 The system SHALL emit an `Error` process state when pre-launch validation fails.
