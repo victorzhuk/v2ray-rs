@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+---
+
+## [0.11.0] - 2026-06-25
+
 ### Added
 - Per-process TUN bypass for xray: a dedicated `v2ray-rs-bypass` system user, a setuid-root `v2ray-rs-run` wrapper, and a `uidrange` policy rule (priority 8998) programmed by `v2ray-rs-netctl xray-up --bypass-uid`. App-launched tools can exit the tunnel via the *Run with bypass* action in TUN preferences; sing-box already excludes processes natively. Packaging creates the user and installs the wrapper setuid on Arch.
 
@@ -438,11 +442,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-- OpenSpec workflow setup
-
----
-
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...HEAD
+[0.11.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...v0.10.1
 [0.10.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.9.0...v0.10.0
