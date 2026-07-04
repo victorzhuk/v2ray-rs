@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.12.0] - 2026-07-04
+
+### Fixed
+- Unstable connections now recover on their own. A backend killed by a signal (out-of-memory, a crash, or an external kill — which reports no exit code) was previously mistaken for a clean stop and left disconnected; it is now treated as a crash and restarted. The in-place restart, which never actually worked because of an invalid state transition, now relaunches without a visible disconnect, with a backoff that grows with recent crashes.
+- A crash or give-up is no longer lost behind a burst of backend log output. Log lines and connection-state changes now travel on separate channels, so a busy log can't drop the event that tells the UI the connection died (which left it showing "connected" against a dead backend).
+- After the backend exhausts its restart budget, the app retries the whole connection a bounded number of times, re-selecting a candidate, instead of staying disconnected.
+- TUN routing state is cleaned up on every path that ends a tunnel — a crash, a failed start, and a give-up — not just a clean disconnect, so host-wide policy rules no longer outlive the device. The recovery marker now survives a crash so leftover state is cleared on the next launch.
+- The app no longer freezes while the polkit TUN-privilege dialog is open, nor for up to ~1.5s while reaping a leftover backend on Connect; both now run off the UI thread.
+
+### Security
+- `v2ray-rs-netctl` refuses to operate on any interface that is not a TUN device, so a local process can no longer point it at `lo` or a physical NIC to black-hole system traffic, or delete another tunnel's link (`wg0`, `docker0`, ...).
+- The one-time privilege grant resolves the route helper and setuid wrapper to absolute paths beside the executable, so a bare name can no longer be resolved against the process working directory by the elevated `setcap`/`chown`/`chmod`.
+- The privileged helpers are no longer world-executable. Packaging now creates a `v2ray-rs` group and restricts `v2ray-rs-netctl` (`0750`) and `v2ray-rs-run` (`4750`) to it, so only group members can invoke them.
+
+### Changed
+- **TUN mode now requires membership in the `v2ray-rs` group.** After installing or upgrading, run `sudo usermod -aG v2ray-rs "$USER"` and re-login; until then TUN connect fails with a permission error. (Non-TUN proxying is unaffected.)
+
+---
+
 ## [0.11.0] - 2026-06-25
 
 ### Added
@@ -442,7 +461,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...HEAD
+[0.12.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...v0.10.2
 [0.10.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.0...v0.10.1
