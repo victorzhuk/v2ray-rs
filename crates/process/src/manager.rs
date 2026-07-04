@@ -95,6 +95,10 @@ impl ProcessManager {
         self.state.subscribe()
     }
 
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<ProcessEvent> {
+        self.state.subscribe_logs()
+    }
+
     pub fn log_buffer(&self) -> &Arc<Mutex<LogBuffer>> {
         &self.log_buffer
     }
@@ -131,7 +135,17 @@ impl ProcessManager {
         }
 
         if self.tun.is_some() {
-            match crate::privilege::has_net_admin(&self.binary_path) {
+            let binary = self.binary_path.clone();
+            let probe =
+                tokio::task::spawn_blocking(move || crate::privilege::has_net_admin(&binary)).await;
+            let cap = match probe {
+                Ok(inner) => inner,
+                Err(join) => Err(crate::privilege::PrivilegeError::Probe(
+                    self.binary_path.clone(),
+                    join.to_string(),
+                )),
+            };
+            match cap {
                 Ok(true) => {}
                 other => {
                     self.state
@@ -180,11 +194,7 @@ impl ProcessManager {
 
         // SIGTERM already let xray close its TUN fd (the kernel drops the
         // device-scoped routes); run the helper teardown as a safeguard.
-        if let Some(rt) = self.tun.clone()
-            && rt.needs_helper()
-        {
-            let _ = tun::xray_down(&rt).await;
-        }
+        self.teardown_tun().await;
 
         self.state.transition(ProcessState::Stopped, None)?;
         self.pid_file.remove().ok();
@@ -258,16 +268,19 @@ impl ProcessManager {
         {
             if !tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await {
                 self.graceful_stop().await;
+                self.teardown_tun().await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
             }
             match tun::xray_up(&rt).await {
                 Ok(true) => {}
                 Ok(false) => {
                     self.graceful_stop().await;
+                    self.teardown_tun().await;
                     return Err(ProcessError::TunHelper("xray-up reported failure".into()));
                 }
                 Err(e) => {
                     self.graceful_stop().await;
+                    self.teardown_tun().await;
                     return Err(ProcessError::TunHelper(e.to_string()));
                 }
             }
@@ -301,7 +314,7 @@ impl ProcessManager {
 
     fn capture_output(&mut self, child: &mut Child) {
         if let Some(stdout) = child.stdout.take() {
-            let tx = self.state.sender().clone();
+            let tx = self.state.log_sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
             self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
@@ -318,7 +331,7 @@ impl ProcessManager {
         }
 
         if let Some(stderr) = child.stderr.take() {
-            let tx = self.state.sender().clone();
+            let tx = self.state.log_sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
             self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
@@ -360,38 +373,36 @@ impl ProcessManager {
             None => "process killed by signal".into(),
         };
 
-        let is_signal_exit =
-            exit_code.is_none() || matches!(exit_code, Some(130) | Some(137) | Some(143));
+        // Reaching here means the backend died while we still expected it
+        // Running: stop() moves state to Stopping before killing, so a requested
+        // stop never lands here. Every exit at this point is an unrequested
+        // crash — including a signal death (OOM, segfault, external kill), which
+        // reports exit_code == None on Unix and must not be mistaken for a clean
+        // stop.
+        self.crash_times.push(Instant::now());
+        self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
 
-        if !is_signal_exit {
-            self.crash_times.push(Instant::now());
-            self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
+        // Roll back any TUN routing state the dead backend left behind before we
+        // relaunch or give up: xray_up installs host-wide policy rules that
+        // outlive the device and is not idempotent across a dirty restart.
+        self.teardown_tun().await;
 
-            if self.crash_times.len() >= MAX_CRASHES {
-                let _ = self.state.transition(
-                    ProcessState::Error(format!(
-                        "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
-                    )),
-                    None,
-                );
-                return;
-            }
+        if !self.auto_restart {
+            let _ = self.state.transition(ProcessState::Error(msg), None);
+            return;
         }
 
-        if !self.auto_restart || is_signal_exit {
+        if self.crash_times.len() >= MAX_CRASHES {
             let _ = self.state.transition(
-                if is_signal_exit {
-                    ProcessState::Stopped
-                } else {
-                    ProcessState::Error(msg)
-                },
+                ProcessState::Error(format!(
+                    "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
+                )),
                 None,
             );
             return;
         }
 
-        let _ = self.state.transition(ProcessState::Stopped, None);
-        sleep(CRASH_RESTART_DELAY).await;
+        sleep(CRASH_RESTART_DELAY * self.crash_times.len() as u32).await;
 
         if let Err(e) = self
             .start_with_connection(self.current_connection.clone())
@@ -400,6 +411,14 @@ impl ProcessManager {
             let _ = self
                 .state
                 .transition(ProcessState::Error(format!("restart failed: {e}")), None);
+        }
+    }
+
+    async fn teardown_tun(&self) {
+        if let Some(rt) = self.tun.clone()
+            && rt.needs_helper()
+        {
+            let _ = tun::xray_down(&rt).await;
         }
     }
 

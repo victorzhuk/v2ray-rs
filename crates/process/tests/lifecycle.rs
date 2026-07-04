@@ -176,3 +176,25 @@ async fn crash_detection() {
         other => panic!("expected Error state, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn signal_death_is_treated_as_crash() {
+    let dir = setup_dir();
+    // The script kills itself with SIGKILL, so ExitStatus::code() is None — the
+    // same shape as an OOM/segfault/external kill. This must count as an
+    // unexpected crash (Error), not be mistaken for a clean stop (Stopped).
+    let binary = create_script(&dir, "backend", "#!/bin/sh\nkill -9 $$\n");
+    let config = create_config(&dir);
+
+    let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
+    mgr.set_auto_restart(false);
+    mgr.start().await.unwrap();
+
+    let exit_code = mgr.wait_and_handle_exit().await.unwrap();
+    assert_eq!(exit_code, None);
+
+    match mgr.state() {
+        ProcessState::Error(_) => {}
+        other => panic!("expected Error state after signal death, got {other:?}"),
+    }
+}

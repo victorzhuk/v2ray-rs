@@ -47,6 +47,17 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
 
     tokio::spawn(async move {
+        // Reap any orphaned backend from a previous run before spawning ours.
+        // Done here, off the GTK thread, so the Connect click never blocks the
+        // UI while an orphan is signalled and waited on.
+        {
+            let orphan_pid = pid_path.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                v2ray_rs_process::PidFile::new(orphan_pid).check_and_kill_orphaned()
+            })
+            .await;
+        }
+
         let mut failures = Vec::new();
 
         for candidate in candidates {
@@ -123,7 +134,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
             });
 
             let log_sender = sender.clone();
-            let mut log_rx = mgr.subscribe();
+            let mut log_rx = mgr.subscribe_logs();
             tokio::spawn(async move {
                 loop {
                     match log_rx.recv().await {
@@ -148,9 +159,12 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                         }
                     }
                     result = mgr.wait_and_handle_exit() => {
+                        // The manager restarts in place on an unexpected exit; if
+                        // it came back Running keep supervising, otherwise the
+                        // session is terminal (clean stop or crash give-up).
                         match result {
-                            Ok(Some(_)) if mgr.state() == ProcessState::Running => {}
-                            Ok(_) | Err(_) => return,
+                            Ok(_) | Err(_) if mgr.state() == ProcessState::Running => {}
+                            _ => return,
                         }
                     }
                 }

@@ -22,6 +22,9 @@ impl ProcessState {
                 | (Stopped, Error(_))
                 | (Starting, Running)
                 | (Starting, Error(_))
+                // supervised in-place restart after an unexpected exit: the
+                // manager relaunches without a user-visible disconnect blip
+                | (Running, Starting)
                 | (Running, Stopping)
                 | (Running, Error(_))
                 | (Stopping, Stopped)
@@ -68,14 +71,19 @@ pub enum TransitionError {
 pub struct StateManager {
     state: ProcessState,
     tx: broadcast::Sender<ProcessEvent>,
+    log_tx: broadcast::Sender<ProcessEvent>,
 }
 
 impl StateManager {
     pub fn new() -> Self {
+        // Logs get their own high-capacity channel so a burst of backend output
+        // can never lag the state channel and drop a terminal StateChanged.
         let (tx, _rx) = broadcast::channel(64);
+        let (log_tx, _log_rx) = broadcast::channel(1024);
         Self {
             state: ProcessState::Stopped,
             tx,
+            log_tx,
         }
     }
 
@@ -101,12 +109,20 @@ impl StateManager {
         self.tx.subscribe()
     }
 
-    pub fn sender(&self) -> &broadcast::Sender<ProcessEvent> {
-        &self.tx
+    pub fn subscribe_logs(&self) -> broadcast::Receiver<ProcessEvent> {
+        self.log_tx.subscribe()
+    }
+
+    pub fn log_sender(&self) -> &broadcast::Sender<ProcessEvent> {
+        &self.log_tx
     }
 
     pub fn emit(&self, event: ProcessEvent) {
-        let _ = self.tx.send(event);
+        let tx = match event {
+            ProcessEvent::LogLine(_) => &self.log_tx,
+            _ => &self.tx,
+        };
+        let _ = tx.send(event);
     }
 }
 
@@ -164,7 +180,7 @@ mod tests {
         assert!(state.transition(ProcessState::Running).is_err());
 
         state = ProcessState::Running;
-        assert!(state.transition(ProcessState::Starting).is_err());
+        assert!(state.transition(ProcessState::Stopped).is_err());
 
         state = ProcessState::Stopped;
         assert!(state.transition(ProcessState::Stopping).is_err());
@@ -219,7 +235,7 @@ mod tests {
     #[test]
     fn state_manager_emit() {
         let mgr = StateManager::new();
-        let mut rx = mgr.subscribe();
+        let mut rx = mgr.subscribe_logs();
 
         mgr.emit(ProcessEvent::LogLine(LogLine::stdout("test")));
 
