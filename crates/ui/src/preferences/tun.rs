@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use adw::prelude::*;
+use relm4::gtk::glib;
 use relm4::{adw, gtk};
 
 use v2ray_rs_core::models::{
@@ -513,17 +514,31 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let refresh = refresh_caps.clone();
         let toast_cb = toast_cb.clone();
-        grant_button.connect_clicked(move |_| {
+        grant_button.connect_clicked(move |btn| {
             let backend_path = state.borrow().backend.binary_path.clone();
             let Some(backend_path) = backend_path else {
                 return;
             };
             let helper = v2ray_rs_process::helper_path();
-            match v2ray_rs_process::grant(&backend_path, &helper) {
-                Ok(()) => toast_cb("TUN privileges granted."),
-                Err(err) => toast_cb(&format!("Grant failed: {err}")),
-            }
-            refresh();
+            // grant() blocks on the polkit dialog; run it off the GTK thread so
+            // the whole app doesn't freeze until the prompt is answered.
+            btn.set_sensitive(false);
+            let btn = btn.clone();
+            let refresh = refresh.clone();
+            let toast_cb = toast_cb.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let result = tokio::task::spawn_blocking(move || {
+                    v2ray_rs_process::grant(&backend_path, &helper).map_err(|e| e.to_string())
+                })
+                .await;
+                btn.set_sensitive(true);
+                match result {
+                    Ok(Ok(())) => toast_cb("TUN privileges granted."),
+                    Ok(Err(err)) => toast_cb(&format!("Grant failed: {err}")),
+                    Err(_) => toast_cb("Grant failed: elevation task aborted"),
+                }
+                refresh();
+            });
         });
     }
 

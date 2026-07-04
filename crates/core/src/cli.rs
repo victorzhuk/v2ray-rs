@@ -2,35 +2,17 @@ use std::path::PathBuf;
 
 use crate::profile::Env;
 
-#[derive(Debug, clap::Parser)]
-#[command(name = "v2ray-rs", about = "V2Ray/XRay proxy GUI")]
-pub struct CliArgs {
-    #[arg(long = "profile")]
-    pub profile: Option<String>,
-
-    #[arg(long = "config-dir")]
+/// Directory overrides parsed from the CLI, before merging with the
+/// environment. The clap parsing surface is an application-entrypoint concern
+/// and lives in the ui binary; this crate only needs the resolved values.
+#[derive(Debug, Default)]
+pub struct CliPaths {
     pub config_dir: Option<PathBuf>,
-
-    #[arg(long = "data-dir")]
     pub data_dir: Option<PathBuf>,
-
-    #[arg(long = "cache-dir")]
     pub cache_dir: Option<PathBuf>,
-
-    #[arg(long = "runtime-dir")]
     pub runtime_dir: Option<PathBuf>,
-
-    #[arg(long = "state-dir")]
     pub state_dir: Option<PathBuf>,
-
-    #[arg(long = "reset-instance")]
-    pub reset_instance: bool,
-
-    #[arg(long = "install-icons")]
     pub install_icons: bool,
-
-    #[arg(long = "i-understand")]
-    pub i_understand: bool,
 }
 
 #[derive(Debug, Default)]
@@ -44,7 +26,7 @@ pub struct PathOverrides {
 }
 
 impl PathOverrides {
-    pub fn resolve(cli: &CliArgs, env: &dyn Env) -> Self {
+    pub fn resolve(cli: &CliPaths, env: &dyn Env) -> Self {
         Self {
             config_dir: cli
                 .config_dir
@@ -118,16 +100,13 @@ mod tests {
         env.set("V2RAY_RS_STATE_DIR", "/from/env/state");
         env.set("V2RAY_RS_INSTALL_ICONS", "true");
 
-        let cli = CliArgs {
-            profile: None,
+        let cli = CliPaths {
             config_dir: Some(PathBuf::from("/from/cli")),
             data_dir: Some(PathBuf::from("/from/cli/data")),
             cache_dir: Some(PathBuf::from("/from/cli/cache")),
             runtime_dir: Some(PathBuf::from("/from/cli/runtime")),
             state_dir: Some(PathBuf::from("/from/cli/state")),
-            reset_instance: false,
             install_icons: true,
-            i_understand: false,
         };
 
         let overrides = PathOverrides::resolve(&cli, &env);
@@ -153,16 +132,13 @@ mod tests {
         env.set("V2RAY_RS_STATE_DIR", "/from/env/state");
         env.set("V2RAY_RS_INSTALL_ICONS", "true");
 
-        let cli = CliArgs {
-            profile: None,
+        let cli = CliPaths {
             config_dir: None,
             data_dir: None,
             cache_dir: None,
             runtime_dir: None,
             state_dir: None,
-            reset_instance: false,
             install_icons: false,
-            i_understand: false,
         };
 
         let overrides = PathOverrides::resolve(&cli, &env);
@@ -181,16 +157,13 @@ mod tests {
     #[test]
     fn test_resolve_none_when_empty() {
         let env = MockEnv::new();
-        let cli = CliArgs {
-            profile: None,
+        let cli = CliPaths {
             config_dir: None,
             data_dir: None,
             cache_dir: None,
             runtime_dir: None,
             state_dir: None,
-            reset_instance: false,
             install_icons: false,
-            i_understand: false,
         };
 
         let overrides = PathOverrides::resolve(&cli, &env);
@@ -233,16 +206,13 @@ mod tests {
     fn test_cli_install_icons_flag() {
         let env = MockEnv::new();
 
-        let cli = CliArgs {
-            profile: None,
+        let cli = CliPaths {
             config_dir: None,
             data_dir: None,
             cache_dir: None,
             runtime_dir: None,
             state_dir: None,
-            reset_instance: false,
             install_icons: true,
-            i_understand: false,
         };
 
         let overrides = PathOverrides::resolve(&cli, &env);

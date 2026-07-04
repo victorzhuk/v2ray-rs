@@ -7,7 +7,8 @@ use relm4::adw;
 use relm4::prelude::*;
 use tokio::sync::broadcast;
 
-use v2ray_rs_core::cli::{CliArgs, PathOverrides};
+use crate::cli::CliArgs;
+use v2ray_rs_core::cli::PathOverrides;
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::instance::{
     CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
@@ -29,6 +30,9 @@ static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::ne
 const DEFAULT_WINDOW_WIDTH: i32 = 900;
 const DEFAULT_WINDOW_HEIGHT: i32 = 650;
 const EVENT_CHANNEL_CAPACITY: usize = 16;
+const MAX_AUTO_RECONNECTS: u32 = 3;
+const AUTO_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+const RECOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct AppInit {
     pub paths: AppPaths,
@@ -71,6 +75,8 @@ pub struct App {
     geodata_service: GeodataRefreshService,
     pending_exit: bool,
     settings_debounce: Option<glib::SourceId>,
+    auto_reconnect_attempts: u32,
+    reconnect_generation: u32,
 }
 
 #[derive(Debug)]
@@ -97,6 +103,7 @@ pub enum AppMsg {
     SwitchView(usize),
     ShowToast(String),
     FlushSettings(AppSettings),
+    AutoReconnect(u32),
 }
 
 impl App {
@@ -187,6 +194,27 @@ impl App {
         self.runtime_snapshot = None;
         self.restart_required = false;
         self.reconnect_pending = false;
+    }
+
+    /// Cancels any pending auto-reconnect and resets the attempt budget. Bumping
+    /// the generation invalidates timers that were already scheduled.
+    fn cancel_auto_reconnect(&mut self) {
+        self.auto_reconnect_attempts = 0;
+        self.reconnect_generation = self.reconnect_generation.wrapping_add(1);
+    }
+
+    /// Schedules a bounded retry after the backend gives up (terminal Error),
+    /// so a flaky upstream reconnects on its own and can pick a fresh candidate.
+    fn schedule_auto_reconnect(&mut self, sender: &ComponentSender<Self>) {
+        if self.pending_exit || self.auto_reconnect_attempts >= MAX_AUTO_RECONNECTS {
+            return;
+        }
+        self.auto_reconnect_attempts += 1;
+        let generation = self.reconnect_generation;
+        let s = sender.clone();
+        glib::timeout_add_local_once(AUTO_RECONNECT_DELAY, move || {
+            s.input(AppMsg::AutoReconnect(generation));
+        });
     }
 
     fn persist_settings(&mut self, settings: AppSettings) -> Result<(), String> {
@@ -656,6 +684,8 @@ impl SimpleComponent for App {
             geodata_service,
             pending_exit: false,
             settings_debounce: None,
+            auto_reconnect_attempts: 0,
+            reconnect_generation: 0,
         };
 
         let toast_overlay = &model.toast_overlay;
@@ -782,10 +812,6 @@ impl SimpleComponent for App {
                     }
                 };
 
-                if let Err(err) = cleanup_orphaned_backend(&self.paths) {
-                    log::warn!("failed to clean orphaned backend process: {err}");
-                }
-
                 let subscriptions = match self.store.load_subscriptions() {
                     Ok(subscriptions) => subscriptions,
                     Err(err) => {
@@ -800,13 +826,21 @@ impl SimpleComponent for App {
                         return;
                     }
                 };
-                let snapshot = match self.store.load_latency_snapshot() {
+                let mut snapshot = match self.store.load_latency_snapshot() {
                     Ok(snapshot) => snapshot,
                     Err(err) => {
                         self.show_toast(&format!("Failed to load latency data: {err}"));
                         return;
                     }
                 };
+                let known = v2ray_rs_core::resolve::all_node_refs(&subscriptions, &manual_nodes);
+                let before = snapshot.len();
+                snapshot.retain_known(&known);
+                if snapshot.len() != before
+                    && let Err(err) = self.store.save_latency_snapshot(&snapshot)
+                {
+                    log::warn!("prune latency snapshot: {err}");
+                }
                 let planner = ConnectionPlanner::new(
                     self.settings.auto_resolve_strategy,
                     self.settings.last_success.clone(),
@@ -871,6 +905,7 @@ impl SimpleComponent for App {
             }
             AppMsg::Disconnect => {
                 self.clear_restart_flow();
+                self.cancel_auto_reconnect();
                 if let Some(handle) = self.process_handle.take() {
                     self.apply_state(&ProcessState::Stopping);
                     handle.stop();
@@ -884,7 +919,12 @@ impl SimpleComponent for App {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
-                    let _ = v2ray_rs_core::persistence::clear_tun_session(&self.paths);
+                    // Clear the TUN recovery marker only on a clean stop. On a
+                    // crash give-up (Error) keep it so the next launch runs the
+                    // route-recovery pass in case teardown didn't complete.
+                    if matches!(state, ProcessState::Stopped) {
+                        let _ = v2ray_rs_core::persistence::clear_tun_session(&self.paths);
+                    }
                 }
                 if connection.is_some() {
                     self.connection_status = connection;
@@ -929,6 +969,18 @@ impl SimpleComponent for App {
                 }
                 if matches!(state, ProcessState::Stopped) && self.reconnect_pending {
                     self.reconnect_pending = false;
+                    sender.input(AppMsg::Connect);
+                }
+                match &state {
+                    ProcessState::Running => self.cancel_auto_reconnect(),
+                    ProcessState::Error(_) if !self.reconnect_pending => {
+                        self.schedule_auto_reconnect(&sender)
+                    }
+                    _ => {}
+                }
+            }
+            AppMsg::AutoReconnect(generation) => {
+                if generation == self.reconnect_generation && self.process_handle.is_none() {
                     sender.input(AppMsg::Connect);
                 }
             }
@@ -1158,20 +1210,41 @@ fn recover_tun_session(paths: &AppPaths) {
         v2ray_rs_core::models::BackendType::SingBox => "--singbox",
         _ => "--xray",
     };
-    match std::process::Command::new(v2ray_rs_process::helper_path())
-        .arg("recover")
+    let mut cmd = std::process::Command::new(v2ray_rs_process::helper_path());
+    cmd.arg("recover")
         .arg(backend_flag)
         .arg("--iface")
-        .arg(&session.iface)
-        .status()
-    {
-        Ok(status) if status.success() => {
+        .arg(&session.iface);
+    match run_with_timeout(cmd, RECOVER_TIMEOUT) {
+        Ok(Some(status)) if status.success() => {
             log::info!("recovered leftover TUN state on {}", session.iface)
         }
-        Ok(status) => log::warn!("tun recover exited with {status}"),
+        Ok(Some(status)) => log::warn!("tun recover exited with {status}"),
+        Ok(None) => log::warn!("tun recover timed out after {RECOVER_TIMEOUT:?}"),
         Err(err) => log::warn!("failed to run tun recover: {err}"),
     }
     let _ = v2ray_rs_core::persistence::clear_tun_session(paths);
+}
+
+/// Runs a child process, killing it if it doesn't exit within `timeout`.
+/// Returns `Ok(None)` on timeout. Keeps a hung helper from blocking startup.
+fn run_with_timeout(
+    mut cmd: std::process::Command,
+    timeout: std::time::Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let mut child = cmd.spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 fn install_icon_for_compositor(profile: &AppProfile) {
@@ -1256,7 +1329,7 @@ fn try_run() -> Result<(), String> {
     let profile = AppProfile::resolve(cli_args.profile.as_deref(), &StdEnv)
         .map_err(|e| format!("invalid profile: {e}"))?;
 
-    let overrides = PathOverrides::resolve(&cli_args, &StdEnv);
+    let overrides = PathOverrides::resolve(&cli_args.paths(), &StdEnv);
 
     let paths = AppPaths::with_overrides(profile.clone(), &overrides)
         .map_err(|err| format!("failed to determine XDG directories: {err}"))?;

@@ -623,7 +623,9 @@ fn listen_address_status_text(addr: &str) -> String {
     if is_loopback_listen_address(addr) {
         "Loopback only (default). Proxy reachable from this machine only.".to_string()
     } else if AppSettings::validate_listen_address(addr).is_ok() {
-        "Non-loopback. Proxy reachable from other hosts on this network.".to_string()
+        "Warning: non-loopback bind. The inbound proxy has no authentication and \
+         will accept connections from any host on this network."
+            .to_string()
     } else {
         format!("Invalid: {addr}")
     }

@@ -3661,7 +3661,6 @@ name = "v2ray-rs-core"
 version = "0.11.0"
 dependencies = [
  "chrono",
- "clap",
  "directories",
  "ipnet",
  "log",

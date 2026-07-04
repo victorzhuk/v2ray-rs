@@ -108,6 +108,12 @@ impl LatencySnapshot {
         entry.measured_at = measured_at;
     }
 
+    /// Drops samples whose node is no longer among `valid`, keeping the snapshot
+    /// from growing without bound as subscriptions and manual nodes churn.
+    pub fn retain_known(&mut self, valid: &std::collections::HashSet<ConnectionNodeRef>) {
+        self.samples.retain(|node_ref, _| valid.contains(node_ref));
+    }
+
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
@@ -121,6 +127,30 @@ impl Default for LatencySnapshot {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Every node reference that currently exists, enabled or not — the set the
+/// latency snapshot is pruned against so it can't grow without bound as
+/// subscriptions and manual nodes are added and removed.
+pub fn all_node_refs(
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+) -> std::collections::HashSet<ConnectionNodeRef> {
+    let mut set = std::collections::HashSet::new();
+    for sub in subscriptions {
+        for node in &sub.nodes {
+            set.insert(ConnectionNodeRef::Subscription {
+                subscription_id: sub.id,
+                node_id: node.id,
+            });
+        }
+    }
+    for manual in manual_nodes {
+        set.insert(ConnectionNodeRef::Manual {
+            node_id: manual.id,
+        });
+    }
+    set
 }
 
 pub struct ConnectionPlanner {
