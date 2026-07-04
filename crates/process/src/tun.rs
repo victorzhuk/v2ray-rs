@@ -61,6 +61,27 @@ pub fn run_path() -> PathBuf {
     PathBuf::from(RUN_BIN)
 }
 
+/// Resolves a helper binary to an absolute path beside the running executable,
+/// or `None` if it isn't there. Unlike [`helper_path`]/[`run_path`] it never
+/// falls back to a bare filename, so the result is safe to hand to a
+/// root-elevated `setcap`/`chown`/`chmod` (which resolve a relative argument
+/// against the process CWD, not `$PATH`).
+fn sibling_bin(name: &str) -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let candidate = exe.parent()?.join(name);
+    candidate.exists().then_some(candidate)
+}
+
+/// Absolute path to the route helper beside the running executable, if present.
+pub fn helper_path_strict() -> Option<PathBuf> {
+    sibling_bin(HELPER_BIN)
+}
+
+/// Absolute path to the SUID run wrapper beside the running executable, if present.
+pub fn run_path_strict() -> Option<PathBuf> {
+    sibling_bin(RUN_BIN)
+}
+
 /// Polls `/sys/class/net/<iface>` until the device exists or the timeout elapses.
 pub async fn wait_for_device(iface: &str, timeout: Duration) -> bool {
     let path = device_path(iface);

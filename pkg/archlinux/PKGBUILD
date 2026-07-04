@@ -34,7 +34,9 @@ build() {
 package() {
     cd "$pkgname-$pkgver"
     install -Dm755 "target/release/v2ray-rs-ui" "$pkgdir/usr/bin/v2ray-rs"
-    # Privileged TUN route helper; granted cap_net_admin in the install hook.
+    # Privileged TUN helpers. The install hook creates the `v2ray-rs` group,
+    # restricts these to it (netctl 0750 + cap_net_admin, run 4750 setuid), and
+    # creates the bypass user. Modes here are the pre-hook defaults.
     install -Dm755 "target/release/v2ray-rs-netctl" "$pkgdir/usr/bin/v2ray-rs-netctl"
     install -Dm4755 "target/release/v2ray-rs-run" "$pkgdir/usr/bin/v2ray-rs-run"
     install_icon "assets/v2ray-rs.svg" \

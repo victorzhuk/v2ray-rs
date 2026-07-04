@@ -91,7 +91,12 @@ pub async fn xray_up(
 pub async fn xray_down(handle: &Handle, iface: &str) -> Result<(), String> {
     del_xray_rules(handle).await;
 
-    if let Some(index) = link_index(handle, iface).await? {
+    // Only ever delete a TUN device. If the name resolves to something else
+    // (a bridge, a WireGuard link, a physical NIC) leave it alone — rules are
+    // still torn down above, which is all that's needed once the device is gone.
+    if crate::validate::is_tun_device(iface)
+        && let Some(index) = link_index(handle, iface).await?
+    {
         match handle.link().del(index).execute().await {
             Ok(()) => {}
             // The device may vanish between the lookup and the delete (e.g. the

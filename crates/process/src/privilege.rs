@@ -56,9 +56,22 @@ pub fn grant(backend: &Path, helper: &Path) -> Result<(), PrivilegeError> {
         });
     }
 
-    let wrapper_path = crate::tun::run_path();
-    let wrapper = wrapper_path.exists().then_some(wrapper_path.as_path());
-    let argv = grant_argv(backend, helper, wrapper);
+    // Resolve helper and wrapper to absolute sibling paths before handing them
+    // to a root-elevated setcap/chown/chmod. A bare or relative path would be
+    // resolved against the elevated process's CWD, so a planted file could be
+    // given caps or the setuid bit; refuse anything not found beside our exe.
+    let helper = if helper.is_absolute() {
+        helper.to_path_buf()
+    } else {
+        crate::tun::helper_path_strict().ok_or_else(|| {
+            PrivilegeError::Probe(
+                helper.to_path_buf(),
+                "route helper not found beside the executable".into(),
+            )
+        })?
+    };
+    let wrapper = crate::tun::run_path_strict();
+    let argv = grant_argv(backend, &helper, wrapper.as_deref());
     let status = Command::new("pkexec")
         .args(&argv)
         .status()

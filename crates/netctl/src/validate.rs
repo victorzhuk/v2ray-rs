@@ -16,6 +16,15 @@ pub fn validate_iface(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Reports whether `iface` is a TUN/TAP device. Only such devices expose the
+/// `tun_flags` sysfs attribute — `lo`, physical NICs, bridges, WireGuard and
+/// veth do not. Used to refuse operating on interfaces this helper did not
+/// create, so an unprivileged caller can't black-hole `lo` or delete another
+/// tunnel's link.
+pub fn is_tun_device(iface: &str) -> bool {
+    std::path::Path::new(&format!("/sys/class/net/{iface}/tun_flags")).exists()
+}
+
 /// Parses and validates a CIDR string into its address and prefix length.
 pub fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8), String> {
     let (ip_str, prefix_str) = cidr
@@ -47,6 +56,13 @@ mod tests {
         for bad in ["", "0123456789abcdef", "Tun0", "tun 0", "tun.0"] {
             assert!(validate_iface(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn rejects_non_tun_interfaces() {
+        // lo always exists but is not a TUN device; a missing name is also false.
+        assert!(!is_tun_device("lo"));
+        assert!(!is_tun_device("nonexistent-iface-xyz"));
     }
 
     #[test]

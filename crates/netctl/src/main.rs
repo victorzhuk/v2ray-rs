@@ -71,6 +71,12 @@ async fn run(cli: Cli) -> Result<(), String> {
             bypass_uid,
         } => {
             validate::validate_iface(&iface)?;
+            // The named device must be a TUN device the backend already created;
+            // refusing anything else stops an unprivileged caller from routing
+            // system traffic into lo or a physical NIC.
+            if !validate::is_tun_device(&iface) {
+                return Err(format!("refusing xray-up on {iface}: not a TUN device"));
+            }
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             let handle = net::connect()?;
