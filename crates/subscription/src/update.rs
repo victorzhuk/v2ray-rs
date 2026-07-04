@@ -97,22 +97,20 @@ pub async fn fetch_with_retry(
     url: &str,
     max_retries: u32,
 ) -> Result<String, FetchError> {
-    let mut last_error = None;
-
-    for attempt in 0..=max_retries {
+    let mut attempt = 0;
+    loop {
         match fetch_with_client(client, url).await {
             Ok(content) => return Ok(content),
             Err(e) => {
-                last_error = Some(e);
-                if attempt < max_retries {
-                    let delay = Duration::from_secs(1 << attempt);
-                    tokio::time::sleep(delay).await;
+                if attempt >= max_retries {
+                    return Err(e);
                 }
+                let delay = Duration::from_secs(1 << attempt);
+                tokio::time::sleep(delay).await;
+                attempt += 1;
             }
         }
     }
-
-    Err(last_error.unwrap())
 }
 
 pub async fn update_subscription(
