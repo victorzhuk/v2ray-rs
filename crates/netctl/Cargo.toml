@@ -12,6 +12,8 @@ rtnetlink.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 clap.workspace = true
+[dev-dependencies]
+v2ray-rs-core.workspace = true
 
 [features]
 # Privileged integration tests (network namespace); skipped by default and in `-short`.

@@ -14,6 +14,7 @@ pub use probe::{
 pub use singbox::SingboxGenerator;
 pub use v2ray::V2rayGenerator;
 pub use writer::ConfigWriter;
+pub use xray::XRAY_TUN_FWMARK;
 pub use xray::XrayGenerator;
 
 use crate::models::{

@@ -49,13 +49,6 @@ pub fn has_net_admin(path: &Path) -> Result<bool, PrivilegeError> {
 /// Grants the required capabilities to both binaries via a single `pkexec`
 /// elevation. Blocks until the polkit dialog completes.
 pub fn grant(backend: &Path, helper: &Path) -> Result<(), PrivilegeError> {
-    if !file_caps_supported(backend) {
-        return Err(PrivilegeError::Unsupported {
-            path: backend.to_path_buf(),
-            caps: BACKEND_CAPS.to_string(),
-        });
-    }
-
     // Resolve helper and wrapper to absolute sibling paths before handing them
     // to a root-elevated setcap/chown/chmod. A bare or relative path would be
     // resolved against the elevated process's CWD, so a planted file could be
@@ -71,6 +64,19 @@ pub fn grant(backend: &Path, helper: &Path) -> Result<(), PrivilegeError> {
         })?
     };
     let wrapper = crate::tun::run_path_strict();
+
+    // Preflight every binary the elevation touches: setcap and chmod u+s exit 0
+    // on a nosuid mount, so flag the offending path and its manual remedy before
+    // prompting for elevation.
+    for (path, caps) in preflight_targets(backend, &helper, wrapper.as_deref()) {
+        if !file_caps_supported(path) {
+            return Err(PrivilegeError::Unsupported {
+                path: path.to_path_buf(),
+                caps: caps.to_string(),
+            });
+        }
+    }
+
     let argv = grant_argv(backend, &helper, wrapper.as_deref());
     let status = Command::new("pkexec")
         .args(&argv)
@@ -131,6 +137,23 @@ fn getcap_has_cap(getcap_output: &str, cap: &str) -> bool {
     capset
         .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
         .any(|token| token == cap)
+}
+
+/// Ordered binaries the grant elevation touches, each paired with the caps
+/// string a manual `setcap` would need. The route helper and backend are always
+/// present; the optional SUID `v2ray-rs-run` wrapper is included only when it
+/// exists. The wrapper runs as root via setuid, so `cap_net_admin+ep` is a valid
+/// manual remedy when its mount refuses the setuid bit.
+fn preflight_targets<'a>(
+    backend: &'a Path,
+    helper: &'a Path,
+    wrapper: Option<&'a Path>,
+) -> Vec<(&'a Path, &'static str)> {
+    let mut targets = vec![(backend, BACKEND_CAPS), (helper, HELPER_CAPS)];
+    if let Some(wp) = wrapper {
+        targets.push((wp, HELPER_CAPS));
+    }
+    targets
 }
 
 /// Best-effort check that the filesystem holding `path` honors file
@@ -344,5 +367,24 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
                 .split(',')
                 .any(|o| o == "nosuid")
         );
+    }
+
+    #[test]
+    fn preflight_targets_includes_helper_and_optional_wrapper() {
+        let backend = Path::new("/usr/bin/xray");
+        let helper = Path::new("/usr/bin/v2ray-rs-netctl");
+        let wrapper = Path::new("/usr/lib/v2ray-rs/v2ray-rs-run");
+
+        let without_wrapper = preflight_targets(backend, helper, None);
+        assert_eq!(without_wrapper.len(), 2);
+        assert_eq!(without_wrapper[0].0, backend);
+        assert_eq!(without_wrapper[0].1, BACKEND_CAPS);
+        assert_eq!(without_wrapper[1].0, helper);
+        assert_eq!(without_wrapper[1].1, HELPER_CAPS);
+
+        let with_wrapper = preflight_targets(backend, helper, Some(wrapper));
+        assert_eq!(with_wrapper.len(), 3);
+        assert_eq!(with_wrapper[2].0, wrapper);
+        assert_eq!(with_wrapper[2].1, HELPER_CAPS);
     }
 }

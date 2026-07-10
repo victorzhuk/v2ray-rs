@@ -10,7 +10,7 @@ pub struct XrayGenerator;
 /// route helper installs a matching policy rule that diverts marked packets past
 /// the TUN table, so `direct` traffic egresses the real interface instead of
 /// looping back into the tunnel. Must match `XRAY_FWMARK` in the netctl crate.
-const XRAY_TUN_FWMARK: u32 = 255;
+pub const XRAY_TUN_FWMARK: u32 = 255;
 
 impl ConfigGenerator for XrayGenerator {
     fn generate(

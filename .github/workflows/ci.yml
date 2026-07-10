@@ -38,7 +38,7 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf
+        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf sing-box
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2

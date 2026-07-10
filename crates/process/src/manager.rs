@@ -208,16 +208,17 @@ impl ProcessManager {
 
     pub async fn stop(&mut self) -> Result<(), ProcessError> {
         if self.child.is_none() {
+            // A preflight failure or crash-budget exhaustion leaves the manager
+            // in Error with no child: drive it to Stopped so the state machine
+            // reaches a terminal state instead of parking in Error.
+            if matches!(self.state(), ProcessState::Error(_)) {
+                self.state.transition(ProcessState::Stopped, None)?;
+            }
             return Ok(());
         }
-
         self.state.transition(ProcessState::Stopping, None)?;
         self.graceful_stop().await;
-
-        // SIGTERM already let xray close its TUN fd (the kernel drops the
-        // device-scoped routes); run the helper teardown as a safeguard.
         self.teardown_tun().await;
-
         self.state.transition(ProcessState::Stopped, None)?;
         self.pid_file.remove().ok();
         Ok(())
@@ -229,12 +230,9 @@ impl ProcessManager {
         }
         self.start().await
     }
-
     pub async fn shutdown(&mut self) {
-        if self.child.is_some() {
-            self.auto_restart = false;
-            let _ = self.stop().await;
-        }
+        self.auto_restart = false;
+        let _ = self.stop().await;
     }
 
     pub fn check_orphaned(&self) -> std::io::Result<bool> {
@@ -662,5 +660,36 @@ mod tests {
         );
         assert!(matches!(mgr.state(), ProcessState::Error(_)));
         assert!(mgr.child.is_none(), "no backend should have been spawned");
+    }
+
+    #[tokio::test]
+    async fn stop_recovers_from_error_without_child() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        // A missing binary fails start() before any child spawns, leaving the
+        // manager in Error with no child — the state stop()/shutdown() must
+        // recover instead of no-oping.
+        let mut mgr = ProcessManager::new(
+            dir.path().join("nonexistent-binary"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        );
+
+        let result = mgr.start().await;
+        assert!(
+            matches!(result, Err(ProcessError::BinaryNotFound(_))),
+            "expected BinaryNotFound, got {result:?}"
+        );
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none());
+
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+
+        // stop() is idempotent on an already-Stopped manager.
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
     }
 }

@@ -3687,6 +3687,7 @@ dependencies = [
  "futures",
  "rtnetlink",
  "tokio",
+ "v2ray-rs-core",
 ]
 
 [[package]]

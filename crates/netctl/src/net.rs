@@ -18,7 +18,7 @@ const XRAY_ROUTE_TABLE: u32 = 2023;
 /// fwmark xray stamps on its own outbound sockets via `streamSettings.sockopt.mark`.
 /// The bypass rule below diverts marked packets to `main`, breaking the otherwise
 /// infinite `tun-in -> direct` loop. Must match `XRAY_TUN_FWMARK` in v2ray-rs-core.
-const XRAY_FWMARK: u32 = 255;
+pub const XRAY_FWMARK: u32 = 255;
 
 const RT_TABLE_MAIN: u32 = 254;
 
@@ -333,4 +333,19 @@ fn is_exists(err: &rtnetlink::Error) -> bool {
 
 fn is_no_such_device(err: &rtnetlink::Error) -> bool {
     matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(ENODEV))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::XRAY_FWMARK;
+    use v2ray_rs_core::config::XRAY_TUN_FWMARK;
+
+    /// Guards against the two fwmark constants drifting: xray stamps its own
+    /// outbound sockets with one value and the route helper's bypass rule
+    /// matches the other, so a mismatch silently loops direct traffic back into
+    /// the tunnel.
+    #[test]
+    fn fwmark_matches_core() {
+        assert_eq!(XRAY_FWMARK, XRAY_TUN_FWMARK);
+    }
 }
