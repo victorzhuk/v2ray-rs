@@ -31,7 +31,7 @@ pub struct SubscriptionsPage {
     testing_real_delay: HashMap<Uuid, u64>,
     real_delay_run_token: u64,
     expanded_subs: HashSet<Uuid>,
-    locked: bool,
+    active_node: Option<(Uuid, Uuid)>,
     backend_type: BackendType,
     binary_path: Option<std::path::PathBuf>,
     real_delay_settings: RealDelaySettings,
@@ -53,6 +53,7 @@ struct RenderState<'a> {
     real_delay_available: bool,
     real_delay_capability: &'a RealDelayCapability,
     locked: bool,
+    active_node: Option<(Uuid, Uuid)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -98,7 +99,7 @@ pub enum SubscriptionsMsg {
         real_delay_settings: RealDelaySettings,
     },
     ResetStorage,
-    SetLocked(bool),
+    SetActiveNode(Option<(Uuid, Uuid)>),
     ExpanderToggled(Uuid, bool),
 }
 
@@ -195,7 +196,7 @@ impl Component for SubscriptionsPage {
                     set_tooltip_text: Some("Add Subscription"),
                     add_css_class: "flat",
                     #[watch]
-                    set_sensitive: !(model.locked || model.load_error.is_some()),
+                    set_sensitive: model.load_error.is_none(),
                     connect_clicked[sender] => move |_| {
                         show_add_dialog(sender.clone());
                     },
@@ -263,7 +264,7 @@ impl Component for SubscriptionsPage {
             testing_real_delay: HashMap::new(),
             real_delay_run_token: 0,
             expanded_subs: HashSet::new(),
-            locked: false,
+            active_node: None,
             backend_type: settings.backend.backend_type,
             binary_path: settings.backend.binary_path.clone(),
             real_delay_settings: settings.real_delay.clone(),
@@ -285,7 +286,8 @@ impl Component for SubscriptionsPage {
                 real_delay_available: model.real_delay_settings.enabled
                     && model.backend_type.supports_real_delay(),
                 real_delay_capability: &model.real_delay_capability,
-                locked: model.locked || model.load_error.is_some(),
+                locked: model.load_error.is_some(),
+                active_node: model.active_node,
             },
         );
 
@@ -317,7 +319,7 @@ impl Component for SubscriptionsPage {
             && !matches!(
                 msg,
                 SubscriptionsMsg::ResetStorage
-                    | SubscriptionsMsg::SetLocked(_)
+                    | SubscriptionsMsg::SetActiveNode(_)
                     | SubscriptionsMsg::SyncSettings { .. }
             )
         {
@@ -668,8 +670,11 @@ impl Component for SubscriptionsPage {
                     Err(err) => report_subscription_persist_error(&sender, &err),
                 }
             }
-            SubscriptionsMsg::SetLocked(locked) => {
-                self.locked = locked;
+            SubscriptionsMsg::SetActiveNode(active) => {
+                if self.active_node == active {
+                    return;
+                }
+                self.active_node = active;
             }
             SubscriptionsMsg::ResetStorage => match self.store.reset_subscriptions() {
                 Ok(()) => {
@@ -774,7 +779,8 @@ impl Component for SubscriptionsPage {
                 real_delay_available: self.real_delay_settings.enabled
                     && self.backend_type.supports_real_delay(),
                 real_delay_capability: &self.real_delay_capability,
-                locked: self.locked || self.load_error.is_some(),
+                locked: self.load_error.is_some(),
+                active_node: self.active_node,
             },
         );
     }
@@ -996,7 +1002,8 @@ impl Component for SubscriptionsPage {
                 real_delay_available: self.real_delay_settings.enabled
                     && self.backend_type.supports_real_delay(),
                 real_delay_capability: &self.real_delay_capability,
-                locked: self.locked || self.load_error.is_some(),
+                locked: self.load_error.is_some(),
+                active_node: self.active_node,
             },
         );
     }
@@ -1296,7 +1303,15 @@ fn build_subscription_group(
     expander.add_suffix(&menu);
 
     for (idx, node) in sub.nodes.iter().enumerate() {
-        expander.add_row(&build_node_row(sub.id, idx, node, sender, state.locked));
+        let active = state.active_node == Some((sub.id, node.id));
+        expander.add_row(&build_node_row(
+            sub.id,
+            idx,
+            node,
+            sender,
+            state.locked,
+            active,
+        ));
     }
 
     expander
@@ -1641,6 +1656,7 @@ fn build_node_row(
     node: &v2ray_rs_core::models::SubscriptionNode,
     sender: &ComponentSender<SubscriptionsPage>,
     locked: bool,
+    active: bool,
 ) -> adw::ActionRow {
     let protocol = match &node.node {
         v2ray_rs_core::models::ProxyNode::Vless(_) => "VLESS",
@@ -1709,6 +1725,16 @@ fn build_node_row(
         .valign(gtk::Align::Center)
         .build();
     row.add_prefix(&badge);
+
+    if active {
+        let connected = gtk::Label::builder()
+            .label("Connected")
+            .css_classes(["caption", "success"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Currently connected node")
+            .build();
+        row.add_suffix(&connected);
+    }
 
     if let Some(ms) = node.last_latency_ms {
         let latency_label = gtk::Label::builder()

@@ -61,6 +61,10 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         let mut failures = Vec::new();
 
         for candidate in candidates {
+            if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
+                sender.emit(AppMsg::ProcessStateConnection(ProcessState::Stopped, None));
+                return;
+            }
             let candidate_label = candidate
                 .node
                 .remark()
@@ -102,10 +106,19 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 pid_path.clone(),
                 Some(geodata_dir.clone()),
             )
-            .with_tun(build_tun_runtime(&settings));
+            .with_tun(build_tun_runtime(&settings))
+            .with_backend(settings.backend.backend_type);
 
             match mgr.start_with_connection(Some(meta.clone())).await {
                 Ok(()) => {
+                    // A Disconnect clicked while the start was in flight sits
+                    // queued until here; honor it instead of flashing the UI
+                    // back to Connected with a dead handle.
+                    if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
+                        mgr.shutdown().await;
+                        sender.emit(AppMsg::ProcessStateConnection(ProcessState::Stopped, None));
+                        return;
+                    }
                     sender.emit(AppMsg::ProcessStateConnection(
                         ProcessState::Running,
                         Some(meta.clone()),
@@ -124,7 +137,12 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 loop {
                     match state_rx.recv().await {
                         Ok(ProcessEvent::StateChanged { to, connection, .. }) => {
-                            state_sender.emit(AppMsg::ProcessStateConnection(to, connection));
+                            // Terminal errors stay with the supervising loop,
+                            // which may fail over to the next candidate; only
+                            // it decides what the app finally sees.
+                            if !matches!(to, ProcessState::Error(_)) {
+                                state_sender.emit(AppMsg::ProcessStateConnection(to, connection));
+                            }
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -148,6 +166,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 }
             });
 
+            let mut stop_requested = false;
             loop {
                 tokio::select! {
                     Some(cmd) = cmd_rx.recv() => {
@@ -158,17 +177,29 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                             }
                         }
                     }
-                    result = mgr.wait_and_handle_exit() => {
+                    _ = mgr.wait_and_handle_exit() => {
                         // The manager restarts in place on an unexpected exit; if
-                        // it came back Running keep supervising, otherwise the
-                        // session is terminal (clean stop or crash give-up).
-                        match result {
-                            Ok(_) | Err(_) if mgr.state() == ProcessState::Running => {}
-                            _ => return,
+                        // it came back Running keep supervising. A crash give-up
+                        // (Error) falls through to the next candidate; anything
+                        // else is a requested stop.
+                        match mgr.state() {
+                            ProcessState::Running => {}
+                            ProcessState::Error(msg) => {
+                                failures.push(format!("{candidate_label}: {msg}"));
+                                break;
+                            }
+                            _ => {
+                                stop_requested = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
+            if stop_requested {
+                return;
+            }
+            mgr.shutdown().await;
         }
 
         let msg = summarize_failures(&failures);

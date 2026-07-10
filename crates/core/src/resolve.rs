@@ -146,9 +146,7 @@ pub fn all_node_refs(
         }
     }
     for manual in manual_nodes {
-        set.insert(ConnectionNodeRef::Manual {
-            node_id: manual.id,
-        });
+        set.insert(ConnectionNodeRef::Manual { node_id: manual.id });
     }
     set
 }

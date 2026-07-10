@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
-    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
-    TunConfig, VlessConfig, VmessConfig, WsSettings,
+    AppSettings, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings,
+    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
+    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -39,7 +39,10 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
     });
 
     if settings.dns.enabled {
-        config["dns"] = build_dns(rules, settings);
+        config["dns"] = build_dns(rules, settings, &first_proxy_tag);
+        if let Some(resolver) = default_domain_resolver_tag(settings) {
+            config["route"]["default_domain_resolver"] = json!(resolver);
+        }
     }
 
     if settings.tun.enabled {
@@ -47,6 +50,16 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
     }
 
     config
+}
+
+fn default_domain_resolver_tag(settings: &AppSettings) -> Option<String> {
+    settings
+        .dns
+        .servers
+        .iter()
+        .find(|s| s.address.parse::<std::net::IpAddr>().is_ok())
+        .or_else(|| settings.dns.servers.first())
+        .map(|s| s.tag.clone())
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
@@ -82,8 +95,6 @@ fn build_tun_inbound(tun: &TunConfig) -> Value {
         "auto_route": true,
         "strict_route": tun.strict_route,
         "stack": tun.stack,
-        "dns_mode": tun.dns_hijack,
-        "sniff": true,
     });
 
     if !tun.exclude_routes.is_empty() {
@@ -272,7 +283,7 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
     out["tls"] = tls_obj;
 }
 
-fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
+fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &str) -> Value {
     let mut dns_config = json!({});
 
     let strategy_str = match settings.dns.strategy {
@@ -286,9 +297,9 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     let mut servers: Vec<Value> = Vec::new();
 
     if !settings.dns.hosts.is_empty() {
-        let mut entries = serde_json::Map::new();
+        let mut predefined = serde_json::Map::new();
         for host in &settings.dns.hosts {
-            entries
+            predefined
                 .entry(host.domain.clone())
                 .or_insert_with(|| json!([]))
                 .as_array_mut()
@@ -298,7 +309,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         servers.push(json!({
             "tag": "hosts",
             "type": "hosts",
-            "entries": entries,
+            "predefined": predefined,
         }));
     }
 
@@ -325,7 +336,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
                 "type": "https",
                 "server": server_cfg.address,
                 "server_port": port,
-                "path": ["/dns-query"],
+                "path": "/dns-query",
             }),
             DnsProtocol::Dot => json!({
                 "tag": server_cfg.tag,
@@ -348,7 +359,11 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         };
 
         if let Some(ref detour) = server_cfg.detour {
-            server["detour"] = json!(detour);
+            server["detour"] = if detour == "direct" {
+                json!(detour)
+            } else {
+                json!(first_proxy_tag)
+            };
         }
 
         if let Some(ref client_subnet) = settings.dns.client_subnet {
@@ -358,23 +373,16 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         servers.push(server);
     }
 
-    let mut final_server = None;
     if settings.dns.fakeip.enabled {
         servers.push(json!({
             "tag": "fakeip",
             "type": "fakeip",
-        }));
-
-        dns_config["fakeip"] = json!({
-            "enabled": true,
             "inet4_range": settings.dns.fakeip.inet4_range,
             "inet6_range": settings.dns.fakeip.inet6_range,
-        });
-
-        final_server = Some("fakeip".to_string());
+        }));
     }
 
-    let final_server = final_server.or_else(|| settings.dns.servers.first().map(|s| s.tag.clone()));
+    let final_server = settings.dns.servers.first().map(|s| s.tag.clone());
     dns_config["final"] = json!(final_server);
 
     dns_config["servers"] = json!(servers);
@@ -402,7 +410,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         }
     }
 
-    let dns_rules: Vec<Value> = if settings.dns.use_custom_rules {
+    let mut dns_rules: Vec<Value> = if settings.dns.use_custom_rules {
         let custom: Vec<Value> = settings
             .dns
             .rules
@@ -465,6 +473,20 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
         all
     };
 
+    if !settings.dns.hosts.is_empty() {
+        let host_domains: Vec<&str> = settings
+            .dns
+            .hosts
+            .iter()
+            .map(|h| h.domain.as_str())
+            .collect();
+        dns_rules.insert(0, json!({ "domain": host_domains, "server": "hosts" }));
+    }
+
+    if settings.dns.fakeip.enabled {
+        dns_rules.push(json!({ "query_type": ["A", "AAAA"], "server": "fakeip" }));
+    }
+
     dns_config["rules"] = json!(dns_rules);
 
     if settings.dns.disable_cache {
@@ -480,6 +502,17 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
     let mut route_rules: Vec<Value> = Vec::new();
 
     if settings.tun.enabled {
+        route_rules.push(json!({
+            "inbound": ["tun-in"],
+            "action": "sniff",
+        }));
+        if settings.dns.enabled && settings.tun.dns_hijack == DnsHijackMode::Hijack {
+            route_rules.push(json!({
+                "protocol": "dns",
+                "action": "hijack-dns",
+            }));
+        }
+
         if !settings.tun.exclude_processes.is_empty() {
             route_rules.push(json!({
                 "process_name": &settings.tun.exclude_processes,
@@ -686,10 +719,64 @@ mod tests {
         assert_eq!(tun["stack"], "system");
         assert_eq!(tun["strict_route"], true);
         assert_eq!(tun["interface_name"], "tun0");
-        assert_eq!(tun["dns_mode"], "hijack");
-        assert_eq!(tun["sniff"], true);
+        assert!(
+            tun.get("dns_mode").is_none(),
+            "dns_mode removed in sing-box 1.13+"
+        );
+        assert!(
+            tun.get("sniff").is_none(),
+            "legacy sniff field removed in sing-box 1.13.0"
+        );
 
         assert_eq!(config["route"]["auto_detect_interface"], true);
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[0]["inbound"], json!(["tun-in"]));
+        assert_eq!(route_rules[0]["action"], "sniff");
+    }
+
+    #[test]
+    fn test_singbox_tun_hijack_dns_rule_when_dns_enabled_and_hijack_mode() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[0]["action"], "sniff");
+        assert_eq!(route_rules[1]["protocol"], "dns");
+        assert_eq!(route_rules[1]["action"], "hijack-dns");
+    }
+
+    #[test]
+    fn test_singbox_no_hijack_dns_rule_when_dns_disabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert!(!route_rules.iter().any(|r| r["action"] == "hijack-dns"));
+    }
+
+    #[test]
+    fn test_singbox_no_hijack_dns_rule_when_hijack_mode_native() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.tun.dns_hijack = DnsHijackMode::Native;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert!(!route_rules.iter().any(|r| r["action"] == "hijack-dns"));
     }
 
     #[test]
@@ -911,6 +998,51 @@ mod tests {
     }
 
     #[test]
+    fn test_dns_default_domain_resolver_picks_ip_literal_server() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "domain-server".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "dns.google".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "ip-server".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "8.8.8.8".to_string(),
+                port: None,
+                detour: None,
+            },
+        ];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        assert_eq!(config["route"]["default_domain_resolver"], "ip-server");
+    }
+
+    #[test]
+    fn test_dns_default_domain_resolver_falls_back_to_first_server() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domain-server".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "dns.google".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        assert_eq!(config["route"]["default_domain_resolver"], "domain-server");
+    }
+
+    #[test]
     fn test_dns_tcp_server() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
@@ -952,7 +1084,7 @@ mod tests {
         assert_eq!(doh_server["type"], "https");
         assert_eq!(doh_server["server"], "cloudflare-dns.com");
         assert_eq!(doh_server["server_port"], 443);
-        assert_eq!(doh_server["path"], json!(["/dns-query"]));
+        assert_eq!(doh_server["path"], "/dns-query");
     }
 
     #[test]
@@ -1055,15 +1187,29 @@ mod tests {
         let generator = SingboxGenerator;
         let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
-        assert_eq!(config["dns"]["fakeip"]["enabled"], true);
-        assert_eq!(config["dns"]["fakeip"]["inet4_range"], "198.18.0.0/16");
-        assert_eq!(config["dns"]["fakeip"]["inet6_range"], "fc00::/16");
+        assert!(
+            config["dns"].get("fakeip").is_none(),
+            "legacy top-level dns.fakeip block deprecated in sing-box 1.12.0"
+        );
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let fakeip_server = servers.iter().find(|s| s["tag"] == "fakeip").unwrap();
         assert_eq!(fakeip_server["type"], "fakeip");
+        assert_eq!(fakeip_server["inet4_range"], "198.18.0.0/16");
+        assert_eq!(fakeip_server["inet6_range"], "fc00::/16");
 
-        assert_eq!(config["dns"]["final"], "fakeip");
+        assert_ne!(
+            config["dns"]["final"], "fakeip",
+            "a fakeip server cannot be the default resolver"
+        );
+        assert_eq!(config["dns"]["final"], settings.dns.servers[0].tag);
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let fakeip_rule = dns_rules
+            .iter()
+            .find(|r| r["server"] == "fakeip")
+            .expect("fakeip query_type rule not found");
+        assert_eq!(fakeip_rule["query_type"], json!(["A", "AAAA"]));
     }
 
     #[test]
@@ -1088,8 +1234,18 @@ mod tests {
         let hosts_server = servers.iter().find(|s| s["tag"] == "hosts").unwrap();
 
         assert_eq!(hosts_server["type"], "hosts");
-        assert_eq!(hosts_server["entries"]["example.com"], json!(["192.0.2.1"]));
-        assert_eq!(hosts_server["entries"]["test.local"], json!(["192.0.2.2"]));
+        assert_eq!(
+            hosts_server["predefined"]["example.com"],
+            json!(["192.0.2.1"])
+        );
+        assert_eq!(
+            hosts_server["predefined"]["test.local"],
+            json!(["192.0.2.2"])
+        );
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        assert_eq!(dns_rules[0]["server"], "hosts");
+        assert_eq!(dns_rules[0]["domain"], json!(["example.com", "test.local"]));
     }
 
     #[test]
@@ -1155,7 +1311,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_server_detour() {
+    fn test_dns_server_detour_resolves_legacy_sentinel_to_real_outbound_tag() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
         settings.dns.servers = vec![DnsServerConfig {
@@ -1171,7 +1327,27 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let proxy_dns = servers.iter().find(|s| s["tag"] == "proxy-dns").unwrap();
-        assert_eq!(proxy_dns["detour"], "proxy-0");
+        assert_eq!(proxy_dns["detour"], "proxy-0-Test SS");
+    }
+
+    #[test]
+    fn test_dns_server_detour_direct_passes_through() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "direct-dns".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "223.5.5.5".to_string(),
+            port: None,
+            detour: Some("direct".to_string()),
+        }];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let direct_dns = servers.iter().find(|s| s["tag"] == "direct-dns").unwrap();
+        assert_eq!(direct_dns["detour"], "direct");
     }
 
     #[test]
@@ -1288,25 +1464,31 @@ mod tests {
             .find(|s| s["tag"] == "hosts")
             .expect("hosts server not found");
         assert_eq!(hosts_server["type"], "hosts");
-        assert_eq!(hosts_server["entries"]["example.com"], json!(["192.0.2.1"]));
-        assert_eq!(hosts_server["entries"]["test.local"], json!(["10.0.0.1"]));
+        assert_eq!(
+            hosts_server["predefined"]["example.com"],
+            json!(["192.0.2.1"])
+        );
+        assert_eq!(
+            hosts_server["predefined"]["test.local"],
+            json!(["10.0.0.1"])
+        );
 
         let fakeip_server = servers
             .iter()
             .find(|s| s["tag"] == "fakeip")
             .expect("fakeip server not found");
         assert_eq!(fakeip_server["type"], "fakeip");
-
-        assert_eq!(dns["fakeip"]["enabled"], true);
-        assert_eq!(dns["fakeip"]["inet4_range"], "198.18.0.0/16");
-        assert_eq!(dns["fakeip"]["inet6_range"], "fc00::/16");
-        assert_eq!(dns["final"], "fakeip");
+        assert_eq!(fakeip_server["inet4_range"], "198.18.0.0/16");
+        assert_eq!(fakeip_server["inet6_range"], "fc00::/16");
+        assert!(dns.get("fakeip").is_none());
+        assert_eq!(dns["final"], "cloudflare");
 
         let cloudflare = servers
             .iter()
             .find(|s| s["tag"] == "cloudflare")
             .expect("cloudflare server not found");
         assert_eq!(cloudflare["client_subnet"], "203.0.113.1");
+        assert_eq!(cloudflare["detour"], "proxy-0-Test SS");
 
         let google = servers
             .iter()
@@ -1315,7 +1497,12 @@ mod tests {
         assert_eq!(google["client_subnet"], "203.0.113.1");
 
         let dns_rules = dns["rules"].as_array().unwrap();
-        assert_eq!(dns_rules.len(), 2);
+        assert_eq!(dns_rules.len(), 4);
+        assert_eq!(dns_rules[0]["server"], "hosts");
+        assert_eq!(dns_rules[3]["server"], "fakeip");
+        assert_eq!(dns_rules[3]["query_type"], json!(["A", "AAAA"]));
+
+        assert_eq!(config["route"]["default_domain_resolver"], "cloudflare");
 
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();
@@ -1331,9 +1518,12 @@ mod tests {
         let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let rules = config["route"]["rules"].as_array().unwrap();
-        let first = &rules[0];
-        assert_eq!(first["process_name"], json!(["cloudflared"]));
-        assert_eq!(first["outbound"], "direct");
+        let process_rule = rules
+            .iter()
+            .find(|r| r.get("process_name").is_some())
+            .expect("process_name route rule not found");
+        assert_eq!(process_rule["process_name"], json!(["cloudflared"]));
+        assert_eq!(process_rule["outbound"], "direct");
     }
 
     #[test]
@@ -1347,9 +1537,12 @@ mod tests {
         let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
         let rules = config["route"]["rules"].as_array().unwrap();
-        let first = &rules[0];
-        assert_eq!(first["domain_suffix"], json!(["example.com"]));
-        assert_eq!(first["outbound"], "direct");
+        let domain_rule = rules
+            .iter()
+            .find(|r| r.get("domain_suffix").is_some())
+            .expect("domain_suffix route rule not found");
+        assert_eq!(domain_rule["domain_suffix"], json!(["example.com"]));
+        assert_eq!(domain_rule["outbound"], "direct");
 
         let dns_rules = config["dns"]["rules"].as_array().unwrap();
         let dns_first = dns_rules

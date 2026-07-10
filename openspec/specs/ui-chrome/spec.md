@@ -65,3 +65,17 @@ The main window SHALL reuse the restart-required banner for connected manual-nod
 #### Scenario: Discard connected manual-node change
 - **WHEN** the user selects `Discard` after connected manual-node changes
 - **THEN** the banner is dismissed and the persisted manual-node set returns to the launched snapshot
+
+### Requirement: Live subscription editing while connected
+Subscription and node controls (toggles, reorder, add, menu actions) SHALL remain enabled while the backend is starting or running; connected changes SHALL be persisted without interrupting the running session and SHALL reuse the restart-required banner.
+
+#### Scenario: Toggle a subscription node while connected
+- **WHEN** the backend is connected and the user toggles, reorders, adds, or removes subscription nodes or subscriptions
+- **THEN** the change is persisted, the running connection stays up, and the restart-required banner offers `Apply & Restart`
+
+### Requirement: Active node indicator
+The subscription and manual node lists SHALL mark the currently connected node while the backend is running.
+
+#### Scenario: Connected node marked in the list
+- **WHEN** the backend reaches Running with a resolved node
+- **THEN** the corresponding row shows a `Connected` tag, which is removed when the session ends or the connection switches nodes

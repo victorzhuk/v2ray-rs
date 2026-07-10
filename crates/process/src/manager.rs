@@ -10,16 +10,19 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use crate::log_buffer::{LogBuffer, LogLine};
+use crate::log_buffer::{LogBuffer, LogLine, LogSource};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, TunRuntime};
-use v2ray_rs_core::models::ConnectionMetadata;
+use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(2);
 const MAX_CRASHES: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
+const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+const LOG_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
+const REASON_MAX_CHARS: usize = 200;
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -41,6 +44,8 @@ pub enum ProcessError {
     TunDeviceTimeout(String),
     #[error("TUN route helper failed: {0}")]
     TunHelper(String),
+    #[error("config rejected by backend: {0}")]
+    ConfigCheck(String),
 }
 
 pub struct ProcessManager {
@@ -56,6 +61,7 @@ pub struct ProcessManager {
     log_handles: Vec<tokio::task::JoinHandle<()>>,
     current_connection: Option<ConnectionMetadata>,
     tun: Option<TunRuntime>,
+    backend: Option<BackendType>,
 }
 
 impl ProcessManager {
@@ -78,12 +84,19 @@ impl ProcessManager {
             log_handles: Vec::new(),
             current_connection: None,
             tun: None,
+            backend: None,
         }
     }
 
     /// Attaches TUN runtime details so start/stop become TUN-aware.
     pub fn with_tun(mut self, tun: Option<TunRuntime>) -> Self {
         self.tun = tun;
+        self
+    }
+
+    /// Enables the pre-spawn config check using the backend's own validator.
+    pub fn with_backend(mut self, backend: BackendType) -> Self {
+        self.backend = Some(backend);
         self
     }
 
@@ -170,6 +183,15 @@ impl ProcessManager {
         self.state
             .transition(ProcessState::Starting, connection.clone())?;
 
+        // Fail fast on a config the backend itself rejects, instead of burning
+        // the crash-restart budget on immediate exits.
+        if let Err(e) = self.check_config().await {
+            let _ = self
+                .state
+                .transition(ProcessState::Error(e.to_string()), None);
+            return Err(e);
+        }
+
         match self.spawn_process().await {
             Ok(()) => {
                 self.state.transition(ProcessState::Running, connection)?;
@@ -226,7 +248,7 @@ impl ProcessManager {
         let status = match child.wait().await {
             Ok(status) => status,
             Err(err) => {
-                self.cleanup_after_exit();
+                self.cleanup_after_exit().await;
                 let error = ProcessError::Wait(err);
                 let _ = self
                     .state
@@ -236,7 +258,7 @@ impl ProcessManager {
         };
         let exit_code = status.code();
 
-        self.cleanup_after_exit();
+        self.cleanup_after_exit().await;
 
         self.state.emit(ProcessEvent::ProcessExited { exit_code });
 
@@ -287,6 +309,55 @@ impl ProcessManager {
         }
 
         Ok(())
+    }
+
+    async fn check_config(&self) -> Result<(), ProcessError> {
+        let Some(backend) = self.backend else {
+            return Ok(());
+        };
+        let args: &[&str] = match backend {
+            BackendType::SingBox => &["check", "-c"],
+            BackendType::Xray => &["run", "-test", "-c"],
+            BackendType::V2ray => &["test", "-c"],
+        };
+        let binary_path = self.binary_path.clone();
+        let config_path = self.config_path.clone();
+        let geodata_dir = self.geodata_dir.clone();
+        let child = crate::spawn::spawn_with_etxtbsy_retry(move || {
+            let mut cmd = Command::new(&binary_path);
+            cmd.args(args)
+                .arg(&config_path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
+            if let Some(dir) = &geodata_dir {
+                cmd.env("V2RAY_LOCATION_ASSET", dir);
+                cmd.env("XRAY_LOCATION_ASSET", dir);
+            }
+            cmd
+        })
+        .await
+        .map_err(ProcessError::Spawn)?;
+
+        let output =
+            match tokio::time::timeout(CONFIG_CHECK_TIMEOUT, child.wait_with_output()).await {
+                Err(_) => return Err(ProcessError::ConfigCheck("config check timed out".into())),
+                Ok(Err(e)) => return Err(ProcessError::Spawn(e)),
+                Ok(Ok(output)) => output,
+            };
+        if output.status.success() {
+            return Ok(());
+        }
+
+        // xray prints test failures to stdout, sing-box and v2ray to stderr.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let reason = last_nonempty_line(&stderr)
+            .or_else(|| last_nonempty_line(&stdout))
+            .map(truncate_reason)
+            .unwrap_or_else(|| format!("exit code {:?}", output.status.code()));
+        Err(ProcessError::ConfigCheck(reason))
     }
 
     // Retry on ETXTBSY which can occur on overlayfs (Docker containers)
@@ -364,14 +435,17 @@ impl ProcessManager {
             child.wait().await.ok();
         }
 
-        self.cleanup_after_exit();
+        self.cleanup_after_exit().await;
     }
 
     async fn handle_unexpected_exit(&mut self, exit_code: Option<i32>) {
-        let msg = match exit_code {
+        let mut msg = match exit_code {
             Some(code) => format!("process exited with code {code}"),
             None => "process killed by signal".into(),
         };
+        if let Some(reason) = self.last_output_line() {
+            msg = format!("{msg}: {reason}");
+        }
 
         // Reaching here means the backend died while we still expected it
         // Running: stop() moves state to Stopping before killing, so a requested
@@ -422,12 +496,47 @@ impl ProcessManager {
         }
     }
 
-    fn cleanup_after_exit(&mut self) {
+    async fn cleanup_after_exit(&mut self) {
         self.child = None;
         self.pid_file.remove().ok();
+        // Child exit closed the pipes: let the readers drain what's left so the
+        // crash reason reaches the buffer before it is read back.
         for handle in self.log_handles.drain(..) {
-            handle.abort();
+            let abort = handle.abort_handle();
+            if tokio::time::timeout(LOG_DRAIN_TIMEOUT, handle)
+                .await
+                .is_err()
+            {
+                abort.abort();
+            }
         }
+    }
+
+    /// Last non-empty captured line, preferring stderr over stdout.
+    fn last_output_line(&self) -> Option<String> {
+        let buffer = self.log_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let lines = buffer.last_n(50);
+        let pick = |source: LogSource| {
+            lines
+                .iter()
+                .rev()
+                .find(|l| l.source == source && !l.content.trim().is_empty())
+                .map(|l| truncate_reason(l.content.trim()))
+        };
+        pick(LogSource::Stderr).or_else(|| pick(LogSource::Stdout))
+    }
+}
+
+fn last_nonempty_line(text: &str) -> Option<&str> {
+    text.lines().rev().map(str::trim).find(|l| !l.is_empty())
+}
+
+fn truncate_reason(line: &str) -> String {
+    if line.chars().count() > REASON_MAX_CHARS {
+        let cut: String = line.chars().take(REASON_MAX_CHARS).collect();
+        format!("{cut}…")
+    } else {
+        line.to_string()
     }
 }
 
@@ -452,6 +561,72 @@ mod tests {
     use super::*;
     use crate::tun::TunRuntime;
     use v2ray_rs_core::models::BackendType;
+
+    fn write_script(dir: &std::path::Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("backend");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn manager_for(dir: &tempfile::TempDir, script_body: &str) -> ProcessManager {
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let binary = write_script(dir.path(), script_body);
+        ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
+    }
+
+    #[tokio::test]
+    async fn config_check_failure_prevents_spawn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            "if [ \"$1\" = check ]; then echo 'FATAL bad dns config' >&2; exit 1; fi\nexec sleep 30\n",
+        )
+        .with_backend(BackendType::SingBox);
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(result, Err(ProcessError::ConfigCheck(_))),
+            "expected ConfigCheck error, got {result:?}"
+        );
+        match mgr.state() {
+            ProcessState::Error(msg) => assert!(msg.contains("FATAL bad dns config"), "{msg}"),
+            other => panic!("expected Error state, got {other:?}"),
+        }
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
+    }
+
+    #[tokio::test]
+    async fn config_check_success_starts_backend() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "[ \"$1\" = check ] && exit 0\nexec sleep 30\n")
+            .with_backend(BackendType::SingBox);
+
+        mgr.start_with_connection(None).await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn crash_error_includes_last_stderr_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "echo 'fatal: tls handshake exploded' >&2\nexit 3\n");
+        mgr.set_auto_restart(false);
+
+        mgr.start_with_connection(None).await.unwrap();
+        let code = mgr.wait_and_handle_exit().await.unwrap();
+        assert_eq!(code, Some(3));
+        match mgr.state() {
+            ProcessState::Error(msg) => {
+                assert!(msg.contains("code 3"), "{msg}");
+                assert!(msg.contains("tls handshake exploded"), "{msg}");
+            }
+            other => panic!("expected Error state, got {other:?}"),
+        }
+    }
 
     #[tokio::test]
     async fn tun_start_refuses_without_capability() {

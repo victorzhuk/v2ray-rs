@@ -142,6 +142,8 @@ pub struct AppSettings {
     pub http_port: u16,
     #[serde(default = "default_listen_address")]
     pub listen_address: String,
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u32,
     #[serde(default, deserialize_with = "deserialize_auto_resolve_strategy")]
     pub auto_resolve_strategy: AutoResolveStrategy,
     #[serde(default)]
@@ -164,6 +166,10 @@ pub struct AppSettings {
 
 pub fn default_listen_address() -> String {
     "127.0.0.1".to_string()
+}
+
+pub fn default_idle_timeout_secs() -> u32 {
+    600
 }
 
 impl AppSettings {
@@ -212,6 +218,7 @@ impl Default for AppSettings {
             socks_port: 1080,
             http_port: 1081,
             listen_address: default_listen_address(),
+            idle_timeout_secs: default_idle_timeout_secs(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             last_success: None,
             auto_update_subscriptions: true,

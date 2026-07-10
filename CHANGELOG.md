@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Generated sing-box configs now pass `sing-box check` on 1.12/1.13 instead of being rejected on launch. The TUN inbound no longer emits the legacy `sniff`/`dns_mode` fields (removed in sing-box 1.13.0) — sniffing and DNS hijacking are now expressed as route rules. DoH servers send `path` as a string instead of an array, static host overrides use the current `predefined` field and are actually consulted via a DNS rule, and `route.default_domain_resolver` is set whenever DNS is enabled, which sing-box now requires with more than one server. A DNS server's `detour` (previously the placeholder `"proxy-0"`, which never matched a real outbound tag) now resolves to the actual first proxy outbound. FakeIP moved off the legacy top-level `dns.fakeip` block onto the fakeip server entry itself, with a DNS rule routing A/AAAA queries to it instead of setting it as the default resolver (which sing-box now rejects).
+- DNS settings can no longer be saved enabled with zero servers configured, which produced an unusable config since FakeIP alone cannot answer real queries.
+- "Apply & Restart" and switching the auto-resolve strategy while connected now actually reconnect. The disconnect handler cleared the pending-reconnect flag before it was read, so both flows silently stayed disconnected until a manual Connect.
+- When a crashing node exhausts its restart budget mid-session, the connection now fails over to the next candidate in the resolved list instead of giving up; the summarized error only surfaces after every candidate has failed.
+- A connection error now carries the backend's own last log line (e.g. the actual xray startup failure) instead of just "process exited with code N", and log readers drain the pipes on exit so that line isn't lost.
+- The generated config is validated with the backend's own checker (`sing-box check`, `xray run -test`, `v2ray test`) before spawning, so a rejected config fails fast with the real reason instead of burning the crash-restart budget on instant exits.
+- Clicking Disconnect while a connection is still starting no longer flips the UI back to "Connected" against a dead session; the stop is honored as soon as the start attempt settles.
+- App startup no longer freezes the window for up to ~6.5s while reaping an orphaned backend and recovering leftover TUN routes; both now run in the background.
+- A corrupt TUN session marker is logged and discarded instead of silently disabling the route-recovery pass on every subsequent launch.
+
+### Added
+- Idle connection timeout setting (Network → Proxy Ports, default 600s). Generated xray/v2ray configs now set `policy.levels.0.connIdle` accordingly; previously every config ran with the backend's stock 300s, which silently killed long-idle streams such as SSE/streaming API connections.
+- Subscriptions and nodes can now be edited while connected — toggles, reordering, and adding no longer require disconnecting first. Changes are persisted immediately and the existing "Configuration changed" banner offers Apply & Restart; the running session is untouched until then.
+- The currently connected node is marked with a "Connected" tag in the subscription and manual node lists.
+
 ---
 
 ## [0.12.0] - 2026-07-04

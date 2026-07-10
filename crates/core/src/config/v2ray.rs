@@ -43,6 +43,11 @@ pub(crate) fn generate_v2ray_family_config(
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let mut config = json!({
         "log": { "loglevel": "warning" },
+        // Partial policy is valid; omitted timers keep backend defaults.
+        // Without it xray's stock connIdle (300s) kills long-idle streams.
+        "policy": {
+            "levels": { "0": { "connIdle": settings.idle_timeout_secs } }
+        },
         "inbounds": build_inbounds(settings, dns_backend),
         "outbounds": build_outbounds(nodes),
         "routing": build_routing(rules, &first_proxy_tag, settings, dns_backend),
@@ -603,6 +608,17 @@ mod tests {
         assert!(config["inbounds"].is_array());
         assert!(config["outbounds"].is_array());
         assert!(config["routing"].is_object());
+    }
+
+    #[test]
+    fn test_policy_conn_idle_from_settings() {
+        let mut settings = default_settings();
+        settings.idle_timeout_secs = 900;
+
+        for backend in [V2rayFamilyBackend::V2ray, V2rayFamilyBackend::Xray] {
+            let config = generate_v2ray_family_config(&[vless_node()], &[], &settings, backend);
+            assert_eq!(config["policy"]["levels"]["0"]["connIdle"], 900);
+        }
     }
 
     fn find_tun_inbound(config: &Value) -> Option<&Value> {

@@ -15,6 +15,7 @@ pub struct NodesPage {
     nodes: Vec<ManualNode>,
     list_container: gtk::ListBox,
     load_error: Option<String>,
+    active_node: Option<Uuid>,
 }
 
 #[derive(Debug)]
@@ -33,6 +34,7 @@ pub enum NodesMsg {
     UpdateNode(Uuid, ProxyNode),
     ImportFromUrl(String),
     ResetStorage,
+    SetActiveNode(Option<Uuid>),
 }
 
 #[derive(Clone, Copy)]
@@ -692,9 +694,10 @@ impl Component for NodesPage {
             nodes,
             list_container: list_container.clone(),
             load_error,
+            active_node: None,
         };
 
-        render_list(&model.nodes, &list_container, &sender);
+        render_list(&model.nodes, &list_container, &sender, None);
 
         let widgets = view_output!();
         ComponentParts { model, widgets }
@@ -796,13 +799,19 @@ impl Component for NodesPage {
                     log::error!("reset manual nodes: {err}");
                 }
             },
+            NodesMsg::SetActiveNode(active) => {
+                if self.active_node == active {
+                    return;
+                }
+                self.active_node = active;
+            }
         }
 
         emit_active_nodes(&self.nodes, &sender);
         if changed {
             let _ = sender.output(NodesOutput::NodesChanged);
         }
-        render_list(&self.nodes, &self.list_container, &sender);
+        render_list(&self.nodes, &self.list_container, &sender, self.active_node);
     }
 }
 
@@ -820,6 +829,7 @@ fn render_list(
     nodes: &[ManualNode],
     container: &gtk::ListBox,
     sender: &ComponentSender<NodesPage>,
+    active_node: Option<Uuid>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
@@ -841,12 +851,16 @@ fn render_list(
     }
 
     for node in nodes {
-        let node_row = build_node_row(node, sender);
+        let node_row = build_node_row(node, sender, active_node == Some(node.id));
         container.append(&node_row);
     }
 }
 
-fn build_node_row(node: &ManualNode, sender: &ComponentSender<NodesPage>) -> adw::ActionRow {
+fn build_node_row(
+    node: &ManualNode,
+    sender: &ComponentSender<NodesPage>,
+    active: bool,
+) -> adw::ActionRow {
     let protocol = match &node.node {
         ProxyNode::Vless(_) => "VLESS",
         ProxyNode::Vmess(_) => "VMESS",
@@ -872,6 +886,16 @@ fn build_node_row(node: &ManualNode, sender: &ComponentSender<NodesPage>) -> adw
         .valign(gtk::Align::Center)
         .build();
     row.add_prefix(&badge);
+
+    if active {
+        let connected = gtk::Label::builder()
+            .label("Connected")
+            .css_classes(["caption", "success"])
+            .valign(gtk::Align::Center)
+            .tooltip_text("Currently connected node")
+            .build();
+        row.add_suffix(&connected);
+    }
 
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")

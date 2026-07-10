@@ -25,8 +25,23 @@ pub fn load_tun_session(paths: &AppPaths) -> Option<TunSession> {
     if !path.exists() {
         return None;
     }
-    let contents = read_file(&path).ok()?;
-    serde_json::from_str(&contents).ok()
+    let contents = match read_file(&path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            log::warn!("read tun session marker: {err}");
+            return None;
+        }
+    };
+    match serde_json::from_str(&contents) {
+        Ok(session) => Some(session),
+        Err(err) => {
+            // An unreadable marker would otherwise linger forever and silently
+            // disable the recovery pass on every launch.
+            log::warn!("corrupt tun session marker, discarding: {err}");
+            let _ = std::fs::remove_file(&path);
+            None
+        }
+    }
 }
 
 pub fn clear_tun_session(paths: &AppPaths) -> Result<(), PersistenceError> {
@@ -57,5 +72,18 @@ mod tests {
         assert!(load_tun_session(&paths).is_none());
         // Clearing an absent marker is a no-op.
         clear_tun_session(&paths).unwrap();
+    }
+
+    #[test]
+    fn corrupt_marker_discarded_on_load() {
+        let (_tmp, paths) = super::super::test_paths();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.tun_session_path(), "{not json").unwrap();
+
+        assert!(load_tun_session(&paths).is_none());
+        assert!(
+            !paths.tun_session_path().exists(),
+            "corrupt marker should be removed"
+        );
     }
 }

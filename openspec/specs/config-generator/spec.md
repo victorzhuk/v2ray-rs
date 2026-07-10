@@ -46,7 +46,7 @@ The system SHALL generate a valid JSON configuration file for v2ray/xray contain
 - **THEN** the generated DNS config SHALL NOT include any detour field
 
 ### Requirement: Generate sing-box configuration
-The system SHALL generate a valid JSON configuration file in sing-box's configuration schema. When DNS is enabled, the DNS section SHALL include typed server objects, DNS rules, strategy, FakeIP, cache settings, and client subnet. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the `mixed` inbound SHALL NOT emit `udp_disabled: true` so UDP remains enabled.
+The system SHALL generate a valid JSON configuration file in sing-box's configuration schema. When DNS is enabled, the DNS section SHALL include typed server objects, DNS rules, strategy, FakeIP, cache settings, and client subnet, and the route section SHALL include `default_domain_resolver` set to the tag of the first DNS server whose address is a literal IP, falling back to the first server's tag. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the `mixed` inbound SHALL NOT emit `udp_disabled: true` so UDP remains enabled.
 
 #### Scenario: sing-box basic config
 - **WHEN** the user has one enabled Shadowsocks node with sing-box selected
@@ -66,7 +66,7 @@ The system SHALL generate a valid JSON configuration file in sing-box's configur
 
 #### Scenario: sing-box DNS with FakeIP enabled
 - **WHEN** DNS is enabled and FakeIP is enabled with ranges 198.18.0.0/15 and fc00::/18
-- **THEN** the sing-box config SHALL include a fakeip server in dns.servers and fakeip configuration with the specified ranges
+- **THEN** the sing-box config SHALL include a `dns.servers` entry `{"type": "fakeip", "tag": "fakeip", "inet4_range": "198.18.0.0/15", "inet6_range": "fc00::/18"}`, a `dns.rules` entry `{"query_type": ["A", "AAAA"], "server": "fakeip"}`, and `dns.final` SHALL point to a real DNS server, never to "fakeip"
 
 #### Scenario: sing-box DNS with custom rules
 - **WHEN** DNS is enabled with custom DNS rules (GeoSite "google" → "remote", domain suffix "cn" → "domestic")
@@ -74,11 +74,15 @@ The system SHALL generate a valid JSON configuration file in sing-box's configur
 
 #### Scenario: sing-box DNS with host overrides
 - **WHEN** DNS is enabled with host overrides {"ads.example.com": "127.0.0.1"}
-- **THEN** the sing-box config SHALL include a hosts-type DNS server with the static mapping
+- **THEN** the sing-box config SHALL include a hosts-type DNS server with a `predefined` static mapping, and `dns.rules` SHALL start with a rule routing the overridden domains to the "hosts" server
+
+#### Scenario: sing-box default_domain_resolver is set when DNS is enabled
+- **WHEN** DNS is enabled with 2 or more servers
+- **THEN** the sing-box config route section SHALL include `default_domain_resolver` set to a DNS server tag
 
 #### Scenario: sing-box DNS with detour
-- **WHEN** DNS is enabled and the "remote" server has detour "proxy-0"
-- **THEN** the sing-box config dns.servers entry for "remote" SHALL include "detour": "proxy-0"
+- **WHEN** DNS is enabled and the "remote" server has a detour set to anything other than "direct"
+- **THEN** the sing-box config dns.servers entry for "remote" SHALL include "detour" set to the tag of the first proxy outbound
 
 #### Scenario: sing-box DNS with strategy and client subnet
 - **WHEN** DNS is enabled with strategy Ipv6Only and client_subnet "2001:db8::1"
@@ -150,11 +154,11 @@ The system SHALL write generated backend config files to the active profile's `r
 - **THEN** each profile SHALL maintain its own generated config files in its own `runtime_dir/generated/`
 
 ### Requirement: Generate sing-box TUN inbound
-When TUN is enabled and the backend is sing-box, the system SHALL add a native `tun` inbound to the generated config alongside the existing `mixed`/`http` inbounds. The inbound SHALL set `auto_route: true`, the configured interface name, address(es), and MTU, and SHALL map the advanced settings: `stack`, `strict_route`, `dns_hijack` → `dns_mode`, and `exclude_routes` → `route_exclude_address`. The route section SHALL set `auto_detect_interface: true`.
+When TUN is enabled and the backend is sing-box, the system SHALL add a native `tun` inbound to the generated config alongside the existing `mixed`/`http` inbounds. The inbound SHALL set `auto_route: true`, the configured interface name, address(es), MTU, `stack`, `strict_route`, and `exclude_routes` → `route_exclude_address`. The legacy `sniff`/`dns_mode` inbound fields SHALL NOT be emitted (removed in sing-box 1.13.0); instead the route section SHALL be prepended with a `{ "inbound": ["tun-in"], "action": "sniff" }` rule, and, when DNS is enabled and `dns_hijack` is `Hijack`, a `{ "protocol": "dns", "action": "hijack-dns" }` rule immediately after it. The route section SHALL set `auto_detect_interface: true`.
 
 #### Scenario: sing-box TUN inbound emitted when enabled
 - **WHEN** TUN is enabled with sing-box, address `172.19.0.1/30`, MTU 1500, stack system, and strict route on
-- **THEN** the generated config inbounds SHALL include a `{ "type": "tun", "auto_route": true, "address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system", "strict_route": true }` entry, and the route section SHALL include `"auto_detect_interface": true`
+- **THEN** the generated config inbounds SHALL include a `{ "type": "tun", "auto_route": true, "address": ["172.19.0.1/30"], "mtu": 1500, "stack": "system", "strict_route": true }` entry with no `sniff`/`dns_mode` fields, the route section SHALL include `"auto_detect_interface": true`, and `route.rules` SHALL start with `{ "inbound": ["tun-in"], "action": "sniff" }`
 
 #### Scenario: Excluded routes mapped
 - **WHEN** TUN is enabled with `exclude_routes` `["192.168.0.0/16"]`

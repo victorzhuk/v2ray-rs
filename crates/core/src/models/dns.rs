@@ -369,6 +369,10 @@ impl Default for DnsConfig {
 
 impl DnsConfig {
     pub fn validate(&self) -> Result<(), DnsValidationError> {
+        if self.enabled && self.servers.is_empty() {
+            return Err(DnsValidationError::NoServers);
+        }
+
         let mut tags = HashSet::new();
         for server in &self.servers {
             if !tags.insert(&server.tag) {
@@ -420,6 +424,8 @@ impl DnsConfig {
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum DnsValidationError {
+    #[error("dns enabled but no servers configured")]
+    NoServers,
     #[error("duplicate server tag: {0}")]
     DuplicateServerTag(String),
     #[error("invalid client_subnet IP: {0}")]
@@ -666,6 +672,29 @@ server_tag = "google"
             DnsRuleMatch::DomainSuffix { suffix } if suffix == ".google.com"
         ));
         assert_eq!(cfg.rules[1].server_tag, "google");
+    }
+
+    #[test]
+    fn test_validate_no_servers_when_enabled() {
+        let cfg = DnsConfig {
+            enabled: true,
+            strategy: DnsStrategy::default(),
+            servers: Vec::new(),
+            rules: Vec::new(),
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "198.18.0.0/15".to_string(),
+                inet6_range: "fc00::/18".to_string(),
+            },
+            disable_cache: false,
+            client_subnet: None,
+            hosts: Vec::new(),
+            use_custom_rules: false,
+        };
+
+        let result = cfg.validate();
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DnsValidationError::NoServers));
     }
 
     #[test]

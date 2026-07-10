@@ -124,6 +124,20 @@ pub(super) fn build_network_page(
         .build();
     ports_group.add(&http_row);
 
+    let idle_timeout_row = adw::SpinRow::builder()
+        .title("Idle connection timeout (seconds)")
+        .subtitle("Streams idle longer than this are closed by the backend")
+        .adjustment(&gtk::Adjustment::new(
+            s.idle_timeout_secs as f64,
+            60.0,
+            86400.0,
+            30.0,
+            0.0,
+            0.0,
+        ))
+        .build();
+    ports_group.add(&idle_timeout_row);
+
     let listen_address_row = adw::EntryRow::builder()
         .title("Listen address")
         .text(s.listen_address.as_str())
@@ -471,6 +485,14 @@ pub(super) fn build_network_page(
         let cb = cb.clone();
         http_row.connect_changed(move |row| {
             st.borrow_mut().http_port = row.value() as u16;
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        idle_timeout_row.connect_changed(move |row| {
+            st.borrow_mut().idle_timeout_secs = row.value() as u32;
             emit(&st, &cb);
         });
     }

@@ -14,8 +14,8 @@ use v2ray_rs_core::instance::{
     CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
 };
 use v2ray_rs_core::models::{
-    AppSettings, ConnectionMetadata, LastSuccessMetadata, ManualNode, RoutingRuleSet, Subscription,
-    SubscriptionSource,
+    AppSettings, ConnectionMetadata, ConnectionNodeRef, LastSuccessMetadata, ManualNode,
+    RoutingRuleSet, Subscription, SubscriptionSource,
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -42,7 +42,7 @@ pub struct AppInit {
 use crate::connection::{ConnectionHandle, ConnectionRequest};
 use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
 use crate::logs::{LogsMsg, LogsPage};
-use crate::nodes::{NodesOutput, NodesPage};
+use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
 use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
 use crate::wizard::OnboardingWizard;
 use crate::workspace::WorkspaceStore;
@@ -138,9 +138,22 @@ impl App {
         }
         self.process_state = state.clone();
 
-        let locked = matches!(state, ProcessState::Running | ProcessState::Starting);
+        let node_ref = if matches!(state, ProcessState::Running) {
+            self.connection_status.as_ref().map(|meta| meta.node_ref)
+        } else {
+            None
+        };
+        let (sub_active, manual_active) = match node_ref {
+            Some(ConnectionNodeRef::Subscription {
+                subscription_id,
+                node_id,
+            }) => (Some((subscription_id, node_id)), None),
+            Some(ConnectionNodeRef::Manual { node_id }) => (None, Some(node_id)),
+            None => (None, None),
+        };
         self.subscriptions_page
-            .emit(SubscriptionsMsg::SetLocked(locked));
+            .emit(SubscriptionsMsg::SetActiveNode(sub_active));
+        self.nodes_page.emit(NodesMsg::SetActiveNode(manual_active));
 
         if let Ok(guard) = TRAY_EVENT_TX.lock()
             && let Some(tx) = guard.as_ref()
@@ -190,10 +203,12 @@ impl App {
         restart_banner_visible_for_state(self.restart_required, &self.process_state)
     }
 
+    // Deliberately leaves `reconnect_pending` alone: restart flows set it right
+    // before dispatching Disconnect, and both Disconnect and the stopped-state
+    // handler run this cleanup before the flag is consumed.
     fn clear_restart_flow(&mut self) {
         self.runtime_snapshot = None;
         self.restart_required = false;
-        self.reconnect_pending = false;
     }
 
     /// Cancels any pending auto-reconnect and resets the attempt budget. Bumping
@@ -604,12 +619,19 @@ impl SimpleComponent for App {
                 (AppSettings::default(), Some(err.to_string()))
             }
         };
-        if settings_load_error.is_none()
-            && let Err(err) = cleanup_orphaned_backend(&paths)
+        // Off the GTK thread: orphan reaping can wait ~1.5s on a stubborn
+        // process and TUN recovery up to RECOVER_TIMEOUT. Connect re-runs the
+        // orphan check itself, so racing an early Connect is safe.
         {
-            log::warn!("failed to clean orphaned backend process: {err}");
+            let bg_paths = paths.clone();
+            let skip_orphans = settings_load_error.is_some();
+            tokio::task::spawn_blocking(move || {
+                if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&bg_paths) {
+                    log::warn!("failed to clean orphaned backend process: {err}");
+                }
+                recover_tun_session(&bg_paths);
+            });
         }
-        recover_tun_session(&paths);
 
         let show_wizard = settings_load_error.is_none() && !settings.onboarding_complete;
 
@@ -910,6 +932,7 @@ impl SimpleComponent for App {
                     self.apply_state(&ProcessState::Stopping);
                     handle.stop();
                 } else {
+                    self.reconnect_pending = false;
                     self.show_toast("Not connected");
                 }
             }
@@ -967,16 +990,15 @@ impl SimpleComponent for App {
                 if stopped && !self.reconnect_pending {
                     self.regenerate_config_disconnected();
                 }
-                if matches!(state, ProcessState::Stopped) && self.reconnect_pending {
+                if reconnect_after_stop(&state, self.reconnect_pending) {
                     self.reconnect_pending = false;
                     sender.input(AppMsg::Connect);
-                }
-                match &state {
-                    ProcessState::Running => self.cancel_auto_reconnect(),
-                    ProcessState::Error(_) if !self.reconnect_pending => {
-                        self.schedule_auto_reconnect(&sender)
+                } else {
+                    match &state {
+                        ProcessState::Running => self.cancel_auto_reconnect(),
+                        ProcessState::Error(_) => self.schedule_auto_reconnect(&sender),
+                        _ => {}
                     }
-                    _ => {}
                 }
             }
             AppMsg::AutoReconnect(generation) => {
@@ -1117,6 +1139,10 @@ fn restart_banner_visible_for_state(restart_required: bool, state: &ProcessState
     restart_required && runtime_process_active(state)
 }
 
+fn reconnect_after_stop(state: &ProcessState, reconnect_pending: bool) -> bool {
+    reconnect_pending && matches!(state, ProcessState::Stopped | ProcessState::Error(_))
+}
+
 fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[ManualNode]) -> bool {
     subscriptions
         .iter()
@@ -1152,6 +1178,18 @@ mod tests {
             false,
             &ProcessState::Running
         ));
+    }
+
+    #[test]
+    fn reconnect_pending_consumed_on_stop_or_error() {
+        assert!(reconnect_after_stop(&ProcessState::Stopped, true));
+        assert!(reconnect_after_stop(
+            &ProcessState::Error("boom".into()),
+            true
+        ));
+        assert!(!reconnect_after_stop(&ProcessState::Stopped, false));
+        assert!(!reconnect_after_stop(&ProcessState::Running, true));
+        assert!(!reconnect_after_stop(&ProcessState::Stopping, true));
     }
 
     #[test]

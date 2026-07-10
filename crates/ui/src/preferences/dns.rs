@@ -793,7 +793,7 @@ fn dns_server_from_inputs(
         Some(if detour_combo.selected() == 1 {
             "direct".to_string()
         } else {
-            "proxy-0".to_string()
+            "proxy".to_string()
         })
     } else {
         None
@@ -1176,7 +1176,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
     let detour_combo = adw::ComboRow::builder()
         .title("Detour")
         .visible(is_singbox)
-        .model(&gtk::StringList::new(&["proxy-0", "direct"]))
+        .model(&gtk::StringList::new(&["proxy", "direct"]))
         .selected(if init_detour == "direct" { 1 } else { 0 })
         .build();
     group.add(&detour_combo);

@@ -86,11 +86,11 @@ The system SHALL support user-defined DNS routing rules. Each rule maps a match 
 The optional detour field on DNS servers SHALL only be used by the sing-box config generator. V2ray and xray generators SHALL ignore the detour field.
 
 #### Scenario: Detour emitted for sing-box
-- **WHEN** a DNS server has detour "proxy-0" and the backend is sing-box
-- **THEN** the generated server object SHALL include "detour": "proxy-0"
+- **WHEN** a DNS server has a detour set and the backend is sing-box
+- **THEN** the generated server object SHALL include a "detour" field: "direct" passes through unchanged, and any other value resolves to the tag of the first proxy outbound
 
 #### Scenario: Detour ignored for v2ray/xray
-- **WHEN** a DNS server has detour "proxy-0" and the backend is v2ray or xray
+- **WHEN** a DNS server has a detour configured and the backend is v2ray or xray
 - **THEN** the generated DNS config SHALL NOT include any detour-related fields for that server
 
 ### Requirement: FakeIP configuration
@@ -174,3 +174,11 @@ The DNS model SHALL validate FakeIP IPv4 and IPv6 CIDR ranges when FakeIP is ena
 #### Scenario: FakeIP validation skipped when disabled
 - **WHEN** FakeIP is disabled
 - **THEN** the DNS model SHALL NOT validate the CIDR range values, allowing them to hold any string without error until FakeIP is enabled
+
+### Requirement: DNS validation rejects an empty server list
+
+The DNS model SHALL reject a configuration where DNS is enabled but no servers are configured, since FakeIP alone cannot answer real queries.
+
+#### Scenario: DNS enabled with no servers
+- **WHEN** DNS is enabled and `servers` is empty
+- **THEN** the DNS model rejects the configuration with a validation error
