@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Clicking Disconnect while a connection is still starting no longer flips the UI back to "Connected" against a dead session; the stop is honored as soon as the start attempt settles.
 - App startup no longer freezes the window for up to ~6.5s while reaping an orphaned backend and recovering leftover TUN routes; both now run in the background.
 - A corrupt TUN session marker is logged and discarded instead of silently disabling the route-recovery pass on every subsequent launch.
+- Subscription fetches no longer retry permanent failures. A 404, 401, malformed URL, or bad request now fails immediately instead of wasting up to 7s on exponential backoff; transient errors (HTTP 408/429/5xx, connection/timeout) keep the existing retry envelope.
 
 ### Added
 - Idle connection timeout setting (Network → Proxy Ports, default 600s). Generated xray/v2ray configs now set `policy.levels.0.connIdle` accordingly; previously every config ran with the backend's stock 300s, which silently killed long-idle streams such as SSE/streaming API connections.

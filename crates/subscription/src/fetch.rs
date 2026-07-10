@@ -9,7 +9,6 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION"));
 const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("network error: {0}")]
@@ -20,22 +19,41 @@ pub enum FetchError {
     FileError(#[from] std::io::Error),
     #[error("request timed out")]
     Timeout,
+    #[error("invalid URL: {0}")]
+    InvalidUrl(String),
+    #[error("request construction failed: {0}")]
+    RequestBuildError(String),
 }
 
-pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
-    if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(FetchError::NetworkError(
-            "only http:// and https:// URLs are supported".into(),
-        ));
+impl FetchError {
+    pub(crate) fn is_transient(&self) -> bool {
+        match self {
+            Self::Timeout => true,
+            Self::NetworkError(_) => true,
+            Self::HttpError { status, .. } => matches!(status, 408 | 429 | 500..=599),
+            Self::InvalidUrl(_) => false,
+            Self::RequestBuildError(_) => false,
+            Self::FileError(_) => false,
+        }
     }
-
-    if url.starts_with("http://") {
+}
+pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
+    let parsed = reqwest::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(FetchError::InvalidUrl(format!(
+            "unsupported scheme: {} (only http/https)",
+            parsed.scheme()
+        )));
+    }
+    if parsed.scheme() == "http" {
         log::warn!("fetching subscription over plaintext HTTP — credentials may be exposed");
     }
 
-    let response = client.get(url).send().await.map_err(|e| {
+    let response = client.get(parsed).send().await.map_err(|e| {
         if e.is_timeout() {
             FetchError::Timeout
+        } else if e.is_builder() {
+            FetchError::RequestBuildError(e.to_string())
         } else {
             FetchError::NetworkError(e.to_string())
         }
@@ -98,6 +116,15 @@ pub fn decode_subscription_content(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Once;
+
+    fn test_client() -> reqwest::Client {
+        static RUSTLS_PROVIDER: Once = Once::new();
+        RUSTLS_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::ring::default_provider().install_default();
+        });
+        reqwest::Client::new()
+    }
 
     #[test]
     fn test_decode_base64_content() {
@@ -200,5 +227,125 @@ mod tests {
         assert!(protocols.contains(&"trojan"));
 
         assert!(import_result.nodes.iter().all(|n| n.enabled));
+    }
+
+    #[test]
+    fn is_transient_timeout() {
+        assert!(FetchError::Timeout.is_transient());
+    }
+
+    #[test]
+    fn is_transient_network_error() {
+        assert!(FetchError::NetworkError("e".into()).is_transient());
+    }
+
+    #[test]
+    fn is_transient_invalid_url() {
+        assert!(!FetchError::InvalidUrl("bad".into()).is_transient());
+    }
+
+    #[test]
+    fn is_transient_request_build_error() {
+        assert!(!FetchError::RequestBuildError("bad".into()).is_transient());
+    }
+
+    #[test]
+    fn is_transient_file_error() {
+        assert!(!FetchError::FileError(std::io::Error::other("e")).is_transient());
+    }
+
+    #[test]
+    fn is_transient_http_408() {
+        assert!(
+            FetchError::HttpError {
+                status: 408,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn is_transient_http_429() {
+        assert!(
+            FetchError::HttpError {
+                status: 429,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn is_transient_http_500() {
+        assert!(
+            FetchError::HttpError {
+                status: 500,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn is_transient_http_503() {
+        assert!(
+            FetchError::HttpError {
+                status: 503,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn is_transient_http_404() {
+        assert!(
+            !FetchError::HttpError {
+                status: 404,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn is_transient_http_401() {
+        assert!(
+            !FetchError::HttpError {
+                status: 401,
+                body: "".into()
+            }
+            .is_transient()
+        );
+    }
+
+    #[test]
+    fn invalid_url_display() {
+        let err = FetchError::InvalidUrl("not-a-uri".into());
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid URL"),
+            "expected 'invalid URL' in display, got: {msg}"
+        );
+    }
+    #[tokio::test]
+    async fn fetch_with_client_rejects_empty_host() {
+        let client = test_client();
+        let result = fetch_with_client(&client, "https://").await;
+        assert!(
+            matches!(result, Err(FetchError::InvalidUrl(_))),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_with_client_rejects_unsupported_scheme() {
+        let client = test_client();
+        let result = fetch_with_client(&client, "ftp://example.com").await;
+        assert!(
+            matches!(result, Err(FetchError::InvalidUrl(_))),
+            "{result:?}"
+        );
     }
 }

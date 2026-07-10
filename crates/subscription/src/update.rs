@@ -8,6 +8,7 @@ use v2ray_rs_core::models::{ProxyNode, Subscription, SubscriptionNode, Subscript
 
 use crate::fetch::{FetchError, fetch_from_file, fetch_with_client};
 use crate::parser::parse_subscription_uris;
+use std::future::Future;
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
 
@@ -97,16 +98,38 @@ pub async fn fetch_with_retry(
     url: &str,
     max_retries: u32,
 ) -> Result<String, FetchError> {
+    fetch_with_retry_impl(
+        || fetch_with_client(client, url),
+        tokio::time::sleep,
+        max_retries,
+    )
+    .await
+}
+
+async fn fetch_with_retry_impl<F, Fut, S, Slp>(
+    fetch_fn: F,
+    sleep_fn: S,
+    max_retries: u32,
+) -> Result<String, FetchError>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<String, FetchError>>,
+    S: Fn(Duration) -> Slp,
+    Slp: Future<Output = ()>,
+{
     let mut attempt = 0;
     loop {
-        match fetch_with_client(client, url).await {
+        match fetch_fn().await {
             Ok(content) => return Ok(content),
             Err(e) => {
+                if !e.is_transient() {
+                    return Err(e);
+                }
                 if attempt >= max_retries {
                     return Err(e);
                 }
                 let delay = Duration::from_secs(1 << attempt);
-                tokio::time::sleep(delay).await;
+                sleep_fn(delay).await;
                 attempt += 1;
             }
         }
@@ -156,7 +179,9 @@ pub async fn update_subscription(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::Once;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use uuid::Uuid;
     use v2ray_rs_core::models::{ShadowsocksConfig, TransportSettings, VlessConfig, VmessConfig};
 
@@ -377,5 +402,61 @@ mod tests {
             other => panic!("expected InvalidContent, got {other:?}"),
         }
         assert!(subscription.nodes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_short_circuits() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count = call_count.clone();
+        let fetch_fn = move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { Err(FetchError::InvalidUrl("bad".into())) }
+        };
+        let sleep_fn = |_: Duration| async {};
+
+        let result = fetch_with_retry_impl(fetch_fn, sleep_fn, 3).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), FetchError::InvalidUrl(_)));
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_retries_then_succeeds() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count = call_count.clone();
+        let fetch_fn = move || {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if n < 2 {
+                    Err(FetchError::Timeout)
+                } else {
+                    Ok("hello".into())
+                }
+            }
+        };
+        let sleep_fn = |_: Duration| async {};
+
+        let result = fetch_with_retry_impl(fetch_fn, sleep_fn, 5).await;
+
+        assert_eq!(result.unwrap(), "hello");
+        assert_eq!(call_count.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn transient_exhausts_retries() {
+        let call_count = Arc::new(AtomicU32::new(0));
+        let count = call_count.clone();
+        let fetch_fn = move || {
+            count.fetch_add(1, Ordering::SeqCst);
+            async { Err(FetchError::Timeout) }
+        };
+        let sleep_fn = |_: Duration| async {};
+
+        let result = fetch_with_retry_impl(fetch_fn, sleep_fn, 3).await;
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), FetchError::Timeout));
+        assert_eq!(call_count.load(Ordering::SeqCst), 4);
     }
 }
