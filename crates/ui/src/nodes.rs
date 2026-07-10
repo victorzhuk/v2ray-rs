@@ -22,6 +22,7 @@ pub struct NodesPage {
 pub enum NodesOutput {
     ActiveNodesChanged(bool),
     NodesChanged,
+    ConnectNode(Uuid),
     Notice(String),
 }
 
@@ -30,6 +31,7 @@ pub enum NodesMsg {
     ToggleNode(Uuid),
     DeleteNode(Uuid),
     EditNode(Uuid),
+    ConnectNode(Uuid),
     AddNode(ProxyNode),
     UpdateNode(Uuid, ProxyNode),
     ImportFromUrl(String),
@@ -743,6 +745,9 @@ impl Component for NodesPage {
                 };
                 show_edit_dialog(id, node, sender.clone());
             }
+            NodesMsg::ConnectNode(id) => {
+                let _ = sender.output(NodesOutput::ConnectNode(id));
+            }
             NodesMsg::AddNode(node) => {
                 if let Err(err) = node.validate() {
                     let _ = sender.output(NodesOutput::Notice(err.to_string()));
@@ -910,6 +915,21 @@ fn build_node_row(
         .spacing(4)
         .build();
 
+    let connect_btn = gtk::Button::builder()
+        .label("Connect")
+        .has_frame(false)
+        .sensitive(node.enabled)
+        .build();
+    {
+        let id = node.id;
+        let s = sender.clone();
+        let p = popover.clone();
+        connect_btn.connect_clicked(move |_| {
+            p.popdown();
+            s.input(NodesMsg::ConnectNode(id));
+        });
+    }
+
     let edit_btn = gtk::Button::builder()
         .label("Edit")
         .has_frame(false)
@@ -939,6 +959,7 @@ fn build_node_row(
         });
     }
 
+    popover_box.append(&connect_btn);
     popover_box.append(&edit_btn);
     popover_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     popover_box.append(&delete_btn);

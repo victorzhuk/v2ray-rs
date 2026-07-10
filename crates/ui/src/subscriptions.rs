@@ -66,6 +66,7 @@ pub enum Direction {
 pub enum SubscriptionsOutput {
     ActiveNodesChanged(bool),
     SubscriptionsChanged,
+    ConnectNode(Uuid, Uuid),
     Notice(String),
 }
 
@@ -90,6 +91,7 @@ pub enum SubscriptionsMsg {
     DisableAllNodes(Uuid),
     DragDropSubscription(usize, usize),
     DragDropNode(Uuid, usize, usize),
+    ConnectNode(Uuid, Uuid),
     CheckAutoUpdate,
     SyncSettings {
         auto_update_enabled: bool,
@@ -675,6 +677,9 @@ impl Component for SubscriptionsPage {
                     return;
                 }
                 self.active_node = active;
+            }
+            SubscriptionsMsg::ConnectNode(sub_id, node_id) => {
+                let _ = sender.output(SubscriptionsOutput::ConnectNode(sub_id, node_id));
             }
             SubscriptionsMsg::ResetStorage => match self.store.reset_subscriptions() {
                 Ok(()) => {
@@ -1778,6 +1783,21 @@ fn build_node_row(
         .valign(gtk::Align::Center)
         .build();
 
+    let connect_btn = gtk::Button::builder()
+        .icon_name("network-connect-symbolic")
+        .has_frame(false)
+        .tooltip_text("Connect")
+        .sensitive(node.enabled && !locked)
+        .build();
+    connect_btn.add_css_class("flat");
+    {
+        let s = sender.clone();
+        let node_id = node.id;
+        connect_btn.connect_clicked(move |_| {
+            s.input(SubscriptionsMsg::ConnectNode(sub_id, node_id));
+        });
+    }
+
     let up_btn = gtk::Button::builder()
         .icon_name("go-up-symbolic")
         .has_frame(false)
@@ -1806,6 +1826,7 @@ fn build_node_row(
         });
     }
 
+    move_box.append(&connect_btn);
     move_box.append(&up_btn);
     move_box.append(&down_btn);
     row.add_suffix(&move_box);

@@ -19,7 +19,9 @@ use v2ray_rs_core::models::{
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
-use v2ray_rs_core::resolve::{ConnectionPlanner, LatencySnapshot};
+use v2ray_rs_core::resolve::{
+    ConnectionCandidate, ConnectionPlanner, LatencySnapshot, resolve_candidate,
+};
 use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
 use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
@@ -74,6 +76,8 @@ pub struct App {
     current_view: usize,
     geodata_service: GeodataRefreshService,
     pending_exit: bool,
+    pending_direct_target: Option<ConnectionNodeRef>,
+    direct_connect_in_flight: bool,
     settings_debounce: Option<glib::SourceId>,
     auto_reconnect_attempts: u32,
     reconnect_generation: u32,
@@ -85,6 +89,7 @@ pub enum AppMsg {
     SettingsChanged(AppSettings),
     ToggleConnection,
     Connect,
+    ConnectToNode(ConnectionNodeRef),
     Disconnect,
     CloseRequested,
     TrayShowWindow,
@@ -371,6 +376,84 @@ impl App {
             }
         }
     }
+
+    fn load_pruned_latency_snapshot(
+        &mut self,
+        subscriptions: &[Subscription],
+        manual_nodes: &[ManualNode],
+    ) -> Result<(LatencySnapshot, bool), String> {
+        let mut snapshot = self
+            .store
+            .load_latency_snapshot()
+            .map_err(|err| err.to_string())?;
+        let known = v2ray_rs_core::resolve::all_node_refs(subscriptions, manual_nodes);
+        let before = snapshot.len();
+        snapshot.retain_known(&known);
+        let pruned = snapshot.len() != before;
+        Ok((snapshot, pruned))
+    }
+
+    fn start_connection(
+        &mut self,
+        candidates: Vec<ConnectionCandidate>,
+        subscriptions: Vec<Subscription>,
+        manual_nodes: Vec<ManualNode>,
+        sender: &ComponentSender<Self>,
+    ) -> Result<(), String> {
+        let binary_path = match &self.settings.backend.binary_path {
+            Some(p) => p.clone(),
+            None => {
+                self.show_toast("No backend binary configured — check Preferences");
+                return Err("no backend binary configured".into());
+            }
+        };
+
+        let rules = match self.store.load_routing_rules() {
+            Ok(rules) => rules,
+            Err(err) => {
+                self.show_toast(&format!("Failed to load routing rules: {err}"));
+                return Err(err.to_string());
+            }
+        };
+        let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+
+        self.runtime_snapshot = Some(RuntimeConfigSnapshot {
+            backend_type: self.settings.backend.backend_type,
+            binary_path: self.settings.backend.binary_path.clone(),
+            socks_port: self.settings.socks_port,
+            http_port: self.settings.http_port,
+            listen_address: self.settings.listen_address.clone(),
+            dns: self.settings.dns.clone(),
+            routing: rules,
+            manual_nodes,
+            subscriptions,
+            timestamp: chrono::Utc::now().timestamp(),
+        });
+
+        let writer = ConfigWriter::new(&self.settings, &self.paths);
+        let pid_path = self.paths.pid_file_path();
+        let geodata_dir = self.paths.geodata_dir();
+
+        self.apply_state(&ProcessState::Starting);
+        self.logs_page.emit(LogsMsg::SetRunning(true));
+        self.logs_page.emit(LogsMsg::Clear);
+
+        let settings = self.settings.clone();
+        let handle = crate::connection::spawn(
+            ConnectionRequest {
+                binary_path,
+                candidates,
+                writer,
+                pid_path,
+                geodata_dir,
+                settings,
+                enabled_rules,
+            },
+            sender.input_sender().clone(),
+        );
+        self.process_handle = Some(handle);
+        Ok(())
+    }
 }
 
 #[relm4::component(pub)]
@@ -640,6 +723,12 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |msg| match msg {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 SubscriptionsOutput::SubscriptionsChanged => AppMsg::SubscriptionsChanged,
+                SubscriptionsOutput::ConnectNode(sub_id, node_id) => {
+                    AppMsg::ConnectToNode(ConnectionNodeRef::Subscription {
+                        subscription_id: sub_id,
+                        node_id,
+                    })
+                }
                 SubscriptionsOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
@@ -648,6 +737,9 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |msg| match msg {
                 NodesOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 NodesOutput::NodesChanged => AppMsg::ManualNodesChanged,
+                NodesOutput::ConnectNode(node_id) => {
+                    AppMsg::ConnectToNode(ConnectionNodeRef::Manual { node_id })
+                }
                 NodesOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
@@ -705,6 +797,8 @@ impl SimpleComponent for App {
             current_view: 0,
             geodata_service,
             pending_exit: false,
+            pending_direct_target: None,
+            direct_connect_in_flight: false,
             settings_debounce: None,
             auto_reconnect_attempts: 0,
             reconnect_generation: 0,
@@ -826,14 +920,6 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let binary_path = match &self.settings.backend.binary_path {
-                    Some(p) => p.clone(),
-                    None => {
-                        self.show_toast("No backend binary configured — check Preferences");
-                        return;
-                    }
-                };
-
                 let subscriptions = match self.store.load_subscriptions() {
                     Ok(subscriptions) => subscriptions,
                     Err(err) => {
@@ -848,21 +934,18 @@ impl SimpleComponent for App {
                         return;
                     }
                 };
-                let mut snapshot = match self.store.load_latency_snapshot() {
-                    Ok(snapshot) => snapshot,
-                    Err(err) => {
-                        self.show_toast(&format!("Failed to load latency data: {err}"));
-                        return;
-                    }
-                };
-                let known = v2ray_rs_core::resolve::all_node_refs(&subscriptions, &manual_nodes);
-                let before = snapshot.len();
-                snapshot.retain_known(&known);
-                if snapshot.len() != before
-                    && let Err(err) = self.store.save_latency_snapshot(&snapshot)
-                {
+                let (snapshot, pruned) =
+                    match self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            self.show_toast(&format!("Failed to load latency data: {err}"));
+                            return;
+                        }
+                    };
+                if pruned && let Err(err) = self.store.save_latency_snapshot(&snapshot) {
                     log::warn!("prune latency snapshot: {err}");
                 }
+
                 let planner = ConnectionPlanner::new(
                     self.settings.auto_resolve_strategy,
                     self.settings.last_success.clone(),
@@ -880,50 +963,59 @@ impl SimpleComponent for App {
                     return;
                 }
 
-                let rules = match self.store.load_routing_rules() {
-                    Ok(rules) => rules,
+                let _ = self.start_connection(candidates, subscriptions, manual_nodes, &sender);
+            }
+            AppMsg::ConnectToNode(target) => {
+                // Resolve the requested node before touching any connection state.
+                // An invalid target must toast and exit without canceling reconnects,
+                // setting a pending target, or tearing down an existing session.
+                let subscriptions = match self.store.load_subscriptions() {
+                    Ok(subscriptions) => subscriptions,
                     Err(err) => {
-                        self.show_toast(&format!("Failed to load routing rules: {err}"));
+                        self.show_toast(&format!("Failed to load subscriptions: {err}"));
                         return;
                     }
                 };
-                let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+                let manual_nodes = match self.store.load_manual_nodes() {
+                    Ok(manual_nodes) => manual_nodes,
+                    Err(err) => {
+                        self.show_toast(&format!("Failed to load manual nodes: {err}"));
+                        return;
+                    }
+                };
+                let (snapshot, _) =
+                    match self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes) {
+                        Ok(result) => result,
+                        Err(err) => {
+                            self.show_toast(&format!("Failed to load latency data: {err}"));
+                            return;
+                        }
+                    };
 
-                self.runtime_snapshot = Some(RuntimeConfigSnapshot {
-                    backend_type: self.settings.backend.backend_type,
-                    binary_path: self.settings.backend.binary_path.clone(),
-                    socks_port: self.settings.socks_port,
-                    http_port: self.settings.http_port,
-                    listen_address: self.settings.listen_address.clone(),
-                    dns: self.settings.dns.clone(),
-                    routing: rules,
-                    manual_nodes: manual_nodes.clone(),
-                    subscriptions: subscriptions.clone(),
-                    timestamp: chrono::Utc::now().timestamp(),
-                });
+                let Some(candidate) =
+                    resolve_candidate(target, &subscriptions, &manual_nodes, &snapshot)
+                else {
+                    self.show_toast("Node not available or disabled");
+                    return;
+                };
 
-                let writer = ConfigWriter::new(&self.settings, &self.paths);
-                let pid_path = self.paths.pid_file_path();
-                let geodata_dir = self.paths.geodata_dir();
+                if self.process_handle.is_some() {
+                    self.cancel_auto_reconnect();
+                    self.reconnect_pending = false;
+                    self.pending_direct_target = Some(target);
+                    sender.input(AppMsg::Disconnect);
+                    return;
+                }
 
-                self.apply_state(&ProcessState::Starting);
-                self.logs_page.emit(LogsMsg::SetRunning(true));
-                self.logs_page.emit(LogsMsg::Clear);
+                self.cancel_auto_reconnect();
+                self.reconnect_pending = false;
 
-                let settings = self.settings.clone();
-                let handle = crate::connection::spawn(
-                    ConnectionRequest {
-                        binary_path,
-                        candidates,
-                        writer,
-                        pid_path,
-                        geodata_dir,
-                        settings,
-                        enabled_rules,
-                    },
-                    sender.input_sender().clone(),
-                );
-                self.process_handle = Some(handle);
+                if self
+                    .start_connection(vec![candidate], subscriptions, manual_nodes, &sender)
+                    .is_ok()
+                {
+                    self.direct_connect_in_flight = true;
+                }
             }
             AppMsg::Disconnect => {
                 self.clear_restart_flow();
@@ -987,6 +1079,16 @@ impl SimpleComponent for App {
                     self.window.destroy();
                     return;
                 }
+                if let Some(target) = consume_terminal_direct_state(
+                    &state,
+                    &mut self.direct_connect_in_flight,
+                    &mut self.pending_direct_target,
+                ) {
+                    self.reconnect_pending = false;
+                    self.cancel_auto_reconnect();
+                    sender.input(AppMsg::ConnectToNode(target));
+                    return;
+                }
                 if stopped && !self.reconnect_pending {
                     self.regenerate_config_disconnected();
                 }
@@ -995,8 +1097,20 @@ impl SimpleComponent for App {
                     sender.input(AppMsg::Connect);
                 } else {
                     match &state {
-                        ProcessState::Running => self.cancel_auto_reconnect(),
-                        ProcessState::Error(_) => self.schedule_auto_reconnect(&sender),
+                        ProcessState::Running => {
+                            self.cancel_auto_reconnect();
+                            self.direct_connect_in_flight = false;
+                        }
+                        ProcessState::Error(_) => {
+                            if self.direct_connect_in_flight {
+                                self.direct_connect_in_flight = false;
+                            } else {
+                                self.schedule_auto_reconnect(&sender);
+                            }
+                        }
+                        ProcessState::Stopped => {
+                            self.direct_connect_in_flight = false;
+                        }
                         _ => {}
                     }
                 }
@@ -1143,6 +1257,37 @@ fn reconnect_after_stop(state: &ProcessState, reconnect_pending: bool) -> bool {
     reconnect_pending && matches!(state, ProcessState::Stopped | ProcessState::Error(_))
 }
 
+/// Pure helper for terminal-state direct-connect bookkeeping.
+///
+/// - `Stopped` with a pending direct target replays that target and clears the
+///   in-flight flag so the revalidation path decides the next state.
+/// - `Stopped` without a pending target clears a stale in-flight flag.
+/// - `Error` with a pending direct target replays that target exactly once and
+///   clears the in-flight flag, suppressing generic auto-reconnect.
+/// - `Error` without a pending target leaves `direct_connect_in_flight` alone
+///   so the caller can decide whether to suppress planner auto-reconnect.
+fn consume_terminal_direct_state(
+    state: &ProcessState,
+    direct_connect_in_flight: &mut bool,
+    pending_direct_target: &mut Option<ConnectionNodeRef>,
+) -> Option<ConnectionNodeRef> {
+    match state {
+        ProcessState::Stopped => {
+            let target = pending_direct_target.take();
+            *direct_connect_in_flight = false;
+            target
+        }
+        ProcessState::Error(_) => {
+            let target = pending_direct_target.take();
+            if target.is_some() {
+                *direct_connect_in_flight = false;
+            }
+            target
+        }
+        _ => None,
+    }
+}
+
 fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[ManualNode]) -> bool {
     subscriptions
         .iter()
@@ -1154,7 +1299,7 @@ fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[Manual
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use v2ray_rs_core::models::{ProxyNode, TransportSettings, VlessConfig};
+    use v2ray_rs_core::models::{ProxyNode, SubscriptionNode, TransportSettings, VlessConfig};
 
     #[test]
     fn restart_banner_only_visible_while_runtime_is_active() {
@@ -1190,6 +1335,101 @@ mod tests {
         assert!(!reconnect_after_stop(&ProcessState::Stopped, false));
         assert!(!reconnect_after_stop(&ProcessState::Running, true));
         assert!(!reconnect_after_stop(&ProcessState::Stopping, true));
+    }
+
+    #[test]
+    fn direct_error_leaves_in_flight_for_caller_suppression() {
+        let mut in_flight = true;
+        let mut pending = None;
+
+        let replay = consume_terminal_direct_state(
+            &ProcessState::Error("boom".into()),
+            &mut in_flight,
+            &mut pending,
+        );
+
+        assert!(replay.is_none());
+        assert!(in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn error_replays_pending_direct_target_before_any_other_reconnect() {
+        let target = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::nil(),
+        };
+        let mut in_flight = true;
+        let mut pending = Some(target);
+
+        let replay = consume_terminal_direct_state(
+            &ProcessState::Error("boom".into()),
+            &mut in_flight,
+            &mut pending,
+        );
+
+        assert_eq!(replay, Some(target));
+        assert!(!in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn stopped_clears_stale_direct_in_flight_when_nothing_pending() {
+        let mut in_flight = true;
+        let mut pending = None;
+
+        let replay =
+            consume_terminal_direct_state(&ProcessState::Stopped, &mut in_flight, &mut pending);
+
+        assert!(replay.is_none());
+        assert!(!in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn stopped_replays_pending_direct_target_before_any_other_reconnect() {
+        let target = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::nil(),
+        };
+        let mut in_flight = false;
+        let mut pending = Some(target);
+
+        let replay =
+            consume_terminal_direct_state(&ProcessState::Stopped, &mut in_flight, &mut pending);
+
+        assert_eq!(replay, Some(target));
+        assert!(!in_flight);
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_disabled_subscription_with_enabled_node_is_unavailable() {
+        let mut subscription = Subscription::new_from_url("DisabledSub", "https://example.com");
+        subscription.enabled = false;
+        let node_id = uuid::Uuid::new_v4();
+        subscription.nodes = vec![SubscriptionNode::with_id(
+            node_id,
+            ProxyNode::Vless(VlessConfig {
+                address: "a.example.com".into(),
+                port: 443,
+                uuid: "test-uuid".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: Some("A".into()),
+            }),
+            true,
+        )];
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: subscription.id,
+            node_id,
+        };
+
+        assert!(
+            resolve_candidate(node_ref, &[subscription], &[], &LatencySnapshot::default())
+                .is_none(),
+            "a disabled subscription must make even an enabled node unavailable for direct connect"
+        );
     }
 
     #[test]

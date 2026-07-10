@@ -151,6 +151,62 @@ pub fn all_node_refs(
     set
 }
 
+/// Resolve one user-chosen node to a single candidate, or `None` if the node
+/// is missing or disabled. Mirrors `ConnectionPlanner::plan` construction and
+/// enabled filtering so direct connects behave like ordinary connects.
+pub fn resolve_candidate(
+    node_ref: ConnectionNodeRef,
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+    latency_snapshot: &LatencySnapshot,
+) -> Option<ConnectionCandidate> {
+    match node_ref {
+        ConnectionNodeRef::Subscription {
+            subscription_id,
+            node_id,
+        } => {
+            let sub = subscriptions.iter().find(|s| s.id == subscription_id)?;
+            if !sub.enabled {
+                return None;
+            }
+            let node = sub.nodes.iter().find(|n| n.id == node_id)?;
+            if !node.enabled {
+                return None;
+            }
+            let sample = latency_snapshot.get(node_ref);
+            let latency_ms = sample
+                .and_then(|sample| sample.latency_ms)
+                .or(node.last_latency_ms);
+            let real_delay_ms = sample
+                .and_then(|sample| sample.real_delay_ms)
+                .or(node.last_real_delay_ms);
+            Some(ConnectionCandidate {
+                node_ref,
+                source_name: sub.name.clone(),
+                node: node.node.clone(),
+                latency_ms,
+                real_delay_ms,
+            })
+        }
+        ConnectionNodeRef::Manual { node_id } => {
+            let manual = manual_nodes.iter().find(|n| n.id == node_id)?;
+            if !manual.enabled {
+                return None;
+            }
+            let sample = latency_snapshot.get(node_ref);
+            let latency_ms = sample.and_then(|sample| sample.latency_ms);
+            let real_delay_ms = sample.and_then(|sample| sample.real_delay_ms);
+            Some(ConnectionCandidate {
+                node_ref,
+                source_name: "Manual".to_string(),
+                node: manual.node.clone(),
+                latency_ms,
+                real_delay_ms,
+            })
+        }
+    }
+}
+
 pub struct ConnectionPlanner {
     strategy: AutoResolveStrategy,
     last_success: Option<LastSuccessMetadata>,
@@ -541,5 +597,103 @@ mod tests {
         let loaded: LastSuccessMetadata = serde_json::from_str(&json).unwrap();
 
         assert_eq!(loaded.node_ref, last.node_ref);
+    }
+
+    fn manual_node(addr: &str, remark: &str) -> ManualNode {
+        ManualNode::new(vless_node(addr, remark))
+    }
+
+    #[test]
+    fn resolve_candidate_enabled_subscription_returns_candidate() {
+        let node = vless_node("a.com", "A");
+        let sub = subscription_with_nodes("Alpha", vec![(node.clone(), true, Some(50))]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+
+        let candidate = resolve_candidate(node_ref, &[sub], &[], &LatencySnapshot::default())
+            .expect("enabled subscription node resolves");
+
+        assert_eq!(candidate.node_ref, node_ref);
+        assert_eq!(candidate.source_name, "Alpha");
+        assert_eq!(candidate.node.address(), "a.com");
+        assert_eq!(candidate.latency_ms, Some(50));
+    }
+
+    #[test]
+    fn resolve_candidate_enabled_manual_returns_candidate() {
+        let manual = manual_node("m.com", "M");
+        let node_ref = ConnectionNodeRef::Manual { node_id: manual.id };
+
+        let candidate = resolve_candidate(node_ref, &[], &[manual], &LatencySnapshot::default())
+            .expect("enabled manual node resolves");
+
+        assert_eq!(candidate.node_ref, node_ref);
+        assert_eq!(candidate.source_name, "Manual");
+        assert_eq!(candidate.node.address(), "m.com");
+    }
+
+    #[test]
+    fn resolve_candidate_disabled_manual_returns_none() {
+        let mut manual = manual_node("m.com", "M");
+        manual.enabled = false;
+        let node_ref = ConnectionNodeRef::Manual { node_id: manual.id };
+
+        assert!(resolve_candidate(node_ref, &[], &[manual], &LatencySnapshot::default()).is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_disabled_node_returns_none() {
+        let node = vless_node("a.com", "A");
+        let sub = subscription_with_nodes("Alpha", vec![(node, false, Some(50))]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+
+        assert!(resolve_candidate(node_ref, &[sub], &[], &LatencySnapshot::default()).is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_disabled_subscription_returns_none() {
+        let node = vless_node("a.com", "A");
+        let mut sub = subscription_with_nodes("Alpha", vec![(node, true, Some(50))]);
+        sub.enabled = false;
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+
+        assert!(resolve_candidate(node_ref, &[sub], &[], &LatencySnapshot::default()).is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_missing_node_returns_none() {
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: uuid::Uuid::new_v4(),
+            node_id: uuid::Uuid::new_v4(),
+        };
+
+        assert!(resolve_candidate(node_ref, &[], &[], &LatencySnapshot::default()).is_none());
+    }
+
+    #[test]
+    fn resolve_candidate_populates_latency_from_snapshot() {
+        let node = vless_node("a.com", "A");
+        let sub = subscription_with_nodes("Alpha", vec![(node, true, Some(50))]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        let mut snapshot = LatencySnapshot::default();
+        let now = Utc::now();
+        snapshot.upsert(node_ref, 123, now);
+        snapshot.upsert_real_delay(node_ref, 456, now);
+
+        let candidate = resolve_candidate(node_ref, &[sub], &[], &snapshot).unwrap();
+
+        assert_eq!(candidate.latency_ms, Some(123));
+        assert_eq!(candidate.real_delay_ms, Some(456));
     }
 }
