@@ -1,5 +1,9 @@
 # Spec: Process Lifecycle
 
+## Purpose
+
+Defines how the application manages the lifecycle of the backend proxy process: starting and stopping it with graceful signal handling, supervising it for crashes with bounded automatic restart, capturing its logs, reporting state changes, and cleaning up on exit including TUN route recovery.
+
 ## Requirements
 
 ### Requirement: Start backend process
@@ -23,6 +27,10 @@ The system SHALL gracefully stop the running backend process using SIGTERM, fall
 #### Scenario: Already stopped
 - **WHEN** stop is requested but no process is running
 - **THEN** the system SHALL return `Ok(())` silently and remain in Stopped state
+
+#### Scenario: Stop while in Error with no child
+- **WHEN** stop or shutdown is requested while the manager is in the `Error` state with no running child
+- **THEN** the system SHALL transition to `Stopped` and return `Ok(())` instead of leaving the manager parked in `Error`
 
 ### Requirement: Restart backend process
 The system SHALL support restarting the backend process (stop then start) when config is regenerated or the user requests it.

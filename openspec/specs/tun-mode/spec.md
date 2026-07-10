@@ -33,8 +33,8 @@ The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN
 - **THEN** the system SHALL detect the missing capability on the next TUN start attempt and re-offer the grant
 
 #### Scenario: File capabilities unsupported
-- **WHEN** the backend binary resides on a filesystem that does not honor file capabilities (e.g. mounted `nosuid`)
-- **THEN** the system SHALL report a clear error pointing at the manual `setcap` command instead of failing opaquely
+- **WHEN** the backend binary, the route helper, or the `v2ray-rs-run` wrapper resides on a filesystem that does not honor file capabilities or setuid (e.g. mounted `nosuid`)
+- **THEN** the grant SHALL fail fast before elevation, naming the affected path and pointing at the manual `setcap` command, instead of reporting success while the privileges silently did not take
 
 ### Requirement: Outbound loop prevention
 The system SHALL configure each backend so the backend's own outbound traffic bypasses the TUN interface and does not loop.
