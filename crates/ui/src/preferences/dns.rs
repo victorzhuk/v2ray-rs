@@ -481,10 +481,15 @@ pub(super) fn build_dns_page(
 
         let sync_dns_ui_observer = sync_dns_ui.clone();
         let ctx = dns_ctx.clone();
+        let last_backend = Rc::new(RefCell::new(ctx.state.borrow().backend.backend_type));
         subscribe_settings(settings_observers, move |settings| {
+            let backend = settings.backend.backend_type;
             sync_dns_ui_observer(settings);
-            render_dns_servers(&ctx);
-            render_primary_dns_servers(&ctx);
+            if backend != *last_backend.borrow() {
+                *last_backend.borrow_mut() = backend;
+                render_dns_servers(&ctx);
+                render_primary_dns_servers(&ctx);
+            }
         });
     }
 
@@ -886,7 +891,6 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
     let mut added = ctx.added_servers.borrow_mut();
     for server in &servers {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let effective = server.protocol.effective_for_backend(backend);
 
         let mut subtitle = format!(
             "{}://{}:{}",
@@ -897,10 +901,10 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
                 .unwrap_or_else(|| server.protocol.default_port())
         );
 
-        if effective != server.protocol {
+        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
             subtitle.push_str(&format!(
                 "\nDowngraded to {} on {}",
-                protocol_display_name(effective),
+                protocol_display_name(fallback),
                 backend_display_name(backend)
             ));
         }
@@ -1021,7 +1025,6 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
 
     if let Some(server) = remote_server {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let effective = server.protocol.effective_for_backend(backend);
         let mut subtitle = format!(
             "{}://{}:{}",
             protocol_str,
@@ -1030,10 +1033,10 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
                 .port
                 .unwrap_or_else(|| server.protocol.default_port())
         );
-        if effective != server.protocol {
+        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
             subtitle.push_str(&format!(
                 "\nDowngraded to {} on {}",
-                protocol_display_name(effective),
+                protocol_display_name(fallback),
                 backend_display_name(backend)
             ));
         }
@@ -1047,7 +1050,6 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
 
     if let Some(server) = domestic_server {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let effective = server.protocol.effective_for_backend(backend);
         let mut subtitle = format!(
             "{}://{}:{}",
             protocol_str,
@@ -1056,10 +1058,10 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
                 .port
                 .unwrap_or_else(|| server.protocol.default_port())
         );
-        if effective != server.protocol {
+        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
             subtitle.push_str(&format!(
                 "\nDowngraded to {} on {}",
-                protocol_display_name(effective),
+                protocol_display_name(fallback),
                 backend_display_name(backend)
             ));
         }
@@ -1258,12 +1260,11 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         let protocol_combo = protocol_combo.clone();
         move || {
             let protocol = index_to_protocol(protocol_combo.selected());
-            let effective = protocol.effective_for_backend(backend);
-            if effective != protocol {
+            if let Some(fallback) = protocol.fallback_protocol_for_backend(backend) {
                 warning_label.set_text(&format!(
                     "Effective protocol on {} is {}",
                     backend_display_name(backend),
-                    protocol_display_name(effective)
+                    protocol_display_name(fallback)
                 ));
                 warning_label.set_visible(true);
             } else {
