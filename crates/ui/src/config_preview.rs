@@ -144,12 +144,7 @@ impl Component for ConfigPreviewDialog {
         ComponentParts { model, widgets }
     }
 
-    fn update(
-        &mut self,
-        msg: Self::Input,
-        sender: ComponentSender<Self>,
-        _root: &Self::Root,
-    ) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             ConfigPreviewInput::Refresh => {
                 let path = self.path.clone();
