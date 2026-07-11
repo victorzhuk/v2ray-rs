@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Polish the status bar and logs page with an ActionBar, icon+label connect button, and cross-fade empty state transitions.
+
+## Requirements
 
 ### Requirement: Status bar uses ActionBar widget
 The connection status bar SHALL use `gtk::ActionBar` instead of a raw `gtk::Box` with manual toolbar styling.

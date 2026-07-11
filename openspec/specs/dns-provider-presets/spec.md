@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Supply built-in DNS provider presets and apply them to the DNS server list and strategy without overwriting unrelated DNS settings.
+
+## Requirements
 
 ### Requirement: Built-in DNS provider presets
 The system SHALL provide a hardcoded list of DNS provider presets. Each preset SHALL contain a name, description, a list of DNS server configurations, and a DNS strategy.

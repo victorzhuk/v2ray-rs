@@ -1,5 +1,9 @@
 # Spec: Backend Detection
 
+## Purpose
+
+Detect installed v2ray/xray/sing-box binaries, query their versions, validate custom paths, persist the user's backend selection, and expose backend-specific Real Delay capability.
+
 ## Requirements
 
 ### Requirement: Auto-detect installed backends

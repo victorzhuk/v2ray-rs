@@ -1,5 +1,9 @@
 # Spec: Single Connection Management
 
+## Purpose
+
+Allow users to manage manual proxy nodes and their participation in connection planning.
+
 ## Requirements
 
 ### Requirement: Manual proxy nodes

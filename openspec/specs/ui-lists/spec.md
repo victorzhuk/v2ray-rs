@@ -1,4 +1,7 @@
-## ADDED Requirements
+## Purpose
+Define behavior and presentation of subscription, routing, and manual node lists.
+
+## Requirements
 
 ### Requirement: Subscription and routing lists use boxed-list styling
 List containers in subscriptions and routing pages SHALL use `gtk::ListBox` with `"boxed-list"` CSS class instead of raw `gtk::Box`.
@@ -95,3 +98,18 @@ Manual node rows SHALL expose at most two visible suffix widgets, with secondary
 #### Scenario: Manual node row suffixes
 - **WHEN** a manual node row is displayed
 - **THEN** only the enable switch and a menu button are visible as suffix widgets
+
+### Requirement: Per-node Connect action
+Node rows in the subscription and manual node lists SHALL offer a Connect action for enabled nodes that triggers a direct connection to that node. The action SHALL be unavailable (hidden or insensitive) for disabled nodes.
+
+#### Scenario: Connect from a manual node row
+- **WHEN** the user opens an enabled manual node's row menu and chooses Connect
+- **THEN** a direct connection to that node starts
+
+#### Scenario: Connect from a subscription node row
+- **WHEN** the user activates the Connect affordance on an enabled subscription node row
+- **THEN** a direct connection to that node starts
+
+#### Scenario: Disabled node offers no Connect
+- **WHEN** a node is disabled
+- **THEN** its row SHALL NOT offer an actionable Connect

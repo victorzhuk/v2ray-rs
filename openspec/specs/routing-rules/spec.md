@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Let users create, edit, delete, reorder, validate, and autocomplete routing rules using GeoData.
+
+## Requirements
 
 ### Requirement: Create routing rules
 The system SHALL allow users to create routing rules specifying a match condition and an action.

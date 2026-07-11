@@ -1,3 +1,9 @@
+## Purpose
+
+Parse downloaded GeoIP/GeoSite databases into a backend-keyed autocomplete index of country codes and categories.
+
+## Requirements
+
 ### Requirement: Backend-keyed GeoData autocomplete index
 The system SHALL parse downloaded geodata files into a backend-keyed autocomplete index for GeoIP country codes and GeoSite categories.
 

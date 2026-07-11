@@ -1,6 +1,10 @@
 # Spec: onboarding-wizard
 
-## ADDED Requirements
+## Purpose
+
+Guide first-time users through backend detection and optional subscription import before showing the main window.
+
+## Requirements
 
 ### Requirement: First-time onboarding wizard
 The system SHALL display a setup wizard on first launch to guide the user through initial configuration.

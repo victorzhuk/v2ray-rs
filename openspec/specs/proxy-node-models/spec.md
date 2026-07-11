@@ -1,6 +1,10 @@
 # Spec: proxy-node-models
 
-## ADDED Requirements
+## Purpose
+
+Define typed models for proxy nodes, subscriptions, routing rules, backend configuration, and application settings.
+
+## Requirements
 
 ### Requirement: Proxy protocol type representation
 The system SHALL define Rust types for VLESS, VMess, Shadowsocks, and Trojan proxy protocols. Each protocol type SHALL contain all fields required to generate a valid backend configuration entry.

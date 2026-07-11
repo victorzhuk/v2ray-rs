@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Provide a Preferences UI for enabling, viewing, and editing DNS servers, strategy, rules, FakeIP, hosts, and advanced settings.
+
+## Requirements
 
 ### Requirement: DNS Preferences page
 The Preferences dialog SHALL include a "DNS" page with icon `network-transmit-symbolic` that provides controls for all DNS configuration settings.

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Standardize main window chrome with a single header bar, page actions, tab icons, restart banner, and active node indicators.
+
+## Requirements
 
 ### Requirement: Single HeaderBar per window
 The application window SHALL have exactly one `adw::HeaderBar` at the top level. Sub-pages inside `adw::ViewStack` SHALL NOT render their own HeaderBars.

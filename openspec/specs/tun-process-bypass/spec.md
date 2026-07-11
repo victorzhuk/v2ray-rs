@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Let selected process traffic bypass the xray TUN tunnel via a dedicated unprivileged user and setuid wrapper.
+
+## Requirements
 
 ### Requirement: Dedicated bypass user and per-UID policy rule
 The system SHALL provide a dedicated unprivileged system user `v2ray-rs-bypass`

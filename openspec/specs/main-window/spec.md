@@ -1,6 +1,10 @@
 # Spec: main-window
 
-## ADDED Requirements
+## Purpose
+
+Define the primary application window layout with subscriptions/nodes management, logs, status bar, and access to routing and settings.
+
+## Requirements
 
 ### Requirement: Application window structure
 The system SHALL display a main window with a header bar, an upper-pane source switcher for `Subscriptions` and `Nodes`, a logs pane, and a connection status bar.

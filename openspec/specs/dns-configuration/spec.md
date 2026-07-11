@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Define DNS server protocols, named servers, query strategy, routing rules, FakeIP, cache, client subnet, host overrides, and backend-specific config generation.
+
+## Requirements
 
 ### Requirement: DNS protocol types
 The system SHALL support the following DNS protocol types: UDP (plain), TCP, DoH (DNS-over-HTTPS), DoT (DNS-over-TLS), DoQ (DNS-over-QUIC), and H3 (DNS-over-HTTP/3).

@@ -1,4 +1,8 @@
-## MODIFIED Requirements
+## Purpose
+
+Keep node latency fresh without disturbing active connections by using direct TCP probes, scheduled background refreshes, and startup hydration of persisted samples.
+
+## Requirements
 
 ### Requirement: Direct TCP latency refresh while connected
 The system SHALL refresh node latency with direct TCP probes without interrupting or modifying the currently running backend process. The "Test Latency" action in the subscriptions UI SHALL continue to use the TCP probe; the new "Test Real Delay" action SHALL be a separate, opt-in operation handled by the `real-delay-latency-test` capability and SHALL NOT be triggered from scheduled or startup paths.

@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Download, update, and index backend-specific GeoIP/GeoSite data in the profile cache, and expose metadata in Preferences.
+
+## Requirements
 
 ### Requirement: Download GeoIP and GeoSite databases
 The system SHALL download GeoIP and GeoSite databases from upstream sources (v2fly GitHub releases for v2ray/xray, SagerNet releases for sing-box).

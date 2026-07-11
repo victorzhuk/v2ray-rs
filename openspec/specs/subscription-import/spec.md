@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Persist per-node Real Delay samples across subscription imports and refreshes.
+
+## Requirements
 
 ### Requirement: Subscription node carries Real Delay sample
 Each `SubscriptionNode` (and the equivalent manual-node record) SHALL carry an optional `last_real_delay_ms: Option<u64>` field representing the most recent successful Real Delay measurement in milliseconds. The field SHALL default to `None` for newly imported nodes and SHALL round-trip through JSON serialization without affecting other persisted fields.

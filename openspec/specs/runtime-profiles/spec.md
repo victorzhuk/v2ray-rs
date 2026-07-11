@@ -1,5 +1,11 @@
 # Spec: Runtime Profiles
 
+## Purpose
+
+Support selectable runtime profiles with isolated directories, App ID/qualifier, per-directory overrides, and non-production icon install opt-out.
+
+## Requirements
+
 ### Requirement: Profile selection
 The system SHALL select an `AppProfile` (`Production`, `Development`, `Test`, or `Custom(name)`) at startup using resolution order: `--profile` CLI flag > `V2RAY_RS_PROFILE` env > legacy `V2RAY_RS_DEV` env > compile-time default (`Development` for debug builds, `Production` for release builds).
 

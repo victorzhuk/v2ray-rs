@@ -1,6 +1,10 @@
 # Spec: System Tray (delta)
 
-## ADDED Requirements
+## Purpose
+
+Show a system tray icon, context menu, tooltip, quick connect/disconnect, minimize-to-tray behavior, and optional notifications.
+
+## Requirements
 
 ### Requirement: Tray icon display
 The system SHALL display a system tray icon that reflects the current proxy connection state.

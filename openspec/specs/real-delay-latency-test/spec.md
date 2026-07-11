@@ -1,4 +1,8 @@
-## ADDED Requirements
+## Purpose
+
+Provide on-demand end-to-end HTTP delay probes through an ephemeral backend instance and persist per-node results.
+
+## Requirements
 
 ### Requirement: On-demand real-delay probe per node
 The system SHALL provide a user-triggered "Real Delay" latency probe that measures the end-to-end wall-clock time of an HTTP request issued through each tested proxy node, including the proxy protocol handshake, TLS negotiation, and HTTP round trip. The system SHALL NOT implement any proxy protocol in v2ray-rs itself; it SHALL delegate the dial through the installed backend binary.

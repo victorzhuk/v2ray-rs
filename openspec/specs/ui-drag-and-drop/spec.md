@@ -1,3 +1,9 @@
+## Purpose
+
+Enable drag-and-drop reordering of subscriptions, subscription nodes, and routing rules.
+
+## Requirements
+
 ### Requirement: Drag-and-Drop List Reordering
 The system SHALL allow drag-and-drop reordering for routing rules, subscriptions, and subscription nodes.
 
