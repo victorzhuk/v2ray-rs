@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-07-11
+
+### Fixed
+- CI `test` job no longer fails at dependency install. `sing-box` is not in the official Arch repositories, so `pacman -Syu … sing-box` aborted with `target not found`; the binary is now fetched from the SagerNet GitHub release into `PATH`, letting the `sing-box check` config test run instead of silently skipping.
+
 ## [0.13.0] - 2026-07-11
 
 ### Fixed
@@ -483,7 +488,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...v0.11.0
