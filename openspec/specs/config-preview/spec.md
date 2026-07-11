@@ -1,5 +1,8 @@
-## ADDED Requirements
+# config-preview Specification
 
+## Purpose
+TBD - created by archiving change add-config-preview. Update Purpose after archive.
+## Requirements
 ### Requirement: View the generated config from the main window
 The system SHALL provide a "View Generated Config" action in the main window menu that opens a dialog showing the generated configuration file for the active backend in a monospace, scrollable, read-only view. The dialog SHALL show the literal on-disk file contents (re-read from disk), SHALL offer a Refresh action, and SHALL offer an action that copies the file's path.
 
@@ -16,11 +19,11 @@ The system SHALL provide a "View Generated Config" action in the main window men
 - **THEN** the file's absolute path SHALL be copied to the clipboard (not the file contents)
 
 ### Requirement: Credential redaction with explicit reveal
-The preview SHALL mask credential values by default — JSON values at keys `id`, `uuid`, `password`, and `short_id` — and SHALL provide an explicit toggle to reveal the raw contents. `public_key` values SHALL remain visible. Redaction SHALL be display-only: the on-disk file is never modified.
+The preview SHALL mask credential values by default — JSON values at keys `id`, `uuid`, `password`, `short_id`, and `shortId` — and SHALL provide an explicit toggle to reveal the raw contents. `public_key` values SHALL remain visible. Redaction SHALL be display-only: the on-disk file is never modified.
 
 #### Scenario: Redacted by default
 - **WHEN** the preview opens
-- **THEN** values at keys `id`, `uuid`, `password`, and `short_id` SHALL be masked
+- **THEN** values at keys `id`, `uuid`, `password`, `short_id`, and `shortId` SHALL be masked
 
 #### Scenario: Explicit reveal
 - **WHEN** the user activates the reveal toggle
@@ -36,3 +39,4 @@ The preview SHALL show a distinct empty state explaining why no file exists when
 #### Scenario: No generated config yet
 - **WHEN** the user opens the preview before any config has been generated (no enabled nodes yet, or the runtime directory was cleared)
 - **THEN** the dialog SHALL show an empty state naming the expected file location instead of an error
+
