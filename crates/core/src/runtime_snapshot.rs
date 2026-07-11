@@ -1,7 +1,8 @@
 use std::path::PathBuf;
 
 use crate::models::{
-    AppSettings, BackendType, DnsConfig, ManualNode, RoutingRuleSet, Subscription,
+    AppSettings, AutoResolveStrategy, BackendType, DnsConfig, ManualNode, RoutingRuleSet,
+    Subscription,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -15,6 +16,8 @@ pub struct RuntimeConfigSnapshot {
     pub routing: RoutingRuleSet,
     pub manual_nodes: Vec<ManualNode>,
     pub subscriptions: Vec<Subscription>,
+    pub auto_resolve_strategy: AutoResolveStrategy,
+    pub use_real_delay_for_lowest_latency: bool,
     pub timestamp: i64,
 }
 
@@ -35,6 +38,8 @@ impl RuntimeConfigSnapshot {
             || self.routing != *routing
             || self.manual_nodes != manual_nodes
             || !subscriptions_runtime_state_eq(&self.subscriptions, subscriptions)
+            || self.auto_resolve_strategy != settings.auto_resolve_strategy
+            || self.use_real_delay_for_lowest_latency != settings.real_delay.use_for_lowest_latency
     }
 
     pub fn restore_settings(&self, settings: &mut AppSettings) {
@@ -44,6 +49,8 @@ impl RuntimeConfigSnapshot {
         settings.http_port = self.http_port;
         settings.listen_address = self.listen_address.clone();
         settings.dns = self.dns.clone();
+        settings.auto_resolve_strategy = self.auto_resolve_strategy;
+        settings.real_delay.use_for_lowest_latency = self.use_real_delay_for_lowest_latency;
     }
 
     pub fn restore_manual_nodes(&self) -> Vec<ManualNode> {
@@ -79,6 +86,8 @@ mod tests {
             routing: RoutingRuleSet::new(),
             manual_nodes: Vec::new(),
             subscriptions: Vec::new(),
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            use_real_delay_for_lowest_latency: false,
             timestamp: 1234567890,
         }
     }
@@ -145,6 +154,8 @@ mod tests {
             routing: RoutingRuleSet::new(),
             manual_nodes: Vec::new(),
             subscriptions: Vec::new(),
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            use_real_delay_for_lowest_latency: false,
             timestamp: 1234567890,
         };
 
@@ -166,6 +177,60 @@ mod tests {
         assert_eq!(settings.listen_address, "0.0.0.0");
         assert_eq!(settings.language, Language::Russian);
         assert!(!settings.minimize_to_tray);
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_strategy_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.auto_resolve_strategy = AutoResolveStrategy::LowestLatency;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_real_delay_lowest_latency_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.real_delay.use_for_lowest_latency = true;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_restores_strategy_and_real_delay() {
+        let snapshot = RuntimeConfigSnapshot {
+            auto_resolve_strategy: AutoResolveStrategy::LastSuccessful,
+            use_real_delay_for_lowest_latency: true,
+            ..make_snapshot(BackendType::Xray, "/usr/bin/xray")
+        };
+
+        let mut settings = AppSettings::default();
+        snapshot.restore_settings(&mut settings);
+
+        assert_eq!(
+            settings.auto_resolve_strategy,
+            AutoResolveStrategy::LastSuccessful
+        );
+        assert!(settings.real_delay.use_for_lowest_latency);
     }
 
     #[test]
@@ -195,6 +260,8 @@ mod tests {
                 true,
             )],
             subscriptions: Vec::new(),
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            use_real_delay_for_lowest_latency: false,
             timestamp: 1234567890,
         };
 
@@ -261,6 +328,8 @@ mod tests {
             routing: RoutingRuleSet::new(),
             manual_nodes: manual_nodes.clone(),
             subscriptions: Vec::new(),
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            use_real_delay_for_lowest_latency: false,
             timestamp: 1234567890,
         };
 

@@ -430,6 +430,8 @@ impl App {
             routing: rules,
             manual_nodes,
             subscriptions,
+            auto_resolve_strategy: self.settings.auto_resolve_strategy,
+            use_real_delay_for_lowest_latency: self.settings.real_delay.use_for_lowest_latency,
             timestamp: chrono::Utc::now().timestamp(),
         });
 
@@ -883,9 +885,6 @@ impl SimpleComponent for App {
             }
             AppMsg::FlushSettings(settings) => {
                 self.settings_debounce = None;
-                let previous_settings = self.settings.clone();
-                let strategy_changed =
-                    previous_settings.auto_resolve_strategy != settings.auto_resolve_strategy;
                 if let Err(err) = self.persist_settings(settings) {
                     log::error!("save settings: {err}");
                     self.show_toast(&format!("Failed to save settings: {err}"));
@@ -893,7 +892,6 @@ impl SimpleComponent for App {
                 }
                 crate::i18n::switch_language(self.settings.language);
                 update_tray_notification_setting(self.settings.notifications_enabled);
-                let was_connected = self.process_handle.is_some();
                 self.geodata_service
                     .update(GeodataRefreshConfig::from_settings(
                         &self.paths,
@@ -908,10 +906,6 @@ impl SimpleComponent for App {
                         real_delay_settings: self.settings.real_delay.clone(),
                     });
                 self.restart_required = self.check_restart_required();
-                if was_connected && strategy_changed {
-                    self.reconnect_pending = true;
-                    sender.input(AppMsg::Disconnect);
-                }
                 if self.process_handle.is_none() {
                     self.regenerate_config_disconnected();
                 }

@@ -24,6 +24,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Subscriptions and nodes can now be edited while connected — toggles, reordering, and adding no longer require disconnecting first. Changes are persisted immediately and the existing "Configuration changed" banner offers Apply & Restart; the running session is untouched until then.
 - The currently connected node is marked with a "Connected" tag in the subscription and manual node lists.
 
+### Changed
+- Changing the auto-resolve strategy or the "Use Real Delay for Lowest Latency" toggle while connected now raises the existing "Configuration changed" banner instead of reconnecting immediately; the new strategy is applied only after clicking **Apply & Restart**. While disconnected, the change is still applied silently.
+
 ---
 
 ## [0.12.0] - 2026-07-04
