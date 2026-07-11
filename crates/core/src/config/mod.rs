@@ -1,11 +1,14 @@
 mod common;
 mod probe;
+mod redact;
 pub(crate) mod singbox;
 #[cfg(test)]
 mod test_fixtures;
 pub(crate) mod v2ray;
 mod writer;
 pub(crate) mod xray;
+
+pub use redact::redact_json;
 
 pub use probe::{
     PROBE_TAG_PREFIX, ProbeConfigGenerator, SingboxProbeGenerator, V2rayProbeGenerator,
