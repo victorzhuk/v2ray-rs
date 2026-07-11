@@ -8,11 +8,11 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
-    HostOverride, builtin_dns_presets,
+    builtin_dns_presets, AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch,
+    DnsServerConfig, DnsStrategy, HostOverride,
 };
 
-use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
+use super::{emit, subscribe_settings, SettingsCallback, SettingsObservers};
 
 pub(super) fn build_dns_page(
     state: &Rc<RefCell<AppSettings>>,
@@ -480,8 +480,11 @@ pub(super) fn build_dns_page(
         sync_dns_ui(&state.borrow());
 
         let sync_dns_ui_observer = sync_dns_ui.clone();
+        let ctx = dns_ctx.clone();
         subscribe_settings(settings_observers, move |settings| {
             sync_dns_ui_observer(settings);
+            render_dns_servers(&ctx);
+            render_primary_dns_servers(&ctx);
         });
     }
 
@@ -643,6 +646,25 @@ fn index_to_protocol(i: u32) -> DnsProtocol {
         4 => DnsProtocol::Doq,
         5 => DnsProtocol::H3,
         _ => DnsProtocol::Udp,
+    }
+}
+
+fn protocol_display_name(p: DnsProtocol) -> &'static str {
+    match p {
+        DnsProtocol::Udp => "UDP",
+        DnsProtocol::Tcp => "TCP",
+        DnsProtocol::Doh => "DoH",
+        DnsProtocol::Dot => "DoT",
+        DnsProtocol::Doq => "DoQ",
+        DnsProtocol::H3 => "H3",
+    }
+}
+
+fn backend_display_name(b: BackendType) -> &'static str {
+    match b {
+        BackendType::V2ray => "v2ray",
+        BackendType::Xray => "xray",
+        BackendType::SingBox => "sing-box",
     }
 }
 
@@ -859,12 +881,14 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
     ctx.added_servers.borrow_mut().clear();
 
     let servers = ctx.state.borrow().dns.servers.clone();
+    let backend = ctx.state.borrow().backend.backend_type;
 
     let mut added = ctx.added_servers.borrow_mut();
     for server in &servers {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
+        let effective = server.protocol.effective_for_backend(backend);
 
-        let subtitle = format!(
+        let mut subtitle = format!(
             "{}://{}:{}",
             protocol_str,
             server.address,
@@ -872,6 +896,14 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
                 .port
                 .unwrap_or_else(|| server.protocol.default_port())
         );
+
+        if effective != server.protocol {
+            subtitle.push_str(&format!(
+                "\nDowngraded to {} on {}",
+                protocol_display_name(effective),
+                backend_display_name(backend)
+            ));
+        }
 
         let row = adw::ActionRow::builder()
             .title(&server.tag)
@@ -982,13 +1014,15 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
 
 fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
     let servers = ctx.state.borrow().dns.servers.clone();
+    let backend = ctx.state.borrow().backend.backend_type;
 
     let remote_server = servers.iter().find(|s| s.tag == "remote");
     let domestic_server = servers.iter().find(|s| s.tag == "domestic");
 
     if let Some(server) = remote_server {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let subtitle = format!(
+        let effective = server.protocol.effective_for_backend(backend);
+        let mut subtitle = format!(
             "{}://{}:{}",
             protocol_str,
             server.address,
@@ -996,6 +1030,13 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
                 .port
                 .unwrap_or_else(|| server.protocol.default_port())
         );
+        if effective != server.protocol {
+            subtitle.push_str(&format!(
+                "\nDowngraded to {} on {}",
+                protocol_display_name(effective),
+                backend_display_name(backend)
+            ));
+        }
         ctx.remote_row.set_subtitle(&subtitle);
         ctx.remote_edit_btn.set_sensitive(true);
     } else {
@@ -1006,7 +1047,8 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
 
     if let Some(server) = domestic_server {
         let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let subtitle = format!(
+        let effective = server.protocol.effective_for_backend(backend);
+        let mut subtitle = format!(
             "{}://{}:{}",
             protocol_str,
             server.address,
@@ -1014,6 +1056,13 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
                 .port
                 .unwrap_or_else(|| server.protocol.default_port())
         );
+        if effective != server.protocol {
+            subtitle.push_str(&format!(
+                "\nDowngraded to {} on {}",
+                protocol_display_name(effective),
+                backend_display_name(backend)
+            ));
+        }
         ctx.domestic_row.set_subtitle(&subtitle);
         ctx.domestic_edit_btn.set_sensitive(true);
     } else {
@@ -1114,6 +1163,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
     };
 
     let is_singbox = ctx.state.borrow().backend.backend_type == BackendType::SingBox;
+    let backend = ctx.state.borrow().backend.backend_type;
 
     let dialog = adw::AlertDialog::builder()
         .heading(if is_edit {
@@ -1190,9 +1240,43 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         .visible(false)
         .build();
 
+    let warning_label = gtk::Label::builder()
+        .label("")
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
+
     content.append(&group);
     content.append(&error_label);
+    content.append(&warning_label);
     dialog.set_extra_child(Some(&content));
+
+    let update_warning: Rc<dyn Fn()> = Rc::new({
+        let warning_label = warning_label.clone();
+        let protocol_combo = protocol_combo.clone();
+        move || {
+            let protocol = index_to_protocol(protocol_combo.selected());
+            let effective = protocol.effective_for_backend(backend);
+            if effective != protocol {
+                warning_label.set_text(&format!(
+                    "Effective protocol on {} is {}",
+                    backend_display_name(backend),
+                    protocol_display_name(effective)
+                ));
+                warning_label.set_visible(true);
+            } else {
+                warning_label.set_text("");
+                warning_label.set_visible(false);
+            }
+        }
+    });
+    update_warning();
+    {
+        let update_warning = update_warning.clone();
+        protocol_combo.connect_selected_notify(move |_| update_warning());
+    }
 
     let validate: Rc<dyn Fn() -> Result<DnsServerConfig, String>> = Rc::new({
         let state = ctx.state.clone();
