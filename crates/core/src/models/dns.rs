@@ -513,35 +513,55 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_protocol_v2ray_fallbacks() {
-        assert_eq!(
-            DnsProtocol::Dot.effective_for_backend(BackendType::V2ray),
-            DnsProtocol::Doh
-        );
-        assert_eq!(
-            DnsProtocol::Doq.effective_for_backend(BackendType::V2ray),
-            DnsProtocol::Doh
-        );
-        assert_eq!(
-            DnsProtocol::H3.effective_for_backend(BackendType::V2ray),
-            DnsProtocol::Doh
-        );
-    }
+    fn test_dns_protocol_backend_matrix() {
+        let cases: [(DnsProtocol, BackendType, Option<DnsProtocol>, DnsProtocol); 18] = [
+            (DnsProtocol::Udp, BackendType::SingBox, None, DnsProtocol::Udp),
+            (DnsProtocol::Tcp, BackendType::SingBox, None, DnsProtocol::Tcp),
+            (DnsProtocol::Doh, BackendType::SingBox, None, DnsProtocol::Doh),
+            (DnsProtocol::Dot, BackendType::SingBox, None, DnsProtocol::Dot),
+            (DnsProtocol::Doq, BackendType::SingBox, None, DnsProtocol::Doq),
+            (DnsProtocol::H3, BackendType::SingBox, None, DnsProtocol::H3),
+            (DnsProtocol::Udp, BackendType::Xray, None, DnsProtocol::Udp),
+            (DnsProtocol::Tcp, BackendType::Xray, None, DnsProtocol::Tcp),
+            (DnsProtocol::Doh, BackendType::Xray, None, DnsProtocol::Doh),
+            (DnsProtocol::Dot, BackendType::Xray, None, DnsProtocol::Dot),
+            (DnsProtocol::Doq, BackendType::Xray, None, DnsProtocol::Doq),
+            (DnsProtocol::H3, BackendType::Xray, Some(DnsProtocol::Doh), DnsProtocol::Doh),
+            (DnsProtocol::Udp, BackendType::V2ray, None, DnsProtocol::Udp),
+            (DnsProtocol::Tcp, BackendType::V2ray, None, DnsProtocol::Tcp),
+            (DnsProtocol::Doh, BackendType::V2ray, None, DnsProtocol::Doh),
+            (
+                DnsProtocol::Dot,
+                BackendType::V2ray,
+                Some(DnsProtocol::Doh),
+                DnsProtocol::Doh,
+            ),
+            (
+                DnsProtocol::Doq,
+                BackendType::V2ray,
+                Some(DnsProtocol::Doh),
+                DnsProtocol::Doh,
+            ),
+            (
+                DnsProtocol::H3,
+                BackendType::V2ray,
+                Some(DnsProtocol::Doh),
+                DnsProtocol::Doh,
+            ),
+        ];
 
-    #[test]
-    fn test_dns_protocol_xray_only_falls_back_h3() {
-        assert_eq!(
-            DnsProtocol::Dot.effective_for_backend(BackendType::Xray),
-            DnsProtocol::Dot
-        );
-        assert_eq!(
-            DnsProtocol::Doq.effective_for_backend(BackendType::Xray),
-            DnsProtocol::Doq
-        );
-        assert_eq!(
-            DnsProtocol::H3.effective_for_backend(BackendType::Xray),
-            DnsProtocol::Doh
-        );
+        for (protocol, backend, expected_fallback, expected_effective) in cases {
+            assert_eq!(
+                protocol.fallback_protocol_for_backend(backend),
+                expected_fallback,
+                "fallback for {protocol:?} on {backend:?} should be {expected_fallback:?}"
+            );
+            assert_eq!(
+                protocol.effective_for_backend(backend),
+                expected_effective,
+                "effective protocol for {protocol:?} on {backend:?} should be {expected_effective:?}"
+            );
+        }
     }
 
     #[test]
