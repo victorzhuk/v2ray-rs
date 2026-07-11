@@ -1,8 +1,6 @@
 ## Purpose
 Define how available nodes are resolved and used for connection attempts.
-
 ## Requirements
-
 ### Requirement: Build ordered connection candidates
 The system SHALL build an ordered list of connection candidates from enabled subscription nodes and enabled manual nodes according to the selected strategy. The Lowest Latency strategy SHALL be configurable via the `use_real_delay_for_lowest_latency` app setting: when the setting is true and a node has a recorded `last_real_delay_ms`, the system SHALL rank by Real Delay; otherwise it SHALL fall back to `last_latency_ms` (TCP). Nodes with neither sample SHALL be placed last.
 
@@ -56,3 +54,15 @@ The system SHALL let the user connect directly to a specific enabled node, using
 #### Scenario: Direct connect updates last-success metadata
 - **WHEN** a direct connection succeeds
 - **THEN** the system SHALL record it as the last successful node, the same as any other successful connection
+
+### Requirement: Strategy changes take effect on the next connection
+A change to the auto-resolve strategy SHALL take effect at the next connection attempt. While a connection is active, the system SHALL NOT automatically disconnect to apply a strategy change; the running session continues under the strategy it was started with until the user explicitly applies the change or reconnects.
+
+#### Scenario: Active session keeps its strategy
+- **WHEN** the user changes the strategy while connected and does not apply the restart
+- **THEN** the active session SHALL continue unchanged and its displayed connection metadata SHALL keep reporting the strategy it was started with
+
+#### Scenario: Next connect uses the new strategy
+- **WHEN** a new connection starts after a strategy change (explicit apply, manual reconnect, or a later connect)
+- **THEN** candidate ordering SHALL follow the new strategy
+

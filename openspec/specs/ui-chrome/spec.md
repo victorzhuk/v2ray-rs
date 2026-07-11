@@ -1,9 +1,7 @@
 ## Purpose
 
 Standardize main window chrome with a single header bar, page actions, tab icons, restart banner, and active node indicators.
-
 ## Requirements
-
 ### Requirement: Single HeaderBar per window
 The application window SHALL have exactly one `adw::HeaderBar` at the top level. Sub-pages inside `adw::ViewStack` SHALL NOT render their own HeaderBars.
 
@@ -83,3 +81,19 @@ The subscription and manual node lists SHALL mark the currently connected node w
 #### Scenario: Connected node marked in the list
 - **WHEN** the backend reaches Running with a resolved node
 - **THEN** the corresponding row shows a `Connected` tag, which is removed when the session ends or the connection switches nodes
+
+### Requirement: Restart-required banner for strategy changes
+Changing the auto-resolve strategy (or the Real Delay ranking toggle) while the backend is starting or running SHALL NOT disconnect automatically; it SHALL mark the runtime configuration as diverged and reuse the restart-required banner, applying the change only on explicit "Apply & Restart".
+
+#### Scenario: Strategy change while connected shows the banner
+- **WHEN** the backend is connected and the user changes the auto-resolve strategy
+- **THEN** the connection SHALL stay up and the restart-required banner SHALL appear with `Apply & Restart`
+
+#### Scenario: Strategy change applies on explicit restart
+- **WHEN** the user clicks `Apply & Restart` after a strategy change
+- **THEN** the system SHALL disconnect and reconnect using the new strategy
+
+#### Scenario: Strategy change while disconnected applies silently
+- **WHEN** the backend is stopped and the user changes the auto-resolve strategy
+- **THEN** no banner SHALL appear and the next connection SHALL use the new strategy
+
