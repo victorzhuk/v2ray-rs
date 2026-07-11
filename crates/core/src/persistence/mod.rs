@@ -1,13 +1,12 @@
-use std::env;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
-use directories::{BaseDirs, ProjectDirs};
+use directories::ProjectDirs;
 use thiserror::Error;
 
 use crate::cli::PathOverrides;
-use crate::profile::AppProfile;
+use crate::profile::{AppProfile, Env, StdEnv};
 
 mod latency;
 mod manual_nodes;
@@ -69,37 +68,32 @@ impl AppPaths {
     }
 
     pub fn for_profile(profile: AppProfile) -> Result<Self, PersistenceError> {
+        Self::for_profile_with_env(profile, &StdEnv)
+    }
+
+    pub(crate) fn for_profile_with_env(
+        profile: AppProfile,
+        env: &dyn Env,
+    ) -> Result<Self, PersistenceError> {
         let qualifier = profile.qualifier();
         let dirs = ProjectDirs::from("com", "v2ray-rs", qualifier.as_str())
             .ok_or(PersistenceError::NoDirs)?;
 
-        let base_dirs = BaseDirs::new().ok_or(PersistenceError::NoDirs)?;
+        let data_dir = dirs.data_dir().to_path_buf();
 
-        // Primary: XDG_RUNTIME_DIR/<qualifier>/
-        // Fallback: data_dir/runtime (when XDG_RUNTIME_DIR is not set)
-        let runtime_dir = if env::var("XDG_RUNTIME_DIR").is_ok() {
-            base_dirs
-                .runtime_dir()
-                .map(|r| r.join(qualifier.as_str()))
-                .unwrap_or_else(|| dirs.data_dir().join("runtime"))
-        } else {
-            dirs.data_dir().join("runtime")
-        };
+        let runtime_dir = env
+            .get("XDG_RUNTIME_DIR")
+            .map(|v| PathBuf::from(v).join(qualifier.as_str()))
+            .unwrap_or_else(|| data_dir.join("runtime"));
 
-        // Primary: XDG_STATE_HOME/<qualifier>/
-        // Fallback: data_dir/state (when XDG_STATE_HOME is not set)
-        let state_dir = if env::var("XDG_STATE_HOME").is_ok() {
-            base_dirs
-                .state_dir()
-                .map(|s| s.join(qualifier.as_str()))
-                .unwrap_or_else(|| dirs.data_dir().join("state"))
-        } else {
-            dirs.data_dir().join("state")
-        };
+        let state_dir = env
+            .get("XDG_STATE_HOME")
+            .map(|v| PathBuf::from(v).join(qualifier.as_str()))
+            .unwrap_or_else(|| data_dir.join("state"));
 
         Ok(Self {
             config_dir: dirs.config_dir().to_path_buf(),
-            data_dir: dirs.data_dir().to_path_buf(),
+            data_dir,
             cache_dir: dirs.cache_dir().to_path_buf(),
             runtime_dir,
             state_dir,
@@ -466,7 +460,30 @@ pub(super) fn test_paths() -> (tempfile::TempDir, AppPaths) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::Env;
     use std::os::unix::fs::PermissionsExt;
+
+    struct MockEnv {
+        vars: std::collections::HashMap<String, String>,
+    }
+
+    impl MockEnv {
+        fn new() -> Self {
+            Self {
+                vars: std::collections::HashMap::new(),
+            }
+        }
+
+        fn set(&mut self, key: &str, value: &str) {
+            self.vars.insert(key.to_string(), value.to_string());
+        }
+    }
+
+    impl Env for MockEnv {
+        fn get(&self, key: &str) -> Option<String> {
+            self.vars.get(key).cloned()
+        }
+    }
 
     #[test]
     fn test_ensure_dirs_creates_directories() {
@@ -545,50 +562,42 @@ mod tests {
 
     #[test]
     fn test_runtime_dir_fallback() {
-        // Temporarily unset XDG_RUNTIME_DIR
-        let original_runtime = env::var("XDG_RUNTIME_DIR").ok();
+        let env = MockEnv::new();
 
-        unsafe { env::remove_var("XDG_RUNTIME_DIR") };
-
-        let result = AppPaths::new();
-        assert!(
-            result.is_ok(),
-            "should create AppPaths even without XDG_RUNTIME_DIR"
-        );
-
-        if let Ok(paths) = result {
-            // Runtime dir should fall back to data_dir/runtime
-            assert!(paths.runtime_dir().ends_with("runtime"));
-        }
-
-        // Restore original value
-        if let Some(val) = original_runtime {
-            unsafe { env::set_var("XDG_RUNTIME_DIR", val) };
-        }
+        let paths = AppPaths::for_profile_with_env(AppProfile::Production, &env).unwrap();
+        assert_eq!(paths.runtime_dir(), paths.data_dir().join("runtime"));
     }
 
     #[test]
     fn test_state_dir_fallback() {
-        // Temporarily unset XDG_STATE_HOME
-        let original_state = env::var("XDG_STATE_HOME").ok();
+        let env = MockEnv::new();
 
-        unsafe { env::remove_var("XDG_STATE_HOME") };
+        let paths = AppPaths::for_profile_with_env(AppProfile::Production, &env).unwrap();
+        assert_eq!(paths.state_dir(), paths.data_dir().join("state"));
+    }
 
-        let result = AppPaths::new();
-        assert!(
-            result.is_ok(),
-            "should create AppPaths even without XDG_STATE_HOME"
+    #[test]
+    fn test_runtime_dir_present() {
+        let mut env = MockEnv::new();
+        env.set("XDG_RUNTIME_DIR", "/tmp/xdg-runtime");
+
+        let paths = AppPaths::for_profile_with_env(AppProfile::Production, &env).unwrap();
+        assert_eq!(
+            paths.runtime_dir(),
+            PathBuf::from("/tmp/xdg-runtime").join(AppProfile::Production.qualifier())
         );
+    }
 
-        if let Ok(paths) = result {
-            // State dir should fall back to data_dir/state
-            assert!(paths.state_dir().ends_with("state"));
-        }
+    #[test]
+    fn test_state_dir_present() {
+        let mut env = MockEnv::new();
+        env.set("XDG_STATE_HOME", "/tmp/xdg-state");
 
-        // Restore original value
-        if let Some(val) = original_state {
-            unsafe { env::set_var("XDG_STATE_HOME", val) };
-        }
+        let paths = AppPaths::for_profile_with_env(AppProfile::Production, &env).unwrap();
+        assert_eq!(
+            paths.state_dir(),
+            PathBuf::from("/tmp/xdg-state").join(AppProfile::Production.qualifier())
+        );
     }
 
     #[test]
