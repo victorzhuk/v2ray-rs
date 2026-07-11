@@ -38,7 +38,13 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf sing-box
+        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl
+      - name: Install sing-box
+        run: |
+          ver=1.13.14
+          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-amd64.tar.gz" \
+            | tar -xz -C /usr/local/bin --strip-components=1 "sing-box-${ver}-linux-amd64/sing-box"
+          sing-box version
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
