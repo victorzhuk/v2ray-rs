@@ -8,11 +8,11 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 use v2ray_rs_core::models::{
-    builtin_dns_presets, AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch,
-    DnsServerConfig, DnsStrategy, HostOverride,
+    AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
+    HostOverride, builtin_dns_presets,
 };
 
-use super::{emit, subscribe_settings, SettingsCallback, SettingsObservers};
+use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
 
 pub(super) fn build_dns_page(
     state: &Rc<RefCell<AppSettings>>,
