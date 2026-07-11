@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-07-11
+
 ### Fixed
 - Generated sing-box configs now pass `sing-box check` on 1.12/1.13 instead of being rejected on launch. The TUN inbound no longer emits the legacy `sniff`/`dns_mode` fields (removed in sing-box 1.13.0) — sniffing and DNS hijacking are now expressed as route rules. DoH servers send `path` as a string instead of an array, static host overrides use the current `predefined` field and are actually consulted via a DNS rule, and `route.default_domain_resolver` is set whenever DNS is enabled, which sing-box now requires with more than one server. A DNS server's `detour` (previously the placeholder `"proxy-0"`, which never matched a real outbound tag) now resolves to the actual first proxy outbound. FakeIP moved off the legacy top-level `dns.fakeip` block onto the fakeip server entry itself, with a DNS rule routing A/AAAA queries to it instead of setting it as the default resolver (which sing-box now rejects).
 - DNS settings can no longer be saved enabled with zero servers configured, which produced an unusable config since FakeIP alone cannot answer real queries.
@@ -481,7 +483,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...HEAD
+[0.13.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.2...v0.11.0
 [0.10.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.10.1...v0.10.2
