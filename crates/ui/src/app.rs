@@ -41,6 +41,7 @@ pub struct AppInit {
     pub tray_action_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TrayAction>>,
 }
 
+use crate::config_preview::{ConfigPreviewDialog, ConfigPreviewInput};
 use crate::connection::{ConnectionHandle, ConnectionRequest};
 use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
 use crate::logs::{LogsMsg, LogsPage};
@@ -71,6 +72,7 @@ pub struct App {
     status_details: gtk::Label,
     toast_overlay: adw::ToastOverlay,
     preferences_dialog: Option<adw::PreferencesDialog>,
+    config_preview: Option<Controller<ConfigPreviewDialog>>,
     runtime_snapshot: Option<RuntimeConfigSnapshot>,
     restart_required: bool,
     current_view: usize,
@@ -98,6 +100,7 @@ pub enum AppMsg {
     ProcessStateConnection(ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(String),
     OpenPreferences,
+    ViewGeneratedConfig,
     PreferencesClosed,
     ResetBrokenSettings,
     QuitAfterSettingsError,
@@ -525,6 +528,7 @@ impl SimpleComponent for App {
                             #[wrap(Some)]
                             set_popover = &gtk::PopoverMenu::from_model(Some(&{
                                 let menu = gtk::gio::Menu::new();
+                                menu.append(Some("View Generated Config"), Some("win.view-generated-config"));
                                 menu.append(Some("Preferences"), Some("win.preferences"));
                                 menu
                             })) {},
@@ -792,6 +796,7 @@ impl SimpleComponent for App {
             status_details: status_details.clone(),
             toast_overlay: toast_overlay.clone(),
             preferences_dialog: None,
+            config_preview: None,
             runtime_snapshot: None,
             restart_required: false,
             current_view: 0,
@@ -824,6 +829,15 @@ impl SimpleComponent for App {
             });
         }
         root.add_action(&prefs_action);
+
+        let view_config_action = gtk::gio::SimpleAction::new("view-generated-config", None);
+        {
+            let s = sender.input_sender().clone();
+            view_config_action.connect_activate(move |_, _| {
+                s.emit(AppMsg::ViewGeneratedConfig);
+            });
+        }
+        root.add_action(&view_config_action);
 
         ComponentParts { model, widgets }
     }
@@ -1180,6 +1194,21 @@ impl SimpleComponent for App {
             }
             AppMsg::PreferencesClosed => {
                 self.preferences_dialog = None;
+            }
+            AppMsg::ViewGeneratedConfig => {
+                let backend = self.settings.backend.backend_type;
+                let writer = ConfigWriter::new(&self.settings, &self.paths);
+                let path = writer.output_path(backend);
+                if let Some(dialog) = &self.config_preview {
+                    dialog.emit(ConfigPreviewInput::SetPath(path));
+                    dialog.widget().present(Some(&self.window));
+                    return;
+                }
+
+                let window = self.window.clone();
+                let dialog = ConfigPreviewDialog::builder().launch(path).detach();
+                dialog.widget().present(Some(&window));
+                self.config_preview = Some(dialog);
             }
             AppMsg::ResetBrokenSettings => match std::fs::remove_file(self.paths.settings_path()) {
                 Ok(()) => {

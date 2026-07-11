@@ -1,5 +1,6 @@
 pub(crate) mod app;
 mod cli;
+mod config_preview;
 mod connection;
 mod geodata_service;
 pub mod i18n;
