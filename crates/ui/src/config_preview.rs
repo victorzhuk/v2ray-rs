@@ -171,32 +171,33 @@ impl Component for ConfigPreviewDialog {
                 self.absolute_path = absolute_path_string(&self.path);
                 sender.input(ConfigPreviewInput::Refresh);
             }
-            ConfigPreviewInput::Loaded(result) => match result {
-                Ok(raw) => {
-                    self.status = None;
-                    self.raw_content = raw;
-                    self.redacted_content = v2ray_rs_core::config::redact_json(&self.raw_content);
-                    self.reveal_raw = false;
+            ConfigPreviewInput::Loaded(result) => {
+                match result {
+                    Ok(raw) => {
+                        self.status = None;
+                        self.raw_content = raw;
+                        self.redacted_content =
+                            v2ray_rs_core::config::redact_json(&self.raw_content);
+                        self.reveal_raw = false;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        self.status = Some(format!(
+                            "The expected config file has not been generated yet.\n{}",
+                            self.absolute_path
+                        ));
+                        self.raw_content.clear();
+                        self.redacted_content = None;
+                        self.reveal_raw = false;
+                    }
+                    Err(e) => {
+                        self.status = Some(format!("Failed to read generated config: {e}"));
+                        self.raw_content.clear();
+                        self.redacted_content = None;
+                        self.reveal_raw = false;
+                    }
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    self.status = Some(format!(
-                        "The expected config file has not been generated yet.\n{}",
-                        self.absolute_path
-                    ));
-                    self.raw_content.clear();
-                    self.redacted_content = None;
-                    self.reveal_raw = false;
-                }
-                Err(e) => {
-                    self.status = Some(format!("Failed to read generated config: {e}"));
-                    self.raw_content.clear();
-                    self.redacted_content = None;
-                    self.reveal_raw = false;
-                }
-            },
-        }
-        if !matches!(msg, ConfigPreviewInput::SetReveal(_) | ConfigPreviewInput::CopyPath) {
-            self.update_text();
+                self.update_text();
+            }
         }
     }
 
