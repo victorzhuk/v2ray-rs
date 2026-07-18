@@ -10,6 +10,7 @@ use crate::persistence::AppPaths;
 
 pub struct ConfigWriter {
     output_dir: PathBuf,
+    singbox_cache_path: Option<PathBuf>,
 }
 
 impl ConfigWriter {
@@ -20,12 +21,18 @@ impl ConfigWriter {
             .clone()
             .unwrap_or_else(|| paths.generated_dir());
 
-        Self { output_dir }
+        Self {
+            output_dir,
+            singbox_cache_path: Some(paths.cache_dir().join("sing-box-cache.db")),
+        }
     }
 
     #[cfg(test)]
     pub fn with_dir(dir: PathBuf) -> Self {
-        Self { output_dir: dir }
+        Self {
+            singbox_cache_path: Some(dir.join("sing-box-cache.db")),
+            output_dir: dir,
+        }
     }
 
     pub fn output_path(&self, backend: BackendType) -> PathBuf {
@@ -66,7 +73,10 @@ impl ConfigWriter {
                 }
             };
 
-        let config = generator.generate(nodes, rules, settings_for_generate)?;
+        let mut config = generator.generate(nodes, rules, settings_for_generate)?;
+        if backend == BackendType::SingBox {
+            apply_singbox_cache_file(&mut config, settings, self.singbox_cache_path.as_deref());
+        }
         let json = serde_json::to_string(&config)?;
 
         std::fs::create_dir_all(&self.output_dir)?;
@@ -78,6 +88,32 @@ impl ConfigWriter {
 
         Ok(path)
     }
+}
+
+/// Remote rule-sets are fetched synchronously at sing-box startup and a failed
+/// fetch is fatal; the cache file lets every start after the first successful
+/// fetch pass rule-set init offline. Path must be absolute — sing-box resolves
+/// a bare name against its own working directory.
+fn apply_singbox_cache_file(
+    config: &mut serde_json::Value,
+    settings: &AppSettings,
+    cache_path: Option<&std::path::Path>,
+) {
+    let Some(cache_path) = cache_path else { return };
+    let has_remote_ruleset = config["route"]["rule_set"]
+        .as_array()
+        .is_some_and(|sets| sets.iter().any(|s| s["type"] == "remote"));
+    if !has_remote_ruleset {
+        return;
+    }
+    let mut cache_file = serde_json::json!({
+        "enabled": true,
+        "path": cache_path,
+    });
+    if settings.dns.fakeip.enabled {
+        cache_file["store_fakeip"] = serde_json::json!(true);
+    }
+    config["experimental"]["cache_file"] = cache_file;
 }
 
 fn validate_runtime_inputs(nodes: &[ProxyNode], settings: &AppSettings) -> Result<(), ConfigError> {
@@ -199,6 +235,61 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed["outbounds"][0]["type"], "shadowsocks");
+    }
+
+    #[test]
+    fn test_write_config_singbox_cache_file_with_rulesets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+
+        let path = writer
+            .write_config(&sample_nodes(), &sample_rules(), &settings)
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let cache_file = &parsed["experimental"]["cache_file"];
+        assert_eq!(cache_file["enabled"], true);
+        let cache_path = cache_file["path"].as_str().unwrap();
+        assert!(std::path::Path::new(cache_path).is_absolute());
+        assert!(cache_path.ends_with("sing-box-cache.db"));
+        assert!(cache_file.get("store_fakeip").is_none());
+    }
+
+    #[test]
+    fn test_write_config_singbox_cache_file_stores_fakeip_when_enabled() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings.dns.enabled = true;
+        settings.dns.fakeip.enabled = true;
+
+        let path = writer
+            .write_config(&sample_nodes(), &sample_rules(), &settings)
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(parsed["experimental"]["cache_file"]["store_fakeip"], true);
+    }
+
+    #[test]
+    fn test_write_config_singbox_no_cache_file_without_rulesets() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+
+        let path = writer
+            .write_config(&sample_nodes(), &[], &settings)
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(parsed.get("experimental").is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::process::Command;
 use v2ray_rs_core::config::{ConfigGenerator, SingboxGenerator};
 use v2ray_rs_core::models::{
     AppSettings, DnsHijackMode, DnsProtocol, DnsServerConfig, FakeIpConfig, HostOverride,
-    ProxyNode, ShadowsocksConfig,
+    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
 };
 
 fn sing_box_available() -> bool {
@@ -45,9 +45,19 @@ fn dns_servers() -> Vec<DnsServerConfig> {
 }
 
 fn check(name: &str, settings: &AppSettings) {
-    let config = SingboxGenerator
-        .generate(&[ss_node()], &[], settings)
+    check_with_rules(name, settings, &[], |_| {});
+}
+
+fn check_with_rules(
+    name: &str,
+    settings: &AppSettings,
+    rules: &[RoutingRule],
+    patch: impl FnOnce(&mut serde_json::Value),
+) {
+    let mut config = SingboxGenerator
+        .generate(&[ss_node()], rules, settings)
         .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
+    patch(&mut config);
     let json = serde_json::to_string_pretty(&config).unwrap();
 
     let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
@@ -197,5 +207,54 @@ fn generated_singbox_configs_pass_sing_box_check() {
 
     for (name, settings) in &cases {
         check(name, settings);
+    }
+}
+
+/// Rule-set config with the experimental cache_file the writer injects — the
+/// exact shape a GeoIP/GeoSite routing setup produces after
+/// fix-singbox-ruleset-offline-start.
+#[test]
+fn ruleset_config_with_cache_file_passes_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let rules = vec![
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::GeoIp {
+                country_code: "RU".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::GeoSite {
+                category: "yandex".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+    ];
+
+    let mut tun_settings = AppSettings::default();
+    tun_settings.tun.enabled = true;
+
+    let cache_dir = tempfile::TempDir::new().unwrap();
+    let cache_path = cache_dir.path().join("sing-box-cache.db");
+    for (name, settings) in [
+        ("rulesets-plain", AppSettings::default()),
+        ("rulesets-tun", tun_settings),
+    ] {
+        check_with_rules(name, &settings, &rules, |config| {
+            config["experimental"]["cache_file"] = serde_json::json!({
+                "enabled": true,
+                "path": cache_path,
+            });
+        });
     }
 }

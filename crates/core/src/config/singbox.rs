@@ -43,6 +43,13 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
         if let Some(resolver) = default_domain_resolver_tag(settings) {
             config["route"]["default_domain_resolver"] = json!(resolver);
         }
+    } else if settings.tun.enabled {
+        // TUN must never depend on the OS resolver: with the DNS feature off,
+        // derive a minimal trusted plane so hijack-dns and route resolution
+        // have somewhere clean to go (poisoned ISP answers otherwise feed
+        // geoip routing and direct dials).
+        config["dns"] = derived_tun_dns(settings, &first_proxy_tag);
+        config["route"]["default_domain_resolver"] = json!(DERIVED_DNS_TAG);
     }
 
     if settings.tun.enabled {
@@ -50,6 +57,32 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
     }
 
     config
+}
+
+const DERIVED_DNS_TAG: &str = "remote";
+
+fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
+    json!({
+        "strategy": strategy_str(settings.dns.strategy),
+        "servers": [{
+            "tag": DERIVED_DNS_TAG,
+            "type": "https",
+            "server": "1.1.1.1",
+            "server_port": 443,
+            "path": "/dns-query",
+            "detour": first_proxy_tag,
+        }],
+        "final": DERIVED_DNS_TAG,
+    })
+}
+
+fn strategy_str(strategy: DnsStrategy) -> &'static str {
+    match strategy {
+        DnsStrategy::PreferIpv4 => "prefer_ipv4",
+        DnsStrategy::PreferIpv6 => "prefer_ipv6",
+        DnsStrategy::Ipv4Only => "ipv4_only",
+        DnsStrategy::Ipv6Only => "ipv6_only",
+    }
 }
 
 fn default_domain_resolver_tag(settings: &AppSettings) -> Option<String> {
@@ -286,13 +319,7 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
 fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &str) -> Value {
     let mut dns_config = json!({});
 
-    let strategy_str = match settings.dns.strategy {
-        DnsStrategy::PreferIpv4 => "prefer_ipv4",
-        DnsStrategy::PreferIpv6 => "prefer_ipv6",
-        DnsStrategy::Ipv4Only => "ipv4_only",
-        DnsStrategy::Ipv6Only => "ipv6_only",
-    };
-    dns_config["strategy"] = json!(strategy_str);
+    dns_config["strategy"] = json!(strategy_str(settings.dns.strategy));
 
     let mut servers: Vec<Value> = Vec::new();
 
@@ -506,7 +533,7 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
             "inbound": ["tun-in"],
             "action": "sniff",
         }));
-        if settings.dns.enabled && settings.tun.dns_hijack == DnsHijackMode::Hijack {
+        if settings.tun.dns_hijack == DnsHijackMode::Hijack {
             route_rules.push(json!({
                 "protocol": "dns",
                 "action": "hijack-dns",
@@ -548,13 +575,15 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
 
     let mut rule_sets: Vec<Value> = Vec::new();
 
+    // No download_detour: sing-box then downloads through the default outbound
+    // (the proxy), the only path that works where GitHub is blocked. The field
+    // is also deprecated in sing-box 1.14 and removed in 1.16.
     for tag in &geoip_tags {
         rule_sets.push(json!({
             "type": "remote",
             "tag": format!("geoip-{tag}"),
             "format": "binary",
             "url": format!("{GEOIP_RULESET_URL}/geoip-{tag}.srs"),
-            "download_detour": "direct",
         }));
     }
     for tag in &geosite_tags {
@@ -563,7 +592,6 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
             "tag": format!("geosite-{tag}"),
             "format": "binary",
             "url": format!("{GEOSITE_RULESET_URL}/geosite-{tag}.srs"),
-            "download_detour": "direct",
         }));
     }
 
@@ -751,7 +779,7 @@ mod tests {
     }
 
     #[test]
-    fn test_singbox_no_hijack_dns_rule_when_dns_disabled() {
+    fn test_singbox_tun_with_dns_disabled_derives_dns_plane() {
         let mut settings = default_settings();
         settings.tun.enabled = true;
         settings.dns.enabled = false;
@@ -760,8 +788,29 @@ mod tests {
             .generate(&[ss_node()], &[], &settings)
             .unwrap();
 
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["type"], "https");
+        assert_eq!(servers[0]["server"], "1.1.1.1");
+        assert_eq!(servers[0]["detour"], "proxy-0-Test SS");
+        assert_eq!(config["dns"]["final"], servers[0]["tag"]);
+        assert_eq!(
+            config["route"]["default_domain_resolver"],
+            servers[0]["tag"]
+        );
+
         let route_rules = config["route"]["rules"].as_array().unwrap();
-        assert!(!route_rules.iter().any(|r| r["action"] == "hijack-dns"));
+        assert!(route_rules.iter().any(|r| r["action"] == "hijack-dns"));
+    }
+
+    #[test]
+    fn test_singbox_no_derived_dns_without_tun() {
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &default_settings())
+            .unwrap();
+
+        assert!(config.get("dns").is_none());
+        assert!(config["route"].get("default_domain_resolver").is_none());
     }
 
     #[test]
@@ -907,7 +956,10 @@ mod tests {
                 .unwrap()
                 .contains("geoip-ru.srs")
         );
-        assert_eq!(rule_sets[0]["download_detour"], "direct");
+        assert!(
+            rule_sets[0].get("download_detour").is_none(),
+            "download_detour must be absent so rule-sets download via the default (proxy) outbound"
+        );
     }
 
     #[test]
