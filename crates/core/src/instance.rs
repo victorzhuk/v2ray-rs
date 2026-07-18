@@ -70,6 +70,7 @@ impl InstanceStamp {
 
     pub fn update_started(&mut self, paths: &AppPaths) -> Result<(), InstanceError> {
         let now = Utc::now().to_rfc3339();
+        self.build_version = BUILD_VERSION.to_string();
         self.last_started_at = now;
         self.last_started_pid = std::process::id();
         self.save_to(&paths.instance_stamp_path())
@@ -266,6 +267,22 @@ mod tests {
         assert_eq!(stamp2.schema_version, stamp1.schema_version);
         assert_eq!(stamp2.first_started_at, first_started);
         assert_eq!(stamp2.last_started_at, first_last_started);
+    }
+
+    #[test]
+    fn test_instance_stamp_update_started_refreshes_build_version() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().unwrap();
+
+        let mut stamp = InstanceStamp::load_or_create(&paths).unwrap();
+        stamp.build_version = "0.7.4".to_string();
+        stamp.save_to(&paths.instance_stamp_path()).unwrap();
+
+        stamp.update_started(&paths).unwrap();
+
+        assert_eq!(stamp.build_version, BUILD_VERSION);
+        let reloaded = InstanceStamp::load_or_create(&paths).unwrap();
+        assert_eq!(reloaded.build_version, BUILD_VERSION);
     }
 
     #[test]

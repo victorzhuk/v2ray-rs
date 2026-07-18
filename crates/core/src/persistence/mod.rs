@@ -280,65 +280,19 @@ impl AppPaths {
     }
 
     fn relocate_generated_dir(&self) {
-        let legacy_dir = self.data_dir.join("generated");
-        let new_dir = self.generated_dir();
-
-        if !legacy_dir.exists() || !is_dir_empty(&new_dir) {
-            return;
-        }
-
-        match fs::read_dir(&legacy_dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let src = entry.path();
-                    if src.is_file() {
-                        let dst = new_dir.join(entry.file_name());
-                        match move_file_best_effort(&src, &dst) {
-                            Ok(()) => {
-                                log::info!("relocated generated config: {:?} -> {:?}", src, dst)
-                            }
-                            Err(e) => {
-                                log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e)
-                            }
-                        }
-                    }
-                }
-                let _ = fs::remove_dir(&legacy_dir);
-            }
-            Err(e) => log::warn!(
-                "failed to read legacy generated dir {:?}: {}",
-                legacy_dir,
-                e
-            ),
-        }
+        relocate_legacy_dir(
+            &self.data_dir.join("generated"),
+            &self.generated_dir(),
+            "generated config",
+        );
     }
 
     fn relocate_geodata_dir(&self) {
-        let legacy_dir = self.data_dir.join("geodata");
-        let new_dir = self.geodata_dir();
-
-        if !legacy_dir.exists() || !is_dir_empty(&new_dir) {
-            return;
-        }
-
-        match fs::read_dir(&legacy_dir) {
-            Ok(entries) => {
-                for entry in entries.flatten() {
-                    let src = entry.path();
-                    if src.is_file() {
-                        let dst = new_dir.join(entry.file_name());
-                        match move_file_best_effort(&src, &dst) {
-                            Ok(()) => log::info!("relocated geodata file: {:?} -> {:?}", src, dst),
-                            Err(e) => {
-                                log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e)
-                            }
-                        }
-                    }
-                }
-                let _ = fs::remove_dir(&legacy_dir);
-            }
-            Err(e) => log::warn!("failed to read legacy geodata dir {:?}: {}", legacy_dir, e),
-        }
+        relocate_legacy_dir(
+            &self.data_dir.join("geodata"),
+            &self.geodata_dir(),
+            "geodata file",
+        );
     }
 
     fn relocate_latency_snapshot(&self) {
@@ -414,6 +368,48 @@ fn is_dir_empty(dir: &Path) -> bool {
     fs::read_dir(dir)
         .map(|mut entries| entries.next().is_none())
         .unwrap_or(true)
+}
+
+/// Migrates files out of a pre-XDG-split legacy directory. The destination is
+/// created first (a cross-device rename into a missing directory otherwise
+/// fails every start and the legacy copies — generated configs carry node
+/// credentials — linger forever). A destination that already holds current
+/// data means the migration happened; the legacy leftovers are then deleted,
+/// not kept.
+fn relocate_legacy_dir(legacy_dir: &Path, new_dir: &Path, what: &str) {
+    if !legacy_dir.exists() {
+        return;
+    }
+
+    if !is_dir_empty(new_dir) {
+        match fs::remove_dir_all(legacy_dir) {
+            Ok(()) => log::info!("removed legacy {what} dir {:?}", legacy_dir),
+            Err(e) => log::warn!("failed to remove legacy {what} dir {:?}: {}", legacy_dir, e),
+        }
+        return;
+    }
+
+    if let Err(e) = create_dir_with_permissions(new_dir) {
+        log::warn!("failed to create {:?} for {what} relocation: {}", new_dir, e);
+        return;
+    }
+
+    match fs::read_dir(legacy_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let src = entry.path();
+                if src.is_file() {
+                    let dst = new_dir.join(entry.file_name());
+                    match move_file_best_effort(&src, &dst) {
+                        Ok(()) => log::info!("relocated {what}: {:?} -> {:?}", src, dst),
+                        Err(e) => log::warn!("failed to relocate {:?} to {:?}: {}", src, dst, e),
+                    }
+                }
+            }
+            let _ = fs::remove_dir(legacy_dir);
+        }
+        Err(e) => log::warn!("failed to read legacy {what} dir {:?}: {}", legacy_dir, e),
+    }
 }
 
 fn move_file_best_effort(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
@@ -509,6 +505,38 @@ mod tests {
 
         let state_perms = fs::metadata(paths.state_dir()).unwrap().permissions();
         assert_eq!(state_perms.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn test_relocation_moves_legacy_generated_into_missing_dir() {
+        let (_tmp, paths) = test_paths();
+        let legacy = paths.data_dir().join("generated");
+        create_dir_with_permissions(&legacy).unwrap();
+        fs::write(legacy.join("xray.json"), b"{}").unwrap();
+        assert!(!paths.generated_dir().exists());
+
+        paths.ensure_dirs().unwrap();
+
+        assert!(!legacy.exists());
+        assert!(paths.generated_dir().join("xray.json").exists());
+    }
+
+    #[test]
+    fn test_relocation_removes_legacy_when_destination_populated() {
+        let (_tmp, paths) = test_paths();
+        let legacy = paths.data_dir().join("generated");
+        create_dir_with_permissions(&legacy).unwrap();
+        fs::write(legacy.join("xray.json"), b"old").unwrap();
+        create_dir_with_permissions(&paths.generated_dir()).unwrap();
+        fs::write(paths.generated_dir().join("xray.json"), b"new").unwrap();
+
+        paths.ensure_dirs().unwrap();
+
+        assert!(!legacy.exists());
+        assert_eq!(
+            fs::read(paths.generated_dir().join("xray.json")).unwrap(),
+            b"new"
+        );
     }
 
     #[test]

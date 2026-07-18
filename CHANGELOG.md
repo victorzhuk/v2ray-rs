@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - xray TUN mode no longer trusts the operating-system resolver, whose poisoned answers for blocked domains landed in `geoip:ru → direct` and got the connection reset by DPI (`proxy/tun: connection reset by peer` / `connection was refused`, dropped API streams). With TUN on, the config always carries a DNS section — derived DoH via the proxy when the DNS feature is off — xray's built-in resolver queries are tagged and routed through the proxy, and the `direct` outbound resolves via that resolver (`domainStrategy: UseIP`) instead of the OS at dial time.
 - The TUN "DNS hijack" setting now works on xray: TUN-captured plaintext DNS (udp/53) is answered by xray's built-in resolver via a `dns` outbound. On sing-box it also applies with the DNS feature off, via the same derived DNS section.
 - Starting TUN with an xray older than 26.1.13 (no `tun` inbound) now fails with a clear versioned message instead of an opaque config-test error. xray 26.1.13–26.6.22 additionally logs an advisory at TUN start: those releases can crash (`panic: Net: Unknown address type.`, upstream Xray-core #6364) when a connection through the tunnel closes quickly — each crash drops the tunnel until the automatic restart — and the fix ships in Xray-core 26.6.27.
+- `instance.json` reports the running build's version instead of the version that first created the profile.
+- Legacy `generated/` and `geodata/` directories under the data dir are actually migrated now (the relocation previously failed every start because the destination directory was never created) and credential-bearing leftovers are removed once the new location is in use.
 
 ## [0.13.1] - 2026-07-11
 
