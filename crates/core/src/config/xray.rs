@@ -38,13 +38,14 @@ impl ConfigGenerator for XrayGenerator {
 
 /// Stamps every dialing outbound with the TUN fwmark via `streamSettings.sockopt.mark`
 /// so the route helper's policy rules exempt xray's own traffic from the tunnel.
-/// The blackhole `block` outbound never dials, so it is skipped.
+/// The blackhole `block` and internal-resolver `dns` outbounds never dial, so
+/// they are skipped.
 fn apply_tun_fwmark(config: &mut Value) {
     let Some(outbounds) = config["outbounds"].as_array_mut() else {
         return;
     };
     for outbound in outbounds {
-        if outbound["protocol"] == "blackhole" {
+        if outbound["protocol"] == "blackhole" || outbound["protocol"] == "dns" {
             continue;
         }
         outbound["streamSettings"]["sockopt"]["mark"] = Value::from(XRAY_TUN_FWMARK);
@@ -261,7 +262,7 @@ mod tests {
             .unwrap();
 
         for outbound in config["outbounds"].as_array().unwrap() {
-            if outbound["protocol"] == "blackhole" {
+            if outbound["protocol"] == "blackhole" || outbound["protocol"] == "dns" {
                 assert!(outbound["streamSettings"]["sockopt"]["mark"].is_null());
             } else {
                 assert_eq!(outbound["streamSettings"]["sockopt"]["mark"], 255);

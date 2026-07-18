@@ -2,9 +2,9 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings,
-    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
-    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    AppSettings, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy,
+    GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 pub struct V2rayGenerator;
@@ -53,11 +53,63 @@ pub(crate) fn generate_v2ray_family_config(
         "routing": build_routing(rules, &first_proxy_tag, settings, dns_backend),
     });
 
+    let tun_xray = dns_backend == V2rayFamilyBackend::Xray && settings.tun.enabled;
+
     if settings.dns.enabled {
         config["dns"] = build_dns_for_backend(rules, settings, dns_backend);
+    } else if tun_xray {
+        // TUN must never lean on the OS resolver: sniffing destOverride wipes
+        // the original IP and IPIfNonMatch feeds geoip rules, so poisoned ISP
+        // answers would steer blocked domains into `direct` and get RST by DPI.
+        config["dns"] = derived_tun_dns(settings);
+    }
+
+    if tun_xray {
+        config["dns"]["tag"] = json!(DNS_INTERNAL_TAG);
+        harden_tun_outbounds(&mut config, settings);
     }
 
     config
+}
+
+/// Inbound tag stamped on queries made by xray's built-in resolver via
+/// `dns.tag`, matched by the routing rule that sends them through the proxy.
+const DNS_INTERNAL_TAG: &str = "dns-internal";
+
+fn derived_tun_dns(settings: &AppSettings) -> Value {
+    json!({
+        "servers": ["https://1.1.1.1/dns-query"],
+        "queryStrategy": query_strategy_str(settings.dns.strategy),
+    })
+}
+
+fn query_strategy_str(strategy: DnsStrategy) -> &'static str {
+    match strategy {
+        DnsStrategy::PreferIpv4 | DnsStrategy::Ipv4Only => "UseIPv4",
+        DnsStrategy::PreferIpv6 | DnsStrategy::Ipv6Only => "UseIPv6",
+    }
+}
+
+/// `freedom` with the default `AsIs` hands sniffed hostnames to the OS
+/// resolver at dial time; `UseIP` forces the built-in (proxy-routed) resolver.
+/// Under `Hijack`, a `dns` outbound answers TUN-captured udp/53 with that same
+/// resolver.
+fn harden_tun_outbounds(config: &mut Value, settings: &AppSettings) {
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
+        return;
+    };
+    for outbound in outbounds.iter_mut() {
+        if outbound["protocol"] == "freedom" {
+            outbound["settings"]["domainStrategy"] = json!("UseIP");
+        }
+    }
+    if settings.tun.dns_hijack == DnsHijackMode::Hijack {
+        outbounds.push(json!({
+            "protocol": "dns",
+            "tag": "dns-out",
+            "settings": {},
+        }));
+    }
 }
 
 fn build_inbounds(settings: &AppSettings, backend: V2rayFamilyBackend) -> Value {
@@ -319,6 +371,19 @@ fn build_routing(
     let mut routing_rules: Vec<Value> = Vec::new();
 
     if backend == V2rayFamilyBackend::Xray && settings.tun.enabled {
+        routing_rules.push(json!({
+            "type": "field",
+            "inboundTag": [DNS_INTERNAL_TAG],
+            "outboundTag": first_proxy_tag,
+        }));
+        if settings.tun.dns_hijack == DnsHijackMode::Hijack {
+            routing_rules.push(json!({
+                "type": "field",
+                "network": "udp",
+                "port": 53,
+                "outboundTag": "dns-out",
+            }));
+        }
         if !settings.tun.exclude_routes.is_empty() {
             routing_rules.push(json!({
                 "type": "field",
@@ -534,13 +599,7 @@ fn build_dns_for_backend(
 
     dns_config["servers"] = json!(servers);
 
-    let query_strategy = match settings.dns.strategy {
-        DnsStrategy::PreferIpv4 => "UseIPv4",
-        DnsStrategy::PreferIpv6 => "UseIPv6",
-        DnsStrategy::Ipv4Only => "UseIPv4",
-        DnsStrategy::Ipv6Only => "UseIPv6",
-    };
-    dns_config["queryStrategy"] = json!(query_strategy);
+    dns_config["queryStrategy"] = json!(query_strategy_str(settings.dns.strategy));
 
     if !settings.dns.hosts.is_empty() {
         let mut hosts: serde_json::Map<String, Value> = serde_json::Map::new();
@@ -1422,5 +1481,138 @@ mod tests {
             assert!(rule.get("ip").is_none());
             assert!(rule.get("domain").is_none());
         }
+    }
+
+    #[test]
+    fn test_xray_tun_derives_dns_plane_when_dns_disabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert_eq!(config["dns"]["tag"], "dns-internal");
+        assert_eq!(config["dns"]["servers"], json!(["https://1.1.1.1/dns-query"]));
+        assert_eq!(config["dns"]["queryStrategy"], "UseIPv4");
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let proxy_tag = config["outbounds"][0]["tag"].as_str().unwrap();
+        assert_eq!(rules[0]["inboundTag"], json!(["dns-internal"]));
+        assert_eq!(rules[0]["outboundTag"], proxy_tag);
+    }
+
+    #[test]
+    fn test_xray_tun_user_dns_gains_internal_tag_and_rule() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert_eq!(config["dns"]["tag"], "dns-internal");
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[0]["inboundTag"], json!(["dns-internal"]));
+    }
+
+    #[test]
+    fn test_xray_tun_hijack_emits_dns_out_and_udp53_rule() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert!(
+            outbounds
+                .iter()
+                .any(|o| o["protocol"] == "dns" && o["tag"] == "dns-out")
+        );
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules[1]["network"], "udp");
+        assert_eq!(rules[1]["port"], 53);
+        assert_eq!(rules[1]["outboundTag"], "dns-out");
+    }
+
+    #[test]
+    fn test_xray_tun_native_and_disabled_skip_hijack() {
+        for mode in [DnsHijackMode::Native, DnsHijackMode::Disabled] {
+            let mut settings = default_settings();
+            settings.tun.enabled = true;
+            settings.tun.dns_hijack = mode;
+
+            let config = generate_v2ray_family_config(
+                &[ss_node()],
+                &[],
+                &settings,
+                V2rayFamilyBackend::Xray,
+            );
+
+            let outbounds = config["outbounds"].as_array().unwrap();
+            assert!(!outbounds.iter().any(|o| o["protocol"] == "dns"));
+            let rules = config["routing"]["rules"].as_array().unwrap();
+            assert!(!rules.iter().any(|r| r["outboundTag"] == "dns-out"));
+            assert_eq!(
+                rules[0]["inboundTag"],
+                json!(["dns-internal"]),
+                "internal-resolver rule stays regardless of hijack mode"
+            );
+        }
+    }
+
+    #[test]
+    fn test_xray_tun_freedom_uses_builtin_resolver() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let freedom = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert_eq!(freedom["settings"]["domainStrategy"], "UseIP");
+    }
+
+    #[test]
+    fn test_xray_no_dns_hardening_without_tun() {
+        let config = generate_v2ray_family_config(
+            &[ss_node()],
+            &[],
+            &default_settings(),
+            V2rayFamilyBackend::Xray,
+        );
+
+        assert!(config.get("dns").is_none());
+        let freedom = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert!(freedom["settings"].get("domainStrategy").is_none());
+        assert!(
+            !config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|o| o["protocol"] == "dns")
+        );
+    }
+
+    #[test]
+    fn test_v2ray_tun_never_derives_dns() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::V2ray);
+
+        assert!(config.get("dns").is_none());
     }
 }

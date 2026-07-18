@@ -16,6 +16,20 @@ use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, TunRuntime};
 use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
 
+fn format_triple((major, minor, patch): (u32, u32, u32)) -> String {
+    format!("{major}.{minor}.{patch}")
+}
+
+fn parse_semver_triple(text: &str) -> Option<(u32, u32, u32)> {
+    text.split_whitespace().find_map(|tok| {
+        let mut parts = tok.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next()?.parse().ok()?;
+        let patch = parts.next()?.parse().ok()?;
+        parts.next().is_none().then_some((major, minor, patch))
+    })
+}
+
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(2);
 const MAX_CRASHES: usize = 3;
@@ -44,9 +58,21 @@ pub enum ProcessError {
     TunDeviceTimeout(String),
     #[error("TUN route helper failed: {0}")]
     TunHelper(String),
+    #[error(
+        "installed xray {installed} has no TUN inbound; TUN mode needs xray {XRAY_TUN_MIN_VERSION_STR} or newer"
+    )]
+    TunBackendTooOld { installed: String },
     #[error("config rejected by backend: {0}")]
     ConfigCheck(String),
 }
+
+/// First Xray-core release shipping the `tun` inbound.
+const XRAY_TUN_MIN_VERSION: (u32, u32, u32) = (26, 1, 13);
+const XRAY_TUN_MIN_VERSION_STR: &str = "26.1.13";
+/// First Xray-core release with the fix for the TUN crash on quickly-closed
+/// connections (gVisor returns a nil RemoteAddr, Xray-core #6364): versions
+/// 26.1.13 through 26.6.22 panic and drop the tunnel until the crash-restart.
+const XRAY_TUN_PANIC_FIX_VERSION: (u32, u32, u32) = (26, 6, 27);
 
 pub struct ProcessManager {
     state: StateManager,
@@ -148,6 +174,32 @@ impl ProcessManager {
         }
 
         if self.tun.is_some() {
+            if self.backend == Some(BackendType::Xray)
+                && let Some(triple) = self.xray_version_triple().await
+            {
+                if triple < XRAY_TUN_MIN_VERSION {
+                    self.state
+                        .transition(ProcessState::Starting, connection.clone())?;
+                    let error = ProcessError::TunBackendTooOld {
+                        installed: format_triple(triple),
+                    };
+                    let _ = self
+                        .state
+                        .transition(ProcessState::Error(error.to_string()), None);
+                    return Err(error);
+                }
+                if triple < XRAY_TUN_PANIC_FIX_VERSION {
+                    let line = LogLine::stderr(format!(
+                        "warning: xray {} can crash the TUN tunnel on quickly-closed connections (Xray-core #6364, fixed in 26.6.27); occasional auto-reconnects are expected until xray is upgraded",
+                        format_triple(triple)
+                    ));
+                    if let Ok(mut buffer) = self.log_buffer.lock() {
+                        buffer.push(line.clone());
+                    }
+                    self.state.emit(ProcessEvent::LogLine(line));
+                }
+            }
+
             let binary = self.binary_path.clone();
             let probe =
                 tokio::task::spawn_blocking(move || crate::privilege::has_net_admin(&binary)).await;
@@ -307,6 +359,24 @@ impl ProcessManager {
         }
 
         Ok(())
+    }
+
+    /// Probes the xray binary's version for the TUN preflight. Best-effort: an
+    /// unreadable or unparsable `version` output yields `None` and does not
+    /// block the start — the pre-spawn config check still rejects configs the
+    /// binary cannot handle.
+    async fn xray_version_triple(&self) -> Option<(u32, u32, u32)> {
+        let output = tokio::time::timeout(
+            CONFIG_CHECK_TIMEOUT,
+            Command::new(&self.binary_path)
+                .arg("version")
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        parse_semver_triple(&String::from_utf8_lossy(&output.stdout))
     }
 
     async fn check_config(&self) -> Result<(), ProcessError> {
@@ -691,5 +761,97 @@ mod tests {
         // stop() is idempotent on an already-Stopped manager.
         mgr.stop().await.unwrap();
         assert_eq!(mgr.state(), ProcessState::Stopped);
+    }
+
+    #[test]
+    fn parse_semver_triple_from_xray_version_output() {
+        assert_eq!(
+            parse_semver_triple("Xray 26.3.27 (Xray, Penetrates Everything.) cc66b68"),
+            Some((26, 3, 27))
+        );
+        assert_eq!(parse_semver_triple("Xray 25.12.8 (...)"), Some((25, 12, 8)));
+        assert_eq!(parse_semver_triple("no version here"), None);
+    }
+
+    #[test]
+    fn xray_tun_minimum_version_comparison() {
+        assert!((25, 12, 8) < XRAY_TUN_MIN_VERSION);
+        assert!((26, 1, 12) < XRAY_TUN_MIN_VERSION);
+        assert!((26, 1, 13) >= XRAY_TUN_MIN_VERSION);
+        assert!((26, 3, 27) >= XRAY_TUN_MIN_VERSION);
+    }
+
+    #[tokio::test]
+    async fn tun_start_fails_fast_on_pre_tun_xray_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binary = dir.path().join("fake-xray");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\necho 'Xray 25.12.8 (Xray, Penetrates Everything.)'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        let rt = TunRuntime {
+            backend: BackendType::Xray,
+            iface: "tun-test".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: PathBuf::from("v2ray-rs-netctl"),
+            bypass_uid: None,
+        };
+        let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
+            .with_tun(Some(rt))
+            .with_backend(BackendType::Xray);
+
+        let result = mgr.start().await;
+        assert!(
+            matches!(result, Err(ProcessError::TunBackendTooOld { ref installed }) if installed == "25.12.8"),
+            "expected TunBackendTooOld, got {result:?}"
+        );
+        assert!(mgr.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn tun_start_warns_on_panic_affected_xray_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let binary = dir.path().join("fake-xray");
+        std::fs::write(
+            &binary,
+            "#!/bin/sh\necho 'Xray 26.3.27 (Xray, Penetrates Everything.)'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        let rt = TunRuntime {
+            backend: BackendType::Xray,
+            iface: "tun-test".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: PathBuf::from("v2ray-rs-netctl"),
+            bypass_uid: None,
+        };
+        let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
+            .with_tun(Some(rt))
+            .with_backend(BackendType::Xray);
+
+        // The fake script has no capabilities, so the start still fails at the
+        // CAP_NET_ADMIN gate — after the version warning has been recorded.
+        let _ = mgr.start().await;
+
+        let warned = mgr
+            .log_buffer()
+            .lock()
+            .unwrap()
+            .last_n(10)
+            .iter()
+            .any(|l| l.content.contains("Xray-core #6364"));
+        assert!(warned, "expected a TUN panic advisory log line");
     }
 }

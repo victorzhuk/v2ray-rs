@@ -3,11 +3,9 @@
 ## Purpose
 
 Defines how the application supports TUN (transparent proxy) mode: which backends support it, how elevated capabilities are acquired, how outbound traffic loops are prevented, and how the privileged route helper manages xray TUN interfaces.
-
 ## Requirements
-
 ### Requirement: TUN mode availability per backend
-The system SHALL offer TUN mode only when the selected backend is sing-box or xray. For the v2ray backend, TUN SHALL be unavailable because v2ray-core has no native TUN inbound.
+The system SHALL offer TUN mode only when the selected backend is sing-box or xray. For the v2ray backend, TUN SHALL be unavailable because v2ray-core has no native TUN inbound. For xray, TUN SHALL additionally require Xray-core v26.1.13 or newer (the first release with the `tun` inbound); starting a TUN connection with an older xray SHALL fail before spawn with an error naming the installed and required versions. For xray versions in the range 26.1.13 through 26.6.22 — affected by the upstream TUN crash on quickly-closed connections (Xray-core #6364, fixed in 26.6.27) — the TUN start SHALL proceed but emit an advisory into the process log stream naming the installed version, the crash behavior, and the fixed version.
 
 #### Scenario: v2ray backend disables TUN
 - **WHEN** the selected backend is v2ray and the user opens the TUN settings page
@@ -16,6 +14,14 @@ The system SHALL offer TUN mode only when the selected backend is sing-box or xr
 #### Scenario: sing-box and xray expose TUN
 - **WHEN** the selected backend is sing-box or xray
 - **THEN** the TUN enable toggle SHALL be available, subject to the capability gate
+
+#### Scenario: Old xray blocks TUN start with a clear error
+- **WHEN** TUN is enabled and the detected xray version is older than v26.1.13
+- **THEN** the connection preflight SHALL fail with an error stating the installed version and the required minimum, without spawning the backend
+
+#### Scenario: Panic-affected xray warns but starts
+- **WHEN** TUN is enabled and the detected xray version is at least 26.1.13 but older than 26.6.27
+- **THEN** the connection SHALL start normally and a warning log line SHALL appear in the process logs naming the installed version, the quickly-closed-connection crash, and 26.6.27 as the fixed version
 
 ### Requirement: TUN requires elevated capabilities granted once
 The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN connection starts, and SHALL detect this by reading the binary's file capabilities. When the capability is missing, the system SHALL offer a one-time grant that runs `setcap` via `pkexec` and SHALL NOT silently start without privileges. The same one-time grant SHALL also ensure that the `v2ray-rs-run` bypass wrapper, when present, is owned by root and carries the setuid bit, so per-process bypass works without a separate elevation.
@@ -61,3 +67,4 @@ The system SHALL include a minimal privileged helper binary that programs and re
 #### Scenario: Recover leftovers after an unclean kill
 - **WHEN** a previous TUN connection ended via SIGKILL and the helper `recover` is invoked for the relevant backend
 - **THEN** the helper SHALL remove any leftover TUN device and, for sing-box, flush the routing rule and table it uses, leaving system networking clean
+
