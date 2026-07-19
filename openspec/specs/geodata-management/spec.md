@@ -1,11 +1,9 @@
 ## Purpose
 
 Download, update, and index backend-specific GeoIP/GeoSite data in the profile cache, and expose metadata in Preferences.
-
 ## Requirements
-
 ### Requirement: Download GeoIP and GeoSite databases
-The system SHALL download GeoIP and GeoSite databases from upstream sources (v2fly GitHub releases for v2ray/xray, SagerNet releases for sing-box).
+The system SHALL download GeoIP and GeoSite data from upstream sources (v2fly GitHub releases for v2ray/xray; the `rule-set` branches of SagerNet/sing-geoip and SagerNet/sing-geosite for sing-box).
 
 #### Scenario: Initial download
 - **WHEN** the app launches and no geodata files exist locally
@@ -13,7 +11,11 @@ The system SHALL download GeoIP and GeoSite databases from upstream sources (v2f
 
 #### Scenario: Download failure
 - **WHEN** the geodata download fails due to network error
-- **THEN** the system SHALL report the error and allow the app to function without geodata (GeoIP/GeoSite rules will be non-functional)
+- **THEN** the system SHALL report the error and allow the app to function without geodata (for sing-box, affected tags fall back to remote rule-sets in the generated config)
+
+#### Scenario: New tag referenced by routing rules
+- **WHEN** a routing rule referencing a GeoIP/GeoSite tag with no cached `.srs` is added and sing-box is the selected backend
+- **THEN** the next refresh pass (startup, scheduled, or manual) SHALL fetch the missing tag's `.srs` file
 
 ### Requirement: Auto-update geodata
 The system SHALL use the persisted geodata refresh settings to perform background refreshes while the app is running.
@@ -27,7 +29,7 @@ The system SHALL use the persisted geodata refresh settings to perform backgroun
 - **THEN** the app SHALL check for updates and rebuild the index if new files arrive or the index is missing
 
 ### Requirement: Backend-specific geodata format
-The system SHALL download the correct geodata format for the selected backend.
+The system SHALL download the correct geodata format for the selected backend. For sing-box that format is per-tag binary rule-set files (`.srs`); the legacy `geoip.db`/`geosite.db` files are unsupported by sing-box 1.12+ and SHALL NOT be downloaded or kept.
 
 #### Scenario: v2ray/xray geodata
 - **WHEN** v2ray or xray is the selected backend
@@ -35,7 +37,11 @@ The system SHALL download the correct geodata format for the selected backend.
 
 #### Scenario: sing-box geodata
 - **WHEN** sing-box is the selected backend
-- **THEN** the system SHALL use .db format files (geoip.db, geosite.db)
+- **THEN** the system SHALL download per-tag `.srs` rule-set files for the GeoIP/GeoSite tags referenced by the current routing rules into `cache_dir/geodata/rule-sets/`
+
+#### Scenario: Stale .db files removed
+- **WHEN** a geodata refresh runs for sing-box and legacy `geoip.db`/`geosite.db` files exist in the cache
+- **THEN** the system SHALL delete them
 
 ### Requirement: GeoData UI Management
 The system SHALL provide a Preferences UI for manual geodata refresh that shows last successful refresh time and indexed tag counts for the current backend.
@@ -62,3 +68,4 @@ The system SHALL place downloaded geodata files and the geodata index under the 
 #### Scenario: Geodata is profile-isolated
 - **WHEN** the same user runs the binary first with `--profile production` and then with `--profile development`
 - **THEN** each profile SHALL maintain its own copy of the geodata files and index
+
