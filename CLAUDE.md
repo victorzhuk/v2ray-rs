@@ -43,7 +43,7 @@ Domain models and infrastructure:
 
 - **`backend.rs`** — Detects installed v2ray/xray/sing-box binaries by checking well-known paths (`/usr/bin/`, `/usr/local/bin/`) and `$PATH` via `which`. Validates executability, extracts version strings. Provides install guidance strings per backend.
 
-- **`geodata.rs`** — `GeodataManager` for GeoIP/GeoSite database management. Handles metadata (last check timestamp, versions), path resolution per backend type (.dat for v2ray/xray, .db for sing-box), update checks (`needs_update()`), and blocking downloads from v2fly/SagerNet GitHub releases. Feature-gated `geodata-fetch` for reqwest blocking client.
+- **`geodata.rs`** — `GeodataManager` for GeoIP/GeoSite database management. Handles metadata (last check timestamp, versions), per-backend geodata: `.dat` whole-file downloads for v2ray/xray, and per-tag binary rule-set (`.srs`) files under `cache_dir/geodata/rule-sets/` for sing-box (only the tags referenced by current routing rules; stale legacy `.db` files are deleted on refresh). Update checks (`needs_update()`) and blocking downloads from v2fly/SagerNet GitHub. Feature-gated `geodata-fetch` for reqwest blocking client.
 
 - **`routing_manager.rs`** — `RoutingManager` coordinating rule CRUD with persistence and config generation. All mutations (add, edit, delete, reorder, apply_preset) auto-persist. `write_config()` delegates to `ConfigWriter` from `config/`.
 

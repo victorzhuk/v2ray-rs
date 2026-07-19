@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-07-19
+
+### Added
+- sing-box geodata is now app-managed as per-tag binary rule-set (`.srs`) files instead of the dead `geoip.db`/`geosite.db`, which sing-box has been unable to read since 1.12. The app downloads only the GeoIP/GeoSite tags referenced by the current routing rules into `cache_dir/geodata/rule-sets/` on the existing refresh paths (startup, scheduled, and manual **Update Now**), and the generated config points each cached tag at its local file (`type: "local"`), falling back to `type: "remote"` for tags not yet fetched — so once rule-sets are primed, a cold start with GitHub blocked no longer needs the network. Stale `.db` files are deleted on the next refresh.
+
 ### Fixed
 - sing-box no longer fails to start when `raw.githubusercontent.com` is blocked or throttled. Remote rule-sets dropped the forced `download_detour: "direct"` — sing-box now fetches them through the proxy outbound, its own default — and configs referencing rule-sets enable `experimental.cache_file`, so every start after the first successful fetch passes rule-set initialization offline. `store_fakeip` is set when FakeIP is on, keeping fakeip mappings valid across restarts.
 - xray TUN mode no longer trusts the operating-system resolver, whose poisoned answers for blocked domains landed in `geoip:ru → direct` and got the connection reset by DPI (`proxy/tun: connection reset by peer` / `connection was refused`, dropped API streams). With TUN on, the config always carries a DNS section — derived DoH via the proxy when the DNS feature is off — xray's built-in resolver queries are tagged and routed through the proxy, and the `direct` outbound resolves via that resolver (`domainStrategy: UseIP`) instead of the OS at dial time.
@@ -496,7 +501,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.11.0...v0.12.0

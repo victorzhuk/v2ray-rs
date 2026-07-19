@@ -75,8 +75,9 @@ serialises the result to JSON, and delegates to `atomic_write()` in
 `sync_all`, then `persist` (rename). The generated file gets 0o600.
 
 `RoutingManager` wraps rule CRUD with auto-persist. `GeodataManager` handles
-.dat/.db geodata downloads and metadata. `GeodataIndexManager` builds a
-searchable index over the proto-encoded geodata. `instance.rs` enforces
+geodata downloads and metadata: `.dat` whole-file for v2ray/xray, per-tag `.srs`
+rule-sets for sing-box. `GeodataIndexManager` builds a searchable tag index (proto
+parse for `.dat`, rule-set enumeration for `.srs`). `instance.rs` enforces
 single-instance via an exclusive `flock` on `runtime_dir/v2ray-rs.lock`.
 
 ### `subscription` (`v2ray-rs-subscription`)
@@ -233,7 +234,7 @@ $XDG_DATA_HOME/v2ray-rs/
   presets/                   — user-created presets
 
 $XDG_CACHE_HOME/v2ray-rs/
-  geodata/                   — .dat or .db geodata files
+  geodata/                   — .dat files (v2ray/xray); rule-sets/*.srs (sing-box)
   geodata-index/             — searchable index over geodata
 
 $XDG_RUNTIME_DIR/v2ray-rs/
