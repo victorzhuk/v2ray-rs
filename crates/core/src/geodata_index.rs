@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use prost::Message;
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -16,8 +15,6 @@ use crate::persistence::AppPaths;
 pub enum GeodataIndexError {
     #[error("protobuf decode failed: {0}")]
     ProtoDecode(String),
-    #[error("sqlite error: {0}")]
-    Sqlite(#[from] rusqlite::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -118,20 +115,21 @@ impl GeodataIndexManager {
         geoip_path: &Path,
         geosite_path: &Path,
     ) -> Result<GeodataIndex, GeodataIndexError> {
-        let (geoip_tags, geosite_tags) = match backend {
-            BackendType::V2ray | BackendType::Xray => {
-                let geoip = parse_v2ray_geoip_dat(geoip_path)?;
-                let geosite = parse_v2ray_geosite_dat(geosite_path)?;
-                (geoip, geosite)
-            }
-            BackendType::SingBox => {
-                let (geoip, geosite) = parse_singbox_db(geoip_path, geosite_path)?;
-                (geoip, geosite)
-            }
-        };
+        let geoip_tags = parse_v2ray_geoip_dat(geoip_path)?;
+        let geosite_tags = parse_v2ray_geosite_dat(geosite_path)?;
 
         let index = GeodataIndex::new(geoip_tags, geosite_tags);
         self.save_index(backend, &index)?;
+        Ok(index)
+    }
+
+    pub fn build_singbox_index(
+        &self,
+        rule_sets_dir: &Path,
+    ) -> Result<GeodataIndex, GeodataIndexError> {
+        let (geoip_tags, geosite_tags) = enumerate_singbox_rule_sets(rule_sets_dir)?;
+        let index = GeodataIndex::new(geoip_tags, geosite_tags);
+        self.save_index(BackendType::SingBox, &index)?;
         Ok(index)
     }
 }
@@ -158,30 +156,23 @@ fn parse_v2ray_geosite_dat(path: &Path) -> Result<Vec<String>, GeodataIndexError
     Ok(sorted)
 }
 
-fn parse_singbox_db(
-    geoip_path: &Path,
-    geosite_path: &Path,
+fn enumerate_singbox_rule_sets(
+    dir: &Path,
 ) -> Result<(Vec<String>, Vec<String>), GeodataIndexError> {
     let mut geoip_tags = Vec::new();
     let mut geosite_tags = Vec::new();
 
-    {
-        let conn = Connection::open(geoip_path)?;
-        let mut stmt = conn.prepare("SELECT country_code FROM geoip")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let tag: String = row.get(0)?;
-            geoip_tags.push(tag);
-        }
-    }
-
-    {
-        let conn = Connection::open(geosite_path)?;
-        let mut stmt = conn.prepare("SELECT tag FROM geosite")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            let tag: String = row.get(0)?;
-            geosite_tags.push(tag);
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(stem) = name.strip_suffix(".srs") else {
+            continue;
+        };
+        if let Some(tag) = stem.strip_prefix("geoip-") {
+            geoip_tags.push(tag.to_string());
+        } else if let Some(tag) = stem.strip_prefix("geosite-") {
+            geosite_tags.push(tag.to_string());
         }
     }
 
@@ -283,35 +274,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_singbox_db() {
+    fn test_enumerate_singbox_rule_sets() {
         let tmp = TempDir::new().unwrap();
-        let geoip_path = tmp.path().join("geoip.db");
-        let geosite_path = tmp.path().join("geosite.db");
+        std::fs::write(tmp.path().join("geoip-us.srs"), b"fake").unwrap();
+        std::fs::write(tmp.path().join("geoip-cn.srs"), b"fake").unwrap();
+        std::fs::write(tmp.path().join("geosite-google.srs"), b"fake").unwrap();
+        std::fs::write(tmp.path().join("not-a-ruleset.txt"), b"ignore me").unwrap();
 
-        {
-            let conn = Connection::open(&geoip_path).unwrap();
-            conn.execute("CREATE TABLE geoip (country_code TEXT)", [])
-                .unwrap();
-            conn.execute(
-                "INSERT INTO geoip (country_code) VALUES (?1), (?2), (?3)",
-                ["US", "CN", "RU"],
-            )
-            .unwrap();
-        }
+        let (geoip_tags, geosite_tags) = enumerate_singbox_rule_sets(tmp.path()).unwrap();
 
-        {
-            let conn = Connection::open(&geosite_path).unwrap();
-            conn.execute("CREATE TABLE geosite (tag TEXT)", []).unwrap();
-            conn.execute(
-                "INSERT INTO geosite (tag) VALUES (?1), (?2)",
-                ["google", "netflix"],
-            )
-            .unwrap();
-        }
+        assert_eq!(geoip_tags, vec!["cn", "us"]);
+        assert_eq!(geosite_tags, vec!["google"]);
+    }
 
-        let (geoip_tags, geosite_tags) = parse_singbox_db(&geoip_path, &geosite_path).unwrap();
+    #[test]
+    fn test_build_singbox_index_from_rule_sets_dir() {
+        let (_tmp, manager) = test_index_manager();
+        let rule_sets_dir = TempDir::new().unwrap();
+        std::fs::write(rule_sets_dir.path().join("geoip-ru.srs"), b"fake").unwrap();
 
-        assert_eq!(geoip_tags, vec!["CN", "RU", "US"]);
-        assert_eq!(geosite_tags, vec!["google", "netflix"]);
+        let index = manager.build_singbox_index(rule_sets_dir.path()).unwrap();
+
+        assert_eq!(index.geoip_tags, vec!["ru"]);
+        assert!(index.geosite_tags.is_empty());
+        assert_eq!(
+            manager
+                .load_index(BackendType::SingBox)
+                .unwrap()
+                .unwrap()
+                .geoip_tags,
+            vec!["ru"]
+        );
     }
 }

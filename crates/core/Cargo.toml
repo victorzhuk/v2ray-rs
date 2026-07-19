@@ -18,7 +18,6 @@ tempfile.workspace = true
 reqwest = { workspace = true, features = ["blocking"], optional = true }
 nix = { workspace = true, features = ["fs"] }
 prost.workspace = true
-rusqlite = { version = "0.30", features = ["bundled"] }
 log.workspace = true
 
 [build-dependencies]

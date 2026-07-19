@@ -226,6 +226,7 @@ pub(super) fn build_network_page(
             let backend_type = st.borrow().backend.backend_type;
             let geodata_manager = GeodataManager::new(&paths);
             let paths_for_status = paths.clone();
+            let paths_for_task = paths.clone();
             let index_manager = GeodataIndexManager::new(&paths);
 
             let btn_clone = btn.clone();
@@ -236,17 +237,38 @@ pub(super) fn build_network_page(
                 let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
                     #[cfg(feature = "geodata-fetch")]
                     {
-                        use v2ray_rs_core::geodata::download_geodata;
+                        use v2ray_rs_core::geodata::{
+                            download_geodata, download_singbox_rule_sets,
+                        };
+                        use v2ray_rs_core::persistence::load_routing_rules;
 
-                        download_geodata(&geodata_manager, backend_type)
-                            .map_err(|e| format!("Download failed: {}", e))?;
+                        if backend_type == BackendType::SingBox {
+                            let rules = load_routing_rules(&paths_for_task).unwrap_or_default();
+                            let tags = crate::geodata_service::singbox_rule_set_tags(&rules);
+                            let missing: Vec<String> = tags
+                                .into_iter()
+                                .filter(|tag| !geodata_manager.has_rule_set(tag))
+                                .collect();
 
-                        let geoip_path = geodata_manager.geoip_path(backend_type);
-                        let geosite_path = geodata_manager.geosite_path(backend_type);
+                            if !missing.is_empty() {
+                                download_singbox_rule_sets(&geodata_manager, &missing)
+                                    .map_err(|e| format!("Download failed: {}", e))?;
+                            }
 
-                        index_manager
-                            .build_index(backend_type, &geoip_path, &geosite_path)
-                            .map_err(|e| format!("Index build failed: {}", e))?;
+                            index_manager
+                                .build_singbox_index(&geodata_manager.rule_sets_dir())
+                                .map_err(|e| format!("Index build failed: {}", e))?;
+                        } else {
+                            download_geodata(&geodata_manager)
+                                .map_err(|e| format!("Download failed: {}", e))?;
+
+                            let geoip_path = geodata_manager.geoip_path();
+                            let geosite_path = geodata_manager.geosite_path();
+
+                            index_manager
+                                .build_index(backend_type, &geoip_path, &geosite_path)
+                                .map_err(|e| format!("Index build failed: {}", e))?;
+                        }
 
                         Ok("Geodata updated successfully".to_string())
                     }

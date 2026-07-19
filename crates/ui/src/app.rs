@@ -779,8 +779,11 @@ impl SimpleComponent for App {
             Vec::new()
         });
         let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
-        let geodata_service =
-            GeodataRefreshService::spawn(GeodataRefreshConfig::from_settings(&paths, &settings));
+        let geodata_service = GeodataRefreshService::spawn(GeodataRefreshConfig::from_settings(
+            &paths,
+            &settings,
+            &store.load_routing_rules().unwrap_or_default(),
+        ));
 
         let model = App {
             settings,
@@ -864,6 +867,7 @@ impl SimpleComponent for App {
                     .update(GeodataRefreshConfig::from_settings(
                         &self.paths,
                         &self.settings,
+                        &self.store.load_routing_rules().unwrap_or_default(),
                     ));
                 self.subscriptions_page
                     .emit(SubscriptionsMsg::SyncSettings {
@@ -902,6 +906,7 @@ impl SimpleComponent for App {
                     .update(GeodataRefreshConfig::from_settings(
                         &self.paths,
                         &self.settings,
+                        &self.store.load_routing_rules().unwrap_or_default(),
                     ));
                 self.subscriptions_page
                     .emit(SubscriptionsMsg::SyncSettings {
@@ -1219,6 +1224,7 @@ impl SimpleComponent for App {
                         .update(GeodataRefreshConfig::from_settings(
                             &self.paths,
                             &self.settings,
+                            &self.store.load_routing_rules().unwrap_or_default(),
                         ));
                     self.subscriptions_page
                         .emit(SubscriptionsMsg::SyncSettings {
@@ -1250,6 +1256,12 @@ impl SimpleComponent for App {
                     return;
                 }
                 log::info!("Routing rules changed");
+                self.geodata_service
+                    .update(GeodataRefreshConfig::from_settings(
+                        &self.paths,
+                        &self.settings,
+                        &rules,
+                    ));
                 self.restart_required = self.check_restart_required();
                 if self.process_handle.is_none() {
                     self.regenerate_config_disconnected();

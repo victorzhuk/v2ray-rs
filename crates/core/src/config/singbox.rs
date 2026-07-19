@@ -611,6 +611,35 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
     }
 }
 
+/// Rewrites `route.rule_set` entries from `remote` to `local` wherever a
+/// cached `.srs` file exists, so a run with fully cached geodata never needs
+/// network access to start. `rule_sets_dir` must be absolute — sing-box
+/// resolves a bare path against its own working directory.
+pub(crate) fn apply_local_rule_sets(config: &mut Value, rule_sets_dir: &std::path::Path) {
+    let Some(rule_sets) = config["route"]["rule_set"].as_array_mut() else {
+        return;
+    };
+
+    for entry in rule_sets.iter_mut() {
+        if entry["type"] != "remote" {
+            continue;
+        }
+        let Some(tag) = entry["tag"].as_str().map(str::to_string) else {
+            continue;
+        };
+        let local_path = rule_sets_dir.join(format!("{tag}.srs"));
+        if !local_path.exists() {
+            continue;
+        }
+        *entry = json!({
+            "type": "local",
+            "tag": tag,
+            "format": "binary",
+            "path": local_path,
+        });
+    }
+}
+
 fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
     let outbound = match rule.action {
         RuleAction::Proxy => first_proxy_tag,
@@ -921,6 +950,71 @@ mod tests {
             .collect();
         assert!(tags.contains(&"direct"));
         assert!(tags.contains(&"block"));
+    }
+
+    #[test]
+    fn test_apply_local_rule_sets_cached_tag_becomes_local() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("geoip-ru.srs"), b"fake").unwrap();
+
+        let mut config = json!({
+            "route": {
+                "rule_set": [
+                    {"type": "remote", "tag": "geoip-ru", "format": "binary", "url": "https://example.com/geoip-ru.srs"},
+                ],
+            },
+        });
+
+        apply_local_rule_sets(&mut config, tmp.path());
+
+        let entry = &config["route"]["rule_set"][0];
+        assert_eq!(entry["type"], "local");
+        assert_eq!(entry["format"], "binary");
+        assert_eq!(entry["tag"], "geoip-ru");
+        assert!(entry.get("url").is_none());
+        let path = entry["path"].as_str().unwrap();
+        assert!(std::path::Path::new(path).is_absolute());
+        assert!(path.ends_with("geoip-ru.srs"));
+    }
+
+    #[test]
+    fn test_apply_local_rule_sets_uncached_tag_stays_remote() {
+        let tmp = tempfile::TempDir::new().unwrap();
+
+        let mut config = json!({
+            "route": {
+                "rule_set": [
+                    {"type": "remote", "tag": "geoip-ru", "format": "binary", "url": "https://example.com/geoip-ru.srs"},
+                ],
+            },
+        });
+
+        apply_local_rule_sets(&mut config, tmp.path());
+
+        let entry = &config["route"]["rule_set"][0];
+        assert_eq!(entry["type"], "remote");
+        assert_eq!(entry["url"], "https://example.com/geoip-ru.srs");
+    }
+
+    #[test]
+    fn test_apply_local_rule_sets_mixed_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("geoip-ru.srs"), b"fake").unwrap();
+
+        let mut config = json!({
+            "route": {
+                "rule_set": [
+                    {"type": "remote", "tag": "geoip-ru", "format": "binary", "url": "https://example.com/geoip-ru.srs"},
+                    {"type": "remote", "tag": "geosite-google", "format": "binary", "url": "https://example.com/geosite-google.srs"},
+                ],
+            },
+        });
+
+        apply_local_rule_sets(&mut config, tmp.path());
+
+        let rule_sets = config["route"]["rule_set"].as_array().unwrap();
+        assert_eq!(rule_sets[0]["type"], "local");
+        assert_eq!(rule_sets[1]["type"], "remote");
     }
 
     #[test]

@@ -1,11 +1,13 @@
 use std::io::Write;
 use std::process::Command;
 
-use v2ray_rs_core::config::{ConfigGenerator, SingboxGenerator};
+use v2ray_rs_core::config::{ConfigGenerator, ConfigWriter, SingboxGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, DnsHijackMode, DnsProtocol, DnsServerConfig, FakeIpConfig, HostOverride,
-    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    AppSettings, BackendType, DnsHijackMode, DnsProtocol, DnsServerConfig, FakeIpConfig,
+    HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
 };
+use v2ray_rs_core::persistence::AppPaths;
+use v2ray_rs_core::profile::AppProfile;
 
 fn sing_box_available() -> bool {
     Command::new("sing-box")
@@ -257,4 +259,75 @@ fn ruleset_config_with_cache_file_passes_sing_box_check() {
             });
         });
     }
+}
+
+/// A config generated through the writer with a cached `.srs` rule-set on
+/// disk resolves the matching `route.rule_set` entry to `local`, letting
+/// sing-box start without fetching it over the network.
+#[test]
+fn local_ruleset_config_passes_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+    let rule_sets_dir = paths.geodata_dir().join("rule-sets");
+    std::fs::create_dir_all(&rule_sets_dir).unwrap();
+
+    let source = tmp.path().join("geoip-ru.json");
+    std::fs::write(
+        &source,
+        br#"{"version":1,"rules":[{"ip_cidr":["1.1.1.1/32"]}]}"#,
+    )
+    .unwrap();
+    let compile = Command::new("sing-box")
+        .args(["rule-set", "compile"])
+        .arg(&source)
+        .arg("-o")
+        .arg(rule_sets_dir.join("geoip-ru.srs"))
+        .output()
+        .unwrap();
+    assert!(
+        compile.status.success(),
+        "rule-set compile failed: {}",
+        String::from_utf8_lossy(&compile.stderr)
+    );
+
+    let mut settings = AppSettings::default();
+    settings.backend.backend_type = BackendType::SingBox;
+    let rules = vec![RoutingRule {
+        id: uuid::Uuid::new_v4(),
+        match_condition: RuleMatch::GeoIp {
+            country_code: "RU".into(),
+        },
+        action: RuleAction::Direct,
+        enabled: true,
+        group: None,
+    }];
+
+    let writer = ConfigWriter::new(&settings, &paths);
+    let path = writer
+        .write_config(&[ss_node()], &rules, &settings)
+        .unwrap();
+    let json = std::fs::read_to_string(&path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+    let rule_sets = config["route"]["rule_set"].as_array().unwrap();
+    let entry = rule_sets.iter().find(|r| r["tag"] == "geoip-ru").unwrap();
+    assert_eq!(entry["type"], "local");
+
+    let output = Command::new("sing-box")
+        .arg("check")
+        .arg("-c")
+        .arg(&path)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "local ruleset config: sing-box check failed\nstderr: {}\nconfig: {json}",
+        String::from_utf8_lossy(&output.stderr),
+    );
 }

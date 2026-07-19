@@ -13,6 +13,10 @@ use crate::persistence::AppPaths;
 const GEODATA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_GEODATA_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
+const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
+const GEOSITE_RULESET_URL: &str =
+    "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
+
 #[derive(Debug, Error)]
 pub enum GeodataError {
     #[error("download failed: {url}: {reason}")]
@@ -53,17 +57,8 @@ impl GeodataManager {
     }
 
     pub fn ensure_dir(&self) -> Result<(), GeodataError> {
-        if !self.geodata_dir.exists() {
-            std::fs::create_dir_all(&self.geodata_dir)?;
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(
-                    &self.geodata_dir,
-                    std::fs::Permissions::from_mode(0o700),
-                )?;
-            }
-        }
+        ensure_dir_0700(&self.geodata_dir)?;
+        ensure_dir_0700(&self.rule_sets_dir())?;
         Ok(())
     }
 
@@ -71,24 +66,28 @@ impl GeodataManager {
         &self.geodata_dir
     }
 
-    pub fn geoip_path(&self, backend: BackendType) -> PathBuf {
-        let filename = match backend {
-            BackendType::V2ray | BackendType::Xray => "geoip.dat",
-            BackendType::SingBox => "geoip.db",
-        };
-        self.geodata_dir.join(filename)
+    pub fn rule_sets_dir(&self) -> PathBuf {
+        self.geodata_dir.join("rule-sets")
     }
 
-    pub fn geosite_path(&self, backend: BackendType) -> PathBuf {
-        let filename = match backend {
-            BackendType::V2ray | BackendType::Xray => "geosite.dat",
-            BackendType::SingBox => "geosite.db",
-        };
-        self.geodata_dir.join(filename)
+    pub fn rule_set_path(&self, full_tag: &str) -> PathBuf {
+        self.rule_sets_dir().join(format!("{full_tag}.srs"))
     }
 
-    pub fn has_geodata(&self, backend: BackendType) -> bool {
-        self.geoip_path(backend).exists() && self.geosite_path(backend).exists()
+    pub fn has_rule_set(&self, full_tag: &str) -> bool {
+        self.rule_set_path(full_tag).exists()
+    }
+
+    pub fn geoip_path(&self) -> PathBuf {
+        self.geodata_dir.join("geoip.dat")
+    }
+
+    pub fn geosite_path(&self) -> PathBuf {
+        self.geodata_dir.join("geosite.dat")
+    }
+
+    pub fn has_geodata(&self) -> bool {
+        self.geoip_path().exists() && self.geosite_path().exists()
     }
 
     pub fn load_metadata(&self) -> Result<Option<GeodataMetadata>, GeodataError> {
@@ -123,72 +122,87 @@ impl GeodataManager {
         }
     }
 
-    pub fn download_urls(backend: BackendType) -> Vec<GeodataDownload> {
-        match backend {
-            BackendType::V2ray | BackendType::Xray => vec![
-                GeodataDownload {
-                    url: "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat"
-                        .into(),
-                    filename: "geoip.dat".into(),
-                },
-                GeodataDownload {
-                    url: "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat".into(),
-                    filename: "geosite.dat".into(),
-                },
-            ],
-            BackendType::SingBox => vec![
-                GeodataDownload {
-                    url: "https://github.com/SagerNet/sing-geoip/releases/latest/download/geoip.db"
-                        .into(),
-                    filename: "geoip.db".into(),
-                },
-                GeodataDownload {
-                    url: "https://github.com/SagerNet/sing-geosite/releases/latest/download/geosite.db".into(),
-                    filename: "geosite.db".into(),
-                },
-            ],
-        }
+    pub fn download_urls() -> Vec<GeodataDownload> {
+        vec![
+            GeodataDownload {
+                url: "https://github.com/v2fly/geoip/releases/latest/download/geoip.dat".into(),
+                filename: "geoip.dat".into(),
+            },
+            GeodataDownload {
+                url: "https://github.com/v2fly/domain-list-community/releases/latest/download/dlc.dat".into(),
+                filename: "geosite.dat".into(),
+            },
+        ]
     }
 
     pub fn reindex(&self, backend: BackendType) -> Result<(), GeodataError> {
         let index_manager = GeodataIndexManager::new_from_geodata_dir(&self.geodata_dir);
-        let geoip_path = self.geoip_path(backend);
-        let geosite_path = self.geosite_path(backend);
 
-        if !geoip_path.exists() || !geosite_path.exists() {
-            return Err(GeodataError::Io(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "geodata files not found",
-            )));
+        match backend {
+            BackendType::V2ray | BackendType::Xray => {
+                let geoip_path = self.geoip_path();
+                let geosite_path = self.geosite_path();
+
+                if !geoip_path.exists() || !geosite_path.exists() {
+                    return Err(GeodataError::Io(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "geodata files not found",
+                    )));
+                }
+
+                index_manager
+                    .build_index(backend, &geoip_path, &geosite_path)
+                    .map_err(|e| GeodataError::Io(std::io::Error::other(e.to_string())))?;
+            }
+            BackendType::SingBox => {
+                index_manager
+                    .build_singbox_index(&self.rule_sets_dir())
+                    .map_err(|e| GeodataError::Io(std::io::Error::other(e.to_string())))?;
+            }
         }
 
-        index_manager
-            .build_index(backend, &geoip_path, &geosite_path)
-            .map_err(|e| GeodataError::Io(std::io::Error::other(e.to_string())))?;
         Ok(())
+    }
+}
+
+fn ensure_dir_0700(path: &Path) -> Result<(), GeodataError> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        }
+    }
+    Ok(())
+}
+
+fn rule_set_url(full_tag: &str) -> Option<String> {
+    if full_tag.starts_with("geoip-") {
+        Some(format!("{GEOIP_RULESET_URL}/{full_tag}.srs"))
+    } else if full_tag.starts_with("geosite-") {
+        Some(format!("{GEOSITE_RULESET_URL}/{full_tag}.srs"))
+    } else {
+        None
     }
 }
 
 #[cfg(feature = "geodata-fetch")]
 pub fn check_and_download(
     manager: &GeodataManager,
-    backend: BackendType,
     interval: Duration,
 ) -> Result<Option<GeodataMetadata>, GeodataError> {
-    if manager.has_geodata(backend) && !manager.needs_update(interval) {
+    if manager.has_geodata() && !manager.needs_update(interval) {
         return Ok(None);
     }
-    download_geodata(manager, backend).map(Some)
+    download_geodata(manager).map(Some)
 }
 
 #[cfg(feature = "geodata-fetch")]
 use std::io::Write;
 
 #[cfg(feature = "geodata-fetch")]
-pub fn download_geodata(
-    manager: &GeodataManager,
-    backend: BackendType,
-) -> Result<GeodataMetadata, GeodataError> {
+pub fn download_geodata(manager: &GeodataManager) -> Result<GeodataMetadata, GeodataError> {
     manager.ensure_dir()?;
     let client = reqwest::blocking::Client::builder()
         .timeout(GEODATA_DOWNLOAD_TIMEOUT)
@@ -198,7 +212,7 @@ pub fn download_geodata(
             reason: e.to_string(),
         })?;
 
-    for dl in GeodataManager::download_urls(backend) {
+    for dl in GeodataManager::download_urls() {
         let target = manager.geodata_dir().join(&dl.filename);
         let response = client
             .get(&dl.url)
@@ -241,6 +255,82 @@ pub fn download_geodata(
         tmp.flush()?;
         tmp.as_file().sync_all()?;
         tmp.persist(&target)
+            .map_err(|e| GeodataError::Io(e.error))?;
+    }
+
+    let metadata = GeodataMetadata {
+        last_check: chrono::Utc::now(),
+        geoip_version: None,
+        geosite_version: None,
+    };
+    manager.save_metadata(&metadata)?;
+    Ok(metadata)
+}
+
+/// Fetches only the sing-box rule-sets not already cached locally. Individual
+/// `.srs` files are versioned independently upstream and never expire once
+/// downloaded, so "missing" is the only staleness signal we track.
+#[cfg(feature = "geodata-fetch")]
+pub fn download_singbox_rule_sets(
+    manager: &GeodataManager,
+    tags: &[String],
+) -> Result<GeodataMetadata, GeodataError> {
+    manager.ensure_dir()?;
+    let _ = std::fs::remove_file(manager.geodata_dir().join("geoip.db"));
+    let _ = std::fs::remove_file(manager.geodata_dir().join("geosite.db"));
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(GEODATA_DOWNLOAD_TIMEOUT)
+        .build()
+        .map_err(|e| GeodataError::Download {
+            url: String::new(),
+            reason: e.to_string(),
+        })?;
+
+    for tag in tags {
+        if manager.has_rule_set(tag) {
+            continue;
+        }
+        let Some(url) = rule_set_url(tag) else {
+            log::warn!("unrecognized sing-box rule-set tag, skipping: {tag}");
+            continue;
+        };
+
+        let response = client
+            .get(&url)
+            .send()
+            .map_err(|e| GeodataError::Download {
+                url: url.clone(),
+                reason: e.to_string(),
+            })?;
+
+        if !response.status().is_success() {
+            return Err(GeodataError::Download {
+                url,
+                reason: format!("HTTP {}", response.status()),
+            });
+        }
+
+        let bytes = response.bytes().map_err(|e| GeodataError::Download {
+            url: url.clone(),
+            reason: e.to_string(),
+        })?;
+
+        if bytes.len() as u64 > MAX_GEODATA_SIZE {
+            return Err(GeodataError::Download {
+                url,
+                reason: format!(
+                    "response too large: {} bytes (max {MAX_GEODATA_SIZE})",
+                    bytes.len()
+                ),
+            });
+        }
+
+        let mut tmp = tempfile::NamedTempFile::new_in(manager.rule_sets_dir())?;
+        tmp.write_all(&bytes)?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(manager.rule_set_path(tag))
             .map_err(|e| GeodataError::Io(e.error))?;
     }
 
@@ -329,9 +419,7 @@ mod tests {
     #[test]
     fn test_has_geodata_missing_files() {
         let (_tmp, manager) = test_manager();
-        assert!(!manager.has_geodata(BackendType::V2ray));
-        assert!(!manager.has_geodata(BackendType::Xray));
-        assert!(!manager.has_geodata(BackendType::SingBox));
+        assert!(!manager.has_geodata());
     }
 
     #[test]
@@ -339,51 +427,27 @@ mod tests {
         let (_tmp, manager) = test_manager();
         manager.ensure_dir().unwrap();
 
-        std::fs::write(manager.geoip_path(BackendType::V2ray), b"test").unwrap();
-        std::fs::write(manager.geosite_path(BackendType::V2ray), b"test").unwrap();
+        std::fs::write(manager.geoip_path(), b"test").unwrap();
+        std::fs::write(manager.geosite_path(), b"test").unwrap();
 
-        assert!(manager.has_geodata(BackendType::V2ray));
-        assert!(manager.has_geodata(BackendType::Xray));
+        assert!(manager.has_geodata());
     }
 
     #[test]
-    fn test_geoip_path_v2ray() {
+    fn test_geoip_path() {
         let (_tmp, manager) = test_manager();
-        let path = manager.geoip_path(BackendType::V2ray);
-        assert!(path.ends_with("geoip.dat"));
+        assert!(manager.geoip_path().ends_with("geoip.dat"));
     }
 
     #[test]
-    fn test_geoip_path_xray() {
+    fn test_geosite_path() {
         let (_tmp, manager) = test_manager();
-        let path = manager.geoip_path(BackendType::Xray);
-        assert!(path.ends_with("geoip.dat"));
+        assert!(manager.geosite_path().ends_with("geosite.dat"));
     }
 
     #[test]
-    fn test_geoip_path_singbox() {
-        let (_tmp, manager) = test_manager();
-        let path = manager.geoip_path(BackendType::SingBox);
-        assert!(path.ends_with("geoip.db"));
-    }
-
-    #[test]
-    fn test_geosite_path_v2ray() {
-        let (_tmp, manager) = test_manager();
-        let path = manager.geosite_path(BackendType::V2ray);
-        assert!(path.ends_with("geosite.dat"));
-    }
-
-    #[test]
-    fn test_geosite_path_singbox() {
-        let (_tmp, manager) = test_manager();
-        let path = manager.geosite_path(BackendType::SingBox);
-        assert!(path.ends_with("geosite.db"));
-    }
-
-    #[test]
-    fn test_download_urls_v2ray() {
-        let urls = GeodataManager::download_urls(BackendType::V2ray);
+    fn test_download_urls() {
+        let urls = GeodataManager::download_urls();
         assert_eq!(urls.len(), 2);
         assert!(urls[0].url.contains("v2fly/geoip"));
         assert_eq!(urls[0].filename, "geoip.dat");
@@ -392,21 +456,45 @@ mod tests {
     }
 
     #[test]
-    fn test_download_urls_xray() {
-        let urls = GeodataManager::download_urls(BackendType::Xray);
-        assert_eq!(urls.len(), 2);
-        assert!(urls[0].url.contains("v2fly/geoip"));
-        assert_eq!(urls[0].filename, "geoip.dat");
+    fn test_rule_sets_dir() {
+        let (_tmp, manager) = test_manager();
+        assert!(manager.rule_sets_dir().ends_with("geodata/rule-sets"));
     }
 
     #[test]
-    fn test_download_urls_singbox() {
-        let urls = GeodataManager::download_urls(BackendType::SingBox);
-        assert_eq!(urls.len(), 2);
-        assert!(urls[0].url.contains("SagerNet/sing-geoip"));
-        assert_eq!(urls[0].filename, "geoip.db");
-        assert!(urls[1].url.contains("SagerNet/sing-geosite"));
-        assert_eq!(urls[1].filename, "geosite.db");
+    fn test_rule_set_path() {
+        let (_tmp, manager) = test_manager();
+        let path = manager.rule_set_path("geoip-ru");
+        assert!(path.ends_with("rule-sets/geoip-ru.srs"));
+    }
+
+    #[test]
+    fn test_has_rule_set() {
+        let (_tmp, manager) = test_manager();
+        assert!(!manager.has_rule_set("geoip-ru"));
+
+        manager.ensure_dir().unwrap();
+        std::fs::write(manager.rule_set_path("geoip-ru"), b"test").unwrap();
+        assert!(manager.has_rule_set("geoip-ru"));
+    }
+
+    #[test]
+    fn test_rule_set_url_geoip() {
+        let url = rule_set_url("geoip-ru").unwrap();
+        assert!(url.contains("SagerNet/sing-geoip"));
+        assert!(url.ends_with("geoip-ru.srs"));
+    }
+
+    #[test]
+    fn test_rule_set_url_geosite() {
+        let url = rule_set_url("geosite-google").unwrap();
+        assert!(url.contains("SagerNet/sing-geosite"));
+        assert!(url.ends_with("geosite-google.srs"));
+    }
+
+    #[test]
+    fn test_rule_set_url_unrecognized_tag() {
+        assert!(rule_set_url("bogus-tag").is_none());
     }
 
     #[test]
@@ -414,32 +502,18 @@ mod tests {
         let (_tmp, manager) = test_manager();
         manager.ensure_dir().unwrap();
         assert!(manager.geodata_dir().exists());
+        assert!(manager.rule_sets_dir().exists());
     }
 
     #[test]
-    fn test_reindex_creates_index_file() {
+    fn test_reindex_singbox_builds_index_from_rule_sets() {
         let (_tmp, manager) = test_manager();
         manager.ensure_dir().unwrap();
 
         use crate::geodata_index::GeodataIndexManager;
 
-        let tmp_dir = TempDir::new().unwrap();
-        let geoip_path = tmp_dir.path().join("geoip.db");
-        let geosite_path = tmp_dir.path().join("geosite.db");
-
-        let conn = rusqlite::Connection::open(&geoip_path).unwrap();
-        conn.execute("CREATE TABLE geoip (country_code TEXT)", [])
-            .unwrap();
-        conn.execute("INSERT INTO geoip (country_code) VALUES (?1)", ["US"])
-            .unwrap();
-
-        let conn = rusqlite::Connection::open(&geosite_path).unwrap();
-        conn.execute("CREATE TABLE geosite (tag TEXT)", []).unwrap();
-        conn.execute("INSERT INTO geosite (tag) VALUES (?1)", ["google"])
-            .unwrap();
-
-        std::fs::copy(&geoip_path, manager.geoip_path(BackendType::SingBox)).unwrap();
-        std::fs::copy(&geosite_path, manager.geosite_path(BackendType::SingBox)).unwrap();
+        std::fs::write(manager.rule_set_path("geoip-us"), b"fake").unwrap();
+        std::fs::write(manager.rule_set_path("geosite-google"), b"fake").unwrap();
 
         manager.reindex(BackendType::SingBox).unwrap();
 
@@ -447,7 +521,7 @@ mod tests {
         let index = index_manager.load_index(BackendType::SingBox).unwrap();
         assert!(index.is_some());
         let index = index.unwrap();
-        assert_eq!(index.geoip_tags, vec!["US"]);
+        assert_eq!(index.geoip_tags, vec!["us"]);
         assert_eq!(index.geosite_tags, vec!["google"]);
     }
 

@@ -11,6 +11,7 @@ use crate::persistence::AppPaths;
 pub struct ConfigWriter {
     output_dir: PathBuf,
     singbox_cache_path: Option<PathBuf>,
+    rule_sets_dir: PathBuf,
 }
 
 impl ConfigWriter {
@@ -24,6 +25,7 @@ impl ConfigWriter {
         Self {
             output_dir,
             singbox_cache_path: Some(paths.cache_dir().join("sing-box-cache.db")),
+            rule_sets_dir: paths.geodata_dir().join("rule-sets"),
         }
     }
 
@@ -31,6 +33,7 @@ impl ConfigWriter {
     pub fn with_dir(dir: PathBuf) -> Self {
         Self {
             singbox_cache_path: Some(dir.join("sing-box-cache.db")),
+            rule_sets_dir: dir.join("rule-sets"),
             output_dir: dir,
         }
     }
@@ -75,6 +78,7 @@ impl ConfigWriter {
 
         let mut config = generator.generate(nodes, rules, settings_for_generate)?;
         if backend == BackendType::SingBox {
+            crate::config::singbox::apply_local_rule_sets(&mut config, &self.rule_sets_dir);
             apply_singbox_cache_file(&mut config, settings, self.singbox_cache_path.as_deref());
         }
         let json = serde_json::to_string(&config)?;
@@ -274,6 +278,111 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["experimental"]["cache_file"]["store_fakeip"], true);
+    }
+
+    #[test]
+    fn test_write_config_singbox_uses_local_rulesets_when_cached() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rule_sets_dir = dir.path().join("rule-sets");
+        std::fs::create_dir_all(&rule_sets_dir).unwrap();
+        std::fs::write(rule_sets_dir.join("geoip-ru.srs"), b"fake").unwrap();
+        std::fs::write(rule_sets_dir.join("geosite-google.srs"), b"fake").unwrap();
+
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoIp {
+                    country_code: "RU".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoSite {
+                    category: "google".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+            },
+        ];
+
+        let path = writer
+            .write_config(&sample_nodes(), &rules, &settings)
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rule_sets = parsed["route"]["rule_set"].as_array().unwrap();
+        let geoip = rule_sets.iter().find(|r| r["tag"] == "geoip-ru").unwrap();
+        assert_eq!(geoip["type"], "local");
+        assert!(std::path::Path::new(geoip["path"].as_str().unwrap()).is_absolute());
+        let geosite = rule_sets
+            .iter()
+            .find(|r| r["tag"] == "geosite-google")
+            .unwrap();
+        assert_eq!(geosite["type"], "local");
+
+        assert!(
+            parsed.get("experimental").is_none(),
+            "no remote rule-sets left, cache_file should not be enabled"
+        );
+    }
+
+    #[test]
+    fn test_write_config_singbox_mixed_local_and_remote_keeps_cache_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let rule_sets_dir = dir.path().join("rule-sets");
+        std::fs::create_dir_all(&rule_sets_dir).unwrap();
+        std::fs::write(rule_sets_dir.join("geoip-ru.srs"), b"fake").unwrap();
+
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoIp {
+                    country_code: "RU".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoSite {
+                    category: "google".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+            },
+        ];
+
+        let path = writer
+            .write_config(&sample_nodes(), &rules, &settings)
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rule_sets = parsed["route"]["rule_set"].as_array().unwrap();
+        let geoip = rule_sets.iter().find(|r| r["tag"] == "geoip-ru").unwrap();
+        assert_eq!(geoip["type"], "local");
+        let geosite = rule_sets
+            .iter()
+            .find(|r| r["tag"] == "geosite-google")
+            .unwrap();
+        assert_eq!(geosite["type"], "remote");
+
+        assert_eq!(parsed["experimental"]["cache_file"]["enabled"], true);
     }
 
     #[test]
