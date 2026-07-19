@@ -32,6 +32,7 @@ pub struct SubscriptionsPage {
     real_delay_run_token: u64,
     expanded_subs: HashSet<Uuid>,
     active_node: Option<(Uuid, Uuid)>,
+    tun_active: bool,
     backend_type: BackendType,
     binary_path: Option<std::path::PathBuf>,
     real_delay_settings: RealDelaySettings,
@@ -54,6 +55,7 @@ struct RenderState<'a> {
     real_delay_capability: &'a RealDelayCapability,
     locked: bool,
     active_node: Option<(Uuid, Uuid)>,
+    tun_active: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +104,7 @@ pub enum SubscriptionsMsg {
     },
     ResetStorage,
     SetActiveNode(Option<(Uuid, Uuid)>),
+    SetTunActive(bool),
     ExpanderToggled(Uuid, bool),
 }
 
@@ -267,6 +270,7 @@ impl Component for SubscriptionsPage {
             real_delay_run_token: 0,
             expanded_subs: HashSet::new(),
             active_node: None,
+            tun_active: false,
             backend_type: settings.backend.backend_type,
             binary_path: settings.backend.binary_path.clone(),
             real_delay_settings: settings.real_delay.clone(),
@@ -290,6 +294,7 @@ impl Component for SubscriptionsPage {
                 real_delay_capability: &model.real_delay_capability,
                 locked: model.load_error.is_some(),
                 active_node: model.active_node,
+                tun_active: model.tun_active,
             },
         );
 
@@ -322,6 +327,7 @@ impl Component for SubscriptionsPage {
                 msg,
                 SubscriptionsMsg::ResetStorage
                     | SubscriptionsMsg::SetActiveNode(_)
+                    | SubscriptionsMsg::SetTunActive(_)
                     | SubscriptionsMsg::SyncSettings { .. }
             )
         {
@@ -479,7 +485,7 @@ impl Component for SubscriptionsPage {
                 return;
             }
             SubscriptionsMsg::TestLatency(id) => {
-                if self.testing_latency.contains(&id) {
+                if self.testing_latency.contains(&id) || self.tun_active {
                     return;
                 }
                 let sub = match self.subscriptions.iter().find(|s| s.id == id) {
@@ -678,6 +684,12 @@ impl Component for SubscriptionsPage {
                 }
                 self.active_node = active;
             }
+            SubscriptionsMsg::SetTunActive(active) => {
+                if self.tun_active == active {
+                    return;
+                }
+                self.tun_active = active;
+            }
             SubscriptionsMsg::ConnectNode(sub_id, node_id) => {
                 let _ = sender.output(SubscriptionsOutput::ConnectNode(sub_id, node_id));
             }
@@ -786,6 +798,7 @@ impl Component for SubscriptionsPage {
                 real_delay_capability: &self.real_delay_capability,
                 locked: self.load_error.is_some(),
                 active_node: self.active_node,
+                tun_active: self.tun_active,
             },
         );
     }
@@ -984,7 +997,11 @@ impl Component for SubscriptionsPage {
                 let eligible = subscriptions_eligible_for_latency_test(
                     &self.subscriptions,
                     &self.testing_latency,
+                    self.tun_active,
                 );
+                if self.tun_active {
+                    log::debug!("skipping background latency probes: TUN active");
+                }
                 for id in eligible {
                     sender.input(SubscriptionsMsg::TestLatency(id));
                 }
@@ -1009,6 +1026,7 @@ impl Component for SubscriptionsPage {
                 real_delay_capability: &self.real_delay_capability,
                 locked: self.load_error.is_some(),
                 active_node: self.active_node,
+                tun_active: self.tun_active,
             },
         );
     }
@@ -1096,7 +1114,11 @@ fn format_subscription_error(error: &SubscriptionError) -> String {
 fn subscriptions_eligible_for_latency_test(
     subscriptions: &[Subscription],
     testing_latency: &HashSet<Uuid>,
+    tun_active: bool,
 ) -> Vec<Uuid> {
+    if tun_active {
+        return Vec::new();
+    }
     subscriptions
         .iter()
         .filter(|sub| sub.enabled && sub.has_enabled_nodes() && !testing_latency.contains(&sub.id))
@@ -1304,6 +1326,7 @@ fn build_subscription_group(
         state.testing_real_delay.contains_key(&sub.id),
         state.real_delay_available,
         state.real_delay_capability,
+        state.tun_active,
     );
     expander.add_suffix(&menu);
 
@@ -1437,6 +1460,7 @@ fn build_subscription_menu(
     is_testing_real_delay: bool,
     real_delay_available: bool,
     real_delay_capability: &RealDelayCapability,
+    tun_active: bool,
 ) -> gtk::MenuButton {
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
@@ -1528,8 +1552,13 @@ fn build_subscription_menu(
             "Test Latency"
         })
         .has_frame(false)
-        .sensitive(!is_testing)
+        .sensitive(!is_testing && !tun_active)
         .build();
+    if tun_active {
+        test_latency_btn.set_tooltip_text(Some(
+            "Direct TCP latency is unavailable under TUN — use Test Real Delay to measure through the tunnel",
+        ));
+    }
     {
         let s = sender.clone();
         let p = popover.clone();
@@ -2043,7 +2072,7 @@ mod tests {
         );
         let testing_latency = HashSet::new();
 
-        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, false);
 
         assert_eq!(eligible.len(), 1);
     }
@@ -2057,7 +2086,7 @@ mod tests {
         );
         let testing_latency = HashSet::new();
 
-        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, false);
 
         assert!(eligible.is_empty());
     }
@@ -2074,7 +2103,7 @@ mod tests {
         );
         let testing_latency = HashSet::new();
 
-        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, false);
 
         assert!(eligible.is_empty());
     }
@@ -2089,7 +2118,7 @@ mod tests {
         let mut testing_latency = HashSet::new();
         testing_latency.insert(sub.id);
 
-        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency);
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, false);
 
         assert!(eligible.is_empty());
     }
@@ -2123,11 +2152,43 @@ mod tests {
         let mut testing_latency = HashSet::new();
         testing_latency.insert(sub4.id);
 
-        let eligible =
-            subscriptions_eligible_for_latency_test(&[sub1, sub2, sub3, sub4], &testing_latency);
+        let eligible = subscriptions_eligible_for_latency_test(
+            &[sub1, sub2, sub3, sub4],
+            &testing_latency,
+            false,
+        );
 
         assert_eq!(eligible.len(), 1);
         assert_eq!(eligible[0], sub1_id);
+    }
+
+    #[test]
+    fn tun_active_suppresses_all_latency_probes() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        let testing_latency = HashSet::new();
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, true);
+
+        assert!(eligible.is_empty());
+    }
+
+    #[test]
+    fn tun_inactive_resumes_latency_probes() {
+        let sub = create_test_subscription(
+            "Test Sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        let sub_id = sub.id;
+        let testing_latency = HashSet::new();
+
+        let eligible = subscriptions_eligible_for_latency_test(&[sub], &testing_latency, false);
+
+        assert_eq!(eligible, vec![sub_id]);
     }
 
     #[test]

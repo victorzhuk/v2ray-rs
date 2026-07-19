@@ -163,6 +163,12 @@ impl App {
             .emit(SubscriptionsMsg::SetActiveNode(sub_active));
         self.nodes_page.emit(NodesMsg::SetActiveNode(manual_active));
 
+        let tun_active = matches!(state, ProcessState::Running)
+            && self.settings.tun.enabled
+            && self.settings.backend.backend_type != v2ray_rs_core::models::BackendType::V2ray;
+        self.subscriptions_page
+            .emit(SubscriptionsMsg::SetTunActive(tun_active));
+
         if let Ok(guard) = TRAY_EVENT_TX.lock()
             && let Some(tx) = guard.as_ref()
         {
