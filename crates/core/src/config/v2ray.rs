@@ -5,6 +5,7 @@ use crate::models::{
     AppSettings, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy,
     GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
     TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -294,6 +295,10 @@ fn apply_stream_settings(
             stream["network"] = json!("h2");
             stream["httpSettings"] = build_h2_settings(h2);
         }
+        TransportSettings::Xhttp(xhttp) => {
+            stream["network"] = json!("xhttp");
+            stream["xhttpSettings"] = build_xhttp_settings(xhttp);
+        }
     }
 
     if let Some(tls_cfg) = tls {
@@ -358,6 +363,17 @@ fn build_h2_settings(h2: &H2Settings) -> Value {
         "host": h2.host,
         "path": h2.path,
     })
+}
+
+fn build_xhttp_settings(xhttp: &XhttpSettings) -> Value {
+    let mut settings = json!({
+        "path": xhttp.path,
+        "mode": xhttp.mode,
+    });
+    if let Some(host) = &xhttp.host {
+        settings["host"] = json!(host);
+    }
+    settings
 }
 
 fn build_routing(
@@ -439,12 +455,37 @@ fn build_routing_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
         }),
         RuleMatch::Domain { pattern } => json!({
             "type": "field",
-            "domain": [pattern],
+            "domain": [format!("domain:{pattern}")],
+            "outboundTag": outbound_tag,
+        }),
+        RuleMatch::DomainKeyword { keyword } => json!({
+            "type": "field",
+            "domain": [keyword],
+            "outboundTag": outbound_tag,
+        }),
+        RuleMatch::DomainFull { domain } => json!({
+            "type": "field",
+            "domain": [format!("full:{domain}")],
             "outboundTag": outbound_tag,
         }),
         RuleMatch::IpCidr { cidr } => json!({
             "type": "field",
             "ip": [cidr.to_string()],
+            "outboundTag": outbound_tag,
+        }),
+        RuleMatch::Protocol { name } => json!({
+            "type": "field",
+            "protocol": [name],
+            "outboundTag": outbound_tag,
+        }),
+        RuleMatch::Port { spec } => json!({
+            "type": "field",
+            "port": spec,
+            "outboundTag": outbound_tag,
+        }),
+        RuleMatch::Network { spec } => json!({
+            "type": "field",
+            "network": spec,
             "outboundTag": outbound_tag,
         }),
     }
@@ -484,6 +525,8 @@ fn build_dns_for_backend(
                 .map(|rule| match &rule.match_condition {
                     DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
                     DnsRuleMatch::DomainSuffix { suffix } => format!("domain:{suffix}"),
+                    DnsRuleMatch::DomainKeyword { keyword } => keyword.clone(),
+                    DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
                 })
                 .collect();
 
@@ -510,7 +553,9 @@ fn build_dns_for_backend(
         for rule in rules.iter().filter(|r| r.enabled) {
             let entry = match &rule.match_condition {
                 RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
-                RuleMatch::Domain { pattern } => Some(pattern.clone()),
+                RuleMatch::Domain { pattern } => Some(format!("domain:{pattern}")),
+                RuleMatch::DomainKeyword { keyword } => Some(keyword.clone()),
+                RuleMatch::DomainFull { domain } => Some(format!("full:{domain}")),
                 _ => None,
             };
             if let Some(d) = entry {
@@ -948,7 +993,113 @@ mod tests {
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(routing_rules[0]["domain"][0], "*.google.com");
+        assert_eq!(routing_rules[0]["domain"][0], "domain:*.google.com");
+    }
+
+    #[test]
+    fn test_domain_keyword_routing_rule() {
+        let generator = V2rayGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainKeyword {
+                keyword: "sina".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[vless_node()], &rules, &default_settings())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["domain"][0], "sina");
+    }
+
+    #[test]
+    fn test_domain_full_routing_rule() {
+        let generator = V2rayGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainFull {
+                domain: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[vless_node()], &rules, &default_settings())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["domain"][0], "full:example.com");
+    }
+
+    #[test]
+    fn test_protocol_routing_rule() {
+        let generator = V2rayGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Protocol {
+                name: "bittorrent".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[vless_node()], &rules, &default_settings())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["protocol"][0], "bittorrent");
+        assert_eq!(routing_rules[0]["outboundTag"], "block");
+    }
+
+    #[test]
+    fn test_port_routing_rule() {
+        let generator = V2rayGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Port {
+                spec: "80,443,1000-2000".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[vless_node()], &rules, &default_settings())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["port"], "80,443,1000-2000");
+    }
+
+    #[test]
+    fn test_network_routing_rule() {
+        let generator = V2rayGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Network {
+                spec: "tcp,udp".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[vless_node()], &rules, &default_settings())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["network"], "tcp,udp");
     }
 
     #[test]
@@ -1057,6 +1208,33 @@ mod tests {
         let stream = &config["outbounds"][0]["streamSettings"];
         assert_eq!(stream["network"], "h2");
         assert_eq!(stream["httpSettings"]["path"], "/h2path");
+    }
+
+    #[test]
+    fn test_xhttp_transport() {
+        let generator = V2rayGenerator;
+        let config = generator
+            .generate(&[xhttp_node()], &[], &default_settings())
+            .unwrap();
+
+        let stream = &config["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["network"], "xhttp");
+        assert_eq!(stream["xhttpSettings"]["path"], "/xhttp");
+        assert_eq!(stream["xhttpSettings"]["host"], "xhttp.example.com");
+        assert_eq!(stream["xhttpSettings"]["mode"], "auto");
+        assert_eq!(stream["security"], "reality");
+    }
+
+    #[test]
+    fn test_xray_xhttp_transport() {
+        let generator = crate::config::XrayGenerator;
+        let config = generator
+            .generate(&[xhttp_node()], &[], &default_settings())
+            .unwrap();
+
+        let stream = &config["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["network"], "xhttp");
+        assert_eq!(stream["xhttpSettings"]["mode"], "auto");
     }
 
     #[test]
@@ -1302,6 +1480,68 @@ mod tests {
     }
 
     #[test]
+    fn test_dns_custom_rules_domain_keyword_and_full() {
+        use crate::models::{DnsRule, DnsRuleMatch};
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainKeyword {
+                    keyword: "sina".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainFull {
+                    domain: "example.com".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            },
+        ];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        let domains = servers[0]["domains"].as_array().unwrap();
+        assert!(domains.contains(&json!("sina")));
+        assert!(domains.contains(&json!("full:example.com")));
+    }
+
+    #[test]
+    fn test_dns_derived_domain_rule_gains_prefix() {
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+
+        let dns = build_dns(&rules, &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        let remote = servers
+            .iter()
+            .find(|s| s.get("domains").is_some())
+            .expect("remote server with derived domains not found");
+        let domains = remote["domains"].as_array().unwrap();
+        assert!(domains.contains(&json!("domain:example.com")));
+    }
+
+    #[test]
     fn test_dns_empty_servers_uses_localhost() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
@@ -1492,7 +1732,10 @@ mod tests {
             generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
 
         assert_eq!(config["dns"]["tag"], "dns-internal");
-        assert_eq!(config["dns"]["servers"], json!(["https://1.1.1.1/dns-query"]));
+        assert_eq!(
+            config["dns"]["servers"],
+            json!(["https://1.1.1.1/dns-query"])
+        );
         assert_eq!(config["dns"]["queryStrategy"], "UseIPv4");
 
         let rules = config["routing"]["rules"].as_array().unwrap();
@@ -1513,6 +1756,54 @@ mod tests {
         assert_eq!(config["dns"]["tag"], "dns-internal");
         let rules = config["routing"]["rules"].as_array().unwrap();
         assert_eq!(rules[0]["inboundTag"], json!(["dns-internal"]));
+    }
+
+    #[test]
+    fn test_xray_tun_profile_dns_overrides_disabled_global_dns() {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.nodes = vec![SubscriptionNode::new(vless_node())];
+        sub.use_imported_profile = true;
+        sub.imported_profile = Some(ImportedProfile {
+            rules: vec![],
+            dns: Some(DnsConfig {
+                enabled: true,
+                servers: vec![DnsServerConfig {
+                    tag: "provider-dns".into(),
+                    protocol: DnsProtocol::Doh,
+                    address: "1.1.1.1".into(),
+                    port: None,
+                    detour: None,
+                }],
+                ..DnsConfig::default()
+            }),
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+
+        let (rules, effective) = resolve_effective_config(&node_ref, &[sub], &[], &settings);
+        assert!(
+            effective.dns.enabled,
+            "provider dns must override a disabled global dns"
+        );
+
+        let config = generate_v2ray_family_config(
+            &[vless_node()],
+            &rules,
+            &effective,
+            V2rayFamilyBackend::Xray,
+        );
+
+        assert_eq!(config["dns"]["tag"], "dns-internal");
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["inboundTag"], json!(["dns-internal"]));
     }
 
     #[test]

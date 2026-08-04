@@ -63,4 +63,26 @@ pub(crate) mod fixtures {
             remark: Some("Test Trojan".into()),
         })
     }
+
+    pub fn xhttp_node() -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "xhttp.example.com".into(),
+            port: 443,
+            uuid: "550e8400-e29b-41d4-a716-446655440001".into(),
+            encryption: Some("none".into()),
+            flow: None,
+            transport: TransportSettings::Xhttp(XhttpSettings {
+                path: "/xhttp".into(),
+                host: Some("xhttp.example.com".into()),
+                mode: "auto".into(),
+            }),
+            tls: Some(TlsSettings {
+                server_name: Some("xhttp.example.com".into()),
+                reality: true,
+                public_key: Some("pbk".into()),
+                ..Default::default()
+            }),
+            remark: Some("Test XHTTP".into()),
+        })
+    }
 }

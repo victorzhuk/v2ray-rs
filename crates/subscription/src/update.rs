@@ -4,9 +4,12 @@ use std::time::Duration;
 
 use chrono::Utc;
 use thiserror::Error;
-use v2ray_rs_core::models::{ProxyNode, Subscription, SubscriptionNode, SubscriptionSource};
+use v2ray_rs_core::models::{
+    ImportedProfile, ProxyNode, Subscription, SubscriptionNode, SubscriptionSource,
+};
 
 use crate::fetch::{FetchError, fetch_from_file, fetch_with_client};
+use crate::json_import::parse_json_subscription;
 use crate::parser::parse_subscription_uris;
 use std::future::Future;
 
@@ -24,6 +27,7 @@ pub struct UpdateResult {
     pub removed: usize,
     pub unchanged: usize,
     pub parse_failures: Vec<ParseFailure>,
+    pub profile: Option<ImportedProfile>,
 }
 
 #[derive(Debug, Error)]
@@ -88,6 +92,7 @@ pub fn reconcile_with_counts(
         removed,
         unchanged,
         parse_failures: Vec::new(),
+        profile: None,
     };
 
     (result, update_result)
@@ -147,8 +152,19 @@ pub async fn update_subscription(
         SubscriptionSource::File { path } => fetch_from_file(path)?,
     };
 
-    let uris = crate::fetch::decode_subscription_content(&raw_content);
-    let import = parse_subscription_uris(&uris);
+    let profile;
+    let import = match parse_json_subscription(&raw_content) {
+        Some(j) => {
+            profile = j.profile;
+            j.result
+        }
+        None => {
+            let uris = crate::fetch::decode_subscription_content(&raw_content);
+            profile = None;
+            parse_subscription_uris(&uris)
+        }
+    };
+
     let parse_failures: Vec<ParseFailure> = import
         .errors
         .into_iter()
@@ -169,9 +185,11 @@ pub async fn update_subscription(
 
     subscription.nodes = new_nodes;
     subscription.last_updated = Some(Utc::now());
+    subscription.imported_profile = profile.clone();
 
     Ok(UpdateResult {
         parse_failures,
+        profile,
         ..result
     })
 }
@@ -359,6 +377,48 @@ mod tests {
         assert_eq!(result[1].id, second_id);
         assert!(!result[0].enabled);
         assert!(result[1].enabled);
+    }
+
+    #[tokio::test]
+    async fn test_update_subscription_json_bundle_sets_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("bundle.json");
+        std::fs::write(
+            &file_path,
+            include_str!("../tests/fixtures/bundle_sample.json"),
+        )
+        .unwrap();
+
+        let mut subscription =
+            Subscription::new_from_file("Bundle", file_path.to_string_lossy().into_owned());
+        let client = test_client();
+
+        let result = update_subscription(&client, &mut subscription)
+            .await
+            .unwrap();
+
+        assert_eq!(subscription.nodes.len(), 24);
+        assert!(subscription.imported_profile.is_some());
+        assert!(result.profile.is_some());
+        assert_eq!(result.profile.unwrap().rules.len(), 6);
+    }
+
+    #[tokio::test]
+    async fn test_update_subscription_uri_list_leaves_profile_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("subscription.txt");
+        std::fs::write(&file_path, "vless://uuid@a.com:443#A").unwrap();
+
+        let mut subscription =
+            Subscription::new_from_file("Test", file_path.to_string_lossy().into_owned());
+        let client = test_client();
+
+        let result = update_subscription(&client, &mut subscription)
+            .await
+            .unwrap();
+
+        assert!(subscription.imported_profile.is_none());
+        assert!(result.profile.is_none());
     }
 
     #[tokio::test]

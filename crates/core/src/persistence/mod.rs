@@ -199,6 +199,10 @@ impl AppPaths {
         self.data_dir.join("subscriptions.json")
     }
 
+    pub fn subscription_blobs_dir(&self) -> PathBuf {
+        self.data_dir.join("subscriptions")
+    }
+
     pub fn routing_rules_path(&self) -> PathBuf {
         self.data_dir.join("routing_rules.json")
     }
@@ -249,6 +253,7 @@ impl AppPaths {
         create_dir_with_permissions(&self.cache_dir)?;
         create_dir_with_permissions(&self.runtime_dir)?;
         create_dir_with_permissions(&self.state_dir)?;
+        create_dir_with_permissions(&self.subscription_blobs_dir())?;
         self.relocate_legacy_files();
         Ok(())
     }
@@ -390,7 +395,11 @@ fn relocate_legacy_dir(legacy_dir: &Path, new_dir: &Path, what: &str) {
     }
 
     if let Err(e) = create_dir_with_permissions(new_dir) {
-        log::warn!("failed to create {:?} for {what} relocation: {}", new_dir, e);
+        log::warn!(
+            "failed to create {:?} for {what} relocation: {}",
+            new_dir,
+            e
+        );
         return;
     }
 
@@ -505,6 +514,21 @@ mod tests {
 
         let state_perms = fs::metadata(paths.state_dir()).unwrap().permissions();
         assert_eq!(state_perms.mode() & 0o777, 0o700);
+
+        assert!(paths.subscription_blobs_dir().exists());
+        let blobs_perms = fs::metadata(paths.subscription_blobs_dir())
+            .unwrap()
+            .permissions();
+        assert_eq!(blobs_perms.mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn test_subscription_blobs_dir_under_data_dir() {
+        let (_tmp, paths) = test_paths();
+        assert_eq!(
+            paths.subscription_blobs_dir(),
+            paths.data_dir().join("subscriptions")
+        );
     }
 
     #[test]

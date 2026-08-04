@@ -848,6 +848,8 @@ fn dns_rule_from_inputs(
 
     let match_condition = match match_combo.selected() {
         1 => DnsRuleMatch::DomainSuffix { suffix: value },
+        2 => DnsRuleMatch::DomainKeyword { keyword: value },
+        3 => DnsRuleMatch::DomainFull { domain: value },
         _ => DnsRuleMatch::GeoSite { category: value },
     };
 
@@ -971,6 +973,8 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
         let (match_type, value) = match &rule.match_condition {
             DnsRuleMatch::GeoSite { category } => ("GeoSite", category),
             DnsRuleMatch::DomainSuffix { suffix } => ("Domain Suffix", suffix),
+            DnsRuleMatch::DomainKeyword { keyword } => ("Domain Keyword", keyword),
+            DnsRuleMatch::DomainFull { domain } => ("Domain Full", domain),
         };
 
         let row = adw::ActionRow::builder()
@@ -1382,6 +1386,8 @@ fn show_dns_rule_dialog(existing: Option<DnsRule>, ctx: &DnsRenderCtx) {
             let (type_idx, val) = match &rule.match_condition {
                 DnsRuleMatch::GeoSite { category } => (0u32, category.clone()),
                 DnsRuleMatch::DomainSuffix { suffix } => (1, suffix.clone()),
+                DnsRuleMatch::DomainKeyword { keyword } => (2, keyword.clone()),
+                DnsRuleMatch::DomainFull { domain } => (3, domain.clone()),
             };
             (type_idx, val, rule.server_tag.clone())
         }
@@ -1447,6 +1453,8 @@ fn show_dns_rule_dialog(existing: Option<DnsRule>, ctx: &DnsRenderCtx) {
         .model(&gtk::StringList::new(&[
             "GeoSite Category",
             "Domain Suffix",
+            "Domain Keyword",
+            "Domain Full",
         ]))
         .selected(init_type)
         .build();

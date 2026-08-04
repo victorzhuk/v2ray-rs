@@ -1,0 +1,3137 @@
+[
+  {
+    "remarks": "Node 01 WS TLS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node01.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000001",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws01",
+            "headers": {
+              "Host": "node01.example.net"
+            }
+          },
+          "security": "tls",
+          "tlsSettings": {
+            "serverName": "node01.example.net",
+            "alpn": [
+              "h2",
+              "http/1.1"
+            ],
+            "fingerprint": "chrome",
+            "allowInsecure": false
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 02 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node02.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000002",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws02",
+            "headers": {
+              "Host": "node02.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 03 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node03.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000003",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws03",
+            "headers": {
+              "Host": "node03.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 04 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node04.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000004",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws04",
+            "headers": {
+              "Host": "node04.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 05 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node05.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000005",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws05",
+            "headers": {
+              "Host": "node05.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 06 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node06.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000006",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws06",
+            "headers": {
+              "Host": "node06.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 07 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node07.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000007",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws07",
+            "headers": {
+              "Host": "node07.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 08 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node08.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000008",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws08",
+            "headers": {
+              "Host": "node08.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 09 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node09.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000009",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws09",
+            "headers": {
+              "Host": "node09.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 10 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node10.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000010",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws10",
+            "headers": {
+              "Host": "node10.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 11 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node11.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000011",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws11",
+            "headers": {
+              "Host": "node11.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 12 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node12.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000012",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws12",
+            "headers": {
+              "Host": "node12.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 13 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node13.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000013",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws13",
+            "headers": {
+              "Host": "node13.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 14 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node14.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000014",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws14",
+            "headers": {
+              "Host": "node14.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 15 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node15.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000015",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws15",
+            "headers": {
+              "Host": "node15.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 16 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node16.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000016",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws16",
+            "headers": {
+              "Host": "node16.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 17 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node17.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000017",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws17",
+            "headers": {
+              "Host": "node17.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 18 WS",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node18.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000018",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "ws",
+          "wsSettings": {
+            "path": "/ws18",
+            "headers": {
+              "Host": "node18.example.net"
+            }
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 19 XHTTP Reality",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node19.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000019",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "xhttpSettings": {
+            "path": "/xhttp19",
+            "host": "node19.example.net",
+            "mode": "auto"
+          },
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.com",
+            "fingerprint": "chrome",
+            "publicKey": "dummyPublicKey19xxxxxxxxxxxxxxxxxxxxxxxx",
+            "shortId": "0013",
+            "spiderX": "/"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 20 XHTTP Reality",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node20.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000020",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "xhttpSettings": {
+            "path": "/xhttp20",
+            "host": "node20.example.net",
+            "mode": "auto"
+          },
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.com",
+            "fingerprint": "chrome",
+            "publicKey": "dummyPublicKey20xxxxxxxxxxxxxxxxxxxxxxxx",
+            "shortId": "0014",
+            "spiderX": "/"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 21 XHTTP Reality",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node21.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000021",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "xhttpSettings": {
+            "path": "/xhttp21",
+            "host": "node21.example.net",
+            "mode": "auto"
+          },
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.com",
+            "fingerprint": "chrome",
+            "publicKey": "dummyPublicKey21xxxxxxxxxxxxxxxxxxxxxxxx",
+            "shortId": "0015",
+            "spiderX": "/"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 22 XHTTP Reality",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node22.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000022",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "xhttpSettings": {
+            "path": "/xhttp22",
+            "host": "node22.example.net",
+            "mode": "auto"
+          },
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.com",
+            "fingerprint": "chrome",
+            "publicKey": "dummyPublicKey22xxxxxxxxxxxxxxxxxxxxxxxx",
+            "shortId": "0016",
+            "spiderX": "/"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 23 XHTTP",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node23.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000023",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "xhttp",
+          "xhttpSettings": {
+            "path": "/xhttp23",
+            "host": "node23.example.net",
+            "mode": "auto"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  },
+  {
+    "remarks": "Node 24 TCP Reality",
+    "dns": {
+      "servers": [
+        "1.1.1.1",
+        {
+          "address": "8.8.8.8",
+          "domains": [
+            "geosite:cn",
+            "domain:example.com"
+          ],
+          "port": 53
+        },
+        {
+          "address": "https://9.9.9.9/dns-query",
+          "domains": [
+            "googleapis",
+            "full:ads.example.com"
+          ]
+        },
+        {
+          "address": "9.9.9.9"
+        }
+      ],
+      "hosts": {
+        "dns.example.com": "1.2.3.4",
+        "api.example.com": "1.2.3.5"
+      },
+      "queryStrategy": "UseIPv4"
+    },
+    "routing": {
+      "domainStrategy": "IPIfNonMatch",
+      "rules": [
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "googleapis"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "proxy",
+          "domain": [
+            "domain:google.com"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "ip": [
+            "geoip:private"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "block",
+          "protocol": [
+            "bittorrent"
+          ]
+        },
+        {
+          "type": "field",
+          "outboundTag": "dns-out",
+          "port": "53,853"
+        },
+        {
+          "type": "field",
+          "outboundTag": "direct",
+          "network": "tcp,udp"
+        }
+      ]
+    },
+    "inbounds": [
+      {
+        "tag": "socks-in",
+        "protocol": "socks",
+        "listen": "127.0.0.1",
+        "port": 10808,
+        "settings": {
+          "udp": true
+        }
+      }
+    ],
+    "outbounds": [
+      {
+        "tag": "proxy",
+        "protocol": "vless",
+        "settings": {
+          "vnext": [
+            {
+              "address": "node24.example.net",
+              "port": 443,
+              "users": [
+                {
+                  "id": "00000000-0000-4000-8000-000000000024",
+                  "encryption": "none"
+                }
+              ]
+            }
+          ]
+        },
+        "streamSettings": {
+          "network": "tcp",
+          "security": "reality",
+          "realitySettings": {
+            "serverName": "www.example.com",
+            "fingerprint": "chrome",
+            "publicKey": "dummyPublicKey24xxxxxxxxxxxxxxxxxxxxxxxx",
+            "shortId": "0018",
+            "spiderX": "/"
+          }
+        }
+      },
+      {
+        "tag": "direct",
+        "protocol": "freedom",
+        "settings": {}
+      },
+      {
+        "tag": "block",
+        "protocol": "blackhole",
+        "settings": {}
+      },
+      {
+        "tag": "dns-out",
+        "protocol": "dns",
+        "settings": {}
+      }
+    ]
+  }
+]

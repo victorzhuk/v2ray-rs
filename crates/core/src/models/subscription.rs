@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::ProxyNode;
+use super::{ImportedProfile, ProxyNode};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Subscription {
@@ -13,6 +13,14 @@ pub struct Subscription {
     pub last_updated: Option<DateTime<Utc>>,
     pub auto_update_interval_secs: Option<u64>,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported_profile: Option<ImportedProfile>,
+    #[serde(default = "default_true")]
+    pub use_imported_profile: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,6 +52,8 @@ impl Subscription {
             last_updated: None,
             auto_update_interval_secs: Some(86400),
             enabled: true,
+            imported_profile: None,
+            use_imported_profile: true,
         }
     }
 
@@ -56,6 +66,8 @@ impl Subscription {
             last_updated: None,
             auto_update_interval_secs: None,
             enabled: true,
+            imported_profile: None,
+            use_imported_profile: true,
         }
     }
 
@@ -149,5 +161,28 @@ mod tests {
         });
         let node: SubscriptionNode = serde_json::from_value(json).unwrap();
         assert_eq!(node.last_real_delay_ms, None);
+    }
+
+    #[test]
+    fn legacy_subscription_without_profile_fields_deserializes() {
+        let json = serde_json::json!({
+            "id": Uuid::new_v4(),
+            "name": "Legacy",
+            "source": { "type": "url", "url": "https://example.com/sub" },
+            "nodes": [],
+            "last_updated": null,
+            "auto_update_interval_secs": 86400,
+            "enabled": true,
+        });
+        let sub: Subscription = serde_json::from_value(json).unwrap();
+        assert_eq!(sub.imported_profile, None);
+        assert!(sub.use_imported_profile);
+    }
+
+    #[test]
+    fn new_from_url_defaults_use_imported_profile_true() {
+        let sub = Subscription::new_from_url("Test", "https://example.com/sub");
+        assert!(sub.use_imported_profile);
+        assert!(sub.imported_profile.is_none());
     }
 }

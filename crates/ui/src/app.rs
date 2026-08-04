@@ -15,7 +15,7 @@ use v2ray_rs_core::instance::{
 };
 use v2ray_rs_core::models::{
     AppSettings, ConnectionMetadata, ConnectionNodeRef, LastSuccessMetadata, ManualNode,
-    RoutingRuleSet, Subscription, SubscriptionSource,
+    RoutingRuleSet, Subscription, SubscriptionSource, resolve_effective_config,
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -46,7 +46,9 @@ use crate::connection::{ConnectionHandle, ConnectionRequest};
 use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
 use crate::logs::{LogsMsg, LogsPage};
 use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
-use crate::subscriptions::{SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage};
+use crate::subscriptions::{
+    SubscriptionSourceInput, SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage,
+};
 use crate::wizard::OnboardingWizard;
 use crate::workspace::WorkspaceStore;
 
@@ -285,6 +287,14 @@ impl App {
 
         self.has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
 
+        self.geodata_service
+            .update(GeodataRefreshConfig::from_settings(
+                &self.paths,
+                &self.settings,
+                &self.store.load_routing_rules().unwrap_or_default(),
+                &subscriptions,
+            ));
+
         if runtime_process_active(&self.process_state) {
             self.restart_required = self.check_restart_required_with(&subscriptions, &manual_nodes);
         } else {
@@ -364,20 +374,26 @@ impl App {
             self.load_latency_snapshot_or_default(),
         )
         .with_real_delay_for_lowest_latency(self.settings.real_delay.use_for_lowest_latency);
-        let candidate = planner
-            .runtime_candidate(subscriptions, manual_nodes)
-            .map(|candidate| candidate.node);
-
-        let Some(node) = candidate else {
+        let Some(candidate) = planner.runtime_candidate(subscriptions, manual_nodes) else {
             log::debug!("No enabled nodes, skipping config regeneration");
             return;
         };
 
         let rules = self.store.load_routing_rules().unwrap_or_default();
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+        let (effective_rules, effective_settings) = resolve_effective_config(
+            &candidate.node_ref,
+            subscriptions,
+            &enabled_rules,
+            &self.settings,
+        );
 
         let writer = ConfigWriter::new(&self.settings, &self.paths);
-        match writer.write_config(std::slice::from_ref(&node), &enabled_rules, &self.settings) {
+        match writer.write_config(
+            std::slice::from_ref(&candidate.node),
+            &effective_rules,
+            &effective_settings,
+        ) {
             Ok(path) => log::info!("Regenerated config at {:?}", path),
             Err(e) => {
                 log::error!("Failed to regenerate config: {}", e);
@@ -425,6 +441,7 @@ impl App {
             }
         };
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+        let connection_subscriptions = subscriptions.clone();
 
         self.runtime_snapshot = Some(RuntimeConfigSnapshot {
             backend_type: self.settings.backend.backend_type,
@@ -459,6 +476,7 @@ impl App {
                 geodata_dir,
                 settings,
                 enabled_rules,
+                subscriptions: connection_subscriptions,
             },
             sender.input_sender().clone(),
         );
@@ -783,6 +801,7 @@ impl SimpleComponent for App {
             &paths,
             &settings,
             &store.load_routing_rules().unwrap_or_default(),
+            &subscriptions,
         ));
 
         let model = App {
@@ -868,6 +887,7 @@ impl SimpleComponent for App {
                         &self.paths,
                         &self.settings,
                         &self.store.load_routing_rules().unwrap_or_default(),
+                        &self.store.load_subscriptions().unwrap_or_default(),
                     ));
                 self.subscriptions_page
                     .emit(SubscriptionsMsg::SyncSettings {
@@ -879,8 +899,12 @@ impl SimpleComponent for App {
                     });
 
                 if let Some((name, source)) = subscription {
+                    let source_input = match source {
+                        SubscriptionSource::Url { url } => SubscriptionSourceInput::Url(url),
+                        SubscriptionSource::File { path } => SubscriptionSourceInput::File(path),
+                    };
                     self.subscriptions_page
-                        .emit(SubscriptionsMsg::AddSubscription(name, source));
+                        .emit(SubscriptionsMsg::AddSubscription(name, source_input));
                 }
             }
             AppMsg::SettingsChanged(settings) => {
@@ -907,6 +931,7 @@ impl SimpleComponent for App {
                         &self.paths,
                         &self.settings,
                         &self.store.load_routing_rules().unwrap_or_default(),
+                        &self.store.load_subscriptions().unwrap_or_default(),
                     ));
                 self.subscriptions_page
                     .emit(SubscriptionsMsg::SyncSettings {
@@ -1225,6 +1250,7 @@ impl SimpleComponent for App {
                             &self.paths,
                             &self.settings,
                             &self.store.load_routing_rules().unwrap_or_default(),
+                            &self.store.load_subscriptions().unwrap_or_default(),
                         ));
                     self.subscriptions_page
                         .emit(SubscriptionsMsg::SyncSettings {
@@ -1261,6 +1287,7 @@ impl SimpleComponent for App {
                         &self.paths,
                         &self.settings,
                         &rules,
+                        &self.store.load_subscriptions().unwrap_or_default(),
                     ));
                 self.restart_required = self.check_restart_required();
                 if self.process_handle.is_none() {

@@ -57,11 +57,15 @@ impl ProbeConfigGenerator for SingboxProbeGenerator {
         _test_url: &str,
         _timeout_ms: u32,
     ) -> Value {
+        // A node whose transport sing-box can't emit (xhttp) just can't be
+        // probed on this backend; drop it rather than fail the whole batch.
+        // Safe because results are matched back by parsing the index out of
+        // the outbound tag, not by position.
         let outbounds: Vec<Value> = nodes
             .iter()
             .enumerate()
-            .map(|(i, node)| {
-                crate::config::singbox::build_singbox_outbound(&node.node, &probe_tag(i))
+            .filter_map(|(i, node)| {
+                crate::config::singbox::build_singbox_outbound(&node.node, &probe_tag(i)).ok()
             })
             .collect();
 

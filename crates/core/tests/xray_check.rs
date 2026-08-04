@@ -3,7 +3,8 @@ use std::process::Command;
 
 use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, DnsHijackMode, DnsProtocol, DnsServerConfig, ProxyNode, ShadowsocksConfig,
+    AppSettings, DnsHijackMode, DnsProtocol, DnsServerConfig, ProxyNode, RoutingRule, RuleAction,
+    RuleMatch, ShadowsocksConfig,
 };
 
 fn xray_available() -> bool {
@@ -25,8 +26,12 @@ fn ss_node() -> ProxyNode {
 }
 
 fn check(name: &str, settings: &AppSettings) {
+    check_with_rules(name, settings, &[]);
+}
+
+fn check_with_rules(name: &str, settings: &AppSettings, rules: &[RoutingRule]) {
     let config = XrayGenerator
-        .generate(&[ss_node()], &[], settings)
+        .generate(&[ss_node()], rules, settings)
         .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
     let json = serde_json::to_string_pretty(&config).unwrap();
 
@@ -94,4 +99,71 @@ fn generated_xray_configs_pass_xray_test() {
     for (name, settings) in &cases {
         check(name, settings);
     }
+}
+
+#[test]
+fn new_rule_kinds_pass_xray_test() {
+    if !xray_available() {
+        eprintln!("xray not found in PATH, skipping");
+        return;
+    }
+
+    let rules = vec![
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainKeyword {
+                keyword: "sina".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainFull {
+                domain: "ads.example.com".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Protocol {
+                name: "bittorrent".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Port {
+                spec: "80,443,1000-2000".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Network {
+                spec: "tcp,udp".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+    ];
+
+    check_with_rules("new-rule-kinds", &AppSettings::default(), &rules);
 }

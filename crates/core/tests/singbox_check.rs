@@ -212,6 +212,131 @@ fn generated_singbox_configs_pass_sing_box_check() {
     }
 }
 
+#[test]
+fn new_rule_kinds_pass_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let rules = vec![
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainKeyword {
+                keyword: "sina".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainFull {
+                domain: "ads.example.com".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Protocol {
+                name: "bittorrent".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Port {
+                spec: "80,443,1000-2000".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Network {
+                spec: "tcp,udp".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        },
+    ];
+
+    check_with_rules("new-rule-kinds", &AppSettings::default(), &rules, |_| {});
+}
+
+/// Public providers commonly address DoH servers by hostname
+/// (https://dns.google/dns-query, https://cloudflare-dns.com/dns-query) rather
+/// than IP literal. sing-box can't resolve such a server using itself as the
+/// bootstrap resolver - `sing-box check` used to reject this with "missing
+/// domain resolver for domain server address".
+#[test]
+fn hostname_only_dns_servers_pass_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns.enabled = true;
+    settings.dns.servers = vec![
+        DnsServerConfig {
+            tag: "google".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "dns.google".to_string(),
+            port: None,
+            detour: None,
+        },
+        DnsServerConfig {
+            tag: "cloudflare".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "cloudflare-dns.com".to_string(),
+            port: None,
+            detour: None,
+        },
+    ];
+
+    check("hostname-only-dns-servers", &settings);
+}
+
+/// v2fly/xray bundle RFC 1918 private ranges as GeoIP "private"; SagerNet's
+/// sing-geoip mirror ships no such .srs, so treating it like any other
+/// country code makes sing-box try to download a file that 404s. Must become
+/// `ip_is_private` instead, which needs no rule-set at all.
+#[test]
+fn geoip_private_route_rule_passes_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let rules = vec![RoutingRule {
+        id: uuid::Uuid::new_v4(),
+        match_condition: RuleMatch::GeoIp {
+            country_code: "private".into(),
+        },
+        action: RuleAction::Direct,
+        enabled: true,
+        group: None,
+    }];
+
+    check_with_rules("geoip-private", &AppSettings::default(), &rules, |_| {});
+}
+
 /// Rule-set config with the experimental cache_file the writer injects — the
 /// exact shape a GeoIP/GeoSite routing setup produces after
 /// fix-singbox-ruleset-offline-start.

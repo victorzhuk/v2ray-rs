@@ -420,6 +420,11 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
                 RuleMatch::GeoSite { category } => (1, category.clone()),
                 RuleMatch::Domain { pattern } => (2, pattern.clone()),
                 RuleMatch::IpCidr { cidr } => (3, cidr.to_string()),
+                RuleMatch::DomainKeyword { keyword } => (4, keyword.clone()),
+                RuleMatch::DomainFull { domain } => (5, domain.clone()),
+                RuleMatch::Protocol { name } => (6, name.clone()),
+                RuleMatch::Port { spec } => (7, spec.clone()),
+                RuleMatch::Network { spec } => (8, spec.clone()),
             };
             let ai = match rule.action {
                 RuleAction::Proxy => 0u32,
@@ -447,6 +452,11 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             "GeoSite Category",
             "Domain Pattern",
             "IP CIDR",
+            "Domain Keyword",
+            "Domain Full",
+            "Protocol",
+            "Port",
+            "Network",
         ]))
         .selected(init_type_idx)
         .build();
@@ -663,6 +673,11 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
                     return;
                 }
             },
+            4 => RuleMatch::DomainKeyword { keyword: value },
+            5 => RuleMatch::DomainFull { domain: value },
+            6 => RuleMatch::Protocol { name: value },
+            7 => RuleMatch::Port { spec: value },
+            8 => RuleMatch::Network { spec: value },
             _ => return,
         };
 
@@ -880,6 +895,11 @@ fn format_match(m: &RuleMatch) -> String {
         RuleMatch::GeoIp { country_code } => format!("GeoIP: {country_code}"),
         RuleMatch::GeoSite { category } => format!("GeoSite: {category}"),
         RuleMatch::Domain { pattern } => format!("Domain: {pattern}"),
+        RuleMatch::DomainKeyword { keyword } => format!("Domain Keyword: {keyword}"),
+        RuleMatch::DomainFull { domain } => format!("Domain Full: {domain}"),
         RuleMatch::IpCidr { cidr } => format!("IP CIDR: {cidr}"),
+        RuleMatch::Protocol { name } => format!("Protocol: {name}"),
+        RuleMatch::Port { spec } => format!("Port: {spec}"),
+        RuleMatch::Network { spec } => format!("Network: {spec}"),
     }
 }

@@ -8,7 +8,7 @@ use v2ray_rs_core::backend::{
 };
 use v2ray_rs_core::models::{AppSettings, BackendConfig, BackendType, SubscriptionSource};
 
-use crate::subscriptions::subscription_source_from_inputs;
+use crate::subscriptions::{SubscriptionSourceInput, subscription_source_from_inputs};
 
 pub struct OnboardingWizard {
     settings: AppSettings,
@@ -508,7 +508,13 @@ impl SimpleComponent for OnboardingWizard {
                 let source = subscription_source_from_inputs(
                     &self.subscription_url,
                     &self.subscription_file_path,
-                );
+                    "",
+                )
+                .and_then(|input| match input {
+                    SubscriptionSourceInput::Url(url) => Some(SubscriptionSource::Url { url }),
+                    SubscriptionSourceInput::File(path) => Some(SubscriptionSource::File { path }),
+                    SubscriptionSourceInput::Paste(_) => None,
+                });
                 let subscription = if let Some(source) = source {
                     let name = if self.subscription_name.trim().is_empty() {
                         default_subscription_name(&source).unwrap_or_else(|| "Subscription".into())

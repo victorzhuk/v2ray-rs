@@ -20,7 +20,12 @@ pub enum RuleMatch {
     GeoIp { country_code: String },
     GeoSite { category: String },
     Domain { pattern: String },
+    DomainKeyword { keyword: String },
+    DomainFull { domain: String },
     IpCidr { cidr: IpNet },
+    Protocol { name: String },
+    Port { spec: String },
+    Network { spec: String },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +230,86 @@ mod tests {
                 pattern: "*.google.com".into(),
             },
             action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_domain_keyword_rule() {
+        let rule = RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::DomainKeyword {
+                keyword: "sina".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_domain_full_rule() {
+        let rule = RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::DomainFull {
+                domain: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_protocol_rule() {
+        let rule = RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Protocol {
+                name: "bittorrent".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_port_rule() {
+        let rule = RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Port {
+                spec: "1000-2000".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, deserialized);
+    }
+
+    #[test]
+    fn test_network_rule() {
+        let rule = RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Network {
+                spec: "tcp,udp".into(),
+            },
+            action: RuleAction::Direct,
             enabled: true,
             group: None,
         };

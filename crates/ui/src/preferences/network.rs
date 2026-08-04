@@ -240,11 +240,16 @@ pub(super) fn build_network_page(
                         use v2ray_rs_core::geodata::{
                             download_geodata, download_singbox_rule_sets,
                         };
-                        use v2ray_rs_core::persistence::load_routing_rules;
+                        use v2ray_rs_core::persistence::{load_routing_rules, load_subscriptions};
 
                         if backend_type == BackendType::SingBox {
                             let rules = load_routing_rules(&paths_for_task).unwrap_or_default();
-                            let tags = crate::geodata_service::singbox_rule_set_tags(&rules);
+                            let subscriptions =
+                                load_subscriptions(&paths_for_task).unwrap_or_default();
+                            let tags = crate::geodata_service::singbox_rule_set_tags(
+                                &rules,
+                                &subscriptions,
+                            );
                             let missing: Vec<String> = tags
                                 .into_iter()
                                 .filter(|tag| !geodata_manager.has_rule_set(tag))

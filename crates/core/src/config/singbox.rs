@@ -4,9 +4,9 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings,
-    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
-    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    AppSettings, BackendType, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings,
+    H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -25,16 +25,20 @@ impl ConfigGenerator for SingboxGenerator {
         if nodes.is_empty() {
             return Err(ConfigError::NoNodes);
         }
-        Ok(assemble(nodes, rules, settings))
+        assemble(nodes, rules, settings)
     }
 }
 
-fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) -> Value {
+fn assemble(
+    nodes: &[ProxyNode],
+    rules: &[RoutingRule],
+    settings: &AppSettings,
+) -> Result<Value, ConfigError> {
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let mut config = json!({
         "log": { "level": "warn" },
         "inbounds": build_inbounds(settings),
-        "outbounds": build_outbounds(nodes),
+        "outbounds": build_outbounds(nodes)?,
         "route": build_route(rules, &first_proxy_tag, settings),
     });
 
@@ -56,7 +60,7 @@ fn assemble(nodes: &[ProxyNode], rules: &[RoutingRule], settings: &AppSettings) 
         config["route"]["auto_detect_interface"] = json!(true);
     }
 
-    config
+    Ok(config)
 }
 
 const DERIVED_DNS_TAG: &str = "remote";
@@ -85,14 +89,16 @@ fn strategy_str(strategy: DnsStrategy) -> &'static str {
     }
 }
 
+const BOOTSTRAP_RESOLVER_TAG: &str = "sys-dns-bootstrap";
+
 fn default_domain_resolver_tag(settings: &AppSettings) -> Option<String> {
     settings
         .dns
         .servers
         .iter()
         .find(|s| s.address.parse::<std::net::IpAddr>().is_ok())
-        .or_else(|| settings.dns.servers.first())
         .map(|s| s.tag.clone())
+        .or_else(|| (!settings.dns.servers.is_empty()).then(|| BOOTSTRAP_RESOLVER_TAG.to_string()))
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
@@ -137,7 +143,7 @@ fn build_tun_inbound(tun: &TunConfig) -> Value {
     inbound
 }
 
-fn build_outbounds(nodes: &[ProxyNode]) -> Value {
+fn build_outbounds(nodes: &[ProxyNode]) -> Result<Value, ConfigError> {
     let mut outbounds: Vec<Value> = nodes
         .iter()
         .enumerate()
@@ -145,7 +151,7 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
             let tag = super::common::outbound_tag(node, i);
             build_outbound(node, &tag)
         })
-        .collect();
+        .collect::<Result<_, _>>()?;
 
     outbounds.push(json!({
         "type": "direct",
@@ -156,14 +162,14 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
         "tag": "block",
     }));
 
-    Value::Array(outbounds)
+    Ok(Value::Array(outbounds))
 }
 
-fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
+fn build_outbound(node: &ProxyNode, tag: &str) -> Result<Value, ConfigError> {
     match node {
         ProxyNode::Vless(c) => build_vless(c, tag),
         ProxyNode::Vmess(c) => build_vmess(c, tag),
-        ProxyNode::Shadowsocks(c) => build_ss(c, tag),
+        ProxyNode::Shadowsocks(c) => Ok(build_ss(c, tag)),
         ProxyNode::Trojan(c) => build_trojan(c, tag),
     }
 }
@@ -171,11 +177,11 @@ fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
 /// Builds a single sing-box outbound for the given node and tag. Shared with
 /// the Real Delay probe config generator so probes dial through the exact same
 /// outbound shape as a normal run.
-pub(crate) fn build_singbox_outbound(node: &ProxyNode, tag: &str) -> Value {
+pub(crate) fn build_singbox_outbound(node: &ProxyNode, tag: &str) -> Result<Value, ConfigError> {
     build_outbound(node, tag)
 }
 
-fn build_vless(c: &VlessConfig, tag: &str) -> Value {
+fn build_vless(c: &VlessConfig, tag: &str) -> Result<Value, ConfigError> {
     let mut out = json!({
         "type": "vless",
         "tag": tag,
@@ -188,12 +194,12 @@ fn build_vless(c: &VlessConfig, tag: &str) -> Value {
         out["flow"] = json!(flow);
     }
 
-    apply_transport(&mut out, &c.transport);
+    apply_transport(&mut out, c.remark.as_deref(), &c.address, &c.transport)?;
     apply_tls(&mut out, c.tls.as_ref());
-    out
+    Ok(out)
 }
 
-fn build_vmess(c: &VmessConfig, tag: &str) -> Value {
+fn build_vmess(c: &VmessConfig, tag: &str) -> Result<Value, ConfigError> {
     let mut out = json!({
         "type": "vmess",
         "tag": tag,
@@ -204,9 +210,9 @@ fn build_vmess(c: &VmessConfig, tag: &str) -> Value {
         "security": c.security,
     });
 
-    apply_transport(&mut out, &c.transport);
+    apply_transport(&mut out, c.remark.as_deref(), &c.address, &c.transport)?;
     apply_tls(&mut out, c.tls.as_ref());
-    out
+    Ok(out)
 }
 
 fn build_ss(c: &ShadowsocksConfig, tag: &str) -> Value {
@@ -220,7 +226,7 @@ fn build_ss(c: &ShadowsocksConfig, tag: &str) -> Value {
     })
 }
 
-fn build_trojan(c: &TrojanConfig, tag: &str) -> Value {
+fn build_trojan(c: &TrojanConfig, tag: &str) -> Result<Value, ConfigError> {
     let mut out = json!({
         "type": "trojan",
         "tag": tag,
@@ -229,12 +235,17 @@ fn build_trojan(c: &TrojanConfig, tag: &str) -> Value {
         "password": c.password,
     });
 
-    apply_transport(&mut out, &c.transport);
+    apply_transport(&mut out, c.remark.as_deref(), &c.address, &c.transport)?;
     apply_tls(&mut out, c.tls.as_ref());
-    out
+    Ok(out)
 }
 
-fn apply_transport(out: &mut Value, transport: &TransportSettings) {
+fn apply_transport(
+    out: &mut Value,
+    remark: Option<&str>,
+    address: &str,
+    transport: &TransportSettings,
+) -> Result<(), ConfigError> {
     match transport {
         TransportSettings::Tcp => {}
         TransportSettings::Ws(ws) => {
@@ -246,7 +257,14 @@ fn apply_transport(out: &mut Value, transport: &TransportSettings) {
         TransportSettings::H2(h2) => {
             out["transport"] = build_h2_transport(h2);
         }
+        TransportSettings::Xhttp(_) => {
+            return Err(ConfigError::UnsupportedTransport {
+                backend: BackendType::SingBox,
+                node: remark.unwrap_or(address).to_string(),
+            });
+        }
     }
+    Ok(())
 }
 
 fn build_ws_transport(ws: &WsSettings) -> Value {
@@ -393,6 +411,19 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             };
         }
 
+        // sing-box rejects a DNS server addressed by hostname at startup
+        // ("missing domain resolver for domain server address") unless that
+        // server carries its own `domain_resolver` dial field - the route-level
+        // default_domain_resolver does not cover DNS server initialization
+        // itself. `default_domain_resolver_tag` never returns this server's own
+        // tag (it only picks an IP-literal server or the bootstrap), so no
+        // self-reference is possible here.
+        if server_cfg.address.parse::<std::net::IpAddr>().is_err()
+            && let Some(resolver) = default_domain_resolver_tag(settings)
+        {
+            server["domain_resolver"] = json!(resolver);
+        }
+
         if let Some(ref client_subnet) = settings.dns.client_subnet {
             server["client_subnet"] = json!(client_subnet);
         }
@@ -406,6 +437,23 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             "type": "fakeip",
             "inet4_range": settings.dns.fakeip.inet4_range,
             "inet6_range": settings.dns.fakeip.inet6_range,
+        }));
+    }
+
+    // A DNS server addressed by hostname (common for public DoH, e.g. dns.google)
+    // can't resolve itself. When none of the configured servers is IP-literal,
+    // `default_domain_resolver_tag` falls back to this local-system bootstrap
+    // so sing-box has somewhere non-circular to resolve those hostnames.
+    if !settings.dns.servers.is_empty()
+        && !settings
+            .dns
+            .servers
+            .iter()
+            .any(|s| s.address.parse::<std::net::IpAddr>().is_ok())
+    {
+        servers.push(json!({
+            "tag": BOOTSTRAP_RESOLVER_TAG,
+            "type": "local",
         }));
     }
 
@@ -449,6 +497,14 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
                 }),
                 DnsRuleMatch::DomainSuffix { suffix } => json!({
                     "domain_suffix": [suffix],
+                    "server": rule.server_tag,
+                }),
+                DnsRuleMatch::DomainKeyword { keyword } => json!({
+                    "domain_keyword": [keyword],
+                    "server": rule.server_tag,
+                }),
+                DnsRuleMatch::DomainFull { domain } => json!({
+                    "domain": [domain],
                     "server": rule.server_tag,
                 }),
             })
@@ -528,6 +584,18 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
 
     let mut route_rules: Vec<Value> = Vec::new();
 
+    let needs_protocol_sniff = enabled
+        .iter()
+        .any(|r| matches!(r.match_condition, RuleMatch::Protocol { .. }));
+    if needs_protocol_sniff {
+        // `protocol` rules match the sniffed protocol; mixed-in/http-in never
+        // sniff on their own (tun-in gets its own sniff rule below).
+        route_rules.push(json!({
+            "inbound": ["mixed-in", "http-in"],
+            "action": "sniff",
+        }));
+    }
+
     if settings.tun.enabled {
         route_rules.push(json!({
             "inbound": ["tun-in"],
@@ -563,6 +631,9 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
 
     for rule in &enabled {
         match &rule.match_condition {
+            // "private" has no downloadable rule-set - build_route_rule emits
+            // ip_is_private instead, so it must not be collected here.
+            RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => {}
             RuleMatch::GeoIp { country_code } => {
                 geoip_tags.insert(country_code.to_lowercase());
             }
@@ -648,6 +719,14 @@ fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
     };
 
     match &rule.match_condition {
+        // v2fly/xray bundle RFC 1918 private ranges as a "private" GeoIP
+        // category; SagerNet's sing-geoip mirror ships no such .srs (404 -
+        // there's nothing to download). sing-box has this as a dedicated
+        // rule field instead.
+        RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => json!({
+            "ip_is_private": true,
+            "outbound": outbound,
+        }),
         RuleMatch::GeoIp { country_code } => json!({
             "rule_set": [format!("geoip-{}", country_code.to_lowercase())],
             "outbound": outbound,
@@ -660,11 +739,57 @@ fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
             "domain_suffix": [pattern],
             "outbound": outbound,
         }),
+        RuleMatch::DomainKeyword { keyword } => json!({
+            "domain_keyword": [keyword],
+            "outbound": outbound,
+        }),
+        RuleMatch::DomainFull { domain } => json!({
+            "domain": [domain],
+            "outbound": outbound,
+        }),
         RuleMatch::IpCidr { cidr } => json!({
             "ip_cidr": [cidr.to_string()],
             "outbound": outbound,
         }),
+        RuleMatch::Protocol { name } => json!({
+            "protocol": name,
+            "outbound": outbound,
+        }),
+        RuleMatch::Port { spec } => {
+            let mut obj = json!({ "outbound": outbound });
+            let (ports, ranges) = split_port_spec(spec);
+            if !ports.is_empty() {
+                obj["port"] = json!(ports);
+            }
+            if !ranges.is_empty() {
+                obj["port_range"] = json!(ranges);
+            }
+            obj
+        }
+        RuleMatch::Network { spec } => json!({
+            "network": spec.split(',').collect::<Vec<_>>(),
+            "outbound": outbound,
+        }),
     }
+}
+
+/// Splits a `Port` match spec ("53", "1000-2000", "80,443") into sing-box's
+/// separate `port` (single values) and `port_range` (colon-delimited strings)
+/// fields.
+fn split_port_spec(spec: &str) -> (Vec<u16>, Vec<String>) {
+    let mut ports = Vec::new();
+    let mut ranges = Vec::new();
+    for part in spec.split(',') {
+        match part.split_once('-') {
+            Some((start, end)) => ranges.push(format!("{start}:{end}")),
+            None => {
+                if let Ok(port) = part.parse::<u16>() {
+                    ports.push(port);
+                }
+            }
+        }
+    }
+    (ports, ranges)
 }
 
 #[cfg(test)]
@@ -805,6 +930,51 @@ mod tests {
         assert_eq!(route_rules[0]["action"], "sniff");
         assert_eq!(route_rules[1]["protocol"], "dns");
         assert_eq!(route_rules[1]["action"], "hijack-dns");
+    }
+
+    #[test]
+    fn test_singbox_tun_profile_dns_overrides_disabled_global_dns() {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.nodes = vec![SubscriptionNode::new(vless_node())];
+        sub.use_imported_profile = true;
+        sub.imported_profile = Some(ImportedProfile {
+            rules: vec![],
+            dns: Some(DnsConfig {
+                enabled: true,
+                servers: vec![DnsServerConfig {
+                    tag: "provider-dns".into(),
+                    protocol: DnsProtocol::Doh,
+                    address: "1.1.1.1".into(),
+                    port: None,
+                    detour: None,
+                }],
+                ..DnsConfig::default()
+            }),
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+
+        let (rules, effective) = resolve_effective_config(&node_ref, &[sub], &[], &settings);
+        assert!(
+            effective.dns.enabled,
+            "provider dns must override a disabled global dns"
+        );
+
+        let config = SingboxGenerator
+            .generate(&[vless_node()], &rules, &effective)
+            .unwrap();
+
+        assert_eq!(config["route"]["default_domain_resolver"], "provider-dns");
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert!(route_rules.iter().any(|r| r["action"] == "hijack-dns"));
     }
 
     #[test]
@@ -1078,6 +1248,200 @@ mod tests {
     }
 
     #[test]
+    fn test_singbox_xhttp_unsupported_transport() {
+        let generator = SingboxGenerator;
+        let result = generator.generate(&[xhttp_node()], &[], &default_settings());
+
+        match result {
+            Err(ConfigError::UnsupportedTransport { backend, node }) => {
+                assert_eq!(backend, BackendType::SingBox);
+                assert_eq!(node, "Test XHTTP");
+            }
+            other => panic!("expected UnsupportedTransport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_singbox_domain_route_stays_suffix() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[0]["domain_suffix"][0], "example.com");
+    }
+
+    #[test]
+    fn test_singbox_domain_keyword_route() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainKeyword {
+                keyword: "sina".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[0]["domain_keyword"][0], "sina");
+    }
+
+    #[test]
+    fn test_singbox_domain_full_route() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::DomainFull {
+                domain: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert_eq!(route_rules[0]["domain"][0], "example.com");
+    }
+
+    #[test]
+    fn test_singbox_protocol_route_and_sniff() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Protocol {
+                name: "bittorrent".into(),
+            },
+            action: RuleAction::Block,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        let sniff_rule = route_rules
+            .iter()
+            .find(|r| r["action"] == "sniff")
+            .expect("sniff rule missing for protocol match");
+        assert_eq!(sniff_rule["inbound"], json!(["mixed-in", "http-in"]));
+
+        let protocol_rule = route_rules
+            .iter()
+            .find(|r| r.get("protocol").is_some())
+            .unwrap();
+        assert_eq!(protocol_rule["protocol"], "bittorrent");
+        assert_eq!(protocol_rule["outbound"], "block");
+    }
+
+    #[test]
+    fn test_singbox_port_route() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Port {
+                spec: "80,443,1000-2000".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        let port_rule = route_rules
+            .iter()
+            .find(|r| r.get("port").is_some() || r.get("port_range").is_some())
+            .unwrap();
+        assert_eq!(port_rule["port"], json!([80, 443]));
+        assert_eq!(port_rule["port_range"], json!(["1000:2000"]));
+    }
+
+    #[test]
+    fn test_singbox_network_route() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Network {
+                spec: "tcp,udp".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        let network_rule = route_rules
+            .iter()
+            .find(|r| r.get("network").is_some())
+            .unwrap();
+        assert_eq!(network_rule["network"], json!(["tcp", "udp"]));
+    }
+
+    #[test]
+    fn test_singbox_dns_custom_rules_domain_keyword_and_full() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainKeyword {
+                    keyword: "sina".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainFull {
+                    domain: "example.com".to_string(),
+                },
+                server_tag: "domestic".to_string(),
+            },
+        ];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let rules = config["dns"]["rules"].as_array().unwrap();
+        let keyword_rule = rules
+            .iter()
+            .find(|r| r.get("domain_keyword").is_some())
+            .unwrap();
+        assert_eq!(keyword_rule["domain_keyword"], json!(["sina"]));
+
+        let full_rule = rules.iter().find(|r| r["server"] == "domestic").unwrap();
+        assert_eq!(full_rule["domain"], json!(["example.com"]));
+    }
+
+    #[test]
     fn test_singbox_multiple_nodes() {
         let generator = SingboxGenerator;
         let nodes = vec![vless_node(), ss_node(), trojan_node()];
@@ -1171,7 +1535,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_default_domain_resolver_falls_back_to_first_server() {
+    fn test_dns_default_domain_resolver_falls_back_to_bootstrap_when_all_servers_are_hostnames() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
         settings.dns.servers = vec![DnsServerConfig {
@@ -1185,7 +1549,42 @@ mod tests {
         let generator = SingboxGenerator;
         let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
 
-        assert_eq!(config["route"]["default_domain_resolver"], "domain-server");
+        // "domain-server" can't resolve its own hostname (circular) - sing-box
+        // rejects that config at startup with "missing domain resolver for
+        // domain server address". Must fall back to a local bootstrap instead.
+        assert_eq!(
+            config["route"]["default_domain_resolver"],
+            BOOTSTRAP_RESOLVER_TAG
+        );
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let bootstrap = servers
+            .iter()
+            .find(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG)
+            .expect("bootstrap resolver server must be present in dns.servers");
+        assert_eq!(bootstrap["type"], "local");
+    }
+
+    #[test]
+    fn test_dns_no_bootstrap_injected_when_ip_literal_server_present() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "ip-server".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        assert_eq!(config["route"]["default_domain_resolver"], "ip-server");
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert!(
+            !servers.iter().any(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG),
+            "no bootstrap should be injected when a resolvable server already exists"
+        );
     }
 
     #[test]

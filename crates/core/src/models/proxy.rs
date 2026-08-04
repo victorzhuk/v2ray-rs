@@ -233,6 +233,7 @@ pub enum TransportSettings {
     Ws(WsSettings),
     Grpc(GrpcSettings),
     H2(H2Settings),
+    Xhttp(XhttpSettings),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -258,6 +259,20 @@ pub struct H2Settings {
     pub host: Vec<String>,
     #[serde(default)]
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct XhttpSettings {
+    #[serde(default)]
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default = "default_xhttp_mode")]
+    pub mode: String,
+}
+
+fn default_xhttp_mode() -> String {
+    "auto".to_string()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -411,6 +426,47 @@ mod tests {
     #[test]
     fn test_default_transport() {
         assert_eq!(TransportSettings::default(), TransportSettings::Tcp);
+    }
+
+    #[test]
+    fn test_xhttp_transport_roundtrip() {
+        let node = ProxyNode::Vless(VlessConfig {
+            address: "xhttp.example.com".into(),
+            port: 443,
+            uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+            encryption: Some("none".into()),
+            flow: None,
+            transport: TransportSettings::Xhttp(XhttpSettings {
+                path: "/xhttp".into(),
+                host: Some("xhttp.example.com".into()),
+                mode: "stream-one".into(),
+            }),
+            tls: Some(TlsSettings {
+                server_name: Some("xhttp.example.com".into()),
+                reality: true,
+                public_key: Some("pbk".into()),
+                ..Default::default()
+            }),
+            remark: Some("XHTTP".into()),
+        });
+
+        let json = serde_json::to_string(&node).unwrap();
+        let deserialized: ProxyNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(node, deserialized);
+    }
+
+    #[test]
+    fn test_xhttp_settings_mode_defaults_to_auto() {
+        let json = r#"{"type":"xhttp","path":"/x"}"#;
+        let transport: TransportSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            transport,
+            TransportSettings::Xhttp(XhttpSettings {
+                path: "/x".into(),
+                host: None,
+                mode: "auto".into(),
+            })
+        );
     }
 
     #[test]

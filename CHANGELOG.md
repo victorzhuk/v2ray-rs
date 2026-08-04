@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-08-04
+
+### Added
+- Subscriptions can now be a JSON config-bundle — the format v2RayTun, v2rayN and v2rayNG export, and the shape many providers subscribe to: an array of complete backend configs, one per node, sharing a common `routing`/`dns` block. Adding a subscription accepts a paste of this JSON directly (spilled to `data_dir/subscriptions/`, never inlined into `subscriptions.json`) in addition to a URL or file, and a `v2raytun://import/` deep link is unwrapped automatically. The provider's routing and DNS import as a profile scoped to that subscription — never merged into the app's own routing rules or DNS config — and apply automatically when a node from that subscription is active; a per-subscription switch turns it off in favor of the app's global rules. A refresh preserves that toggle instead of silently re-enabling the profile.
+- `xhttp` transport support for VLESS/VMess (xray and v2ray only — sing-box has no xhttp upstream, so a node using it on that backend fails config generation with a clear error naming the node, instead of connecting silently wrong).
+- Routing rules gained `Protocol` (sniffed-protocol match, e.g. block BitTorrent), `Port`, `Network`, `DomainKeyword`, and `DomainFull` matchers, closing the gap between what provider-exported routing configs commonly express and what the app could represent.
+
+### Changed
+- A `Domain` routing rule now matches a domain and its subdomains on xray/v2ray (`domain:` prefix) instead of any substring occurrence — it already matched that way on sing-box. The bare-substring case is still available, explicitly, as the new `DomainKeyword` matcher.
+
+### Fixed
+- sing-box no longer fails to start when a configured DNS server (the app's own or an imported profile's) is addressed by hostname rather than IP literal — the common case for public DoH, e.g. `https://dns.google/dns-query`. Such a server can't resolve itself; the generator now adds a local bootstrap resolver and points every hostname-addressed server at it.
+- An imported or hand-written routing rule matching GeoIP `private` no longer makes sing-box try to download a rule-set file that doesn't exist (v2fly/xray bundle RFC 1918 ranges as a `private` GeoIP category; SagerNet's sing-geoip mirror ships no such file). It now generates as `ip_is_private`, sing-box's own equivalent, which needs no download at all.
+- A subscription's imported profile — or a routing-rule edit referencing a GeoIP/GeoSite category the app hadn't cached yet — is now included in what gets pre-fetched before connecting. Previously only the global routing rules were scanned, so a subscription bringing new categories (a provider's own GeoSite-based rules, for instance) hit sing-box's synchronous, FATAL-on-failure startup fetch for all of them at once instead of using cached data.
+
 ## [0.14.0] - 2026-07-19
 
 ### Added
@@ -501,7 +516,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...v0.13.1
 [0.13.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.12.0...v0.13.0

@@ -5,7 +5,7 @@ use uuid::Uuid;
 
 use v2ray_rs_core::models::{
     GrpcSettings, H2Settings, ManualNode, ProxyNode, ShadowsocksConfig, TlsSettings,
-    TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings,
+    TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
 };
 
 use crate::workspace::WorkspaceStore;
@@ -140,6 +140,9 @@ struct TransportRows {
     grpc_multi_mode: adw::SwitchRow,
     h2_host: adw::EntryRow,
     h2_path: adw::EntryRow,
+    xhttp_path: adw::EntryRow,
+    xhttp_host: adw::EntryRow,
+    xhttp_mode: adw::EntryRow,
 }
 
 impl TransportRows {
@@ -149,6 +152,7 @@ impl TransportRows {
             TransportSettings::Ws(_) => 1,
             TransportSettings::Grpc(_) => 2,
             TransportSettings::H2(_) => 3,
+            TransportSettings::Xhttp(_) => 4,
         };
         let (ws_path, ws_host) = match initial {
             TransportSettings::Ws(ws) => (ws.path.clone(), ws.host.clone().unwrap_or_default()),
@@ -162,6 +166,14 @@ impl TransportRows {
             TransportSettings::H2(h2) => (h2.host.join(","), h2.path.clone()),
             _ => (String::new(), "/".into()),
         };
+        let (xhttp_path, xhttp_host, xhttp_mode) = match initial {
+            TransportSettings::Xhttp(xhttp) => (
+                xhttp.path.clone(),
+                xhttp.host.clone().unwrap_or_default(),
+                xhttp.mode.clone(),
+            ),
+            _ => ("/".into(), String::new(), "auto".into()),
+        };
         let rows = Self {
             kind: adw::ComboRow::builder()
                 .title("Transport")
@@ -170,6 +182,7 @@ impl TransportRows {
                     "WebSocket",
                     "gRPC",
                     "HTTP/2",
+                    "XHTTP",
                 ]))
                 .selected(selected)
                 .build(),
@@ -197,6 +210,18 @@ impl TransportRows {
                 .title("HTTP/2 Path")
                 .text(&h2_path)
                 .build(),
+            xhttp_path: adw::EntryRow::builder()
+                .title("XHTTP Path")
+                .text(&xhttp_path)
+                .build(),
+            xhttp_host: adw::EntryRow::builder()
+                .title("XHTTP Host")
+                .text(&xhttp_host)
+                .build(),
+            xhttp_mode: adw::EntryRow::builder()
+                .title("XHTTP Mode")
+                .text(&xhttp_mode)
+                .build(),
         };
         rows.sync_visibility();
         {
@@ -216,18 +241,25 @@ impl TransportRows {
         group.add(&self.grpc_multi_mode);
         group.add(&self.h2_host);
         group.add(&self.h2_path);
+        group.add(&self.xhttp_path);
+        group.add(&self.xhttp_host);
+        group.add(&self.xhttp_mode);
     }
 
     fn sync_visibility(&self) {
         let ws_selected = self.kind.selected() == 1;
         let grpc_selected = self.kind.selected() == 2;
         let h2_selected = self.kind.selected() == 3;
+        let xhttp_selected = self.kind.selected() == 4;
         self.ws_path.set_visible(ws_selected);
         self.ws_host.set_visible(ws_selected);
         self.grpc_service_name.set_visible(grpc_selected);
         self.grpc_multi_mode.set_visible(grpc_selected);
         self.h2_host.set_visible(h2_selected);
         self.h2_path.set_visible(h2_selected);
+        self.xhttp_path.set_visible(xhttp_selected);
+        self.xhttp_host.set_visible(xhttp_selected);
+        self.xhttp_mode.set_visible(xhttp_selected);
     }
 
     fn value(&self) -> TransportSettings {
@@ -245,6 +277,14 @@ impl TransportRows {
                 host: comma_separated_values(&self.h2_host),
                 path: trimmed_text(&self.h2_path),
             }),
+            4 => {
+                let mode = trimmed_text(&self.xhttp_mode);
+                TransportSettings::Xhttp(XhttpSettings {
+                    path: trimmed_text(&self.xhttp_path),
+                    host: trimmed_optional_text(&self.xhttp_host),
+                    mode: if mode.is_empty() { "auto".into() } else { mode },
+                })
+            }
             _ => TransportSettings::Tcp,
         }
     }

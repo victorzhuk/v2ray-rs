@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use v2ray_rs_core::models::{AppSettings, BackendType, RoutingRuleSet, RuleMatch};
+use v2ray_rs_core::models::{
+    AppSettings, BackendType, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
+};
 use v2ray_rs_core::persistence::AppPaths;
 
 #[derive(Clone)]
@@ -13,36 +15,164 @@ pub struct GeodataRefreshConfig {
 }
 
 impl GeodataRefreshConfig {
-    pub fn from_settings(paths: &AppPaths, settings: &AppSettings, rules: &RoutingRuleSet) -> Self {
+    pub fn from_settings(
+        paths: &AppPaths,
+        settings: &AppSettings,
+        rules: &RoutingRuleSet,
+        subscriptions: &[Subscription],
+    ) -> Self {
         Self {
             paths: paths.clone(),
             backend_type: settings.backend.backend_type,
             enabled: settings.auto_update_geodata && settings.backend.binary_path.is_some(),
             interval_secs: settings.geodata_update_interval_secs.max(60),
-            singbox_rule_set_tags: singbox_rule_set_tags(rules),
+            singbox_rule_set_tags: singbox_rule_set_tags(rules, subscriptions),
         }
     }
 }
 
 /// Derives the full sing-box rule-set tags (`geoip-ru`, `geosite-google`, ...)
-/// referenced by the enabled routing rules, for fetching and indexing only
-/// the geodata actually in use.
-pub(crate) fn singbox_rule_set_tags(rules: &RoutingRuleSet) -> Vec<String> {
+/// referenced by the enabled global routing rules plus every subscription's
+/// active imported profile, for fetching and indexing only the geodata
+/// actually in use. A profile's rules are otherwise invisible to this scan -
+/// without it, sing-box hits an uncached category at connect time and does a
+/// live, blocking, FATAL-on-failure fetch instead.
+pub(crate) fn singbox_rule_set_tags(
+    rules: &RoutingRuleSet,
+    subscriptions: &[Subscription],
+) -> Vec<String> {
     let mut tags: Vec<String> = rules
         .rules()
         .iter()
         .filter(|r| r.enabled)
-        .filter_map(|r| match &r.match_condition {
-            RuleMatch::GeoIp { country_code } => {
-                Some(format!("geoip-{}", country_code.to_lowercase()))
-            }
-            RuleMatch::GeoSite { category } => Some(format!("geosite-{}", category.to_lowercase())),
-            _ => None,
-        })
+        .filter_map(rule_set_tag)
         .collect();
+
+    for sub in subscriptions {
+        if !sub.use_imported_profile {
+            continue;
+        }
+        let Some(profile) = &sub.imported_profile else {
+            continue;
+        };
+        tags.extend(
+            profile
+                .rules
+                .iter()
+                .filter(|r| r.enabled)
+                .filter_map(rule_set_tag),
+        );
+    }
+
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn rule_set_tag(rule: &RoutingRule) -> Option<String> {
+    match &rule.match_condition {
+        // No downloadable rule-set exists for this pseudo-category (see
+        // singbox.rs's ip_is_private handling) - nothing to prefetch.
+        RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => None,
+        RuleMatch::GeoIp { country_code } => Some(format!("geoip-{}", country_code.to_lowercase())),
+        RuleMatch::GeoSite { category } => Some(format!("geosite-{}", category.to_lowercase())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use v2ray_rs_core::models::{ImportedProfile, ProxyNode, RuleAction, SubscriptionNode};
+    use v2ray_rs_core::models::{TransportSettings, VlessConfig};
+
+    fn geo_rule(condition: RuleMatch, enabled: bool) -> RoutingRule {
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: condition,
+            action: RuleAction::Proxy,
+            enabled,
+            group: None,
+        }
+    }
+
+    fn vless_node() -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "example.com".into(),
+            port: 443,
+            uuid: "test-uuid".into(),
+            encryption: None,
+            flow: None,
+            transport: TransportSettings::Tcp,
+            tls: None,
+            remark: None,
+        })
+    }
+
+    #[test]
+    fn geoip_private_is_never_collected_as_a_downloadable_tag() {
+        let rules = RoutingRuleSet::default();
+        let mut rules = rules;
+        rules
+            .add_at(
+                0,
+                geo_rule(
+                    RuleMatch::GeoIp {
+                        country_code: "PRIVATE".into(),
+                    },
+                    true,
+                ),
+            )
+            .unwrap();
+
+        let tags = singbox_rule_set_tags(&rules, &[]);
+
+        assert!(tags.is_empty(), "private has no .srs to fetch: {tags:?}");
+    }
+
+    #[test]
+    fn active_imported_profile_categories_are_included() {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.nodes = vec![SubscriptionNode::new(vless_node())];
+        sub.use_imported_profile = true;
+        sub.imported_profile = Some(ImportedProfile {
+            rules: vec![geo_rule(
+                RuleMatch::GeoSite {
+                    category: "netflix".into(),
+                },
+                true,
+            )],
+            dns: None,
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+
+        let tags = singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub]);
+
+        assert_eq!(tags, vec!["geosite-netflix".to_string()]);
+    }
+
+    #[test]
+    fn inactive_imported_profile_is_not_prefetched() {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.nodes = vec![SubscriptionNode::new(vless_node())];
+        sub.use_imported_profile = false;
+        sub.imported_profile = Some(ImportedProfile {
+            rules: vec![geo_rule(
+                RuleMatch::GeoSite {
+                    category: "netflix".into(),
+                },
+                true,
+            )],
+            dns: None,
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+
+        let tags = singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub]);
+
+        assert!(tags.is_empty());
+    }
 }
 
 #[derive(Clone)]

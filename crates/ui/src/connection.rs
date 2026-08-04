@@ -3,7 +3,8 @@ use std::path::PathBuf;
 use tokio::sync::{broadcast, mpsc};
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, RoutingRule,
+    AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, RoutingRule, Subscription,
+    resolve_effective_config,
 };
 use v2ray_rs_core::resolve::ConnectionCandidate;
 use v2ray_rs_process::{ProcessEvent, ProcessState, TunRuntime};
@@ -22,6 +23,7 @@ pub(super) struct ConnectionRequest {
     pub geodata_dir: PathBuf,
     pub settings: AppSettings,
     pub enabled_rules: Vec<RoutingRule>,
+    pub subscriptions: Vec<Subscription>,
 }
 
 enum ConnectionCmd {
@@ -43,6 +45,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         geodata_dir,
         settings,
         enabled_rules,
+        subscriptions,
     } = request;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
 
@@ -70,10 +73,16 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 .remark()
                 .unwrap_or(candidate.node.address())
                 .to_string();
-            let config_path = match writer.write_config(
-                std::slice::from_ref(&candidate.node),
+            let (effective_rules, effective_settings) = resolve_effective_config(
+                &candidate.node_ref,
+                &subscriptions,
                 &enabled_rules,
                 &settings,
+            );
+            let config_path = match writer.write_config(
+                std::slice::from_ref(&candidate.node),
+                &effective_rules,
+                &effective_settings,
             ) {
                 Ok(path) => path,
                 Err(e) => {

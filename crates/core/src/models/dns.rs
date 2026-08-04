@@ -103,6 +103,8 @@ pub enum DnsStrategy {
 pub enum DnsRuleMatch {
     GeoSite { category: String },
     DomainSuffix { suffix: String },
+    DomainKeyword { keyword: String },
+    DomainFull { domain: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -722,6 +724,32 @@ server_tag = "google"
             DnsRuleMatch::DomainSuffix { suffix } if suffix == ".google.com"
         ));
         assert_eq!(cfg.rules[1].server_tag, "google");
+    }
+
+    #[test]
+    fn test_dns_rule_match_domain_keyword_roundtrip() {
+        let rule = DnsRule {
+            match_condition: DnsRuleMatch::DomainKeyword {
+                keyword: "sina".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: DnsRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, back);
+    }
+
+    #[test]
+    fn test_dns_rule_match_domain_full_roundtrip() {
+        let rule = DnsRule {
+            match_condition: DnsRuleMatch::DomainFull {
+                domain: "example.com".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        };
+        let json = serde_json::to_string(&rule).unwrap();
+        let back: DnsRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(rule, back);
     }
 
     #[test]

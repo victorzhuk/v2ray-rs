@@ -1,4 +1,5 @@
 use adw::prelude::*;
+use base64::Engine;
 use gtk::gdk;
 use relm4::adw;
 use relm4::prelude::*;
@@ -78,12 +79,13 @@ type AutoUpdateRefreshBatch = Vec<(Uuid, AutoUpdateRefreshResult)>;
 #[derive(Debug)]
 pub enum SubscriptionsMsg {
     ToggleSubscription(Uuid),
+    ToggleUseImportedProfile(Uuid),
     ToggleNode(Uuid, usize),
     DeleteSubscription(Uuid),
     RenameSubscription(Uuid, String),
     MoveSubscription(Uuid, Direction),
     MoveNode(Uuid, usize, Direction),
-    AddSubscription(String, SubscriptionSource),
+    AddSubscription(String, SubscriptionSourceInput),
     UpdateSubscription(Uuid),
     TestLatency(Uuid),
     SortByLatency(Uuid),
@@ -356,6 +358,23 @@ impl Component for SubscriptionsPage {
                     Err(err) => report_subscription_persist_error(&sender, &err),
                 }
             }
+            SubscriptionsMsg::ToggleUseImportedProfile(id) => {
+                match commit_subscriptions_mutation(
+                    &self.store,
+                    &mut self.subscriptions,
+                    |subscriptions| {
+                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                        sub.use_imported_profile = !sub.use_imported_profile;
+                        Some(())
+                    },
+                ) {
+                    Ok(Some(())) => {
+                        subscriptions_changed = true;
+                    }
+                    Ok(None) => {}
+                    Err(err) => report_subscription_persist_error(&sender, &err),
+                }
+            }
             SubscriptionsMsg::ToggleNode(sub_id, idx) => {
                 match commit_subscriptions_mutation(
                     &self.store,
@@ -460,7 +479,24 @@ impl Component for SubscriptionsPage {
                     Err(err) => report_subscription_persist_error(&sender, &err),
                 }
             }
-            SubscriptionsMsg::AddSubscription(name, source) => {
+            SubscriptionsMsg::AddSubscription(name, source_input) => {
+                let source = match source_input {
+                    SubscriptionSourceInput::Url(url) => SubscriptionSource::Url { url },
+                    SubscriptionSourceInput::File(path) => SubscriptionSource::File { path },
+                    SubscriptionSourceInput::Paste(json) => {
+                        match write_subscription_blob(&self.paths, &json) {
+                            Ok(path) => SubscriptionSource::File {
+                                path: path.to_string_lossy().into_owned(),
+                            },
+                            Err(err) => {
+                                let _ = sender.output(SubscriptionsOutput::Notice(format!(
+                                    "Failed to save pasted subscription: {err}"
+                                )));
+                                return;
+                            }
+                        }
+                    }
+                };
                 let svc = self.service.clone();
                 sender.oneshot_command(async move {
                     match svc.add_and_fetch(name, source).await {
@@ -830,6 +866,8 @@ impl Component for SubscriptionsPage {
                 if let Some(pos) = self.subscriptions.iter().position(|s| s.id == id) {
                     let name = self.subscriptions[pos].name.clone();
                     let previous = self.subscriptions[pos].clone();
+                    let lost_profile =
+                        previous.imported_profile.is_some() && sub.imported_profile.is_none();
                     let merged = merge_refreshed_subscription(&previous, sub);
                     let runtime_changed = !previous.runtime_state_eq(&merged);
                     self.subscriptions[pos] = merged;
@@ -847,6 +885,11 @@ impl Component for SubscriptionsPage {
                             let _ = sender.output(SubscriptionsOutput::Notice(
                                 format_update_summary(&name, "Updated", &result),
                             ));
+                        }
+                        if lost_profile {
+                            let _ = sender.output(SubscriptionsOutput::Notice(format!(
+                                "{name}: source no longer carries a routing profile — keeping the existing one"
+                            )));
                         }
                     }
                 }
@@ -1057,11 +1100,15 @@ fn merge_refreshed_subscription(current: &Subscription, refreshed: Subscription)
         last_updated: refreshed.last_updated,
         auto_update_interval_secs: current.auto_update_interval_secs,
         enabled: current.enabled,
+        imported_profile: refreshed
+            .imported_profile
+            .or_else(|| current.imported_profile.clone()),
+        use_imported_profile: current.use_imported_profile,
     }
 }
 
 fn format_update_summary(name: &str, action: &str, result: &UpdateResult) -> String {
-    if result.parse_failures.is_empty() {
+    let mut summary = if result.parse_failures.is_empty() {
         format!(
             "{action} {name}: +{} -{} unchanged {}",
             result.added, result.removed, result.unchanged
@@ -1086,7 +1133,30 @@ fn format_update_summary(name: &str, action: &str, result: &UpdateResult) -> Str
             result.unchanged,
             result.parse_failures.len()
         )
+    };
+
+    if let Some(profile) = &result.profile
+        && !profile.skipped.is_empty()
+    {
+        let skipped = profile
+            .skipped
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("; ");
+        let suffix = if profile.skipped.len() > 2 {
+            "; ..."
+        } else {
+            ""
+        };
+        summary.push_str(&format!(
+            "; {} profile item(s) skipped: {skipped}{suffix}",
+            profile.skipped.len()
+        ));
     }
+
+    summary
 }
 
 fn format_subscription_error(error: &SubscriptionError) -> String {
@@ -1342,6 +1412,8 @@ fn build_subscription_group(
         ));
     }
 
+    attach_profile_toggle(&expander, sub, sender, state.locked);
+
     expander
 }
 
@@ -1451,6 +1523,37 @@ fn attach_subscription_toggle(
         });
     }
     expander.add_suffix(&toggle);
+}
+
+fn attach_profile_toggle(
+    expander: &adw::ExpanderRow,
+    sub: &Subscription,
+    sender: &ComponentSender<SubscriptionsPage>,
+    locked: bool,
+) {
+    let Some(profile) = &sub.imported_profile else {
+        return;
+    };
+
+    let dns_servers = profile.dns.as_ref().map(|d| d.servers.len()).unwrap_or(0);
+    let row = adw::SwitchRow::builder()
+        .title("Use Provider Routing & DNS")
+        .subtitle(format!(
+            "{} rule(s), {} DNS server(s) from this subscription",
+            profile.rules.len(),
+            dns_servers
+        ))
+        .active(sub.use_imported_profile)
+        .sensitive(!locked)
+        .build();
+
+    let id = sub.id;
+    let s = sender.clone();
+    row.connect_active_notify(move |_| {
+        s.input(SubscriptionsMsg::ToggleUseImportedProfile(id));
+    });
+
+    expander.add_row(&row);
 }
 
 fn build_subscription_menu(
@@ -1920,15 +2023,42 @@ fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
     group.add(&file_entry);
     content.append(&group);
 
+    let paste_label = gtk::Label::builder()
+        .label("Or paste a config-bundle JSON subscription")
+        .halign(gtk::Align::Start)
+        .css_classes(["caption"])
+        .build();
+    content.append(&paste_label);
+
+    let paste_buffer = gtk::TextBuffer::new(None::<&gtk::TextTagTable>);
+    let paste_view = gtk::TextView::builder()
+        .buffer(&paste_buffer)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .top_margin(6)
+        .bottom_margin(6)
+        .left_margin(6)
+        .right_margin(6)
+        .build();
+    let paste_scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(96)
+        .max_content_height(160)
+        .child(&paste_view)
+        .css_classes(["card"])
+        .build();
+    content.append(&paste_scroll);
+
     dialog.set_extra_child(Some(&content));
 
     dialog.connect_response(None, move |_, response| {
         if response == "add" {
             let name = name_entry.text().to_string();
-            let url = url_entry.text().to_string();
+            let url = strip_v2raytun_import_prefix(url_entry.text().trim());
             let file_path = file_entry.text().to_string();
+            let (start, end) = paste_buffer.bounds();
+            let pasted_json = paste_buffer.text(&start, &end, false).to_string();
             if !name.trim().is_empty()
-                && let Some(source) = subscription_source_from_inputs(url.trim(), file_path.trim())
+                && let Some(source) =
+                    subscription_source_from_inputs(&url, file_path.trim(), pasted_json.trim())
             {
                 sender.input(SubscriptionsMsg::AddSubscription(
                     name.trim().into(),
@@ -1941,19 +2071,67 @@ fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
     dialog.present(crate::active_window().as_ref());
 }
 
+const V2RAYTUN_IMPORT_PREFIX: &str = "v2raytun://import/";
+
+/// Strips a `v2raytun://import/` deep-link prefix and recovers the
+/// underlying subscription URL, which the app encodes URL-then-base64.
+fn strip_v2raytun_import_prefix(input: &str) -> String {
+    let Some(rest) = input.strip_prefix(V2RAYTUN_IMPORT_PREFIX) else {
+        return input.to_string();
+    };
+    let decoded = percent_encoding::percent_decode_str(rest)
+        .decode_utf8()
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| rest.to_string());
+    base64::engine::general_purpose::STANDARD
+        .decode(&decoded)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&decoded))
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or(decoded)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SubscriptionSourceInput {
+    Url(String),
+    File(String),
+    Paste(String),
+}
+
 pub(crate) fn subscription_source_from_inputs(
     url: &str,
     file_path: &str,
-) -> Option<SubscriptionSource> {
-    match (url.trim().is_empty(), file_path.trim().is_empty()) {
-        (false, true) => Some(SubscriptionSource::Url {
-            url: url.trim().into(),
-        }),
-        (true, false) => Some(SubscriptionSource::File {
-            path: file_path.trim().into(),
-        }),
+    pasted_json: &str,
+) -> Option<SubscriptionSourceInput> {
+    let url = url.trim();
+    let file_path = file_path.trim();
+    let pasted_json = pasted_json.trim();
+    match (url.is_empty(), file_path.is_empty(), pasted_json.is_empty()) {
+        (false, true, true) => Some(SubscriptionSourceInput::Url(url.into())),
+        (true, false, true) => Some(SubscriptionSourceInput::File(file_path.into())),
+        (true, true, false) => Some(SubscriptionSourceInput::Paste(pasted_json.into())),
         _ => None,
     }
+}
+
+fn write_subscription_blob(
+    paths: &AppPaths,
+    content: &str,
+) -> Result<std::path::PathBuf, PersistenceError> {
+    paths.ensure_dirs()?;
+    let path = paths
+        .subscription_blobs_dir()
+        .join(format!("{}.json", Uuid::new_v4()));
+    std::fs::write(&path, content.as_bytes()).map_err(PersistenceError::Io)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .map_err(PersistenceError::Io)?;
+    }
+
+    Ok(path)
 }
 
 fn show_rename_dialog(id: Uuid, current_name: &str, sender: ComponentSender<SubscriptionsPage>) {
@@ -2044,6 +2222,8 @@ mod tests {
             last_updated: None,
             auto_update_interval_secs: None,
             enabled,
+            imported_profile: None,
+            use_imported_profile: true,
         }
     }
 
@@ -2212,6 +2392,8 @@ mod tests {
             last_updated: Some(chrono::Utc::now()),
             auto_update_interval_secs: None,
             enabled: false,
+            imported_profile: None,
+            use_imported_profile: true,
         };
 
         let merged = merge_refreshed_subscription(&current, refreshed.clone());
@@ -2230,5 +2412,98 @@ mod tests {
         assert_eq!(merged.nodes[0].last_latency_ms, Some(37));
         assert_eq!(merged.nodes[1].node.address(), "127.0.0.2");
         assert!(merged.nodes[1].enabled);
+    }
+
+    #[test]
+    fn merge_refreshed_subscription_preserves_disabled_profile_toggle() {
+        let mut current = create_test_subscription(
+            "Provider sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        current.use_imported_profile = false;
+        current.imported_profile = Some(v2ray_rs_core::models::ImportedProfile {
+            rules: vec![],
+            dns: None,
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+
+        let refreshed = Subscription {
+            id: current.id,
+            name: current.name.clone(),
+            source: current.source.clone(),
+            nodes: vec![create_test_node("127.0.0.1", 8080, true)],
+            last_updated: Some(chrono::Utc::now()),
+            auto_update_interval_secs: None,
+            enabled: true,
+            imported_profile: Some(v2ray_rs_core::models::ImportedProfile {
+                rules: vec![],
+                dns: None,
+                skipped: vec![],
+                imported_at: chrono::Utc::now(),
+            }),
+            use_imported_profile: true,
+        };
+
+        let merged = merge_refreshed_subscription(&current, refreshed);
+
+        assert!(
+            !merged.use_imported_profile,
+            "refresh must not silently re-enable a disabled profile"
+        );
+        assert!(merged.imported_profile.is_some());
+    }
+
+    #[test]
+    fn merge_refreshed_subscription_keeps_stale_profile_when_refresh_has_none() {
+        let mut current = create_test_subscription(
+            "Provider sub",
+            true,
+            vec![create_test_node("127.0.0.1", 8080, true)],
+        );
+        current.imported_profile = Some(v2ray_rs_core::models::ImportedProfile {
+            rules: vec![],
+            dns: None,
+            skipped: vec![],
+            imported_at: chrono::Utc::now(),
+        });
+
+        let refreshed = Subscription {
+            id: current.id,
+            name: current.name.clone(),
+            source: current.source.clone(),
+            nodes: vec![create_test_node("127.0.0.1", 8080, true)],
+            last_updated: Some(chrono::Utc::now()),
+            auto_update_interval_secs: None,
+            enabled: true,
+            imported_profile: None,
+            use_imported_profile: true,
+        };
+
+        let merged = merge_refreshed_subscription(&current, refreshed);
+
+        assert!(
+            merged.imported_profile.is_some(),
+            "a refresh that lost the bundle body must keep the stale profile"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_subscription_blob_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_profile_in(v2ray_rs_core::profile::AppProfile::Test, tmp.path());
+
+        let blob_path = write_subscription_blob(&paths, "[]").unwrap();
+
+        let mode = std::fs::metadata(&blob_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "subscription blob holds live credentials and must not be group/world readable"
+        );
     }
 }

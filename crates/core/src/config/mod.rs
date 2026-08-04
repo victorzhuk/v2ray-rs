@@ -41,6 +41,8 @@ pub enum ConfigError {
         protocol: DnsProtocol,
         tag: String,
     },
+    #[error("transport not supported by backend {backend} for node '{node}'")]
+    UnsupportedTransport { backend: BackendType, node: String },
     #[error("serialize config: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("write config: {0}")]

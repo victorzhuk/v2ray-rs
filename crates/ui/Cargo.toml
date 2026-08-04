@@ -18,6 +18,11 @@ ipnet.workspace = true
 rustls.workspace = true
 clap.workspace = true
 nix.workspace = true
+base64.workspace = true
+percent-encoding.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [features]
 default = ["geodata-fetch"]
