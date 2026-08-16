@@ -717,6 +717,7 @@ mod tests {
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
             bypass_uid: None,
+            capture_dns: false,
         }));
 
         let result = mgr.start_with_connection(None).await;
@@ -802,6 +803,7 @@ mod tests {
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
             bypass_uid: None,
+            capture_dns: false,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))
@@ -836,6 +838,7 @@ mod tests {
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
             bypass_uid: None,
+            capture_dns: false,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))

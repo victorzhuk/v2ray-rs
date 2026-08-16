@@ -2,10 +2,10 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy,
-    GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
-    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
-    XhttpSettings,
+    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig,
+    DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
+    ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig,
+    WsSettings, XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -42,6 +42,7 @@ pub(crate) fn generate_v2ray_family_config(
     dns_backend: V2rayFamilyBackend,
 ) -> Value {
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
+    let via_tags = via_outbound_tags(nodes, rules);
     let mut config = json!({
         "log": { "loglevel": "warning" },
         // Partial policy is valid; omitted timers keep backend defaults.
@@ -51,7 +52,7 @@ pub(crate) fn generate_v2ray_family_config(
         },
         "inbounds": build_inbounds(settings, dns_backend),
         "outbounds": build_outbounds(nodes),
-        "routing": build_routing(rules, &first_proxy_tag, settings, dns_backend),
+        "routing": build_routing(rules, &first_proxy_tag, &via_tags, settings, dns_backend),
     });
 
     let tun_xray = dns_backend == V2rayFamilyBackend::Xray && settings.tun.enabled;
@@ -77,11 +78,34 @@ pub(crate) fn generate_v2ray_family_config(
 /// `dns.tag`, matched by the routing rule that sends them through the proxy.
 const DNS_INTERNAL_TAG: &str = "dns-internal";
 
+/// Resolver of last resort for domains no configured server claims. Under TUN
+/// it is reached through the proxy like every other built-in resolver query, so
+/// answers come back geo-located to the exit node rather than to the ISP.
+const FALLBACK_DNS: &str = "https://1.1.1.1/dns-query";
+
 fn derived_tun_dns(settings: &AppSettings) -> Value {
     json!({
-        "servers": ["https://1.1.1.1/dns-query"],
+        "servers": [FALLBACK_DNS],
         "queryStrategy": query_strategy_str(settings.dns.strategy),
     })
+}
+
+/// xray still queries a `domains`-scoped server for everything else unless
+/// `skipFallback` says otherwise, so a region-scoped resolver ends up answering
+/// for the domains it was never meant to see. Scope those strictly and make sure
+/// something unrestricted is left to answer the rest.
+fn apply_dns_fallback_policy(servers: &mut Vec<Value>) {
+    let mut unrestricted = false;
+    for server in servers.iter_mut() {
+        if server.get("domains").is_some() {
+            server["skipFallback"] = json!(true);
+        } else {
+            unrestricted = true;
+        }
+    }
+    if !unrestricted {
+        servers.push(json!(FALLBACK_DNS));
+    }
 }
 
 fn query_strategy_str(strategy: DnsStrategy) -> &'static str {
@@ -376,9 +400,52 @@ fn build_xhttp_settings(xhttp: &XhttpSettings) -> Value {
     settings
 }
 
+/// Pairs each distinct `via_node` target with the outbound tag that carries it.
+///
+/// The connected node is always `nodes[0]`; the connection layer appends the
+/// rules' `via_node` targets after it in first-appearance order among enabled
+/// rules, and clears any it could not resolve. Rebuilding that order here is
+/// what lets a rule name a node without threading node identities through the
+/// generator API.
+pub(crate) fn via_outbound_tags(
+    nodes: &[ProxyNode],
+    rules: &[RoutingRule],
+) -> Vec<(ConnectionNodeRef, String)> {
+    let mut order: Vec<ConnectionNodeRef> = Vec::new();
+    for rule in rules.iter().filter(|r| r.enabled) {
+        if let Some(node_ref) = rule.via_node
+            && !order.contains(&node_ref)
+        {
+            order.push(node_ref);
+        }
+    }
+
+    order
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, node_ref)| {
+            let index = i + 1;
+            let node = nodes.get(index)?;
+            Some((node_ref, super::common::outbound_tag(node, index)))
+        })
+        .collect()
+}
+
+pub(crate) fn proxy_tag_for(
+    rule: &RoutingRule,
+    first_proxy_tag: &str,
+    via_tags: &[(ConnectionNodeRef, String)],
+) -> String {
+    rule.via_node
+        .and_then(|node_ref| via_tags.iter().find(|(k, _)| *k == node_ref))
+        .map(|(_, tag)| tag.clone())
+        .unwrap_or_else(|| first_proxy_tag.to_string())
+}
+
 fn build_routing(
     rules: &[RoutingRule],
     first_proxy_tag: &str,
+    via_tags: &[(ConnectionNodeRef, String)],
     settings: &AppSettings,
     backend: V2rayFamilyBackend,
 ) -> Value {
@@ -393,9 +460,12 @@ fn build_routing(
             "outboundTag": first_proxy_tag,
         }));
         if settings.tun.dns_hijack == DnsHijackMode::Hijack {
+            // Both transports: the route helper steers tcp/53 into the tunnel
+            // alongside udp/53, and a resolver falling back to TCP on a
+            // truncated answer must not get a different view of the world.
             routing_rules.push(json!({
                 "type": "field",
-                "network": "udp",
+                "network": "tcp,udp",
                 "port": 53,
                 "outboundTag": "dns-out",
             }));
@@ -425,7 +495,7 @@ fn build_routing(
 
     let user_rules: Vec<Value> = enabled
         .iter()
-        .map(|r| build_routing_rule(r, first_proxy_tag))
+        .map(|r| build_routing_rule(r, first_proxy_tag, via_tags))
         .collect();
     routing_rules.extend(user_rules);
 
@@ -435,9 +505,13 @@ fn build_routing(
     })
 }
 
-fn build_routing_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
+fn build_routing_rule(
+    rule: &RoutingRule,
+    first_proxy_tag: &str,
+    via_tags: &[(ConnectionNodeRef, String)],
+) -> Value {
     let outbound_tag = match rule.action {
-        RuleAction::Proxy => first_proxy_tag.to_string(),
+        RuleAction::Proxy => proxy_tag_for(rule, first_proxy_tag, via_tags),
         RuleAction::Direct => "direct".to_string(),
         RuleAction::Block => "block".to_string(),
     };
@@ -642,14 +716,29 @@ fn build_dns_for_backend(
         servers.push(json!("localhost"));
     }
 
+    if backend == V2rayFamilyBackend::Xray {
+        apply_dns_fallback_policy(&mut servers);
+    }
+
     dns_config["servers"] = json!(servers);
 
     dns_config["queryStrategy"] = json!(query_strategy_str(settings.dns.strategy));
 
     if !settings.dns.hosts.is_empty() {
+        // Several entries may name the same domain (a proxy host resolves to a
+        // pool). xray takes an array there, so collect rather than overwrite —
+        // last-wins would throw away every address but one.
         let mut hosts: serde_json::Map<String, Value> = serde_json::Map::new();
         for host in &settings.dns.hosts {
-            hosts.insert(host.domain.clone(), json!(host.ip));
+            match hosts.get_mut(&host.domain) {
+                Some(Value::Array(ips)) => ips.push(json!(host.ip)),
+                Some(existing) => {
+                    *existing = json!([existing.clone(), json!(host.ip)]);
+                }
+                None => {
+                    hosts.insert(host.domain.clone(), json!(host.ip));
+                }
+            }
         }
         dns_config["hosts"] = json!(hosts);
     }
@@ -693,6 +782,7 @@ mod tests {
     use super::*;
     use crate::config::test_fixtures::fixtures::*;
     use crate::models::{DnsServerConfig, DnsStrategy, HostOverride, *};
+    use uuid::Uuid;
 
     #[test]
     fn test_generate_returns_error_on_empty_nodes() {
@@ -723,6 +813,212 @@ mod tests {
             let config = generate_v2ray_family_config(&[vless_node()], &[], &settings, backend);
             assert_eq!(config["policy"]["levels"]["0"]["connIdle"], 900);
         }
+    }
+
+    fn proxy_rule(pattern: &str, via_node: Option<ConnectionNodeRef>) -> RoutingRule {
+        RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: pattern.into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node,
+        }
+    }
+
+    #[test]
+    fn test_rule_via_node_targets_that_nodes_outbound() {
+        let pinned = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        let nodes = [vless_node(), ss_node()];
+        let rules = vec![
+            proxy_rule("api.z.ai", Some(pinned)),
+            proxy_rule("example.org", None),
+        ];
+
+        let config = generate_v2ray_family_config(
+            &nodes,
+            &rules,
+            &default_settings(),
+            V2rayFamilyBackend::Xray,
+        );
+
+        let routing = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(
+            routing[0]["outboundTag"],
+            crate::config::common::outbound_tag(&nodes[1], 1)
+        );
+        assert_eq!(
+            routing[1]["outboundTag"],
+            crate::config::common::outbound_tag(&nodes[0], 0)
+        );
+    }
+
+    #[test]
+    fn test_rule_via_node_falls_back_when_node_missing() {
+        let pinned = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        // Only the connected node was passed, so the pinned ref has no outbound.
+        let nodes = [vless_node()];
+        let rules = vec![proxy_rule("api.z.ai", Some(pinned))];
+
+        let config = generate_v2ray_family_config(
+            &nodes,
+            &rules,
+            &default_settings(),
+            V2rayFamilyBackend::Xray,
+        );
+
+        let routing = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(
+            routing[0]["outboundTag"],
+            crate::config::common::outbound_tag(&nodes[0], 0)
+        );
+    }
+
+    #[test]
+    fn test_via_outbound_tags_dedupes_and_keeps_first_appearance_order() {
+        let a = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        let b = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        let nodes = [vless_node(), ss_node(), trojan_node()];
+        let rules = vec![
+            proxy_rule("one.example", Some(a)),
+            proxy_rule("two.example", Some(b)),
+            proxy_rule("three.example", Some(a)),
+        ];
+
+        let tags = via_outbound_tags(&nodes, &rules);
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].0, a);
+        assert_eq!(tags[1].0, b);
+        assert_eq!(tags[0].1, crate::config::common::outbound_tag(&nodes[1], 1));
+        assert_eq!(tags[1].1, crate::config::common::outbound_tag(&nodes[2], 2));
+    }
+
+    #[test]
+    fn test_disabled_rule_does_not_claim_an_outbound_slot() {
+        let pinned = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        let mut disabled = proxy_rule("skipped.example", Some(pinned));
+        disabled.enabled = false;
+        let live = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        let nodes = [vless_node(), ss_node()];
+        let rules = vec![disabled, proxy_rule("api.z.ai", Some(live))];
+
+        let tags = via_outbound_tags(&nodes, &rules);
+
+        assert_eq!(tags.len(), 1);
+        assert_eq!(tags[0].0, live);
+        assert_eq!(tags[0].1, crate::config::common::outbound_tag(&nodes[1], 1));
+    }
+
+    #[test]
+    fn test_repeated_host_domain_becomes_an_address_array() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "ap.example.com".into(),
+                ip: "203.0.113.1".into(),
+            },
+            HostOverride {
+                domain: "ap.example.com".into(),
+                ip: "203.0.113.2".into(),
+            },
+            HostOverride {
+                domain: "single.example.com".into(),
+                ip: "203.0.113.9".into(),
+            },
+        ];
+
+        let config =
+            generate_v2ray_family_config(&[vless_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert_eq!(
+            config["dns"]["hosts"]["ap.example.com"],
+            json!(["203.0.113.1", "203.0.113.2"]),
+            "a pooled proxy host must keep every address, not just the last"
+        );
+        assert_eq!(config["dns"]["hosts"]["single.example.com"], "203.0.113.9");
+    }
+
+    fn scoped_dns_settings() -> AppSettings {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "192.0.2.1".into(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::GeoSite {
+                category: "category-ru".into(),
+            },
+            server_tag: "domestic".into(),
+        }];
+        settings
+    }
+
+    #[test]
+    fn test_scoped_dns_server_skips_fallback_and_gains_a_catch_all() {
+        let config = generate_v2ray_family_config(
+            &[vless_node()],
+            &[],
+            &scoped_dns_settings(),
+            V2rayFamilyBackend::Xray,
+        );
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let scoped = &servers[0];
+        assert_eq!(scoped["address"], "192.0.2.1");
+        assert_eq!(scoped["skipFallback"], true);
+        assert_eq!(
+            servers.last().unwrap(),
+            FALLBACK_DNS,
+            "a scoped-only server list needs an unrestricted resolver: {servers:?}"
+        );
+    }
+
+    #[test]
+    fn test_unrestricted_dns_server_keeps_fallback_and_adds_nothing() {
+        let mut settings = scoped_dns_settings();
+        settings.dns.rules.clear();
+
+        let config =
+            generate_v2ray_family_config(&[vless_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1, "no catch-all needed: {servers:?}");
+        assert_eq!(servers[0], "192.0.2.1");
+    }
+
+    #[test]
+    fn test_dns_fallback_policy_is_xray_only() {
+        let config = generate_v2ray_family_config(
+            &[vless_node()],
+            &[],
+            &scoped_dns_settings(),
+            V2rayFamilyBackend::V2ray,
+        );
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].get("skipFallback").is_none());
     }
 
     fn find_tun_inbound(config: &Value) -> Option<&Value> {
@@ -942,6 +1238,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -965,6 +1262,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -986,6 +1284,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1007,6 +1306,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1028,6 +1328,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1049,6 +1350,7 @@ mod tests {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1071,6 +1373,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1092,6 +1395,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1113,6 +1417,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1136,6 +1441,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: false,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -1145,6 +1451,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 
@@ -1250,6 +1557,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -1259,6 +1567,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 
@@ -1525,6 +1834,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let mut settings = default_settings();
@@ -1822,7 +2132,7 @@ mod tests {
         );
 
         let rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules[1]["network"], "udp");
+        assert_eq!(rules[1]["network"], "tcp,udp");
         assert_eq!(rules[1]["port"], 53);
         assert_eq!(rules[1]["outboundTag"], "dns-out");
     }

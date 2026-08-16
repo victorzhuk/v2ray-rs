@@ -64,6 +64,8 @@ pub struct App {
     wizard: Controller<OnboardingWizard>,
     window: adw::ApplicationWindow,
     process_handle: Option<ConnectionHandle>,
+    tun_lifecycle: crate::connection::TunLifecycle,
+    connection_generation: u64,
     process_state: ProcessState,
     reconnect_pending: bool,
     connected: bool,
@@ -99,7 +101,7 @@ pub enum AppMsg {
     TrayShowWindow,
     TrayQuit,
     ActiveNodesChanged(bool),
-    ProcessStateConnection(ProcessState, Option<ConnectionMetadata>),
+    ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(String),
     OpenPreferences,
     ViewGeneratedConfig,
@@ -381,19 +383,21 @@ impl App {
 
         let rules = self.store.load_routing_rules().unwrap_or_default();
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
-        let (effective_rules, effective_settings) = resolve_effective_config(
+        let (mut effective_rules, effective_settings) = resolve_effective_config(
             &candidate.node_ref,
             subscriptions,
             &enabled_rules,
             &self.settings,
         );
+        let mut nodes = vec![candidate.node.clone()];
+        nodes.extend(v2ray_rs_core::resolve::resolve_via_nodes(
+            &mut effective_rules,
+            subscriptions,
+            manual_nodes,
+        ));
 
         let writer = ConfigWriter::new(&self.settings, &self.paths);
-        match writer.write_config(
-            std::slice::from_ref(&candidate.node),
-            &effective_rules,
-            &effective_settings,
-        ) {
+        match writer.write_config(&nodes, &effective_rules, &effective_settings) {
             Ok(path) => log::info!("Regenerated config at {:?}", path),
             Err(e) => {
                 log::error!("Failed to regenerate config: {}", e);
@@ -442,6 +446,9 @@ impl App {
         };
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
         let connection_subscriptions = subscriptions.clone();
+        let connection_manual_nodes = manual_nodes.clone();
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
 
         self.runtime_snapshot = Some(RuntimeConfigSnapshot {
             backend_type: self.settings.backend.backend_type,
@@ -477,6 +484,9 @@ impl App {
                 settings,
                 enabled_rules,
                 subscriptions: connection_subscriptions,
+                manual_nodes: connection_manual_nodes,
+                lifecycle: self.tun_lifecycle.clone(),
+                generation,
             },
             sender.input_sender().clone(),
         );
@@ -733,16 +743,24 @@ impl SimpleComponent for App {
             }
         };
         // Off the GTK thread: orphan reaping can wait ~1.5s on a stubborn
-        // process and TUN recovery up to RECOVER_TIMEOUT. Connect re-runs the
-        // orphan check itself, so racing an early Connect is safe.
+        // process and TUN recovery up to RECOVER_TIMEOUT. Recovery flushes the
+        // tunnel routing table wholesale, so it takes the lifecycle lock: an
+        // early Connect must queue behind it rather than have its fresh rules
+        // flushed out from under it.
+        let tun_lifecycle: crate::connection::TunLifecycle = Default::default();
         {
             let bg_paths = paths.clone();
             let skip_orphans = settings_load_error.is_some();
-            tokio::task::spawn_blocking(move || {
-                if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&bg_paths) {
-                    log::warn!("failed to clean orphaned backend process: {err}");
-                }
-                recover_tun_session(&bg_paths);
+            let lifecycle = tun_lifecycle.clone();
+            tokio::spawn(async move {
+                let _lifecycle = lifecycle.lock().await;
+                let _ = tokio::task::spawn_blocking(move || {
+                    if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&bg_paths) {
+                        log::warn!("failed to clean orphaned backend process: {err}");
+                    }
+                    recover_tun_session(&bg_paths);
+                })
+                .await;
             });
         }
 
@@ -816,6 +834,8 @@ impl SimpleComponent for App {
             wizard,
             window: root.clone(),
             process_handle: None,
+            tun_lifecycle,
+            connection_generation: 0,
             process_state: ProcessState::Stopped,
             reconnect_pending: false,
             connected: false,
@@ -1072,7 +1092,13 @@ impl SimpleComponent for App {
                     self.show_toast("Not connected");
                 }
             }
-            AppMsg::ProcessStateConnection(state, connection) => {
+            AppMsg::ProcessStateConnection(generation, state, connection) => {
+                // A superseded connection keeps reporting until its teardown
+                // finishes; acting on its terminal state would clear the handle
+                // of the connection that replaced it.
+                if generation != self.connection_generation {
+                    return;
+                }
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
                 if stopped {
                     self.process_handle = None;

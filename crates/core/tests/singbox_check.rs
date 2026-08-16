@@ -228,6 +228,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -237,6 +238,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -246,6 +248,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -255,6 +258,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -264,6 +268,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -273,6 +278,7 @@ fn new_rule_kinds_pass_sing_box_check() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
     ];
 
@@ -332,6 +338,7 @@ fn geoip_private_route_rule_passes_sing_box_check() {
         action: RuleAction::Direct,
         enabled: true,
         group: None,
+        via_node: None,
     }];
 
     check_with_rules("geoip-private", &AppSettings::default(), &rules, |_| {});
@@ -356,6 +363,7 @@ fn ruleset_config_with_cache_file_passes_sing_box_check() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -365,6 +373,7 @@ fn ruleset_config_with_cache_file_passes_sing_box_check() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
     ];
 
@@ -430,6 +439,7 @@ fn local_ruleset_config_passes_sing_box_check() {
         action: RuleAction::Direct,
         enabled: true,
         group: None,
+        via_node: None,
     }];
 
     let writer = ConfigWriter::new(&settings, &paths);

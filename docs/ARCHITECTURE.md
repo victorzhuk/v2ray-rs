@@ -123,6 +123,16 @@ args to avoid injection). `tun.rs` holds `TunRuntime` and the xray-specific
 helpers: `wait_for_device()` polls `/sys/class/net/<iface>`, then invokes
 `netctl xray-up`. sing-box programs its own routes via `auto_route`.
 
+Connection setup and teardown are serialized by a single lock held for a
+connection's whole lifetime, and the startup route-recovery pass takes the same
+lock. This is load-bearing rather than defensive: `netctl` has no session
+identity, so a teardown deletes whatever currently holds the interface name and
+rule priorities, not specifically what that session installed. Without the lock a
+prompt reconnect sets up a session that the previous teardown then deletes,
+leaving a live backend with no tunnel. For the same reason each connection
+carries a generation number and the app ignores state reported by a superseded
+one.
+
 `PidFile` writes an ownership record (binary path + config path) and
 `check_and_kill_orphaned()` kills stale processes from a previous run using
 `kill(pid, 0)` as a liveness probe. `ProbeRunner` generates a minimal backend
@@ -135,10 +145,21 @@ dependencies — deliberately minimal (rtnetlink, tokio current-thread, clap).
 
 Three subcommands, all idempotent and input-validated before any netlink call:
 
-- `xray-up --iface --addr [--addr6] [--bypass-uid]`: brings the link up,
-  assigns the address, adds `0.0.0.0/1` + `128.0.0.0/1` split routes (and
-  IPv6 equivalents), installs a `uidrange` policy rule at priority 8998 when
-  `--bypass-uid` is given so that traffic from the bypass user skips the tunnel.
+- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns]`: brings the
+  link up, assigns the address, and installs the tunnel default route into table
+  2023 plus the policy rules that steer traffic into it:
+  - 9000 — `fwmark 0xff` → `main`, so xray's own sockets reach the real default
+    instead of looping back through the tunnel;
+  - 9001 — `main` with `suppress_prefixlength 0`, keeping LAN and link routes;
+  - 9002 — everything else → table 2023.
+
+  `--bypass-uid` adds a `uidrange` rule at 8998 so traffic from the bypass user
+  skips the tunnel. `--capture-dns` adds a udp/tcp `dport 53` pair at 8999,
+  matched on `fwmark 0/0xff`: rule 9001 would otherwise send DNS to a resolver on
+  the local subnet out the LAN route, leaving host name resolution as the one
+  thing the tunnel never sees, while the fwmark match keeps the proxy's own
+  upstream queries on the 9000 bypass. Because the rules resolve to table 2023,
+  an unclean exit leaves entries that match nothing rather than blackholing DNS.
 - `xray-down --iface`: removes the device (no-op if already gone).
 - `recover --iface --singbox|--xray`: cleans up leftover TUN state after an
   unclean shutdown; for sing-box also flushes its `auto_route` table/rules.

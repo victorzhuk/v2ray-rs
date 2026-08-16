@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-08-16
+
+### Added
+- A routing rule can now name the node that carries it. Proxy rules gained a "Via node" picker, so destinations that hold connections open for a long time can use one provider while everything else keeps using the connected node — useful when a provider tears down idle streams sooner than the traffic can tolerate. A pinned node that has since been deleted or disabled falls back to the connected node instead of failing the connect.
+- WebSocket ping interval setting for xray (`wsSettings.heartbeatPeriod`), off by default. Holds NATs and middleboxes open on idle ws tunnels; it operates on the transport, so it does not affect an idle timer at the far end of the proxy hop.
+
+### Changed
+- xray TUN mode now steers port-53 traffic into the tunnel's routing table, so a resolver on the local subnet stops being the one destination the tunnel never sees. Previously the policy rule that keeps LAN routes working also carried DNS, so a `nameserver` pointing at the router meant every name the host looked up was resolved outside the tunnel and the app's DNS settings applied to nothing but the proxy's own lookups. The rules exclude the proxy's marked sockets, and they resolve to the tunnel table, so if the app dies the entries stop matching anything and DNS falls back to normal instead of blackholing. Applies when TUN is on and DNS hijack is set to `hijack`.
+- The TUN DNS hijack rule now covers TCP as well as UDP, so a resolver falling back to TCP on a truncated answer does not get a different view of the world.
+- Under TUN, node hostnames are pinned to their resolved addresses in `dns.hosts` at connect time and outbounds dial with `sockopt.domainStrategy`, so the backend resolves its own server through its built-in resolver rather than the OS one. Left as-is, that lookup goes out on an unmarked socket — the kind the tunnel captures — so it would be sent into the tunnel it is trying to establish. Xray's documentation recommends this pinning for transparent-proxy setups. DNS capture stays off for any connect where a node could not be pinned, so an unresolvable host degrades to the previous behavior instead of deadlocking.
+- Multiple `dns.hosts` entries for one domain now emit as an address array instead of the last one silently winning.
+- xray DNS servers scoped to a domain list now set `skipFallback`, and an unrestricted resolver is appended when every configured server is scoped. Previously a region-scoped resolver also answered for every domain it was never meant to see.
+- WebSocket outbounds emit the dedicated `wsSettings.host` field instead of `headers.Host`, which xray 26 warns about on every start and has slated for removal.
+
+### Fixed
+- Reconnecting quickly could leave a running backend with no tunnel while the UI reported Connected. Disconnect clears the connection handle before teardown has run, so a following Connect started setting up while the previous session was still tearing down — and since the route helper deletes devices by interface name and policy rules by fixed priority, with no session identity, that teardown removed the new session's rules rather than its own. Connection setup and teardown now run under one lock, and the startup route-recovery pass takes it too instead of racing an early Connect. Terminal state from a superseded connection is also ignored, so it can no longer clear the handle of the connection that replaced it.
+- The TUN "DNS hijack" setting was greyed out on the xray backend even though both generators act on it.
+- The WebSocket ping interval is now marked and gated as xray-only rather than offered on backends whose generators ignore it.
+
 ## [0.15.0] - 2026-08-04
 
 ### Added
@@ -516,7 +535,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...v0.14.0
 [0.13.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.0...v0.13.1

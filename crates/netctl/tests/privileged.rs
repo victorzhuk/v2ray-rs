@@ -9,6 +9,9 @@ use std::process::Command;
 
 const BIN: &str = env!("CARGO_BIN_EXE_v2ray-rs-netctl");
 const NS: &str = "nctl-test-ns";
+/// Second namespace so the DNS-capture test can run alongside the idempotency
+/// one without the two fighting over the same rules.
+const NS_DNS: &str = "nctl-dns-ns";
 const IFACE: &str = "nctltest0";
 const ADDR: &str = "172.31.255.1/30";
 const ADDR6: &str = "fd00:ffff::1/64";
@@ -21,16 +24,20 @@ fn run(cmd: &str, args: &[&str]) -> bool {
         .unwrap_or(false)
 }
 
-/// Runs `ip <args>` inside the test network namespace.
-fn ip_in_ns(args: &[&str]) -> bool {
-    let mut full = vec!["netns", "exec", NS, "ip"];
+/// Runs `ip <args>` inside the given network namespace.
+fn ip_in(ns: &str, args: &[&str]) -> bool {
+    let mut full = vec!["netns", "exec", ns, "ip"];
     full.extend_from_slice(args);
     run("ip", &full)
 }
 
-/// Runs `ip <args>` inside the namespace and returns its stdout.
-fn ip_in_ns_output(args: &[&str]) -> String {
-    let mut full = vec!["netns", "exec", NS, "ip"];
+fn ip_in_ns(args: &[&str]) -> bool {
+    ip_in(NS, args)
+}
+
+/// Runs `ip <args>` inside the given namespace and returns its stdout.
+fn ip_in_output(ns: &str, args: &[&str]) -> String {
+    let mut full = vec!["netns", "exec", ns, "ip"];
     full.extend_from_slice(args);
     Command::new("ip")
         .args(&full)
@@ -39,12 +46,20 @@ fn ip_in_ns_output(args: &[&str]) -> String {
         .unwrap_or_default()
 }
 
-/// Runs the netctl binary inside the test namespace, so its netlink socket
-/// operates on the namespace's network stack rather than the host's.
-fn netctl(args: &[&str]) -> bool {
-    let mut full = vec!["netns", "exec", NS, BIN];
+fn ip_in_ns_output(args: &[&str]) -> String {
+    ip_in_output(NS, args)
+}
+
+/// Runs the netctl binary inside the given namespace, so its netlink socket
+/// operates on that namespace's network stack rather than the host's.
+fn netctl_in(ns: &str, args: &[&str]) -> bool {
+    let mut full = vec!["netns", "exec", ns, BIN];
     full.extend_from_slice(args);
     run("ip", &full)
+}
+
+fn netctl(args: &[&str]) -> bool {
+    netctl_in(NS, args)
 }
 
 /// Whether the test device currently exists inside the namespace.
@@ -54,10 +69,10 @@ fn device_exists() -> bool {
 
 /// Deletes the namespace (and everything in it) on drop, so a panicking
 /// assertion can never leak the namespace or the test device.
-struct NsGuard;
+struct NsGuard(&'static str);
 impl Drop for NsGuard {
     fn drop(&mut self) {
-        let _ = run("ip", &["netns", "del", NS]);
+        let _ = run("ip", &["netns", "del", self.0]);
     }
 }
 
@@ -68,7 +83,7 @@ fn up_down_is_idempotent_in_namespace() {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
         return;
     }
-    let _guard = NsGuard; // from here, any return or panic deletes the namespace
+    let _guard = NsGuard(NS); // from here, any return or panic deletes the namespace
 
     // A `tun` device stands in for the one xray creates (the `dummy` driver is
     // not universally installed; the feature requires `tun` regardless).
@@ -182,5 +197,75 @@ fn up_down_is_idempotent_in_namespace() {
     assert!(
         !recovered.contains("8998:"),
         "bypass-uid rule leaked after recover --xray: {recovered}"
+    );
+}
+
+#[test]
+fn capture_dns_steers_port_53_into_the_tunnel_table() {
+    let _ = run("ip", &["netns", "del", NS_DNS]);
+    if !run("ip", &["netns", "add", NS_DNS]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_DNS);
+
+    if !ip_in(NS_DNS, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+
+    assert!(netctl_in(
+        NS_DNS,
+        &["xray-up", "--iface", IFACE, "--addr", ADDR, "--capture-dns"]
+    ));
+
+    // The pair must sit ahead of the fwmark bypass so unmarked queries reach the
+    // tunnel, and must carry `fwmark 0/0xff` so the proxy's own marked queries
+    // fall through to it instead of looping back into the tunnel.
+    let rules = ip_in_output(NS_DNS, &["rule", "show"]);
+    for proto in ["udp", "tcp"] {
+        assert!(
+            rules.contains(&format!(
+                "fwmark 0/0xff ipproto {proto} dport 53 lookup 2023"
+            )),
+            "dns capture rule missing for {proto}: {rules}"
+        );
+    }
+    assert!(
+        rules.find("8999:").unwrap() < rules.find("9000:").unwrap(),
+        "dns capture must be evaluated before the fwmark bypass: {rules}"
+    );
+
+    // Without the flag the rules must not appear at all.
+    assert!(netctl_in(NS_DNS, &["xray-down", "--iface", IFACE]));
+    assert!(ip_in(
+        NS_DNS,
+        &["tuntap", "add", "dev", IFACE, "mode", "tun"]
+    ));
+    assert!(netctl_in(
+        NS_DNS,
+        &["xray-up", "--iface", IFACE, "--addr", ADDR]
+    ));
+    let without = ip_in_output(NS_DNS, &["rule", "show"]);
+    assert!(
+        !without.contains("8999:"),
+        "dns capture rules present without --capture-dns: {without}"
+    );
+
+    // And they are torn down with everything else, not left to blackhole DNS.
+    assert!(netctl_in(NS_DNS, &["xray-down", "--iface", IFACE]));
+    assert!(ip_in(
+        NS_DNS,
+        &["tuntap", "add", "dev", IFACE, "mode", "tun"]
+    ));
+    assert!(netctl_in(
+        NS_DNS,
+        &["xray-up", "--iface", IFACE, "--addr", ADDR, "--capture-dns"]
+    ));
+    assert!(netctl_in(NS_DNS, &["recover", "--xray", "--iface", IFACE]));
+    let after = ip_in_output(NS_DNS, &["rule", "show"]);
+    assert!(
+        !after.contains("8999:"),
+        "dns capture rules leaked after recover --xray: {after}"
     );
 }

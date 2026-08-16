@@ -9,8 +9,8 @@ use uuid::Uuid;
 
 use v2ray_rs_core::geodata_index::GeodataIndexManager;
 use v2ray_rs_core::models::{
-    AppSettings, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch, builtin_presets,
-    validate_rule_match,
+    AppSettings, ConnectionNodeRef, Preset, RoutingRule, RoutingRuleSet, RuleAction, RuleMatch,
+    builtin_presets, validate_rule_match,
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
@@ -400,6 +400,41 @@ fn build_routing_rule_row(
     row
 }
 
+/// Nodes a rule can be pinned to. Useful when one provider tears down idle
+/// streams sooner than another and only some destinations can afford it.
+fn via_node_choices(paths: &AppPaths) -> Vec<(ConnectionNodeRef, String)> {
+    let mut choices = Vec::new();
+
+    for sub in persistence::load_subscriptions(paths).unwrap_or_default() {
+        for node in sub.nodes.iter().filter(|n| n.enabled) {
+            let label = node.node.remark().unwrap_or_else(|| node.node.address());
+            choices.push((
+                ConnectionNodeRef::Subscription {
+                    subscription_id: sub.id,
+                    node_id: node.id,
+                },
+                format!("{} — {label}", sub.name),
+            ));
+        }
+    }
+
+    for manual in persistence::load_manual_nodes_or_default(paths)
+        .iter()
+        .filter(|n| n.enabled)
+    {
+        let label = manual
+            .node
+            .remark()
+            .unwrap_or_else(|| manual.node.address());
+        choices.push((
+            ConnectionNodeRef::Manual { node_id: manual.id },
+            format!("Manual — {label}"),
+        ));
+    }
+
+    choices
+}
+
 fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
     let is_edit = existing.is_some();
 
@@ -472,10 +507,42 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
         .selected(init_action_idx)
         .build();
 
+    let node_choices = via_node_choices(&ctx.paths);
+    let mut via_labels = vec!["Connected node".to_string()];
+    via_labels.extend(node_choices.iter().map(|(_, label)| label.clone()));
+    let init_via_idx = existing
+        .as_ref()
+        .and_then(|rule| rule.via_node)
+        .and_then(|node_ref| node_choices.iter().position(|(r, _)| *r == node_ref))
+        .map(|i| i as u32 + 1)
+        .unwrap_or(0);
+
+    let via_combo = adw::ComboRow::builder()
+        .title("Via node")
+        .subtitle("Send this rule through a specific node instead of the connected one")
+        .model(&gtk::StringList::new(
+            &via_labels.iter().map(String::as_str).collect::<Vec<_>>(),
+        ))
+        .selected(init_via_idx)
+        .sensitive(init_action_idx == 0)
+        .build();
+
+    {
+        let via_combo = via_combo.clone();
+        action_combo.connect_selected_notify(move |row| {
+            let is_proxy = row.selected() == 0;
+            via_combo.set_sensitive(is_proxy);
+            if !is_proxy {
+                via_combo.set_selected(0);
+            }
+        });
+    }
+
     let group = adw::PreferencesGroup::new();
     group.add(&type_combo);
     group.add(&value_entry);
     group.add(&action_combo);
+    group.add(&via_combo);
     content.append(&group);
 
     let error_label = gtk::Label::builder()
@@ -697,12 +764,20 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             _ => RuleAction::Block,
         };
 
+        let via_node = match (action, via_combo.selected()) {
+            (RuleAction::Proxy, i) if i > 0 => node_choices
+                .get(i as usize - 1)
+                .map(|(node_ref, _)| *node_ref),
+            _ => None,
+        };
+
         let rule = RoutingRule {
             id: editing_id.unwrap_or_else(Uuid::new_v4),
             match_condition,
             action,
             enabled: true,
             group: None,
+            via_node,
         };
 
         {

@@ -26,10 +26,11 @@ impl ConfigGenerator for XrayGenerator {
         let mut config =
             generate_v2ray_family_config(nodes, rules, settings, V2rayFamilyBackend::Xray);
 
-        patch_xray_outbounds(&mut config, nodes);
+        patch_xray_outbounds(&mut config, nodes, settings);
 
         if settings.tun.enabled {
             apply_tun_fwmark(&mut config);
+            apply_tun_domain_strategy(&mut config, tun_domain_strategy(settings));
         }
 
         Ok(config)
@@ -52,18 +53,56 @@ fn apply_tun_fwmark(config: &mut Value) {
     }
 }
 
-fn patch_xray_outbounds(config: &mut Value, nodes: &[ProxyNode]) {
+/// Routes the dialer's own hostname lookups through xray's built-in resolver
+/// instead of the OS one.
+///
+/// The default `AsIs` hands a proxy server's hostname to Go's resolver, which
+/// reads `/etc/resolv.conf` and queries on an unmarked socket — a socket the TUN
+/// captures, so the lookup needed to build the tunnel is sent through it. Paired
+/// with pinned `dns.hosts` entries the built-in resolver answers locally and the
+/// loop never forms; xray's own docs recommend exactly this pinning for
+/// transparent-proxy setups.
+fn apply_tun_domain_strategy(config: &mut Value, strategy: &str) {
+    let Some(outbounds) = config["outbounds"].as_array_mut() else {
+        return;
+    };
+    for outbound in outbounds {
+        if outbound["protocol"] == "blackhole" || outbound["protocol"] == "dns" {
+            continue;
+        }
+        outbound["streamSettings"]["sockopt"]["domainStrategy"] = Value::from(strategy);
+    }
+}
+
+fn patch_xray_outbounds(config: &mut Value, nodes: &[ProxyNode], settings: &AppSettings) {
     let Some(outbounds) = config["outbounds"].as_array_mut() else {
         return;
     };
 
     for (i, node) in nodes.iter().enumerate() {
-        if let ProxyNode::Vless(c) = node
-            && let Some(outbound) = outbounds.get_mut(i)
-        {
+        let Some(outbound) = outbounds.get_mut(i) else {
+            continue;
+        };
+        if let ProxyNode::Vless(c) = node {
             apply_xray_vless_extensions(outbound, c);
         }
+        migrate_ws_host(outbound);
+        apply_ws_heartbeat(outbound, settings.ws_heartbeat_secs);
     }
+}
+
+fn apply_ws_heartbeat(outbound: &mut Value, secs: u32) {
+    if secs == 0 {
+        return;
+    }
+    let Some(ws) = outbound
+        .get_mut("streamSettings")
+        .and_then(|s| s.get_mut("wsSettings"))
+        .and_then(|w| w.as_object_mut())
+    else {
+        return;
+    };
+    ws.insert("heartbeatPeriod".to_string(), Value::from(secs));
 }
 
 /// Builds a single xray outbound (v2ray-family outbound plus xray-specific
@@ -74,7 +113,38 @@ pub(crate) fn build_xray_outbound(node: &ProxyNode, tag: &str) -> Value {
     if let ProxyNode::Vless(c) = node {
         apply_xray_vless_extensions(&mut outbound, c);
     }
+    migrate_ws_host(&mut outbound);
     outbound
+}
+
+/// xray 26 warns on every start that `wsSettings.headers.Host` is deprecated and
+/// due for removal in favour of a dedicated `host` field, which also outranks the
+/// header when both are present. Move it across so the config outlives the removal.
+fn migrate_ws_host(outbound: &mut Value) {
+    let Some(ws) = outbound
+        .get_mut("streamSettings")
+        .and_then(|s| s.get_mut("wsSettings"))
+        .and_then(|w| w.as_object_mut())
+    else {
+        return;
+    };
+    let Some(headers) = ws.get_mut("headers").and_then(|h| h.as_object_mut()) else {
+        return;
+    };
+    let Some(key) = headers
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case("host"))
+        .cloned()
+    else {
+        return;
+    };
+    let Some(host) = headers.remove(&key) else {
+        return;
+    };
+    if headers.is_empty() {
+        ws.remove("headers");
+    }
+    ws.insert("host".to_string(), host);
 }
 
 fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
@@ -84,6 +154,15 @@ fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
         && let Some(user) = users.first_mut()
     {
         user["flow"] = serde_json::json!(flow);
+    }
+}
+
+/// `Use*` rather than `Force*`: a node whose address family the resolver cannot
+/// satisfy should still be dialled as-is instead of failing the connection.
+fn tun_domain_strategy(settings: &AppSettings) -> &'static str {
+    match settings.dns.strategy {
+        crate::models::DnsStrategy::Ipv6Only | crate::models::DnsStrategy::PreferIpv6 => "UseIPv6",
+        _ => "UseIPv4",
     }
 }
 
@@ -111,6 +190,146 @@ mod tests {
             }),
             remark: Some("XTLS Node".into()),
         })
+    }
+
+    fn ws_vless_with_host_header(headers: &[(&str, &str)]) -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "ws.example.com".into(),
+            port: 443,
+            uuid: "test-uuid-ws".into(),
+            encryption: Some("none".into()),
+            flow: None,
+            transport: TransportSettings::Ws(WsSettings {
+                path: "/ws".into(),
+                host: Some("cdn.example.com".into()),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+            tls: Some(TlsSettings {
+                server_name: Some("ws.example.com".into()),
+                ..Default::default()
+            }),
+            remark: Some("WS Node".into()),
+        })
+    }
+
+    #[test]
+    fn test_ws_host_header_moves_to_dedicated_field() {
+        let node = ws_vless_with_host_header(&[]);
+        let config = XrayGenerator
+            .generate(&[node], &[], &AppSettings::default())
+            .unwrap();
+
+        let ws = &config["outbounds"][0]["streamSettings"]["wsSettings"];
+        assert_eq!(ws["host"], "cdn.example.com");
+        assert!(
+            ws.get("headers").is_none(),
+            "Host was the only header, so headers should be gone: {ws}"
+        );
+    }
+
+    #[test]
+    fn test_ws_host_migration_keeps_other_headers() {
+        let node = ws_vless_with_host_header(&[("Host", "cdn.example.com"), ("X-Tag", "keep")]);
+        let config = XrayGenerator
+            .generate(&[node], &[], &AppSettings::default())
+            .unwrap();
+
+        let ws = &config["outbounds"][0]["streamSettings"]["wsSettings"];
+        assert_eq!(ws["host"], "cdn.example.com");
+        assert_eq!(ws["headers"]["X-Tag"], "keep");
+        assert!(ws["headers"].get("Host").is_none());
+    }
+
+    #[test]
+    fn test_tun_sets_domain_strategy_so_the_dialer_uses_the_builtin_resolver() {
+        let settings = AppSettings {
+            tun: TunConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let config = XrayGenerator
+            .generate(&[ws_vless_with_host_header(&[])], &[], &settings)
+            .unwrap();
+
+        for outbound in config["outbounds"].as_array().unwrap() {
+            let sockopt = &outbound["streamSettings"]["sockopt"];
+            if outbound["protocol"] == "blackhole" || outbound["protocol"] == "dns" {
+                assert!(sockopt.get("domainStrategy").is_none());
+            } else {
+                assert_eq!(
+                    sockopt["domainStrategy"], "UseIPv4",
+                    "dialer must not fall back to the OS resolver under TUN: {outbound}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_domain_strategy_without_tun() {
+        let config = XrayGenerator
+            .generate(
+                &[ws_vless_with_host_header(&[])],
+                &[],
+                &AppSettings::default(),
+            )
+            .unwrap();
+
+        assert!(
+            config["outbounds"][0]["streamSettings"]["sockopt"]
+                .get("domainStrategy")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_ws_heartbeat_emitted_when_configured() {
+        let settings = AppSettings {
+            ws_heartbeat_secs: 30,
+            ..Default::default()
+        };
+
+        let config = XrayGenerator
+            .generate(&[ws_vless_with_host_header(&[])], &[], &settings)
+            .unwrap();
+
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["wsSettings"]["heartbeatPeriod"],
+            30
+        );
+    }
+
+    #[test]
+    fn test_ws_heartbeat_absent_by_default() {
+        let config = XrayGenerator
+            .generate(
+                &[ws_vless_with_host_header(&[])],
+                &[],
+                &AppSettings::default(),
+            )
+            .unwrap();
+
+        assert!(
+            config["outbounds"][0]["streamSettings"]["wsSettings"]
+                .get("heartbeatPeriod")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_non_ws_outbound_untouched_by_host_migration() {
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &AppSettings::default())
+            .unwrap();
+
+        let stream = &config["outbounds"][0]["streamSettings"];
+        assert_eq!(stream["network"], "tcp");
+        assert!(stream.get("wsSettings").is_none());
     }
 
     fn vless_without_xtls() -> ProxyNode {

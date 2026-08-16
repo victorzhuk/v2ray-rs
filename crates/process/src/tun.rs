@@ -23,6 +23,10 @@ pub struct TunRuntime {
     pub addr_v6: Option<String>,
     pub helper_path: PathBuf,
     pub bypass_uid: Option<u32>,
+    /// Steer port-53 traffic into the tunnel table. Without it a resolver on the
+    /// local subnet is reached through the preserved LAN route, so the host
+    /// resolves every name outside the tunnel.
+    pub capture_dns: bool,
 }
 
 impl TunRuntime {
@@ -115,6 +119,9 @@ pub async fn xray_up(rt: &TunRuntime) -> std::io::Result<bool> {
     if let Some(uid) = rt.bypass_uid {
         cmd.arg("--bypass-uid").arg(uid.to_string());
     }
+    if rt.capture_dns {
+        cmd.arg("--capture-dns");
+    }
     Ok(cmd.status().await?.success())
 }
 
@@ -153,6 +160,7 @@ mod tests {
             addr_v6: None,
             helper_path: PathBuf::from("v2ray-rs-netctl"),
             bypass_uid: None,
+            capture_dns: false,
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());

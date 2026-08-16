@@ -138,6 +138,23 @@ pub(super) fn build_network_page(
         .build();
     ports_group.add(&idle_timeout_row);
 
+    // Only the xray generator emits `wsSettings.heartbeatPeriod`; leaving the
+    // control live on the other backends would offer a setting that does nothing.
+    let ws_heartbeat_row = adw::SpinRow::builder()
+        .title("WebSocket ping interval (seconds)")
+        .subtitle("xray only. 0 disables. Keeps NATs and middleboxes from dropping idle ws tunnels")
+        .sensitive(backend_type == BackendType::Xray)
+        .adjustment(&gtk::Adjustment::new(
+            s.ws_heartbeat_secs as f64,
+            0.0,
+            600.0,
+            5.0,
+            0.0,
+            0.0,
+        ))
+        .build();
+    ports_group.add(&ws_heartbeat_row);
+
     let listen_address_row = adw::EntryRow::builder()
         .title("Listen address")
         .text(s.listen_address.as_str())
@@ -526,6 +543,14 @@ pub(super) fn build_network_page(
     {
         let st = state.clone();
         let cb = cb.clone();
+        ws_heartbeat_row.connect_changed(move |row| {
+            st.borrow_mut().ws_heartbeat_secs = row.value() as u32;
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
         let status_row = listen_address_status.clone();
         let toast_cb = toast_cb.clone();
         listen_address_row.connect_apply(move |row| {
@@ -646,8 +671,10 @@ pub(super) fn build_network_page(
         let geodata_row = geodata_row.clone();
         let detected_state = detected_state.clone();
         let paths = paths.clone();
+        let ws_heartbeat_row = ws_heartbeat_row.clone();
         subscribe_settings(settings_observers, move |settings| {
             custom_type_row.set_selected(settings.backend.backend_type.to_index());
+            ws_heartbeat_row.set_sensitive(settings.backend.backend_type == BackendType::Xray);
 
             let detected = detected_state.borrow();
             set_current_backend_status(&custom_status_row, settings, &detected);

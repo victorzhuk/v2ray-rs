@@ -3,8 +3,9 @@ use std::process::Command;
 
 use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, DnsHijackMode, DnsProtocol, DnsServerConfig, ProxyNode, RoutingRule, RuleAction,
-    RuleMatch, ShadowsocksConfig,
+    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig, ProxyNode,
+    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings, TransportSettings,
+    VlessConfig, WsSettings,
 };
 
 fn xray_available() -> bool {
@@ -30,8 +31,17 @@ fn check(name: &str, settings: &AppSettings) {
 }
 
 fn check_with_rules(name: &str, settings: &AppSettings, rules: &[RoutingRule]) {
+    check_with_nodes(name, settings, rules, &[ss_node()]);
+}
+
+fn check_with_nodes(
+    name: &str,
+    settings: &AppSettings,
+    rules: &[RoutingRule],
+    nodes: &[ProxyNode],
+) {
     let config = XrayGenerator
-        .generate(&[ss_node()], rules, settings)
+        .generate(nodes, rules, settings)
         .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
     let json = serde_json::to_string_pretty(&config).unwrap();
 
@@ -101,6 +111,72 @@ fn generated_xray_configs_pass_xray_test() {
     }
 }
 
+fn ws_node() -> ProxyNode {
+    ProxyNode::Vless(VlessConfig {
+        address: "ws.example.com".into(),
+        port: 443,
+        uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+        encryption: Some("none".into()),
+        flow: None,
+        transport: TransportSettings::Ws(WsSettings {
+            path: "/ws".into(),
+            host: Some("cdn.example.com".into()),
+            headers: Default::default(),
+        }),
+        tls: Some(TlsSettings {
+            server_name: Some("ws.example.com".into()),
+            ..Default::default()
+        }),
+        remark: Some("Pinned WS".into()),
+    })
+}
+
+#[test]
+fn pinned_node_and_ws_transport_options_pass_xray_test() {
+    if !xray_available() {
+        eprintln!("xray not found in PATH, skipping");
+        return;
+    }
+
+    let pinned = ConnectionNodeRef::Manual {
+        node_id: uuid::Uuid::new_v4(),
+    };
+    let rules = vec![
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "api.z.ai".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: Some(pinned),
+        },
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::GeoIp {
+                country_code: "RU".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+            via_node: None,
+        },
+    ];
+
+    let settings = AppSettings {
+        ws_heartbeat_secs: 30,
+        ..Default::default()
+    };
+
+    check_with_nodes(
+        "pinned-node-with-ws-heartbeat",
+        &settings,
+        &rules,
+        &[ss_node(), ws_node()],
+    );
+}
+
 #[test]
 fn new_rule_kinds_pass_xray_test() {
     if !xray_available() {
@@ -117,6 +193,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -126,6 +203,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -135,6 +213,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -144,6 +223,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -153,6 +233,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
         RoutingRule {
             id: uuid::Uuid::new_v4(),
@@ -162,6 +243,7 @@ fn new_rule_kinds_pass_xray_test() {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         },
     ];
 
