@@ -4,9 +4,10 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, BackendType, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings,
-    H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
-    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    AppSettings, BackendType, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch,
+    DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
+    ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig,
+    WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -35,11 +36,12 @@ fn assemble(
     settings: &AppSettings,
 ) -> Result<Value, ConfigError> {
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
+    let via_tags = super::v2ray::via_outbound_tags(nodes, rules);
     let mut config = json!({
         "log": { "level": "warn" },
         "inbounds": build_inbounds(settings),
         "outbounds": build_outbounds(nodes)?,
-        "route": build_route(rules, &first_proxy_tag, settings),
+        "route": build_route(rules, &first_proxy_tag, &via_tags, settings),
     });
 
     if settings.dns.enabled {
@@ -579,7 +581,12 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
     dns_config
 }
 
-fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSettings) -> Value {
+fn build_route(
+    rules: &[RoutingRule],
+    first_proxy_tag: &str,
+    via_tags: &[(ConnectionNodeRef, String)],
+    settings: &AppSettings,
+) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
     let mut route_rules: Vec<Value> = Vec::new();
@@ -668,7 +675,7 @@ fn build_route(rules: &[RoutingRule], first_proxy_tag: &str, settings: &AppSetti
 
     let user_rules: Vec<Value> = enabled
         .iter()
-        .map(|r| build_route_rule(r, first_proxy_tag))
+        .map(|r| build_route_rule(r, first_proxy_tag, via_tags))
         .collect();
     route_rules.extend(user_rules);
 
@@ -711,9 +718,17 @@ pub(crate) fn apply_local_rule_sets(config: &mut Value, rule_sets_dir: &std::pat
     }
 }
 
-fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
+fn build_route_rule(
+    rule: &RoutingRule,
+    first_proxy_tag: &str,
+    via_tags: &[(ConnectionNodeRef, String)],
+) -> Value {
+    let proxy_tag;
     let outbound = match rule.action {
-        RuleAction::Proxy => first_proxy_tag,
+        RuleAction::Proxy => {
+            proxy_tag = super::v2ray::proxy_tag_for(rule, first_proxy_tag, via_tags);
+            proxy_tag.as_str()
+        }
         RuleAction::Direct => "direct",
         RuleAction::Block => "block",
     };
@@ -723,10 +738,12 @@ fn build_route_rule(rule: &RoutingRule, first_proxy_tag: &str) -> Value {
         // category; SagerNet's sing-geoip mirror ships no such .srs (404 -
         // there's nothing to download). sing-box has this as a dedicated
         // rule field instead.
-        RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => json!({
-            "ip_is_private": true,
-            "outbound": outbound,
-        }),
+        RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => {
+            json!({
+                "ip_is_private": true,
+                "outbound": outbound,
+            })
+        }
         RuleMatch::GeoIp { country_code } => json!({
             "rule_set": [format!("geoip-{}", country_code.to_lowercase())],
             "outbound": outbound,
@@ -1198,6 +1215,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1237,6 +1255,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1272,6 +1291,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1293,6 +1313,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1314,6 +1335,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1335,6 +1357,7 @@ mod tests {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1367,6 +1390,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1393,6 +1417,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }];
 
         let config = generator
@@ -1465,6 +1490,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: false,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -1474,6 +1500,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 
@@ -1906,6 +1933,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -1915,6 +1943,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -1924,6 +1953,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 

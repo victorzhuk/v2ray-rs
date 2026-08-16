@@ -517,6 +517,7 @@ fn push_rule(
             action,
             enabled: true,
             group: None,
+            via_node: None,
         }),
         Err(e) => skipped.push(format!("routing rule {idx}: {e}, ignored")),
     }

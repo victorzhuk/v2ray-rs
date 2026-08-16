@@ -75,6 +75,15 @@ pub(super) fn build_tun_page(
         ))
         .build();
     primary.add(&mtu_row);
+
+    // Both generators act on this, so it does not belong with the sing-box-only
+    // advanced rows: xray gets a udp/53 routing rule plus a `dns` outbound.
+    let hijack_row = adw::ComboRow::builder()
+        .title("DNS hijack")
+        .model(&gtk::StringList::new(&["hijack", "native", "disabled"]))
+        .selected(hijack_to_index(state.borrow().tun.dns_hijack))
+        .build();
+    primary.add(&hijack_row);
     page.add(&primary);
 
     // --- Advanced -----------------------------------------------------------
@@ -103,13 +112,6 @@ pub(super) fn build_tun_page(
         .active(state.borrow().tun.strict_route)
         .build();
     advanced.add_row(&strict_row);
-
-    let hijack_row = adw::ComboRow::builder()
-        .title("DNS hijack")
-        .model(&gtk::StringList::new(&["hijack", "native", "disabled"]))
-        .selected(hijack_to_index(state.borrow().tun.dns_hijack))
-        .build();
-    advanced.add_row(&hijack_row);
 
     advanced_group.add(&advanced);
     page.add(&advanced_group);
@@ -668,7 +670,7 @@ pub(super) fn build_tun_page(
             apps_note.set_visible(backend == BackendType::Xray);
             stack_row.set_sensitive(singbox_only);
             strict_row.set_sensitive(singbox_only);
-            hijack_row.set_sensitive(singbox_only);
+            hijack_row.set_sensitive(backend != BackendType::V2ray);
             routes_group.set_sensitive(backend != BackendType::V2ray);
             domains_group.set_sensitive(backend != BackendType::V2ray);
             apps_group.set_sensitive(singbox_only);
@@ -679,7 +681,7 @@ pub(super) fn build_tun_page(
     let singbox_only = backend == BackendType::SingBox;
     stack_row.set_sensitive(singbox_only);
     strict_row.set_sensitive(singbox_only);
-    hijack_row.set_sensitive(singbox_only);
+    hijack_row.set_sensitive(backend != BackendType::V2ray);
     routes_group.set_sensitive(backend != BackendType::V2ray);
     domains_group.set_sensitive(backend != BackendType::V2ray);
     apps_group.set_sensitive(singbox_only);

@@ -40,6 +40,7 @@ impl Preset {
                 action: pr.action,
                 enabled: true,
                 group: Some(self.name.clone()),
+                via_node: None,
             })
             .collect()
     }

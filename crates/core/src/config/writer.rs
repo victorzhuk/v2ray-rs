@@ -161,6 +161,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         }]
     }
 
@@ -301,6 +302,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -310,6 +312,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 
@@ -355,6 +358,7 @@ mod tests {
                 action: RuleAction::Direct,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
             RoutingRule {
                 id: uuid::Uuid::new_v4(),
@@ -364,6 +368,7 @@ mod tests {
                 action: RuleAction::Proxy,
                 enabled: true,
                 group: None,
+                via_node: None,
             },
         ];
 

@@ -144,6 +144,11 @@ pub struct AppSettings {
     pub listen_address: String,
     #[serde(default = "default_idle_timeout_secs")]
     pub idle_timeout_secs: u32,
+    /// Interval between WebSocket Ping frames on ws outbounds, in seconds. `0`
+    /// leaves xray at its default of sending none. Only reaches the transport,
+    /// so it holds middleboxes open but does not feed the far end's idle timer.
+    #[serde(default)]
+    pub ws_heartbeat_secs: u32,
     #[serde(default, deserialize_with = "deserialize_auto_resolve_strategy")]
     pub auto_resolve_strategy: AutoResolveStrategy,
     #[serde(default)]
@@ -219,6 +224,7 @@ impl Default for AppSettings {
             http_port: 1081,
             listen_address: default_listen_address(),
             idle_timeout_secs: default_idle_timeout_secs(),
+            ws_heartbeat_secs: 0,
             auto_resolve_strategy: AutoResolveStrategy::default(),
             last_success: None,
             auto_update_subscriptions: true,

@@ -40,6 +40,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         });
 
         save_routing_rules(&paths, &rules).unwrap();

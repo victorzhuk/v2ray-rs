@@ -93,6 +93,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled,
             group: None,
+            via_node: None,
         }
     }
 

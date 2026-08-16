@@ -6,8 +6,69 @@ use serde::{Deserialize, Serialize};
 
 use crate::models::{
     AutoResolveStrategy, ConnectionNodeRef, LastSuccessMetadata, LatencySample, ManualNode,
-    ProxyNode, Subscription,
+    ProxyNode, RoutingRule, Subscription,
 };
+
+/// Resolves the nodes named by rules' `via_node`, in first-appearance order
+/// among enabled rules, and clears every reference that no longer resolves so
+/// those rules fall back to the connected node.
+///
+/// The returned nodes go after the connected one in the slice handed to the
+/// config generator; that is the ordering the generator reconstructs to map a
+/// rule back to its outbound. Pruning here is what keeps the two sides agreeing
+/// when a node has been deleted or disabled since the rule was written.
+pub fn resolve_via_nodes(
+    rules: &mut [RoutingRule],
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+) -> Vec<ProxyNode> {
+    let mut resolved: Vec<ConnectionNodeRef> = Vec::new();
+    let mut nodes = Vec::new();
+
+    for rule in rules.iter().filter(|r| r.enabled) {
+        let Some(node_ref) = rule.via_node else {
+            continue;
+        };
+        if resolved.contains(&node_ref) {
+            continue;
+        }
+        if let Some(node) = via_node(node_ref, subscriptions, manual_nodes) {
+            resolved.push(node_ref);
+            nodes.push(node);
+        }
+    }
+
+    for rule in rules.iter_mut() {
+        if let Some(node_ref) = rule.via_node
+            && !resolved.contains(&node_ref)
+        {
+            rule.via_node = None;
+        }
+    }
+
+    nodes
+}
+
+fn via_node(
+    node_ref: ConnectionNodeRef,
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+) -> Option<ProxyNode> {
+    match node_ref {
+        ConnectionNodeRef::Subscription {
+            subscription_id,
+            node_id,
+        } => {
+            let sub = subscriptions.iter().find(|s| s.id == subscription_id)?;
+            let node = sub.nodes.iter().find(|n| n.id == node_id)?;
+            node.enabled.then(|| node.node.clone())
+        }
+        ConnectionNodeRef::Manual { node_id } => {
+            let manual = manual_nodes.iter().find(|n| n.id == node_id)?;
+            manual.enabled.then(|| manual.node.clone())
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ConnectionCandidate {
@@ -601,6 +662,95 @@ mod tests {
 
     fn manual_node(addr: &str, remark: &str) -> ManualNode {
         ManualNode::new(vless_node(addr, remark))
+    }
+
+    fn via_rule(via_node: Option<ConnectionNodeRef>) -> crate::models::RoutingRule {
+        crate::models::RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: crate::models::RuleMatch::Domain {
+                pattern: "api.z.ai".into(),
+            },
+            action: crate::models::RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node,
+        }
+    }
+
+    #[test]
+    fn resolve_via_nodes_returns_pinned_node_and_keeps_the_reference() {
+        let sub = subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), true, None)]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        let mut rules = vec![via_rule(Some(node_ref))];
+
+        let nodes = resolve_via_nodes(&mut rules, &[sub], &[]);
+
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].address(), "a.com");
+        assert_eq!(rules[0].via_node, Some(node_ref));
+    }
+
+    #[test]
+    fn resolve_via_nodes_clears_references_that_no_longer_resolve() {
+        let mut rules = vec![via_rule(Some(ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        }))];
+
+        let nodes = resolve_via_nodes(&mut rules, &[], &[]);
+
+        assert!(nodes.is_empty());
+        assert_eq!(
+            rules[0].via_node, None,
+            "an unresolvable pin must fall back to the connected node"
+        );
+    }
+
+    #[test]
+    fn resolve_via_nodes_clears_references_to_disabled_nodes() {
+        let sub = subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), false, None)]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        let mut rules = vec![via_rule(Some(node_ref))];
+
+        let nodes = resolve_via_nodes(&mut rules, &[sub], &[]);
+
+        assert!(nodes.is_empty());
+        assert_eq!(rules[0].via_node, None);
+    }
+
+    #[test]
+    fn resolve_via_nodes_emits_one_node_per_distinct_reference() {
+        let sub = subscription_with_nodes(
+            "Alpha",
+            vec![
+                (vless_node("a.com", "A"), true, None),
+                (vless_node("b.com", "B"), true, None),
+            ],
+        );
+        let first = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        let second = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[1].id,
+        };
+        let mut rules = vec![
+            via_rule(Some(first)),
+            via_rule(Some(second)),
+            via_rule(Some(first)),
+        ];
+
+        let nodes = resolve_via_nodes(&mut rules, &[sub], &[]);
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].address(), "a.com");
+        assert_eq!(nodes[1].address(), "b.com");
     }
 
     #[test]

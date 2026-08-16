@@ -2,6 +2,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use super::resolve::ConnectionNodeRef;
 use super::validation::{ValidationError, validate_rule_match};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -12,6 +13,11 @@ pub struct RoutingRule {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    /// Sends this rule's traffic through a specific node instead of the one the
+    /// connection was established on. Only meaningful with `RuleAction::Proxy`;
+    /// a node that no longer resolves falls back to the connected one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via_node: Option<ConnectionNodeRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -146,6 +152,7 @@ mod tests {
             action,
             enabled: true,
             group: None,
+            via_node: None,
         }
     }
 
@@ -232,6 +239,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -248,6 +256,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -264,6 +273,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -280,6 +290,7 @@ mod tests {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -296,6 +307,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -312,6 +324,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -328,6 +341,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         };
         let json = serde_json::to_string(&rule).unwrap();
         let deserialized: RoutingRule = serde_json::from_str(&json).unwrap();
@@ -345,6 +359,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
 
         let result = set.add_validated(rule.clone());
@@ -364,6 +379,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
 
         let result = set.add_validated(rule);
@@ -382,6 +398,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
 
         let result = set.add_validated(rule);
@@ -405,6 +422,7 @@ mod tests {
             action: RuleAction::Block,
             enabled: true,
             group: None,
+            via_node: None,
         };
 
         let result = set.add_at(1, r_middle.clone());
@@ -426,6 +444,7 @@ mod tests {
             action: RuleAction::Proxy,
             enabled: true,
             group: None,
+            via_node: None,
         };
 
         let result = set.add_at(0, rule);

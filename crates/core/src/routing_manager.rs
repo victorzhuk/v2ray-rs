@@ -113,6 +113,7 @@ mod tests {
             action,
             enabled: true,
             group: None,
+            via_node: None,
         }
     }
 
@@ -137,6 +138,7 @@ mod tests {
             action: RuleAction::Direct,
             enabled: true,
             group: None,
+            via_node: None,
         };
         assert!(mgr.add_rule(rule).is_err());
         assert!(mgr.rules().rules().is_empty());
