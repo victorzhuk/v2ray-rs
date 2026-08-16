@@ -2,8 +2,11 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
+use rtnetlink::packet_route::IpProtocol;
 use rtnetlink::packet_route::route::{RouteAttribute, RouteScope};
-use rtnetlink::packet_route::rule::{RuleAction, RuleAttribute, RuleMessage, RuleUidRange};
+use rtnetlink::packet_route::rule::{
+    RuleAction, RuleAttribute, RuleMessage, RulePortRange, RuleUidRange,
+};
 use rtnetlink::{Handle, IpVersion, LinkUnspec, RouteMessageBuilder, new_connection};
 
 /// Route table sing-box uses for its `auto_route` policy routing. Used by the
@@ -25,6 +28,15 @@ const RT_TABLE_MAIN: u32 = 254;
 /// Per-UID bypass: traffic owned by the bypass UID reaches `main` ahead of the
 /// capture rules, so it egresses the real interface instead of the tunnel.
 const RULE_PREF_BYPASS_UID: u32 = 8998;
+
+/// DNS capture: port-53 traffic reaches the tunnel table ahead of the rule that
+/// keeps LAN routes working, so a resolver on the local subnet stops being the
+/// one exception the tunnel never sees. Matched on an unmarked fwmark so the
+/// proxy's own resolver queries still take the bypass at
+/// [`RULE_PREF_BYPASS`] instead of looping back in.
+const RULE_PREF_DNS: u32 = 8999;
+
+const DNS_PORT: u16 = 53;
 
 /// Policy-rule priorities, evaluated after `local` (0) and before `main` (32766).
 const RULE_PREF_BYPASS: u32 = 9000;
@@ -52,6 +64,7 @@ pub async fn xray_up(
     v4: (IpAddr, u8),
     v6: Option<(IpAddr, u8)>,
     bypass_uid: Option<u32>,
+    capture_dns: bool,
 ) -> Result<(), String> {
     let index = link_index(handle, iface)
         .await?
@@ -71,12 +84,18 @@ pub async fn xray_up(
 
     add_default_route_v4(handle, index).await?;
     add_xray_rules(handle, AddressFamily::Inet).await?;
+    if capture_dns {
+        add_dns_capture_rules(handle, AddressFamily::Inet).await?;
+    }
     if let Some(uid) = bypass_uid {
         add_bypass_uid_rule(handle, AddressFamily::Inet, uid).await?;
     }
     if v6.is_some() {
         add_default_route_v6(handle, index).await?;
         add_xray_rules(handle, AddressFamily::Inet6).await?;
+        if capture_dns {
+            add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
+        }
         if let Some(uid) = bypass_uid {
             add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
         }
@@ -199,6 +218,40 @@ async fn add_xray_rules(handle: &Handle, family: AddressFamily) -> Result<(), St
     Ok(())
 }
 
+/// Steers port-53 traffic into the tunnel table for one address family.
+///
+/// Without this a resolver on the local subnet is reached through the LAN route
+/// that [`RULE_PREF_MAIN`] deliberately preserves, so every name the host looks
+/// up is resolved outside the tunnel. `fwmark 0/XRAY_FWMARK` excludes the
+/// proxy's own upstream queries, which carry the mark and must keep egressing
+/// the real interface.
+async fn add_dns_capture_rules(handle: &Handle, family: AddressFamily) -> Result<(), String> {
+    for proto in [IpProtocol::Udp, IpProtocol::Tcp] {
+        let mut req = handle.rule().add();
+        {
+            let msg = req.message_mut();
+            msg.header.family = family;
+            msg.header.action = RuleAction::ToTable;
+            msg.attributes.push(RuleAttribute::Table(XRAY_ROUTE_TABLE));
+            msg.attributes.push(RuleAttribute::Priority(RULE_PREF_DNS));
+            msg.attributes.push(RuleAttribute::FwMark(0));
+            msg.attributes.push(RuleAttribute::FwMask(XRAY_FWMARK));
+            msg.attributes.push(RuleAttribute::IpProtocol(proto));
+            msg.attributes
+                .push(RuleAttribute::DestinationPortRange(RulePortRange {
+                    start: DNS_PORT,
+                    end: DNS_PORT,
+                }));
+        }
+        match req.execute().await {
+            Ok(()) => {}
+            Err(e) if is_exists(&e) => {}
+            Err(e) => return Err(format!("add dns capture rule (pref {RULE_PREF_DNS}): {e}")),
+        }
+    }
+    Ok(())
+}
+
 async fn add_rule(
     handle: &Handle,
     family: AddressFamily,
@@ -280,7 +333,14 @@ fn is_xray_rule(rule: &RuleMessage) -> bool {
         matches!(
             attr,
             RuleAttribute::Priority(p)
-                if [RULE_PREF_BYPASS_UID, RULE_PREF_BYPASS, RULE_PREF_MAIN, RULE_PREF_TUN].contains(p)
+                if [
+                    RULE_PREF_BYPASS_UID,
+                    RULE_PREF_DNS,
+                    RULE_PREF_BYPASS,
+                    RULE_PREF_MAIN,
+                    RULE_PREF_TUN,
+                ]
+                .contains(p)
         )
     })
 }

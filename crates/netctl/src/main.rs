@@ -27,6 +27,10 @@ enum Command {
         addr6: Option<String>,
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         bypass_uid: Option<u32>,
+        /// Steer port-53 traffic into the tunnel table, so a resolver on the
+        /// local subnet is reached through the tunnel like everything else.
+        #[arg(long)]
+        capture_dns: bool,
     },
     /// Remove the xray TUN device (no-op if absent).
     XrayDown {
@@ -69,6 +73,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             addr,
             addr6,
             bypass_uid,
+            capture_dns,
         } => {
             validate::validate_iface(&iface)?;
             // The named device must be a TUN device the backend already created;
@@ -80,7 +85,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             let handle = net::connect()?;
-            net::xray_up(&handle, &iface, v4, v6, bypass_uid).await
+            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns).await
         }
         Command::XrayDown { iface } => {
             validate::validate_iface(&iface)?;
