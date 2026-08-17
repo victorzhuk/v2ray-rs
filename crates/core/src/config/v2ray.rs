@@ -459,17 +459,10 @@ fn build_routing(
             "inboundTag": [DNS_INTERNAL_TAG],
             "outboundTag": first_proxy_tag,
         }));
-        if settings.tun.dns_hijack == DnsHijackMode::Hijack {
-            // Both transports: the route helper steers tcp/53 into the tunnel
-            // alongside udp/53, and a resolver falling back to TCP on a
-            // truncated answer must not get a different view of the world.
-            routing_rules.push(json!({
-                "type": "field",
-                "network": "tcp,udp",
-                "port": 53,
-                "outboundTag": "dns-out",
-            }));
-        }
+        // Exclusions outrank the port-53 hijack below: xray takes the first
+        // matching rule, so a hijack rule placed first would swallow every
+        // query — including the ones aimed at a split-horizon resolver the user
+        // excluded precisely because only it holds those records.
         if !settings.tun.exclude_routes.is_empty() {
             routing_rules.push(json!({
                 "type": "field",
@@ -482,6 +475,17 @@ fn build_routing(
                 "type": "field",
                 "domain": &settings.tun.exclude_domains,
                 "outboundTag": "direct",
+            }));
+        }
+        if settings.tun.dns_hijack == DnsHijackMode::Hijack {
+            // Both transports: the route helper steers tcp/53 into the tunnel
+            // alongside udp/53, and a resolver falling back to TCP on a
+            // truncated answer must not get a different view of the world.
+            routing_rules.push(json!({
+                "type": "field",
+                "network": "tcp,udp",
+                "port": 53,
+                "outboundTag": "dns-out",
             }));
         }
     }
@@ -1979,6 +1983,41 @@ mod tests {
         assert_eq!(domain_rule["type"], "field");
         assert_eq!(domain_rule["domain"], json!(["example.com"]));
         assert_eq!(domain_rule["outboundTag"], "direct");
+    }
+
+    /// xray takes the first matching rule, so an exclusion listed after the
+    /// port-53 hijack never applies to DNS — which is the only traffic an
+    /// excluded split-horizon resolver exists to carry.
+    #[test]
+    fn test_xray_tun_exclusion_precedes_dns_hijack() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.dns_hijack = DnsHijackMode::Hijack;
+        settings.tun.exclude_routes = vec!["10.15.12.100/32".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string()];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let hijack = rules
+            .iter()
+            .position(|r| r["outboundTag"] == "dns-out")
+            .expect("dns hijack rule not found");
+        let ip = rules
+            .iter()
+            .position(|r| r.get("ip").is_some())
+            .expect("ip exclusion rule not found");
+        let domain = rules
+            .iter()
+            .position(|r| r.get("domain").is_some())
+            .expect("domain exclusion rule not found");
+
+        assert!(ip < hijack, "ip exclusion must precede the dns hijack");
+        assert!(
+            domain < hijack,
+            "domain exclusion must precede the dns hijack"
+        );
     }
 
     #[test]
