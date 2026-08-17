@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-08-17
+
+### Fixed
+- Under xray TUN, the excluded routes and domains now take precedence over the port-53 hijack rule. Xray applies the first matching routing rule, and the hijack was emitted first, so it swallowed every query — including the ones aimed at an excluded resolver. That made the exclusion useless in the case it exists for: a split-horizon corporate resolver reachable only over a separate VPN, holding internal records no public resolver can answer. Names in those zones resolved to nothing while the resolver itself stayed reachable on every other port, and a corporate VPN whose endpoint hostname had to be looked up before its tunnel existed could fail to connect at all.
+
 ## [0.16.0] - 2026-08-16
 
 ### Added
@@ -535,7 +540,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...HEAD
+[0.16.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.13.1...v0.14.0
