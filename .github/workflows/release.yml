@@ -135,8 +135,9 @@ jobs:
           apt-get install -y --no-install-recommends \
             pkgconf libgtk-4-dev libadwaita-1-dev libglib2.0-dev-bin \
             librsvg2-common adwaita-icon-theme libgdk-pixbuf2.0-bin \
-            desktop-file-utils ca-certificates curl file \
-            fuse3 libfuse2t64 xvfb
+            desktop-file-utils ca-certificates curl file binutils \
+            fuse3 libfuse2t64 xvfb \
+            dpkg-dev
       - uses: actions/download-artifact@v4
         with:
           name: tarball
