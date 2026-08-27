@@ -6,15 +6,23 @@ on:
 
 jobs:
   aur:
-    name: Publish to AUR
+    name: Publish ${{ matrix.pkgname }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkgname: v2ray-rs
+            pkgbuild: pkg/archlinux/PKGBUILD
+          - pkgname: v2ray-rs-bin
+            pkgbuild: pkg/archlinux/bin/PKGBUILD
     steps:
       - uses: actions/checkout@v6
       - name: Publish to AUR
         uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
         with:
-          pkgname: v2ray-rs
-          pkgbuild: pkg/archlinux/PKGBUILD
+          pkgname: ${{ matrix.pkgname }}
+          pkgbuild: ${{ matrix.pkgbuild }}
           assets: |
             pkg/archlinux/v2ray-rs.install
           commit_username: ${{ secrets.AUR_USERNAME }}

@@ -79,7 +79,7 @@ Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle manageme
 
 - **`privilege.rs`** — TUN capability model. `has_net_admin()` reads a binary's file capabilities via `getcap`; `grant()` runs a single `pkexec` elevation applying `setcap` to the backend binary and the route helper, and also sets root ownership + the setuid bit on the `v2ray-rs-run` wrapper when it is present; `file_caps_supported()` detects a `nosuid` mount and surfaces the manual `setcap` command.
 
-- **`tun.rs`** — `TunRuntime` (backend, iface, addresses, helper path, optional bypass UID), `helper_path()` and `run_path()` resolution (sibling of the running exe, else `$PATH`), `wait_for_device()` polling `/sys/class/net/<iface>`, and `xray_up`/`xray_down` helper invocations. `bypass_uid`, when set, is passed to `netctl xray-up --bypass-uid` so traffic from the `v2ray-rs-bypass` user skips the tunnel.
+- **`tun.rs`** — `TunRuntime` (backend, iface, addresses, helper path, optional bypass UID), `helper_path()`/`run_path()` resolution via the pure `pick_bin()` (capability-capable sibling of the running exe, else the relocated copy under `RELOCATE_DIR`, else the capability-less sibling, else `$PATH`), `wait_for_device()` polling `/sys/class/net/<iface>`, and `xray_up`/`xray_down` helper invocations. `bypass_uid`, when set, is passed to `netctl xray-up --bypass-uid` so traffic from the `v2ray-rs-bypass` user skips the tunnel.
 
 ### `crates/run` (`v2ray-rs-run`)
 
@@ -138,12 +138,15 @@ AppSettings + ProxyNodes + RoutingRuleSet → ConfigWriter → JSON config file
 
 ## Versioning
 
-When bumping the version, update all three places:
+When bumping the version, update all four places:
 1. `Cargo.toml` — `[workspace.package] version`
 2. `pkg/archlinux/PKGBUILD` — `pkgver`
-3. `CHANGELOG.md` — new section + link refs at bottom
+3. `pkg/archlinux/bin/PKGBUILD` — `pkgver`
+4. `CHANGELOG.md` — new section + link refs at bottom
 
 Then run `cargo check` to regenerate `Cargo.lock`.
+
+Release artifacts, the glibc/GTK floor, and the AUR publish order: `docs/RELEASE.md`.
 
 ## OpenSpec
 

@@ -244,3 +244,6 @@ ENV/
 ehthumbs.db
 Icon?
 nohup.out
+
+# Release staging (make dist)
+dist/

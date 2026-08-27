@@ -13,7 +13,6 @@ optdepends=(
     'sing-box: sing-box proxy backend'
     'polkit: one-time TUN privilege grant via pkexec'
 )
-options=(!lto)
 install=v2ray-rs.install
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
 sha256sums=('SKIP')
@@ -50,6 +49,11 @@ package() {
     install_icon "assets/com.github.v2ray-rs.desktop" \
         "crates/ui/assets/com.github.v2ray-rs.desktop" \
         "$pkgdir/usr/share/applications/com.github.v2ray-rs.desktop"
+    local lang
+    for lang in en_US ru_RU; do
+        install -Dm644 "locale/$lang/LC_MESSAGES/v2ray-rs.mo" \
+            "$pkgdir/usr/share/locale/$lang/LC_MESSAGES/v2ray-rs.mo"
+    done
     install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
 

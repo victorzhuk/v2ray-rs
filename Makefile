@@ -135,6 +135,7 @@ test-watch:
 clean:
 	@printf "$(YELLOW)Cleaning build artifacts...$(RESET)\n"
 	$(CARGO) clean
+	rm -rf dist
 
 # =============================================================================
 # Run Targets
@@ -183,11 +184,34 @@ fix:
 # Release Target
 # =============================================================================
 
-.PHONY: release
+.PHONY: release dist
 
+# `target-cpu=native` is deliberately absent: this profile also feeds `dist`,
+# and a native build is not portable off the machine that produced it.
 release:
 	@printf "$(GREEN)Building optimized release...$(RESET)\n"
-	RUSTFLAGS="-C target-cpu=native $(RUSTFLAGS)" $(CARGO) build --release $(CARGO_FLAGS)
+	$(CARGO) build --release $(CARGO_FLAGS)
+
+# Mirrors the CI tarball. The helpers are built static against musl; the GUI
+# links GTK dynamically and inherits this host's glibc, so a tarball produced
+# here is only portable to hosts at least as new.
+dist: VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+dist:
+	@printf "$(BLUE)Building dist artifacts for $(VERSION)...$(RESET)\n"
+	$(CARGO) build --release --locked -p v2ray-rs-ui
+	$(CARGO) build --release --locked --target x86_64-unknown-linux-musl \
+		-p v2ray-rs-netctl -p v2ray-rs-run
+	scripts/stage-dist.sh \
+		--version "$(VERSION)" \
+		--ui target/release/v2ray-rs-ui \
+		--netctl target/x86_64-unknown-linux-musl/release/v2ray-rs-netctl \
+		--run target/x86_64-unknown-linux-musl/release/v2ray-rs-run \
+		--out dist
+	tar -C dist -czf dist/v2ray-rs-x86_64-linux.tar.gz \
+		"v2ray-rs-$(VERSION)-x86_64-linux"
+	cd dist && sha256sum -b v2ray-rs-x86_64-linux.tar.gz \
+		> v2ray-rs-x86_64-linux.tar.gz.sha256
+	@printf "$(GREEN)dist/v2ray-rs-x86_64-linux.tar.gz$(RESET)\n"
 
 # =============================================================================
 # Help Target
@@ -241,6 +265,7 @@ help:
 	@echo ""
 	@printf "$(BLUE)Release:$(RESET)\n"
 	@echo "  make release        Build optimized release"
+	@echo "  make dist           Build the release tarball + checksum into dist/"
 	@echo ""
 	@printf "$(BLUE)Help:$(RESET)\n"
 	@echo "  make help           Show this help message"

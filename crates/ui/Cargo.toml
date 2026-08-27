@@ -42,5 +42,7 @@ assets = [
     ["assets/v2ray-rs.png", "usr/share/icons/hicolor/256x256/apps/com.github.v2ray-rs.png", "644"],
     ["crates/ui/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "644"],
     ["assets/com.github.v2ray-rs.desktop", "usr/share/applications/com.github.v2ray-rs.desktop", "644"],
+    ["locale/en_US/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/en_US/LC_MESSAGES/v2ray-rs.mo", "644"],
+    ["locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "644"],
     ["LICENSE", "usr/share/doc/v2ray-rs/copyright", "644"],
 ]

@@ -29,26 +29,95 @@
 
 ## Installation
 
+Prebuilt releases target **GTK 4.18 / libadwaita 1.7 and glibc 2.41** — Debian 13+,
+Ubuntu 25.04+, Fedora 42+, Arch, openSUSE Tumbleweed. On anything older, use the AppImage.
+
+### Install script
+
+```bash
+curl -fsSL https://github.com/victorzhuk/v2ray-rs/releases/latest/download/install.sh | sh
+```
+
+Installs under `$HOME/.local` by default:
+
+| Path | Contents |
+| --- | --- |
+| `bin/` | `v2ray-rs`, `v2ray-rs-netctl`, `v2ray-rs-run` |
+| `share/applications/` | desktop entry |
+| `share/icons/hicolor/` | app and symbolic icons |
+| `share/locale/` | `en_US`, `ru_RU` translations |
+
+The script verifies the download against a checksum baked in when the installer
+was published, falling back to the `.sha256` beside the tarball when you pin a
+different version or override the URL, and telling you plainly if it ends up
+with neither. It checks that GTK and libadwaita are new enough before unpacking
+anything, and adds `bin/` to `PATH` only when it is missing — appending to
+`~/.profile`, `~/.bashrc` and `~/.zshrc`, never creating a `~/.bash_profile`
+that would shadow an existing `~/.profile`.
+
+It never runs `sudo`. A home-directory install cannot support TUN mode, because
+the privileged helpers have to be owned by root; the script says so and points
+at the system-wide install or a distribution package (see [TUN mode](#tun-mode)).
+
+```bash
+V2RAY_RS_INSTALL_DIR=/usr/local sh install.sh   # different prefix
+V2RAY_RS_VERSION=0.16.1 sh install.sh           # pin a release
+V2RAY_RS_NO_MODIFY_PATH=1 sh install.sh         # leave shell rc files alone
+sh install.sh --uninstall                       # remove it again
+```
+
+### AppImage
+
+Self-contained, bundles GTK 4.18 and libadwaita — use it when your distribution
+ships something older.
+
+```bash
+curl -fsSLO https://github.com/victorzhuk/v2ray-rs/releases/latest/download/v2ray-rs-x86_64.AppImage
+chmod +x v2ray-rs-x86_64.AppImage
+./v2ray-rs-x86_64.AppImage
+```
+
+TUN mode works, with one extra step. An AppImage is mounted `nosuid`, so the
+route helper cannot hold `cap_net_admin` where it sits — **Grant TUN
+privileges** in the TUN preferences installs it to `/usr/local/lib/v2ray-rs/`
+during the same `pkexec` prompt and grants it there. Re-run the grant after
+updating the AppImage; the app prompts when it notices a stale helper.
+
+*Run with bypass* is unavailable from an AppImage: it needs the
+`v2ray-rs-bypass` system user, which only a distribution package creates.
+
 ### Arch Linux (AUR)
 
 ```bash
-yay -S v2ray-rs
+yay -S v2ray-rs-bin   # prebuilt from the release tarball
+yay -S v2ray-rs       # compiled from source
 ```
+
+Either package installs the privileged helpers and sets their capabilities
+through the install hook, so TUN mode works after a single re-login.
 
 ### From Source
 
+Requires GTK 4.18 and libadwaita 1.7 or newer.
+
 ```bash
 # Dependencies (Debian/Ubuntu)
-sudo apt install libgtk-4-dev libadwaita-1-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev protobuf-compiler
 
 # Dependencies (Fedora)
-sudo dnf install gtk4-devel libadwaita-devel
+sudo dnf install gtk4-devel libadwaita-devel protobuf-compiler
+
+# Dependencies (Arch)
+sudo pacman -S gtk4 libadwaita protobuf
 
 # Build
 git clone https://github.com/victorzhuk/v2ray-rs.git
 cd v2ray-rs
 cargo build --release
 ```
+
+`make dist` produces the same tarball the release workflow ships, provided the
+`x86_64-unknown-linux-musl` target is installed.
 
 You also need at least one proxy backend installed: `v2ray`, `xray`, or `sing-box`.
 
