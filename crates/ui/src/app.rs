@@ -1690,13 +1690,14 @@ pub fn run() {
 }
 
 fn try_run() -> Result<(), String> {
-    let cli_args = CliArgs::try_parse().map_err(|e: clap::error::Error| {
-        if e.use_stderr() {
-            let _ = e.print();
-            std::process::exit(e.exit_code());
-        }
-        e.to_string()
-    })?;
+    // clap sends --help/--version to stdout with exit code 0 and real errors to
+    // stderr; `print` and `exit_code` already know which. Routing the stdout
+    // cases through the startup-failure path printed help text to stderr and
+    // exited 1.
+    let cli_args = CliArgs::try_parse().unwrap_or_else(|e: clap::error::Error| {
+        let _ = e.print();
+        std::process::exit(e.exit_code());
+    });
 
     let profile = AppProfile::resolve(cli_args.profile.as_deref(), &StdEnv)
         .map_err(|e| format!("invalid profile: {e}"))?;

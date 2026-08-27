@@ -4,7 +4,7 @@ use clap::Parser;
 use v2ray_rs_core::cli::CliPaths;
 
 #[derive(Debug, Parser)]
-#[command(name = "v2ray-rs", about = "V2Ray/XRay proxy GUI")]
+#[command(name = "v2ray-rs", version, about = "V2Ray/XRay proxy GUI")]
 pub struct CliArgs {
     #[arg(long = "profile")]
     pub profile: Option<String>,
