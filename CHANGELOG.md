@@ -7,14 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.2] - 2026-08-27
+
+### Fixed
+- The AppImage release job now installs `xauth`. `xvfb-run` needs it and the
+  `xvfb` package does not pull it in, so the windowed smoke test aborted before
+  it could start the app. v0.17.0 and v0.17.1 were tagged but never published
+  for this and the `dpkg-dev` problem below; the 0.17.0 entry describes what
+  first ships in 0.17.2.
+
 ## [0.17.1] - 2026-08-27
 
 ### Fixed
 - The AppImage release job now installs `dpkg-dev`. `linuxdeploy-plugin-gtk`
   shells out to `dpkg-architecture` to pick the multiarch library directory and
   aborts without it, which failed the AppImage build and, with it, the release
-  and AUR jobs. v0.17.0 was tagged but never published for this reason; its
-  entry below describes what first ships in 0.17.1.
+  and AUR jobs. v0.17.0 was tagged but never published for this reason.
 
 ## [0.17.0] - 2026-08-27
 
@@ -593,7 +601,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.2...HEAD
+[0.17.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...v0.16.1
