@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-08-27
+
+### Added
+- Prebuilt release artifacts and a `curl | sh` installer. The GUI ships as a
+  tarball built against glibc 2.41, GTK 4.18, and libadwaita 1.7 — the floor the
+  app already required — so it runs on Debian 13+, Ubuntu 25.04+, Fedora 42+,
+  and Arch. The two privileged helpers are statically linked against musl and
+  carry no runtime dependency at all. The installer verifies the release
+  checksum, refuses to unpack onto a host whose GTK is too old, installs under
+  `$HOME/.local` by default, and prints the privileged TUN setup commands rather
+  than running them.
+- An AppImage bundling GTK 4.18 and libadwaita, for distributions below that
+  floor.
+- TUN mode now works from the AppImage. An AppImage is mounted `nosuid`, so the
+  route helper could never hold `cap_net_admin` where it sits; **Grant TUN
+  privileges** now installs it to `/usr/local/lib/v2ray-rs/` in the same
+  elevation and grants it there. The helper is streamed to the elevated process
+  on stdin rather than copied by it, because the kernel gives root no exemption
+  from FUSE's owner-only access rule and a copy under `pkexec` would fail on the
+  AppImage's own mount. It is restricted to a dedicated `v2ray-rs` system group,
+  matching the distribution package, so the grant asks you to log out and back
+  in once. The trigger is the mount refusing file capabilities rather than any
+  AppImage detection, so the same path covers a hardened `nosuid` `/home` or a
+  USB stick. The setuid bypass wrapper is deliberately excluded from the
+  AppImage: it requires a system user only a distribution package creates.
+- `v2ray-rs-bin` on the AUR, installing the prebuilt tarball instead of
+  compiling. It conflicts with `v2ray-rs` and shares the same install hook, so
+  the privileged helper setup is identical either way.
+- `make dist` builds the release tarball and its checksum locally.
+
+### Fixed
+- `v2ray-rs --help` and `--version` now print to stdout and exit 0. Both were
+  routed through the startup-failure path, so help text went to stderr behind a
+  "startup failed" prefix and the process exited 1.
+- Translations are now installed. The `en_US` and `ru_RU` catalogs were built
+  and committed but shipped by neither the Arch package nor the Debian metadata,
+  so every packaged install silently fell back to untranslated strings.
+
+### Changed
+- Release builds are now optimised with thin LTO, a single codegen unit, and
+  stripped symbols.
+- `make release` no longer passes `-C target-cpu=native`, which produced
+  binaries that could not run off the machine that built them.
+
 ## [0.16.1] - 2026-08-17
 
 ### Fixed
@@ -540,7 +584,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.14.0...v0.15.0
