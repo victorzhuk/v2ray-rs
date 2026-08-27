@@ -207,22 +207,22 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: tarball
-          path: assets
+          path: release-assets
       - uses: actions/download-artifact@v4
         with:
           name: appimage
-          path: assets
+          path: release-assets
       - name: Collect PKGBUILDs
         run: |
-          cp pkg/archlinux/PKGBUILD assets/PKGBUILD
-          cp pkg/archlinux/bin/PKGBUILD assets/PKGBUILD-bin
+          cp pkg/archlinux/PKGBUILD release-assets/PKGBUILD
+          cp pkg/archlinux/bin/PKGBUILD release-assets/PKGBUILD-bin
           # Both recipes declare install=v2ray-rs.install; without it a
           # downloaded PKGBUILD cannot be built.
-          cp pkg/archlinux/v2ray-rs.install assets/v2ray-rs.install
+          cp pkg/archlinux/v2ray-rs.install release-assets/v2ray-rs.install
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          files: assets/*
+          files: release-assets/*
 
   aur:
     name: Publish to AUR
