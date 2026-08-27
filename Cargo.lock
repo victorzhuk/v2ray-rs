@@ -3584,7 +3584,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-core"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "chrono",
  "directories",
@@ -3606,7 +3606,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-netctl"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "clap",
  "futures",
@@ -3617,7 +3617,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-process"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "log",
  "nix 0.31.1",
@@ -3631,14 +3631,14 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-run"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "v2ray-rs-subscription"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3664,7 +3664,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-tray"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "chrono",
  "ksni",
@@ -3680,7 +3680,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-ui"
-version = "0.17.0"
+version = "0.17.1"
 dependencies = [
  "base64",
  "chrono",

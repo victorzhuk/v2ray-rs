@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.1] - 2026-08-27
+
+### Fixed
+- The AppImage release job now installs `dpkg-dev`. `linuxdeploy-plugin-gtk`
+  shells out to `dpkg-architecture` to pick the multiarch library directory and
+  aborts without it, which failed the AppImage build and, with it, the release
+  and AUR jobs. v0.17.0 was tagged but never published for this reason; its
+  entry below describes what first ships in 0.17.1.
+
 ## [0.17.0] - 2026-08-27
 
 ### Added
@@ -584,7 +593,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.1...HEAD
+[0.17.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...v0.17.0
 [0.16.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.0...v0.16.1
 [0.16.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.15.0...v0.16.0
