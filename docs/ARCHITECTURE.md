@@ -242,6 +242,89 @@ running executable before elevating; it never passes a bare/relative name to the
 root `setcap`/`chown`/`chmod`, which would otherwise resolve against the process
 CWD.
 
+### Relocating the helper off a `nosuid` mount
+
+An AppImage's squashfs is mounted `nosuid` by the kernel and its mount point
+changes on every launch, so a bundled `v2ray-rs-netctl` can never hold
+capabilities where it sits. The grant therefore has two plans, chosen by
+`privilege::plan_grant()`:
+
+| Plan | When | What the elevation does |
+|---|---|---|
+| `InPlace` | the bundled helper's mount honours file capabilities | `setcap` where the binaries already are |
+| `Relocate` | it does not | copy the helper to `/usr/local/lib/v2ray-rs/`, then `setcap` there |
+
+`tun::RELOCATE_DIR` is `/usr/local/lib/v2ray-rs`. It is root-owned and off
+`$PATH`, so the invoking user cannot tamper with the directory and a relocated
+copy cannot shadow a distribution package's `/usr/bin` binaries. `~/.local/lib`
+is not an option: a user-writable directory breaks the trusted-path-prefix
+assumption that file capabilities rest on.
+
+`tun::pick_bin()` decides which copy runs. A bundled copy that can hold
+capabilities always wins, so a stale relocated copy never shadows a correct
+package install; a relocated copy comes next; a capability-less bundled copy is
+still preferred over `$PATH`, so the failure is a visible permission error
+rather than a silent jump to an unrelated binary.
+
+**Root cannot read the AppImage it is installing from.** A squashfuse mount
+carries no `allow_other` (an unprivileged mount cannot set it without
+`user_allow_other` in `/etc/fuse.conf`), and the kernel's
+`fuse_allow_current_process()` grants root no exemption — only the mounting uid
+may access the mount, and `pkexec` stays in the same mount namespace. A `cp`
+under the elevation would therefore fail with `EACCES` on exactly the file it
+exists to install. So the helper is **streamed in on stdin**: the unprivileged
+process, which *is* the mounting uid, opens the file and `run_elevation()`
+passes the descriptor as the elevated shell's stdin. Root only ever writes the
+destination.
+
+Constraints on the relocating elevation:
+
+- The payload source comes from `/proc/self/exe` only, never `$APPDIR`. Taking
+  it from the environment would let anything able to set that variable — a
+  rewritten desktop entry, say — choose what root installs.
+- `privilege::validated_source()` stats the path as given (before
+  `canonicalize` resolves the final component away), canonicalizes it, and
+  refuses anything that is not a regular file beside our own executable. Opening
+  it here rather than naming it to root also closes the window between checking
+  the path and reading it.
+- The destination directory is created inside the elevation with an explicit
+  `chown root:root` and `chmod 0755`, never relying on the inherited umask.
+- `chown` runs before `chmod`/`setcap`, since it clears both file capabilities
+  and the setuid bit. The destination mode is set absolutely, and `rm -f` before
+  the redirect forces a fresh inode, so no attribute of any previous file at
+  that path survives.
+- The result is `0750 root:v2ray-rs`, using the same dedicated system group the
+  package hook creates. The invoker's *primary* group is deliberately not used:
+  where a distribution shares one across accounts (gid 100 `users`), that would
+  hand every local user a `cap_net_admin` binary. The elevation adds the invoker
+  to the group, so the first grant needs a re-login — `tun::helper_needs_relogin()`
+  detects that and the preferences page says so.
+- The grant rewrites the destination unconditionally, so re-granting is the
+  universal repair. `tun::helpers_stale()` compares size and mtime against the
+  bundled copy: the destination's mtime is the time of the last grant, so a
+  newer source is exactly the "needs re-granting" condition. It is pure metadata
+  because the preferences page polls it on every settings change, on the GTK
+  thread — an earlier version spawned `netctl --version` there with no timeout.
+- After the elevation, `grant()` confirms the destination is a regular file
+  carrying `cap_net_admin`. A `getcap` that cannot be run is not treated as
+  failure: it may simply be absent from the user's `PATH` while the elevation's
+  `setcap` worked fine.
+- `preflight_targets()` checks the *destination* directory's mount, not the
+  bundled copy's — the latter is known `nosuid`, which is the whole reason for
+  relocating.
+
+`v2ray-rs-run` is deliberately **not** relocated and not shipped in the
+AppImage. It drops to the `v2ray-rs-bypass` system user
+(`crates/run/src/main.rs`), which only a distribution package creates, so a
+setuid-root copy outside one could not function and would be pure attack
+surface. The TUN page hides *Run with bypass* when that user is absent.
+
+Two residual risks are accepted rather than fixed: a same-user process that
+overwrites the `.AppImage` before a grant (indistinguishable from the existing
+risk of running any downloaded AppImage and then authenticating a root prompt —
+only bundle signature verification would address it), and the TOCTOU window
+between the Rust-side source validation and the root-side `cp`.
+
 ## On-disk layout
 
 ```

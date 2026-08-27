@@ -14,6 +14,36 @@ use super::{SettingsCallback, SettingsObservers, ToastCallback, subscribe_settin
 
 type RenderFn = Rc<dyn Fn()>;
 
+/// Why the route helper still needs a privileged grant, or `None` when it is
+/// ready. The backend holding CAP_NET_ADMIN says nothing about the helper, which
+/// is granted separately and can be missing, stale, or simply never have taken
+/// the capability -- the package hook tolerates `setcap` failing with a warning.
+fn helper_install_reason() -> Option<&'static str> {
+    if v2ray_rs_process::relocation_required() {
+        if !v2ray_rs_process::relocated_helper_path().exists() {
+            return Some("Route helper needs installing before TUN can start");
+        }
+        // The grant adds the user to a system group, which the running session
+        // does not pick up. Say so rather than letting the next connect fail
+        // with a bare permission error.
+        if v2ray_rs_process::helper_needs_relogin() {
+            return Some("Log out and back in to finish enabling TUN");
+        }
+        if v2ray_rs_process::helpers_stale() {
+            return Some("Installed route helper is out of date; grant again");
+        }
+        return None;
+    }
+
+    match v2ray_rs_process::has_net_admin(&v2ray_rs_process::helper_path()) {
+        Ok(true) => None,
+        Ok(false) => Some("Route helper lacks CAP_NET_ADMIN"),
+        // Unreadable capabilities are not proof of absence; leave the row alone
+        // rather than nagging about a helper that may well be fine.
+        Err(_) => None,
+    }
+}
+
 pub(super) fn build_tun_page(
     state: &Rc<RefCell<AppSettings>>,
     cb: &SettingsCallback,
@@ -424,13 +454,25 @@ pub(super) fn build_tun_page(
         .build();
 
     let run_bin = v2ray_rs_process::run_path();
-    let wrapper_available = run_bin.is_file()
+    let wrapper_on_disk = run_bin.is_file()
         || std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .any(|dir| dir.join(&run_bin).is_file());
+    // The wrapper drops to this user and exits with "user not found" without it.
+    // Nothing outside a distribution package creates it, so an AppImage never
+    // has one.
+    let bypass_user_exists = nix::unistd::User::from_name(v2ray_rs_process::BYPASS_USER)
+        .ok()
+        .flatten()
+        .is_some();
+    let wrapper_available = wrapper_on_disk && bypass_user_exists;
 
     let run_note = adw::ActionRow::builder()
-        .title("Wrapper not found")
-        .subtitle("Install v2ray-rs-run and grant privileges first")
+        .title("Wrapper not available")
+        .subtitle(if wrapper_on_disk {
+            "The v2ray-rs-bypass system user is missing; install the distribution package"
+        } else {
+            "Install v2ray-rs-run and grant privileges first"
+        })
         .visible(!wrapper_available)
         .build();
     run_group.add(&run_note);
@@ -492,6 +534,7 @@ pub(super) fn build_tun_page(
                 None => {
                     cap_row.set_subtitle("Configure a backend binary first");
                     grant_button.set_visible(false);
+                    return;
                 }
                 Some(path) => match v2ray_rs_process::has_net_admin(&path) {
                     Ok(true) => {
@@ -501,12 +544,22 @@ pub(super) fn build_tun_page(
                     Ok(false) => {
                         cap_row.set_subtitle("Backend lacks CAP_NET_ADMIN");
                         grant_button.set_visible(true);
+                        return;
                     }
                     Err(err) => {
                         cap_row.set_subtitle(&format!("Cannot read capabilities: {err}"));
                         grant_button.set_visible(true);
+                        return;
                     }
                 },
+            }
+
+            // The backend can hold capabilities while the route helper still
+            // cannot, which is every AppImage: the grant has to install a copy
+            // somewhere the kernel honours them.
+            if let Some(reason) = helper_install_reason() {
+                cap_row.set_subtitle(reason);
+                grant_button.set_visible(true);
             }
         })
     };

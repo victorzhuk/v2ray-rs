@@ -15,4 +15,7 @@ pub use privilege::{
 };
 pub use probe::{ProbeError, ProbeRunner};
 pub use state::{ProcessEvent, ProcessState};
-pub use tun::{BYPASS_USER, TunRuntime, helper_path, run_path};
+pub use tun::{
+    BYPASS_USER, TunRuntime, helper_needs_relogin, helper_path, helpers_stale,
+    relocated_helper_path, relocation_required, run_path,
+};
