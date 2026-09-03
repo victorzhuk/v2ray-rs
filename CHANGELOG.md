@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.3] - 2026-09-03
+
 ### Fixed
 - Applying a DNS provider preset no longer aborts the app. The preset dialog
   drove the strategy row while the settings were still borrowed, and the row's
@@ -620,7 +622,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.2...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.3...HEAD
+[0.17.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...v0.17.1
 [0.17.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.16.1...v0.17.0
