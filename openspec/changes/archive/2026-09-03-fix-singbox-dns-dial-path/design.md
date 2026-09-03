@@ -42,7 +42,15 @@ The first says the pin can only reach a dial by being named. The second says nam
 - [A stale pin points a proxy outbound at a dead address] → the dial fails fast against a wrong address rather than hanging on a circular lookup, and the pin is rewritten on every connect.
 - [The startup harness adds about six seconds to the suite] → it is the only thing standing between this class of defect and a release, and it is scoped to four cases.
 
+## Settled after implementation
+
+Both questions this design opened were answered against the v1.13.21 source.
+
+- **A DNS server with no detour dials directly from sing-box's own process.** `common/dialer/dialer.go` `NewWithOptions` branches on the detour tag: set, it pins that one outbound; unset, it builds a plain socket dialer honoring only that server's own dial fields. DNS servers reach it through `dns/transport_dialer.go`. Neither branch consults `route.rules`. So omitting the field is not merely the shape that starts, it is the shape that egresses outside the proxy, and excluded domains genuinely resolve outside the tunnel. The startup guard exists precisely because detouring to an option-less direct outbound would re-derive the same dialer.
+- **Dial-time resolution bypasses `dns.rules` by construction, in both forms.** `dns/router.go` `Lookup` queries the named transport directly whenever one is configured and skips the rule-matching loop; `route.default_domain_resolver` and a per-outbound `domain_resolver` behave identically. Configuring no resolver is the only way to reach the rule engine, and that is already fatal in 1.13.21 and removed in 1.14.0. Naming the pin per outbound is therefore the only mechanism available, not merely the one chosen.
+
+The `hosts` server's two failure modes were also confirmed: a domain it does not hold returns NXDOMAIN, and one whose addresses the strategy filters out returns NOERROR with no answers. Neither falls through, which is why it is named per pinned outbound rather than globally.
+
 ## Open Questions
 
-- Whether a DNS server with no detour egresses directly or follows `route.final`. Four attempts to measure it were inconclusive: sing-box routes a domain destination to the outbound before resolving it, so the DNS path was never exercised, and forcing local resolution with `domain_strategy` did not change that. The answer decides whether excluded domains genuinely resolve outside the tunnel or merely stop crashing. It needs either the sing-box source or a live tunnel to settle.
-- Whether `route.default_domain_resolver` should become a `local` server on the derived path, covering unpinned hostname nodes. `local` reads the system resolver, which on this host is a local stub whose own upstream query is tunnel traffic — the amplifying loop `fix-tun-dns-bootstrap` rejected for xray. sing-box may exempt it through `auto_route`; unverified.
+- Whether `route.default_domain_resolver` should become a `local` server on the derived path, covering unpinned hostname nodes. `local` has no automatic self-exclusion under `auto_route`; the documented loop prevention is `route.auto_detect_interface`, which binds outbound connections to the default interface and which this generator already emits whenever TUN is on. That suggests the amplifying loop `fix-tun-dns-bootstrap` rejected for xray does not apply here, but it has not been exercised under a live tunnel.

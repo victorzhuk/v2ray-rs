@@ -137,6 +137,17 @@ fn generated_singbox_configs_start() {
 
     let mut cases: Vec<(&str, AppSettings)> = Vec::new();
 
+    // No DNS section at all. The daemon refuses to start when one exists
+    // without a resolver, so the absence of the whole section is worth pinning.
+    cases.push(("plain", AppSettings::default()));
+
+    let mut pinned_no_dns = AppSettings::default();
+    pinned_no_dns.dns.hosts = vec![HostOverride {
+        domain: "ss.example.com".to_string(),
+        ip: "203.0.113.9".to_string(),
+    }];
+    cases.push(("pinned-without-dns-section", pinned_no_dns));
+
     let mut detour_direct = AppSettings::default();
     detour_direct.dns.enabled = true;
     detour_direct.dns.servers = vec![DnsServerConfig {

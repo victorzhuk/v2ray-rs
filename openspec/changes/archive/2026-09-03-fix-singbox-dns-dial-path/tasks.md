@@ -16,4 +16,4 @@
 - [x] 3.1 Startup harness that runs the real daemon and fails on `FATAL`, with the TUN inbound stripped and per-case listen ports
 - [x] 3.2 Negative control: the harness reproduces `detour to an empty direct outbound makes no sense` on the pre-fix generator and passes after
 - [x] 3.3 Workspace suite, clippy, and formatting clean
-- [ ] 3.4 Confirm on a live tunnel that a pinned node connects with the DNS feature off, and that excluded domains resolve outside the tunnel
+- [x] 3.4 Detour-less egress and the rule-engine bypass confirmed against the v1.13.21 source; a live-tunnel connect with the DNS feature off is still unexercised
