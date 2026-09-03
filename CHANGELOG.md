@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A DNS server set to a "direct" detour no longer produces a sing-box config
+  that refuses to start. The backend rejects a DNS server detoured to an
+  outbound that carries no settings, and validation accepts it, so the failure
+  only appeared on connect. A direct detour is now expressed by omitting the
+  field, which is what the backend asks for.
+- sing-box carries the connect-time host pin on every path, not only when the
+  DNS feature is on, and a proxy node whose hostname is pinned resolves from
+  that pin at dial time. Dial-time resolution does not consult the DNS rules,
+  so the pin previously sat in the config unused while the proxy's own hostname
+  was resolved through the proxy being dialed.
+
 ## [0.17.3] - 2026-09-03
 
 ### Fixed

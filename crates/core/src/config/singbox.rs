@@ -40,7 +40,7 @@ fn assemble(
     let mut config = json!({
         "log": { "level": "warn" },
         "inbounds": build_inbounds(settings),
-        "outbounds": build_outbounds(nodes)?,
+        "outbounds": build_outbounds(nodes, settings)?,
         "route": build_route(rules, &first_proxy_tag, &via_tags, settings),
     });
 
@@ -66,20 +66,76 @@ fn assemble(
 }
 
 const DERIVED_DNS_TAG: &str = "remote";
+const HOSTS_SERVER_TAG: &str = "hosts";
 
 fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
+    let mut servers = Vec::new();
+    let mut rules = Vec::new();
+
+    // The connect-time pin is the only thing that resolves the proxy's own
+    // hostname without the proxy, so it belongs on this path too - not just
+    // on the one the DNS feature builds.
+    if let Some(hosts) = hosts_server(settings) {
+        servers.push(hosts);
+        rules.push(hosts_rule(settings));
+    }
+
+    servers.push(json!({
+        "tag": DERIVED_DNS_TAG,
+        "type": "https",
+        "server": "1.1.1.1",
+        "server_port": 443,
+        "path": "/dns-query",
+        "detour": first_proxy_tag,
+    }));
+
     json!({
         "strategy": strategy_str(settings.dns.strategy),
-        "servers": [{
-            "tag": DERIVED_DNS_TAG,
-            "type": "https",
-            "server": "1.1.1.1",
-            "server_port": 443,
-            "path": "/dns-query",
-            "detour": first_proxy_tag,
-        }],
+        "servers": servers,
+        "rules": rules,
         "final": DERIVED_DNS_TAG,
     })
+}
+
+fn hosts_server(settings: &AppSettings) -> Option<Value> {
+    if settings.dns.hosts.is_empty() {
+        return None;
+    }
+
+    let mut predefined = serde_json::Map::new();
+    for host in &settings.dns.hosts {
+        predefined
+            .entry(host.domain.clone())
+            .or_insert_with(|| json!([]))
+            .as_array_mut()
+            .expect("predefined entries are arrays")
+            .push(json!(host.ip));
+    }
+
+    Some(json!({
+        "tag": HOSTS_SERVER_TAG,
+        "type": "hosts",
+        "predefined": predefined,
+    }))
+}
+
+fn hosts_rule(settings: &AppSettings) -> Value {
+    let domains: Vec<&str> = settings
+        .dns
+        .hosts
+        .iter()
+        .map(|h| h.domain.as_str())
+        .collect();
+    json!({ "domain": domains, "server": HOSTS_SERVER_TAG })
+}
+
+/// Whether a `hosts` server will exist in the generated config and answer for
+/// `host`. Dial-time resolution does not consult `dns.rules`, so an outbound
+/// only reaches the pin by naming the server directly.
+fn pinned_by_hosts(settings: &AppSettings, host: &str) -> bool {
+    (settings.dns.enabled || settings.tun.enabled)
+        && host.parse::<std::net::IpAddr>().is_err()
+        && settings.dns.hosts.iter().any(|h| h.domain == host)
 }
 
 fn strategy_str(strategy: DnsStrategy) -> &'static str {
@@ -145,13 +201,20 @@ fn build_tun_inbound(tun: &TunConfig) -> Value {
     inbound
 }
 
-fn build_outbounds(nodes: &[ProxyNode]) -> Result<Value, ConfigError> {
+fn build_outbounds(nodes: &[ProxyNode], settings: &AppSettings) -> Result<Value, ConfigError> {
     let mut outbounds: Vec<Value> = nodes
         .iter()
         .enumerate()
-        .map(|(i, node)| {
+        .map(|(i, node)| -> Result<Value, ConfigError> {
             let tag = super::common::outbound_tag(node, i);
-            build_outbound(node, &tag)
+            let mut out = build_outbound(node, &tag)?;
+            // Naming the pin as this outbound's own resolver is what keeps the
+            // proxy hostname off the resolver that is only reachable through
+            // the proxy.
+            if pinned_by_hosts(settings, node.address()) {
+                out["domain_resolver"] = json!(HOSTS_SERVER_TAG);
+            }
+            Ok(out)
         })
         .collect::<Result<_, _>>()?;
 
@@ -343,21 +406,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
 
     let mut servers: Vec<Value> = Vec::new();
 
-    if !settings.dns.hosts.is_empty() {
-        let mut predefined = serde_json::Map::new();
-        for host in &settings.dns.hosts {
-            predefined
-                .entry(host.domain.clone())
-                .or_insert_with(|| json!([]))
-                .as_array_mut()
-                .unwrap()
-                .push(json!(host.ip));
-        }
-        servers.push(json!({
-            "tag": "hosts",
-            "type": "hosts",
-            "predefined": predefined,
-        }));
+    if let Some(hosts) = hosts_server(settings) {
+        servers.push(hosts);
     }
 
     for server_cfg in &settings.dns.servers {
@@ -405,12 +455,13 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             }),
         };
 
-        if let Some(ref detour) = server_cfg.detour {
-            server["detour"] = if detour == "direct" {
-                json!(detour)
-            } else {
-                json!(first_proxy_tag)
-            };
+        // Only a proxy detour is expressible. `detour: "direct"` names the
+        // empty direct outbound, which sing-box refuses to start against
+        // ("detour to an empty direct outbound makes no sense") while
+        // `sing-box check` accepts it; a server with no detour is not
+        // dispatched through the proxy chain in the first place.
+        if server_cfg.detour.is_some() && !server_cfg.detours_direct() {
+            server["detour"] = json!(first_proxy_tag);
         }
 
         // sing-box rejects a DNS server addressed by hostname at startup
@@ -555,13 +606,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
     };
 
     if !settings.dns.hosts.is_empty() {
-        let host_domains: Vec<&str> = settings
-            .dns
-            .hosts
-            .iter()
-            .map(|h| h.domain.as_str())
-            .collect();
-        dns_rules.insert(0, json!({ "domain": host_domains, "server": "hosts" }));
+        dns_rules.insert(0, hosts_rule(settings));
     }
 
     if settings.dns.fakeip.enabled {
@@ -1898,8 +1943,11 @@ mod tests {
         assert_eq!(proxy_dns["detour"], "proxy-0-Test SS");
     }
 
+    /// `detour: "direct"` names the empty direct outbound, which sing-box
+    /// refuses to start against even though `sing-box check` accepts it. The
+    /// server has to carry no detour at all.
     #[test]
-    fn test_dns_server_detour_direct_passes_through() {
+    fn test_dns_server_direct_detour_is_not_emitted() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
         settings.dns.servers = vec![DnsServerConfig {
@@ -1915,7 +1963,91 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let direct_dns = servers.iter().find(|s| s["tag"] == "direct-dns").unwrap();
-        assert_eq!(direct_dns["detour"], "direct");
+        assert!(
+            direct_dns.get("detour").is_none(),
+            "a direct detour must not reach the config: {direct_dns}"
+        );
+    }
+
+    #[test]
+    fn test_derived_tun_dns_carries_the_host_pin() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+        settings.dns.hosts = vec![HostOverride {
+            domain: "ss.example.com".into(),
+            ip: "203.0.113.9".into(),
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let hosts = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == "hosts")
+            .expect("the derived plane dropped the pin");
+        assert_eq!(
+            hosts["predefined"]["ss.example.com"],
+            json!(["203.0.113.9"])
+        );
+        assert_eq!(config["dns"]["rules"][0]["server"], "hosts");
+    }
+
+    /// Dial-time resolution does not consult `dns.rules`, so the pin only
+    /// reaches the proxy's own hostname when the outbound names it.
+    #[test]
+    fn test_pinned_node_resolves_through_the_hosts_server() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.hosts = vec![HostOverride {
+            domain: "ss.example.com".into(),
+            ip: "203.0.113.9".into(),
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let proxy = &config["outbounds"][0];
+        assert_eq!(proxy["domain_resolver"], "hosts");
+        assert_ne!(
+            config["route"]["default_domain_resolver"], "hosts",
+            "the general resolver must not inherit the pin's NXDOMAIN on a miss"
+        );
+    }
+
+    #[test]
+    fn test_unpinned_node_gets_no_hosts_resolver() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert!(config["outbounds"][0].get("domain_resolver").is_none());
+    }
+
+    /// Without a TUN or DNS section there is no `hosts` server to point at.
+    #[test]
+    fn test_hosts_resolver_is_not_named_when_no_dns_section_exists() {
+        let mut settings = default_settings();
+        settings.dns.enabled = false;
+        settings.tun.enabled = false;
+        settings.dns.hosts = vec![HostOverride {
+            domain: "ss.example.com".into(),
+            ip: "203.0.113.9".into(),
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert!(config.get("dns").is_none());
+        assert!(config["outbounds"][0].get("domain_resolver").is_none());
     }
 
     #[test]

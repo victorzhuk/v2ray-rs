@@ -87,11 +87,15 @@ The system SHALL support user-defined DNS routing rules. Each rule maps a match 
 - **THEN** DNS queries for example.com and all its subdomains SHALL be routed to the "domestic" DNS server
 
 ### Requirement: DNS server detour per backend
-The optional detour field on DNS servers SHALL be honored by the sing-box and xray config generators and ignored by the v2ray generator. sing-box SHALL emit it as a `detour` field on the server object. xray has no per-server detour field, so a detour of "direct" SHALL be expressed as a `tag` on the server object plus a routing rule sending that tag to the direct outbound; any other detour value SHALL be ignored, because it names the default route. A server with no detour SHALL keep the default behaviour of traversing the proxy.
+The optional detour field on DNS servers SHALL be honored by the sing-box and xray config generators and ignored by the v2ray generator. Each backend SHALL express only the detour it can start against. sing-box SHALL emit a `detour` field naming the first proxy outbound for any detour other than "direct"; a detour of "direct" SHALL be expressed by omitting the field, because a DNS server carrying no detour is not dispatched through the proxy chain and sing-box refuses to start when a DNS server detours to an outbound that carries no settings. xray has no per-server detour field, so a detour of "direct" SHALL be expressed as a `tag` on the server object plus a routing rule sending that tag to the direct outbound; any other detour value SHALL be ignored, because it names the default route. A server with no detour SHALL keep the default behaviour of traversing the proxy.
 
 #### Scenario: Detour emitted for sing-box
-- **WHEN** a DNS server has a detour set and the backend is sing-box
-- **THEN** the generated server object SHALL include a "detour" field: "direct" passes through unchanged, and any other value resolves to the tag of the first proxy outbound
+- **WHEN** a DNS server has a detour other than "direct" and the backend is sing-box
+- **THEN** the generated server object SHALL include a "detour" field naming the tag of the first proxy outbound
+
+#### Scenario: Direct detour omitted for sing-box
+- **WHEN** a DNS server has a detour of "direct" and the backend is sing-box
+- **THEN** the generated server object SHALL carry no "detour" field, and the generated configuration SHALL start against the backend rather than being rejected at service start
 
 #### Scenario: Direct detour becomes a tag and a rule for xray
 - **WHEN** a DNS server has a detour of "direct" and the backend is xray

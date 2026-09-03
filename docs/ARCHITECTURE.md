@@ -267,8 +267,18 @@ hostname. Three mechanisms break it, in order of consultation:
    `inboundTag` and would otherwise swallow the UDP entry. sing-box has its own
    equivalent (`sys-dns-bootstrap` + `route.default_domain_resolver`).
 3. **Direct detour.** A DNS server with `detour: "direct"` gets the same tag on
-   xray and a `detour` field on sing-box; every other value is the default
-   route. Names in `tun.exclude_domains` bind to that server when one exists.
+   xray; every other value is the default route. Names in `tun.exclude_domains`
+   bind to that server when one exists.
+
+sing-box differs in two ways worth knowing. Its dial-time resolution does not
+consult `dns.rules`, so a pinned hostname reaches the dial only when the
+outbound names the pin: a proxy outbound whose hostname is in `dns.hosts`
+carries `domain_resolver: "hosts"`, which needs no network and cannot be
+circular. And a direct detour is expressed by *omitting* `detour` — a DNS
+server that carries none is not dispatched through the proxy chain, and naming
+the settings-free `direct` outbound makes the daemon refuse to start even
+though `sing-box check` accepts it. That gap between validation and startup is
+why the sing-box tests also start the real binary.
 
 `capture_dns` for netctl is derived from the generated config, not from the
 lookup: it is armed only when every hostname node has an override xray can

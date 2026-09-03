@@ -80,6 +80,104 @@ fn check_with_rules(
     );
 }
 
+/// `sing-box check` validates the schema but starts no services, so it accepts
+/// configurations the daemon then refuses to run - a DNS server detoured to the
+/// empty direct outbound is one. This starts the real thing and fails on any
+/// FATAL. The TUN inbound is dropped because creating the device needs
+/// CAP_NET_ADMIN, which the test runner does not have; everything the DNS plane
+/// is built from survives that edit.
+fn check_starts(name: &str, settings: &AppSettings, slot: u16) {
+    let mut config = SingboxGenerator
+        .generate(&[ss_node()], &[], settings)
+        .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
+
+    if let Some(inbounds) = config["inbounds"].as_array_mut() {
+        inbounds.retain(|i| i["type"] != "tun");
+        for (i, inbound) in inbounds.iter_mut().enumerate() {
+            inbound["listen_port"] = serde_json::json!(38000 + slot * 10 + i as u16);
+        }
+    }
+    let json = serde_json::to_string_pretty(&config).unwrap();
+
+    let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    file.write_all(json.as_bytes()).unwrap();
+    file.flush().unwrap();
+
+    let mut child = Command::new("sing-box")
+        .arg("run")
+        .arg("-c")
+        .arg(file.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    let running = child.try_wait().unwrap().is_none();
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+    let log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert!(
+        running && !log.contains("FATAL"),
+        "{name}: sing-box refused to start\nlog: {log}\nconfig: {json}",
+    );
+}
+
+#[test]
+fn generated_singbox_configs_start() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let mut cases: Vec<(&str, AppSettings)> = Vec::new();
+
+    let mut detour_direct = AppSettings::default();
+    detour_direct.dns.enabled = true;
+    detour_direct.dns.servers = vec![DnsServerConfig {
+        tag: "domestic".to_string(),
+        protocol: DnsProtocol::Udp,
+        address: "77.88.8.8".to_string(),
+        port: None,
+        detour: Some("direct".to_string()),
+    }];
+    cases.push(("detour-direct", detour_direct));
+
+    let mut detour_proxy = AppSettings::default();
+    detour_proxy.dns.enabled = true;
+    detour_proxy.dns.servers = vec![DnsServerConfig {
+        tag: "remote".to_string(),
+        protocol: DnsProtocol::Doh,
+        address: "1.1.1.1".to_string(),
+        port: None,
+        detour: Some("proxy".to_string()),
+    }];
+    cases.push(("detour-proxy", detour_proxy));
+
+    let mut tun_derived = AppSettings::default();
+    tun_derived.tun.enabled = true;
+    tun_derived.dns.hosts = vec![HostOverride {
+        domain: "ss.example.com".to_string(),
+        ip: "203.0.113.9".to_string(),
+    }];
+    cases.push(("tun-derived-pinned", tun_derived));
+
+    let mut tun_dns = AppSettings::default();
+    tun_dns.tun.enabled = true;
+    tun_dns.dns.enabled = true;
+    tun_dns.dns.servers = dns_servers();
+    cases.push(("tun-dns", tun_dns));
+
+    for (slot, (name, settings)) in cases.iter().enumerate() {
+        check_starts(name, settings, slot as u16);
+    }
+}
+
 #[test]
 fn generated_singbox_configs_pass_sing_box_check() {
     if !sing_box_available() {
