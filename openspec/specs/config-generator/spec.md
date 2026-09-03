@@ -1,7 +1,9 @@
 ## Purpose
 
 Defines how the system generates backend-specific JSON configurations for sing-box, xray, and v2ray from proxy nodes, routing rules, DNS settings, and TUN preferences.
+
 ## Requirements
+
 ### Requirement: Generate v2ray-compatible configuration
 The system SHALL generate a valid JSON configuration file for v2ray/xray containing inbound, outbound, routing, and DNS sections. When DNS is enabled, the DNS section SHALL reflect the full DNS configuration model including multiple servers, query strategy, hosts, cache settings, and client IP. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the SOCKS-capable inbound SHALL declare `settings.udp = true`.
 
@@ -217,7 +219,11 @@ mechanism. Process-name exclusion SHALL be emitted for sing-box only, because
 xray cannot match TUN-captured traffic by process. Destination exclusion (CIDR
 and domain) SHALL be emitted for both backends. Exclusion rules SHALL take
 precedence over the user's routing rules, and excluded DNS SHALL resolve directly
-so excluded traffic does not leak through hijacked DNS.
+so excluded traffic does not leak through hijacked DNS. The server that answers
+for excluded domains SHALL be the first DNS server detoured to `direct` when one
+is configured, because a server on the default route resolves through the
+tunnel under TUN; only when none is detoured SHALL the first configured server be
+used.
 
 #### Scenario: sing-box process-name exclusion
 - **WHEN** TUN is enabled with sing-box and `exclude_processes` is `["cloudflared"]`
@@ -225,7 +231,7 @@ so excluded traffic does not leak through hijacked DNS.
 
 #### Scenario: sing-box domain exclusion with direct DNS
 - **WHEN** TUN is enabled with sing-box and `exclude_domains` is `["example.com"]` and DNS is enabled
-- **THEN** the sing-box `route.rules` SHALL include `{ "domain_suffix": ["example.com"], "outbound": "direct" }` ahead of the user rules, and `dns.rules` SHALL include a matching rule routing those domains to a direct (non-detour) server
+- **THEN** the sing-box `route.rules` SHALL include `{ "domain_suffix": ["example.com"], "outbound": "direct" }` ahead of the user rules, and `dns.rules` SHALL include a matching rule routing those domains to the server detoured to `direct`, or to the first configured server when none is
 
 #### Scenario: xray destination exclusion via the direct outbound
 - **WHEN** TUN is enabled with xray and `exclude_routes` is `["104.16.0.0/13"]` and `exclude_domains` is `["example.com"]`
@@ -233,7 +239,7 @@ so excluded traffic does not leak through hijacked DNS.
 
 #### Scenario: xray excluded domains resolve directly
 - **WHEN** TUN is enabled with xray, `exclude_domains` is `["example.com"]`, and DNS is enabled
-- **THEN** the excluded domains SHALL be bound to xray's direct/domestic DNS server (its `domains` list) so their resolution does not traverse the tunnel
+- **THEN** the excluded domains SHALL be bound to the `domains` list of the DNS server detoured to `direct`, or of the first configured server when none is, so their resolution does not traverse the tunnel
 
 #### Scenario: No exclusion rules when TUN disabled
 - **WHEN** TUN is disabled
@@ -242,9 +248,41 @@ so excluded traffic does not leak through hijacked DNS.
 ### Requirement: TUN mode DNS resolution is self-contained
 When TUN is enabled, the generated config SHALL NOT depend on the operating-system resolver for any resolution that feeds routing decisions or direct dials. When the DNS feature is disabled in settings, the generator SHALL derive a minimal DNS configuration — a DoH server at an IP-literal endpoint (`https://1.1.1.1/dns-query`) whose queries travel through the first proxy outbound — for the duration of config generation, without mutating settings. For xray this means: a `dns` section with `tag: "dns-internal"` plus a routing rule sending `inboundTag: ["dns-internal"]` to the first proxy outbound ahead of all user rules, and `"domainStrategy": "UseIP"` on the `freedom` direct outbound. For sing-box this means: the `dns` section, `dns.final`, and `route.default_domain_resolver` are emitted with the derived server (detour = first proxy outbound) even though the DNS feature is off.
 
+Static host overrides, cache control and the EDNS client subnet SHALL be emitted on both the derived and the user-configured path, so a connect-time host pin reaches the generated config regardless of whether the DNS feature is enabled. Host overrides SHALL be filtered to the address family the query strategy selects, and a domain left with no address of that family SHALL be omitted rather than emitted empty.
+
+For xray under TUN the generator SHALL emit bootstrap DNS servers for every name that must resolve before the tunnel carries traffic — each hostname-addressed proxy node and each hostname-addressed DNS server. The bootstrap SHALL be one server object per transport, plain UDP before DoH, each carrying `tag: "dns-direct"`, `skipFallback: true` and a `domains` list scoped to those names, with `finalQuery: true` on the last one only so the pair is tried in order and nothing falls back past it. The routing rules SHALL begin with `{"inboundTag": ["dns-direct"], "outboundTag": "direct"}` so those queries leave through the marked direct outbound instead of the tunnel. When every such address is an IP literal the generator SHALL emit neither the bootstrap server nor the rule. When no server would otherwise be emitted, xray under TUN SHALL fall back to the derived DoH endpoint rather than the operating-system resolver, which bypasses the outbound stack onto an unmarked socket.
+
 #### Scenario: xray TUN with DNS settings off derives a DNS plane
 - **WHEN** TUN is enabled, the DNS feature is disabled, and the backend is xray
-- **THEN** the generated config SHALL contain a `dns` section with `"tag": "dns-internal"` and a DoH server `https://1.1.1.1/dns-query`, and `routing.rules` SHALL begin with `{"inboundTag": ["dns-internal"], "outboundTag": <first proxy tag>}`
+- **THEN** the generated config SHALL contain a `dns` section with `"tag": "dns-internal"` and a DoH server `https://1.1.1.1/dns-query`, and `routing.rules` SHALL contain `{"inboundTag": ["dns-internal"], "outboundTag": <first proxy tag>}` ahead of all user rules
+
+#### Scenario: Host overrides survive the derived path
+- **WHEN** TUN is enabled, the DNS feature is disabled, the backend is xray, and settings carry a host override for the connected node's hostname
+- **THEN** the generated `dns` section SHALL contain a `hosts` object mapping that hostname to the override address
+
+#### Scenario: Host overrides are filtered to the query strategy's family
+- **WHEN** a host override maps a domain to both an IPv4 and an IPv6 address and the query strategy is IPv4-only
+- **THEN** the emitted `hosts` entry SHALL contain only the IPv4 address, and a domain left with no IPv4 address SHALL be absent from `hosts` entirely
+
+#### Scenario: Hostname-addressed node gets direct bootstrap resolvers
+- **WHEN** TUN is enabled, the backend is xray, and a proxy node is addressed by hostname
+- **THEN** `dns.servers` SHALL begin with a plain-UDP entry and then a DoH entry, both `{"tag": "dns-direct", "domains": ["full:<node hostname>"], "skipFallback": true}`, with `finalQuery: true` on the DoH entry only, and `routing.rules[0]` SHALL be `{"inboundTag": ["dns-direct"], "outboundTag": "direct"}`
+
+#### Scenario: A dead bootstrap transport falls through to the next
+- **WHEN** the first bootstrap entry cannot answer
+- **THEN** the second SHALL be queried over the same direct route, and the query SHALL NOT fall back onto a resolver that is only reachable through the proxy being resolved
+
+#### Scenario: Hostname-addressed DNS servers are bootstrapped too
+- **WHEN** TUN is enabled, the backend is xray, and a configured DNS server is addressed by hostname
+- **THEN** that hostname SHALL appear in the bootstrap server's `domains` list
+
+#### Scenario: IP-literal configuration needs no bootstrap
+- **WHEN** TUN is enabled, the backend is xray, and every proxy node and DNS server is addressed by an IP literal
+- **THEN** the config SHALL contain no `dns-direct` server and no `dns-direct` routing rule
+
+#### Scenario: The direct DNS rule precedes the port-53 hijack
+- **WHEN** TUN is enabled, the backend is xray, DNS hijack is on, and a `dns-direct` server is emitted
+- **THEN** the `dns-direct` routing rule SHALL appear before the `{"network": "tcp,udp", "port": 53, "outboundTag": "dns-out"}` rule, so a direct plain-UDP resolver is not captured back into the internal resolver
 
 #### Scenario: xray direct outbound never uses the OS resolver under TUN
 - **WHEN** TUN is enabled and the backend is xray
@@ -256,7 +294,7 @@ When TUN is enabled, the generated config SHALL NOT depend on the operating-syst
 
 #### Scenario: User-configured DNS is preserved and hardened
 - **WHEN** TUN is enabled and the DNS feature is enabled with user servers
-- **THEN** the user's servers SHALL be emitted as today, and (xray) the `dns-internal` inboundTag rule SHALL still be prepended so internal queries traverse the proxy
+- **THEN** the user's servers SHALL be emitted as today, and (xray) the `dns-internal` inboundTag rule SHALL still be present so internal queries traverse the proxy
 
 ### Requirement: sing-box rule-sets prefer local cached files
 When generating a sing-box config, each referenced GeoIP/GeoSite rule-set SHALL be emitted as `type: "local"` with `format: "binary"` and the absolute path of the cached `.srs` file when that file exists in the geodata cache, and as `type: "remote"` otherwise.
@@ -272,4 +310,3 @@ When generating a sing-box config, each referenced GeoIP/GeoSite rule-set SHALL 
 #### Scenario: Mixed local and remote sets coexist
 - **WHEN** some referenced tags are cached and others are not
 - **THEN** the config SHALL contain local entries for the cached tags and remote entries for the rest, and `experimental.cache_file` SHALL be enabled while any remote entry is present
-

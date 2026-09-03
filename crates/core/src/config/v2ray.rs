@@ -43,6 +43,14 @@ pub(crate) fn generate_v2ray_family_config(
 ) -> Value {
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let via_tags = via_outbound_tags(nodes, rules);
+    let tun_xray = dns_backend == V2rayFamilyBackend::Xray && settings.tun.enabled;
+
+    // Built before routing: whether any server is tagged for direct dispatch
+    // decides whether routing needs the rule that carries that tag.
+    let dns = (settings.dns.enabled || tun_xray)
+        .then(|| build_dns_for_backend(nodes, rules, settings, dns_backend, tun_xray));
+    let has_direct_dns = dns.as_ref().is_some_and(has_direct_dns_server);
+
     let mut config = json!({
         "log": { "loglevel": "warning" },
         // Partial policy is valid; omitted timers keep backend defaults.
@@ -52,18 +60,18 @@ pub(crate) fn generate_v2ray_family_config(
         },
         "inbounds": build_inbounds(settings, dns_backend),
         "outbounds": build_outbounds(nodes),
-        "routing": build_routing(rules, &first_proxy_tag, &via_tags, settings, dns_backend),
+        "routing": build_routing(
+            rules,
+            &first_proxy_tag,
+            &via_tags,
+            settings,
+            dns_backend,
+            has_direct_dns,
+        ),
     });
 
-    let tun_xray = dns_backend == V2rayFamilyBackend::Xray && settings.tun.enabled;
-
-    if settings.dns.enabled {
-        config["dns"] = build_dns_for_backend(rules, settings, dns_backend);
-    } else if tun_xray {
-        // TUN must never lean on the OS resolver: sniffing destOverride wipes
-        // the original IP and IPIfNonMatch feeds geoip rules, so poisoned ISP
-        // answers would steer blocked domains into `direct` and get RST by DPI.
-        config["dns"] = derived_tun_dns(settings);
+    if let Some(dns) = dns {
+        config["dns"] = dns;
     }
 
     if tun_xray {
@@ -72,6 +80,12 @@ pub(crate) fn generate_v2ray_family_config(
     }
 
     config
+}
+
+fn has_direct_dns_server(dns: &Value) -> bool {
+    dns["servers"]
+        .as_array()
+        .is_some_and(|servers| servers.iter().any(|s| s["tag"] == json!(DNS_DIRECT_TAG)))
 }
 
 /// Inbound tag stamped on queries made by xray's built-in resolver via
@@ -83,12 +97,19 @@ const DNS_INTERNAL_TAG: &str = "dns-internal";
 /// answers come back geo-located to the exit node rather than to the ISP.
 const FALLBACK_DNS: &str = "https://1.1.1.1/dns-query";
 
-fn derived_tun_dns(settings: &AppSettings) -> Value {
-    json!({
-        "servers": [FALLBACK_DNS],
-        "queryStrategy": query_strategy_str(settings.dns.strategy),
-    })
-}
+/// Second unrestricted resolver, so one unreachable endpoint is a slow lookup
+/// rather than a total outage.
+const FALLBACK_DNS_SECONDARY: &str = "https://8.8.8.8/dns-query";
+
+/// Plain-UDP bootstrap endpoint, tried before the DoH one. Networks that block
+/// DoH on 443 outright are exactly the networks this app is used on, and there
+/// the encrypted endpoint can be routed correctly and still never answer.
+const BOOTSTRAP_DNS_UDP: &str = "1.1.1.1";
+
+/// Stamped on servers whose queries must leave through `direct`. xray has no
+/// per-server detour, but a tagged server labels its own queries, which a
+/// routing rule can then match by `inboundTag`.
+const DNS_DIRECT_TAG: &str = "dns-direct";
 
 /// xray still queries a `domains`-scoped server for everything else unless
 /// `skipFallback` says otherwise, so a region-scoped resolver ends up answering
@@ -448,12 +469,23 @@ fn build_routing(
     via_tags: &[(ConnectionNodeRef, String)],
     settings: &AppSettings,
     backend: V2rayFamilyBackend,
+    has_direct_dns: bool,
 ) -> Value {
     let enabled: Vec<&RoutingRule> = rules.iter().filter(|r| r.enabled).collect();
 
     let mut routing_rules: Vec<Value> = Vec::new();
 
     if backend == V2rayFamilyBackend::Xray && settings.tun.enabled {
+        // First of all: the port-53 hijack below carries no inboundTag, so it
+        // would swallow a direct plain-UDP resolver's own query and feed it
+        // back into the resolver that issued it.
+        if has_direct_dns {
+            routing_rules.push(json!({
+                "type": "field",
+                "inboundTag": [DNS_DIRECT_TAG],
+                "outboundTag": "direct",
+            }));
+        }
         routing_rules.push(json!({
             "type": "field",
             "inboundTag": [DNS_INTERNAL_TAG],
@@ -581,16 +613,205 @@ fn udp_port_for_v2ray(server: &DnsServerConfig) -> Option<u16> {
 
 #[cfg(test)]
 fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
-    build_dns_for_backend(rules, settings, V2rayFamilyBackend::V2ray)
+    build_dns_for_backend(&[], rules, settings, V2rayFamilyBackend::V2ray, false)
 }
 
 fn build_dns_for_backend(
+    nodes: &[ProxyNode],
     rules: &[RoutingRule],
     settings: &AppSettings,
     backend: V2rayFamilyBackend,
+    tun_xray: bool,
 ) -> Value {
     let mut dns_config = json!({});
 
+    let mut servers = if settings.dns.enabled {
+        build_user_dns_servers(rules, settings, backend, tun_xray)
+    } else {
+        // TUN must never lean on the OS resolver: sniffing destOverride wipes
+        // the original IP and IPIfNonMatch feeds geoip rules, so poisoned ISP
+        // answers would steer blocked domains into `direct` and get RST by DPI.
+        vec![json!(FALLBACK_DNS), json!(FALLBACK_DNS_SECONDARY)]
+    };
+
+    let bootstrap = bootstrap_dns_servers(nodes, settings, tun_xray);
+    servers.splice(0..0, bootstrap);
+
+    if servers.is_empty() {
+        servers.push(if tun_xray {
+            json!(FALLBACK_DNS)
+        } else {
+            json!("localhost")
+        });
+    }
+
+    if backend == V2rayFamilyBackend::Xray {
+        apply_dns_fallback_policy(&mut servers);
+    }
+
+    dns_config["servers"] = json!(servers);
+
+    dns_config["queryStrategy"] = json!(query_strategy_str(settings.dns.strategy));
+
+    if let Some(hosts) = hosts_for_strategy(settings) {
+        dns_config["hosts"] = hosts;
+    }
+
+    if settings.dns.disable_cache {
+        dns_config["disableCache"] = json!(true);
+    }
+
+    if let Some(ref subnet) = settings.dns.client_subnet {
+        dns_config["clientIp"] = json!(subnet);
+    }
+
+    dns_config
+}
+
+/// Resolvers for the names that must be answered before the tunnel carries
+/// anything: the proxy's own hostname, and any DNS server addressed by one.
+/// Tagged so routing sends them out through `direct` instead of the proxy they
+/// are trying to reach, and tried in transport order — plain UDP first because
+/// DoH on 443 is blocked on many of the networks this runs on, encrypted second
+/// because UDP/53 is intercepted on others. Only the last carries `finalQuery`,
+/// so the pair is tried in order and nothing falls back past it onto a resolver
+/// that is only reachable through the proxy being resolved.
+fn bootstrap_dns_servers(
+    nodes: &[ProxyNode],
+    settings: &AppSettings,
+    tun_xray: bool,
+) -> Vec<Value> {
+    if !tun_xray {
+        return Vec::new();
+    }
+
+    let domains = bootstrap_domains(nodes, settings);
+    if domains.is_empty() {
+        return Vec::new();
+    }
+
+    vec![
+        json!({
+            "tag": DNS_DIRECT_TAG,
+            "address": BOOTSTRAP_DNS_UDP,
+            "domains": &domains,
+            "skipFallback": true,
+        }),
+        json!({
+            "tag": DNS_DIRECT_TAG,
+            "address": FALLBACK_DNS,
+            "domains": &domains,
+            "skipFallback": true,
+            "finalQuery": true,
+        }),
+    ]
+}
+
+fn bootstrap_domains(nodes: &[ProxyNode], settings: &AppSettings) -> Vec<String> {
+    let mut domains: Vec<String> = Vec::new();
+    for node in nodes {
+        push_bootstrap_domain(&mut domains, node.address());
+    }
+    if settings.dns.enabled {
+        for server in &settings.dns.servers {
+            push_bootstrap_domain(&mut domains, &server.address);
+        }
+    }
+    domains
+}
+
+fn push_bootstrap_domain(domains: &mut Vec<String>, host: &str) {
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return;
+    }
+    let entry = format!("full:{host}");
+    if !domains.contains(&entry) {
+        domains.push(entry);
+    }
+}
+
+/// xray answers a `hosts` hit authoritatively, so an entry holding only
+/// addresses the query strategy discards resolves to an empty answer instead of
+/// falling through to the servers. Keep the usable family, drop the rest.
+fn hosts_for_strategy(settings: &AppSettings) -> Option<Value> {
+    if settings.dns.hosts.is_empty() {
+        return None;
+    }
+
+    // Several entries may name the same domain (a proxy host resolves to a
+    // pool). xray takes an array there, so collect rather than overwrite —
+    // last-wins would throw away every address but one.
+    let mut hosts: serde_json::Map<String, Value> = serde_json::Map::new();
+    let mut named: Vec<&str> = Vec::new();
+    for host in &settings.dns.hosts {
+        if host.ip.parse::<std::net::IpAddr>().is_err() {
+            log::warn!(
+                "host override {} -> {} is not an address; dropped",
+                host.domain,
+                host.ip
+            );
+            continue;
+        }
+        if !named.contains(&host.domain.as_str()) {
+            named.push(&host.domain);
+        }
+        if !host.matches_strategy(settings.dns.strategy) {
+            continue;
+        }
+
+        match hosts.get_mut(&host.domain) {
+            Some(Value::Array(ips)) => ips.push(json!(host.ip)),
+            Some(existing) => {
+                *existing = json!([existing.clone(), json!(host.ip)]);
+            }
+            None => {
+                hosts.insert(host.domain.clone(), json!(host.ip));
+            }
+        }
+    }
+
+    for domain in named.iter().filter(|d| !hosts.contains_key(**d)) {
+        log::warn!("host override {domain} has no address the query strategy can use; dropped");
+    }
+
+    (!hosts.is_empty()).then_some(Value::Object(hosts))
+}
+
+/// xray has no per-server detour field. Only "direct" is expressible, and only
+/// under TUN, where a routing rule can act on the server's tag.
+fn direct_detour(server: &DnsServerConfig, tun_xray: bool) -> bool {
+    tun_xray && server.detours_direct()
+}
+
+fn dns_server_entry(
+    address: String,
+    port: Option<u16>,
+    domains: Option<Vec<String>>,
+    direct: bool,
+) -> Value {
+    if port.is_none() && domains.is_none() && !direct {
+        return json!(address);
+    }
+
+    let mut entry = json!({ "address": address });
+    if let Some(port) = port {
+        entry["port"] = json!(port);
+    }
+    if let Some(domains) = domains {
+        entry["domains"] = json!(domains);
+    }
+    if direct {
+        entry["tag"] = json!(DNS_DIRECT_TAG);
+    }
+    entry
+}
+
+fn build_user_dns_servers(
+    rules: &[RoutingRule],
+    settings: &AppSettings,
+    backend: V2rayFamilyBackend,
+    tun_xray: bool,
+) -> Vec<Value> {
     let mut servers: Vec<Value> = Vec::new();
 
     if settings.dns.use_custom_rules {
@@ -608,21 +829,12 @@ fn build_dns_for_backend(
                 })
                 .collect();
 
-            let address = dns_server_address_for_backend(server, backend);
-            let port = udp_port_for_v2ray(server);
-
-            if domains.is_empty() {
-                match port {
-                    Some(p) => servers.push(json!({ "address": address, "port": p })),
-                    None => servers.push(json!(address)),
-                }
-            } else {
-                let mut entry = json!({ "address": address, "domains": domains });
-                if let Some(p) = port {
-                    entry["port"] = json!(p);
-                }
-                servers.push(entry);
-            }
+            servers.push(dns_server_entry(
+                dns_server_address_for_backend(server, backend),
+                udp_port_for_v2ray(server),
+                (!domains.is_empty()).then_some(domains),
+                direct_detour(server, tun_xray),
+            ));
         }
     } else {
         let mut remote_domains: Vec<String> = Vec::new();
@@ -655,27 +867,17 @@ fn build_dns_for_backend(
         }
 
         for server in &settings.dns.servers {
-            let address = dns_server_address_for_backend(server, backend);
-            let port = udp_port_for_v2ray(server);
-
-            if server.tag == "remote" && !remote_domains.is_empty() {
-                let mut entry = json!({ "address": address, "domains": remote_domains });
-                if let Some(p) = port {
-                    entry["port"] = json!(p);
-                }
-                servers.push(entry);
-            } else if server.tag == "domestic" && !domestic_domains.is_empty() {
-                let mut entry = json!({ "address": address, "domains": domestic_domains });
-                if let Some(p) = port {
-                    entry["port"] = json!(p);
-                }
-                servers.push(entry);
-            } else {
-                match port {
-                    Some(p) => servers.push(json!({ "address": address, "port": p })),
-                    None => servers.push(json!(address)),
-                }
-            }
+            let domains = match server.tag.as_str() {
+                "remote" if !remote_domains.is_empty() => Some(remote_domains.clone()),
+                "domestic" if !domestic_domains.is_empty() => Some(domestic_domains.clone()),
+                _ => None,
+            };
+            servers.push(dns_server_entry(
+                dns_server_address_for_backend(server, backend),
+                udp_port_for_v2ray(server),
+                domains,
+                direct_detour(server, tun_xray),
+            ));
         }
     }
 
@@ -684,78 +886,50 @@ fn build_dns_for_backend(
         && !settings.tun.exclude_domains.is_empty()
         && settings.dns.use_custom_rules
     {
-        let non_detour = settings.dns.servers.iter().find(|s| s.detour.is_none());
-        if let Some(target) = non_detour {
-            let target_addr = dns_server_address_for_backend(target, backend);
-            if let Some(entry) = servers.iter_mut().find(|s| {
-                s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
-                    s.get("address")
-                        .and_then(|a| a.as_str())
-                        .map(|a| a == target_addr)
-                        .unwrap_or(false)
-                })
-            }) {
-                if entry.is_string() {
-                    let addr = entry.as_str().unwrap().to_string();
-                    *entry = json!({ "address": addr, "domains": &settings.tun.exclude_domains });
-                } else if let Some(arr) = entry.get_mut("domains") {
-                    if let Some(arr) = arr.as_array_mut() {
-                        for d in &settings.tun.exclude_domains {
-                            arr.push(json!(d));
-                        }
-                    }
-                } else {
-                    entry["domains"] = json!(&settings.tun.exclude_domains);
-                }
-            }
-        } else {
-            servers.push(json!({
-                "address": "localhost",
-                "domains": &settings.tun.exclude_domains,
-            }));
+        attach_exclude_domains(&mut servers, settings, backend);
+    }
+
+    servers
+}
+
+/// Excluded domains are split-horizon names, so they are folded into the
+/// server that resolves outside the tunnel when there is one, and the OS
+/// resolver otherwise.
+fn attach_exclude_domains(
+    servers: &mut Vec<Value>,
+    settings: &AppSettings,
+    backend: V2rayFamilyBackend,
+) {
+    let Some(target) = super::common::split_horizon_server(settings) else {
+        servers.push(json!({
+            "address": "localhost",
+            "domains": &settings.tun.exclude_domains,
+        }));
+        return;
+    };
+    let target_addr = dns_server_address_for_backend(target, backend);
+
+    let Some(entry) = servers.iter_mut().find(|s| {
+        s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
+            s.get("address")
+                .and_then(|a| a.as_str())
+                .map(|a| a == target_addr)
+                .unwrap_or(false)
+        })
+    }) else {
+        return;
+    };
+
+    if entry.is_string() {
+        let addr = entry.as_str().unwrap_or_default().to_string();
+        *entry = json!({ "address": addr, "domains": &settings.tun.exclude_domains });
+    } else if let Some(Value::Array(domains)) = entry.get_mut("domains") {
+        for d in &settings.tun.exclude_domains {
+            domains.push(json!(d));
         }
+    } else {
+        entry["domains"] = json!(&settings.tun.exclude_domains);
     }
-
-    if servers.is_empty() {
-        servers.push(json!("localhost"));
-    }
-
-    if backend == V2rayFamilyBackend::Xray {
-        apply_dns_fallback_policy(&mut servers);
-    }
-
-    dns_config["servers"] = json!(servers);
-
-    dns_config["queryStrategy"] = json!(query_strategy_str(settings.dns.strategy));
-
-    if !settings.dns.hosts.is_empty() {
-        // Several entries may name the same domain (a proxy host resolves to a
-        // pool). xray takes an array there, so collect rather than overwrite —
-        // last-wins would throw away every address but one.
-        let mut hosts: serde_json::Map<String, Value> = serde_json::Map::new();
-        for host in &settings.dns.hosts {
-            match hosts.get_mut(&host.domain) {
-                Some(Value::Array(ips)) => ips.push(json!(host.ip)),
-                Some(existing) => {
-                    *existing = json!([existing.clone(), json!(host.ip)]);
-                }
-                None => {
-                    hosts.insert(host.domain.clone(), json!(host.ip));
-                }
-            }
-        }
-        dns_config["hosts"] = json!(hosts);
-    }
-
-    if settings.dns.disable_cache {
-        dns_config["disableCache"] = json!(true);
-    }
-
-    if let Some(ref subnet) = settings.dns.client_subnet {
-        dns_config["clientIp"] = json!(subnet);
-    }
-
-    dns_config
 }
 
 fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamilyBackend) -> String {
@@ -2020,6 +2194,35 @@ mod tests {
         );
     }
 
+    fn rule_index_with_inbound_tag(config: &Value, tag: &str) -> Option<usize> {
+        config["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|r| r["inboundTag"] == json!([tag]))
+    }
+
+    fn rule_index_with_outbound_tag(config: &Value, tag: &str) -> Option<usize> {
+        config["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|r| r["outboundTag"] == json!(tag))
+    }
+
+    fn dns_server_with_tag<'a>(config: &'a Value, tag: &str) -> Option<&'a Value> {
+        dns_servers_with_tag(config, tag).into_iter().next()
+    }
+
+    fn dns_servers_with_tag<'a>(config: &'a Value, tag: &str) -> Vec<&'a Value> {
+        config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["tag"] == json!(tag))
+            .collect()
+    }
+
     #[test]
     fn test_xray_tun_exclusion_dns() {
         let mut settings = default_settings();
@@ -2031,12 +2234,80 @@ mod tests {
             generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
 
         let servers = config["dns"]["servers"].as_array().unwrap();
-        let domestic = servers
+        assert!(
+            servers.iter().any(|s| s["domains"]
+                .as_array()
+                .is_some_and(|d| d.contains(&json!("example.com")))),
+            "no server answers the excluded domain"
+        );
+    }
+
+    #[test]
+    fn test_excluded_domains_bind_to_the_direct_detoured_server() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["corp.example".to_string()];
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "remote".into(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".into(),
+                port: None,
+                detour: Some("proxy".into()),
+            },
+            DnsServerConfig {
+                tag: "domestic".into(),
+                protocol: DnsProtocol::Udp,
+                address: "77.88.8.8".into(),
+                port: None,
+                detour: Some("direct".into()),
+            },
+        ];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let answering = servers
             .iter()
-            .find(|s| s.get("domains").is_some())
-            .expect("server with domains not found");
-        let domains = domestic["domains"].as_array().unwrap();
-        assert!(domains.contains(&json!("example.com")));
+            .find(|s| {
+                s["domains"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&json!("corp.example")))
+            })
+            .expect("no server answers the excluded domain");
+        assert_eq!(answering["address"], "77.88.8.8");
+        assert_eq!(answering["tag"], DNS_DIRECT_TAG);
+        assert!(
+            !servers.iter().any(|s| s["address"] == "localhost"),
+            "the OS resolver must not be reached for when a direct server exists"
+        );
+    }
+
+    #[test]
+    fn test_proxy_detour_is_the_default_route() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".into(),
+            protocol: DnsProtocol::Doh,
+            address: "9.9.9.9".into(),
+            port: None,
+            detour: Some("proxy".into()),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert!(
+            !dns_servers_with_tag(&config, DNS_DIRECT_TAG)
+                .iter()
+                .any(|s| s["address"] == "https://9.9.9.9/dns-query"),
+            "a proxy detour is the default route, not a direct one"
+        );
     }
 
     #[test]
@@ -2081,16 +2352,15 @@ mod tests {
             generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
 
         assert_eq!(config["dns"]["tag"], "dns-internal");
-        assert_eq!(
-            config["dns"]["servers"],
-            json!(["https://1.1.1.1/dns-query"])
-        );
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert!(servers.contains(&json!("https://1.1.1.1/dns-query")));
+        assert!(servers.contains(&json!("https://8.8.8.8/dns-query")));
         assert_eq!(config["dns"]["queryStrategy"], "UseIPv4");
 
         let rules = config["routing"]["rules"].as_array().unwrap();
         let proxy_tag = config["outbounds"][0]["tag"].as_str().unwrap();
-        assert_eq!(rules[0]["inboundTag"], json!(["dns-internal"]));
-        assert_eq!(rules[0]["outboundTag"], proxy_tag);
+        let internal = rule_index_with_inbound_tag(&config, "dns-internal").unwrap();
+        assert_eq!(rules[internal]["outboundTag"], proxy_tag);
     }
 
     #[test]
@@ -2103,8 +2373,7 @@ mod tests {
             generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
 
         assert_eq!(config["dns"]["tag"], "dns-internal");
-        let rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules[0]["inboundTag"], json!(["dns-internal"]));
+        assert!(rule_index_with_inbound_tag(&config, "dns-internal").is_some());
     }
 
     #[test]
@@ -2151,8 +2420,7 @@ mod tests {
         );
 
         assert_eq!(config["dns"]["tag"], "dns-internal");
-        let routing_rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(routing_rules[0]["inboundTag"], json!(["dns-internal"]));
+        assert!(rule_index_with_inbound_tag(&config, "dns-internal").is_some());
     }
 
     #[test]
@@ -2171,9 +2439,9 @@ mod tests {
         );
 
         let rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(rules[1]["network"], "tcp,udp");
-        assert_eq!(rules[1]["port"], 53);
-        assert_eq!(rules[1]["outboundTag"], "dns-out");
+        let hijack = rule_index_with_outbound_tag(&config, "dns-out").unwrap();
+        assert_eq!(rules[hijack]["network"], "tcp,udp");
+        assert_eq!(rules[hijack]["port"], 53);
     }
 
     #[test]
@@ -2194,12 +2462,232 @@ mod tests {
             assert!(!outbounds.iter().any(|o| o["protocol"] == "dns"));
             let rules = config["routing"]["rules"].as_array().unwrap();
             assert!(!rules.iter().any(|r| r["outboundTag"] == "dns-out"));
-            assert_eq!(
-                rules[0]["inboundTag"],
-                json!(["dns-internal"]),
+            assert!(
+                rule_index_with_inbound_tag(&config, "dns-internal").is_some(),
                 "internal-resolver rule stays regardless of hijack mode"
             );
         }
+    }
+
+    #[test]
+    fn test_xray_tun_emits_hosts_even_when_dns_disabled() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+        settings.dns.hosts = vec![HostOverride {
+            domain: "ss.example.com".into(),
+            ip: "203.0.113.9".into(),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert_eq!(config["dns"]["hosts"]["ss.example.com"], "203.0.113.9");
+    }
+
+    #[test]
+    fn test_hosts_keep_only_the_family_the_strategy_uses() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.strategy = DnsStrategy::Ipv4Only;
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "ss.example.com".into(),
+                ip: "203.0.113.9".into(),
+            },
+            HostOverride {
+                domain: "ss.example.com".into(),
+                ip: "2001:db8::1".into(),
+            },
+            HostOverride {
+                domain: "v6.example.com".into(),
+                ip: "2001:db8::2".into(),
+            },
+        ];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let hosts = config["dns"]["hosts"].as_object().unwrap();
+        assert_eq!(hosts["ss.example.com"], "203.0.113.9");
+        assert!(
+            !hosts.contains_key("v6.example.com"),
+            "a domain left with no usable address must be dropped, not emitted empty"
+        );
+    }
+
+    #[test]
+    fn test_xray_tun_bootstrap_servers_are_scoped_and_direct_tagged() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let bootstrap = dns_servers_with_tag(&config, "dns-direct");
+        assert_eq!(bootstrap.len(), 2, "one endpoint per transport");
+
+        // Plain UDP first: a network that blocks DoH on 443 is the common case.
+        assert_eq!(bootstrap[0]["address"], BOOTSTRAP_DNS_UDP);
+        assert_eq!(bootstrap[1]["address"], FALLBACK_DNS);
+
+        for server in &bootstrap {
+            assert_eq!(server["domains"], json!(["full:ss.example.com"]));
+            assert_eq!(server["skipFallback"], json!(true));
+        }
+
+        // Only the last one ends the query, or the second would never be tried.
+        assert!(bootstrap[0]["finalQuery"].is_null());
+        assert_eq!(bootstrap[1]["finalQuery"], json!(true));
+
+        let direct = rule_index_with_inbound_tag(&config, "dns-direct").expect("no direct rule");
+        assert_eq!(
+            config["routing"]["rules"][direct]["outboundTag"], "direct",
+            "the bootstrap must leave through the marked direct outbound"
+        );
+    }
+
+    #[test]
+    fn test_dns_direct_rule_precedes_the_internal_and_hijack_rules() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let direct = rule_index_with_inbound_tag(&config, "dns-direct").unwrap();
+        let internal = rule_index_with_inbound_tag(&config, "dns-internal").unwrap();
+        let hijack = rule_index_with_outbound_tag(&config, "dns-out").unwrap();
+
+        assert_eq!(direct, 0);
+        assert!(direct < internal);
+        assert!(
+            direct < hijack,
+            "the port-53 hijack carries no inboundTag and would swallow the plain-UDP bootstrap"
+        );
+    }
+
+    #[test]
+    fn test_xray_tun_omits_bootstrap_for_ip_addressed_nodes() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+
+        let node = ProxyNode::Shadowsocks(ShadowsocksConfig {
+            address: "203.0.113.9".into(),
+            port: 8388,
+            method: "aes-256-gcm".into(),
+            password: "secret".into(),
+            remark: Some("Literal".into()),
+        });
+
+        let config =
+            generate_v2ray_family_config(&[node], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert!(dns_server_with_tag(&config, "dns-direct").is_none());
+        assert!(rule_index_with_inbound_tag(&config, "dns-direct").is_none());
+    }
+
+    #[test]
+    fn test_xray_tun_bootstrap_covers_hostname_addressed_dns_servers() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "remote".into(),
+                protocol: DnsProtocol::Doh,
+                address: "dns.adguard.com".into(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "domestic".into(),
+                protocol: DnsProtocol::Udp,
+                address: "94.140.14.14".into(),
+                port: None,
+                detour: None,
+            },
+        ];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let domains = dns_server_with_tag(&config, "dns-direct").unwrap()["domains"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(domains.contains(&json!("full:ss.example.com")));
+        assert!(domains.contains(&json!("full:dns.adguard.com")));
+        assert!(
+            !domains.contains(&json!("full:94.140.14.14")),
+            "an IP-literal resolver needs no bootstrap"
+        );
+    }
+
+    #[test]
+    fn test_direct_detour_server_is_tagged_for_xray_tun() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".into(),
+            port: None,
+            detour: Some("direct".into()),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let tagged: Vec<&Value> = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["tag"] == json!("dns-direct"))
+            .collect();
+        assert!(
+            tagged.iter().any(|s| s["address"] == "77.88.8.8"),
+            "a direct detour must reach the direct outbound"
+        );
+    }
+
+    #[test]
+    fn test_detour_is_not_expressed_without_tun() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".into(),
+            port: None,
+            detour: Some("direct".into()),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        assert!(dns_server_with_tag(&config, "dns-direct").is_none());
+    }
+
+    #[test]
+    fn test_v2ray_backend_gets_no_bootstrap_or_direct_tag() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".into(),
+            port: None,
+            detour: Some("direct".into()),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::V2ray);
+
+        assert!(dns_server_with_tag(&config, "dns-direct").is_none());
+        assert!(rule_index_with_inbound_tag(&config, "dns-direct").is_none());
     }
 
     #[test]

@@ -133,7 +133,8 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
             ));
             // Must happen before the tunnel exists: once its rules are up, this
             // very lookup would be captured by the tunnel it is preparing.
-            let pinned = pin_node_addresses(&mut effective_settings, &nodes).await;
+            pin_node_addresses(&mut effective_settings, &nodes).await;
+            let pinned = hosts_cover_nodes(&effective_settings, &nodes);
             let config_path =
                 match writer.write_config(&nodes, &effective_rules, &effective_settings) {
                     Ok(path) => path,
@@ -167,7 +168,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 pid_path.clone(),
                 Some(geodata_dir.clone()),
             )
-            .with_tun(build_tun_runtime(&settings, pinned))
+            .with_tun(build_tun_runtime(&effective_settings, pinned))
             .with_backend(settings.backend.backend_type);
 
             match mgr.start_with_connection(Some(meta.clone())).await {
@@ -281,19 +282,11 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
     ConnectionHandle { cmd_tx }
 }
 
-/// Builds the TUN runtime from settings, or `None` when TUN is off or the
-/// backend is v2ray (which has no native TUN inbound).
 const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Pins every hostname-addressed node to concrete IPs in `dns.hosts`.
-///
-/// Returns false if any of them could not be resolved. The caller uses that to
-/// leave DNS capture off for this connect: capturing port 53 while the backend
-/// still needs the OS resolver to find its own server would send that lookup
-/// into the tunnel it is trying to build.
-async fn pin_node_addresses(settings: &mut AppSettings, nodes: &[ProxyNode]) -> bool {
-    let mut all_pinned = true;
-
+/// Pins every hostname-addressed node to concrete IPs in `dns.hosts`. Every
+/// family is carried; the generator keeps what its backend can use.
+async fn pin_node_addresses(settings: &mut AppSettings, nodes: &[ProxyNode]) {
     for node in nodes {
         let host = node.address();
         if host.parse::<std::net::IpAddr>().is_ok() {
@@ -313,33 +306,39 @@ async fn pin_node_addresses(settings: &mut AppSettings, nodes: &[ProxyNode]) -> 
         .await;
 
         match lookup {
-            Err(_) => {
-                log::warn!("cannot pin {host}: lookup timed out");
-                all_pinned = false;
-            }
+            Err(_) => log::warn!("cannot pin {host}: lookup timed out"),
+            Ok(Err(err)) => log::warn!("cannot pin {host}: {err}"),
             Ok(Ok(addrs)) => {
-                let mut found = false;
                 for addr in addrs {
                     settings.dns.hosts.push(HostOverride {
                         domain: host.to_string(),
                         ip: addr.ip().to_string(),
                     });
-                    found = true;
                 }
-                if !found {
-                    all_pinned = false;
-                }
-            }
-            Ok(Err(err)) => {
-                log::warn!("cannot pin {host}: {err}");
-                all_pinned = false;
             }
         }
     }
-
-    all_pinned
 }
 
+/// Whether the settings the config is generated from resolve every node
+/// hostname on their own. Capturing port 53 while the backend still needs the
+/// OS resolver to find its own server would send that lookup into the tunnel it
+/// is trying to build. An override xray answers with an empty set — the wrong
+/// family for its query strategy — does not count.
+fn hosts_cover_nodes(settings: &AppSettings, nodes: &[ProxyNode]) -> bool {
+    nodes.iter().all(|node| {
+        let host = node.address();
+        host.parse::<std::net::IpAddr>().is_ok()
+            || settings
+                .dns
+                .hosts
+                .iter()
+                .any(|h| h.domain == host && h.matches_strategy(settings.dns.strategy))
+    })
+}
+
+/// Builds the TUN runtime from settings, or `None` when TUN is off or the
+/// backend is v2ray (which has no native TUN inbound).
 fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRuntime> {
     if !settings.tun.enabled {
         return None;
@@ -361,9 +360,9 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
         bypass_uid,
         // sing-box captures DNS itself via auto_route; only the xray path needs
         // the policy rule, and only when the config actually hijacks port 53.
-        // `nodes_pinned` is the safety interlock: an unpinned node still needs
-        // the OS resolver to be found, and capturing port 53 would swallow that
-        // lookup.
+        // `nodes_pinned` is the safety interlock: a node the generated config
+        // cannot resolve on its own still needs the OS resolver to be found,
+        // and capturing port 53 would swallow that lookup.
         capture_dns: backend == BackendType::Xray
             && settings.tun.dns_hijack == DnsHijackMode::Hijack
             && nodes_pinned,
@@ -386,5 +385,83 @@ fn summarize_failures(failures: &[String]) -> String {
         format!("All candidates failed: {preview}; ...")
     } else {
         format!("All candidates failed: {preview}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use v2ray_rs_core::models::{DnsStrategy, ShadowsocksConfig, TunConfig};
+
+    fn node(address: &str) -> ProxyNode {
+        ProxyNode::Shadowsocks(ShadowsocksConfig {
+            address: address.into(),
+            port: 8388,
+            method: "aes-256-gcm".into(),
+            password: "secret".into(),
+            remark: None,
+        })
+    }
+
+    fn tun_settings() -> AppSettings {
+        AppSettings {
+            tun: TunConfig {
+                enabled: true,
+                ..TunConfig::default()
+            },
+            ..AppSettings::default()
+        }
+    }
+
+    #[test]
+    fn ip_addressed_nodes_need_no_pin() {
+        let settings = tun_settings();
+        assert!(hosts_cover_nodes(&settings, &[node("203.0.113.9")]));
+    }
+
+    #[test]
+    fn hostname_without_a_pin_leaves_capture_off() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+
+        assert!(!hosts_cover_nodes(&settings, &[node("proxy.example.com")]));
+        let runtime = build_tun_runtime(
+            &settings,
+            hosts_cover_nodes(&settings, &[node("proxy.example.com")]),
+        )
+        .unwrap();
+        assert!(!runtime.capture_dns);
+    }
+
+    #[test]
+    fn pinned_hostname_arms_capture() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.dns.hosts.push(HostOverride {
+            domain: "proxy.example.com".into(),
+            ip: "203.0.113.9".into(),
+        });
+
+        let nodes = [node("proxy.example.com")];
+        assert!(hosts_cover_nodes(&settings, &nodes));
+        let runtime = build_tun_runtime(&settings, hosts_cover_nodes(&settings, &nodes)).unwrap();
+        assert!(runtime.capture_dns);
+    }
+
+    #[test]
+    fn wrong_family_pin_leaves_capture_off() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.dns.strategy = DnsStrategy::Ipv4Only;
+        settings.dns.hosts.push(HostOverride {
+            domain: "proxy.example.com".into(),
+            ip: "2001:db8::1".into(),
+        });
+
+        let nodes = [node("proxy.example.com")];
+        assert!(
+            !hosts_cover_nodes(&settings, &nodes),
+            "an override of the wrong family is an empty answer, not a pin"
+        );
     }
 }

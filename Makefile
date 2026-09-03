@@ -9,6 +9,13 @@ CARGO := cargo
 CARGO_FLAGS ?=
 RUSTFLAGS ?=
 
+# Test runs are bounded: cargo test has no timeout of its own and defaults to
+# one thread per core, which starves a laptop running the GUI alongside.
+TEST_TIMEOUT ?= 5m
+TEST_THREADS ?= 4
+TEST := timeout $(TEST_TIMEOUT) $(CARGO) test
+TEST_ARGS := -- --test-threads=$(TEST_THREADS)
+
 # Colors for output
 BLUE := \033[34m
 GREEN := \033[32m
@@ -100,27 +107,27 @@ fmt-fix:
 
 test:
 	@printf "$(BLUE)Running all tests...$(RESET)\n"
-	$(CARGO) test --workspace --all-targets $(CARGO_FLAGS)
+	$(TEST) --workspace --all-targets $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-core:
 	@printf "$(BLUE)Testing core crate...$(RESET)\n"
-	$(CARGO) test -p $(CORE) $(CARGO_FLAGS)
+	$(TEST) -p $(CORE) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-ui:
 	@printf "$(BLUE)Testing UI crate...$(RESET)\n"
-	$(CARGO) test -p $(UI) $(CARGO_FLAGS)
+	$(TEST) -p $(UI) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-tray:
 	@printf "$(BLUE)Testing tray crate...$(RESET)\n"
-	$(CARGO) test -p $(TRAY) $(CARGO_FLAGS)
+	$(TEST) -p $(TRAY) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-process:
 	@printf "$(BLUE)Testing process crate...$(RESET)\n"
-	$(CARGO) test -p $(PROCESS) $(CARGO_FLAGS)
+	$(TEST) -p $(PROCESS) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-subscription:
 	@printf "$(BLUE)Testing subscription crate...$(RESET)\n"
-	$(CARGO) test -p $(SUBSCRIPTION) $(CARGO_FLAGS)
+	$(TEST) -p $(SUBSCRIPTION) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-watch:
 	@printf "$(YELLOW)Running tests in watch mode (requires cargo-watch)...$(RESET)\n"

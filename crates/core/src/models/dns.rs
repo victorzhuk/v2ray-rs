@@ -88,6 +88,14 @@ pub struct DnsServerConfig {
     pub detour: Option<String>,
 }
 
+impl DnsServerConfig {
+    /// Anything but an explicit "direct" follows the default route, which under
+    /// TUN is the proxy — including the "proxy" value the server dialog stores.
+    pub fn detours_direct(&self) -> bool {
+        self.detour.as_deref() == Some("direct")
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DnsStrategy {
@@ -149,6 +157,22 @@ impl Default for FakeIpConfig {
 pub struct HostOverride {
     pub domain: String,
     pub ip: String,
+}
+
+impl DnsStrategy {
+    /// xray collapses `Prefer*` to one family (`UseIPv4` / `UseIPv6`), so an
+    /// address of the other family is unusable there.
+    pub fn ipv4(self) -> bool {
+        matches!(self, Self::PreferIpv4 | Self::Ipv4Only)
+    }
+}
+
+impl HostOverride {
+    pub fn matches_strategy(&self, strategy: DnsStrategy) -> bool {
+        self.ip
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_ipv4() == strategy.ipv4())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

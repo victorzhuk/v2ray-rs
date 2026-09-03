@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- Applying a DNS provider preset no longer aborts the app. The preset dialog
+  drove the strategy row while the settings were still borrowed, and the row's
+  own handler re-entered that borrow. Programmatic widget updates on the DNS
+  page now run with the handlers suppressed, and the preset also syncs the
+  master switch it turns on.
+- xray with TUN can resolve its own proxy hostname again. With the DNS feature
+  off, the derived DNS plane dropped the connect-time host pin, so the only
+  resolver was reachable through the proxy it was resolving. The pin now reaches
+  every xray TUN config, and a bootstrap resolver scoped to the proxy and DNS
+  server hostnames leaves through the direct outbound — plain UDP first, DoH
+  second, since each transport is blocked on some of the networks this runs on.
+- xray honors a `direct` detour on a DNS server, and the server dialog keeps the
+  choice for xray. Excluded domains bind to that server on both backends
+  instead of the first proxied one.
+- Kernel-side DNS capture follows the generated config: it stays off when a
+  hostname node has no override xray can answer with, and the route helper is
+  configured from the same effective settings the config came from.
+
 ## [0.17.2] - 2026-08-27
 
 ### Fixed

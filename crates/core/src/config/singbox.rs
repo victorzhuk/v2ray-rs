@@ -466,12 +466,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
 
     let mut tun_exclusion_rules: Vec<Value> = Vec::new();
     if settings.tun.enabled
-        && let Some(direct_tag) = settings
-            .dns
-            .servers
-            .iter()
-            .find(|s| s.detour.is_none())
-            .map(|s| s.tag.clone())
+        && let Some(direct_tag) =
+            super::common::split_horizon_server(settings).map(|s| s.tag.clone())
     {
         if !settings.tun.exclude_processes.is_empty() {
             tun_exclusion_rules.push(json!({
@@ -2125,6 +2121,41 @@ mod tests {
             .find(|r| r.get("domain_suffix").is_some())
             .expect("domain_suffix DNS rule not found");
         assert_eq!(dns_first["domain_suffix"], json!(["example.com"]));
+    }
+
+    #[test]
+    fn test_singbox_excluded_domains_use_the_direct_detoured_server() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["corp.example".to_string()];
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "remote".into(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".into(),
+                port: None,
+                detour: Some("proxy".into()),
+            },
+            DnsServerConfig {
+                tag: "domestic".into(),
+                protocol: DnsProtocol::Udp,
+                address: "77.88.8.8".into(),
+                port: None,
+                detour: Some("direct".into()),
+            },
+        ];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let rule = dns_rules
+            .iter()
+            .find(|r| r.get("domain_suffix").is_some())
+            .expect("domain_suffix DNS rule not found");
+        assert_eq!(rule["server"], "domestic");
     }
 
     #[test]

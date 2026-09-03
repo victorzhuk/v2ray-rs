@@ -1,7 +1,9 @@
 ## Purpose
 
 Define DNS server protocols, named servers, query strategy, routing rules, FakeIP, cache, client subnet, host overrides, and backend-specific config generation.
+
 ## Requirements
+
 ### Requirement: DNS protocol types
 The system SHALL support the following DNS protocol types: UDP (plain), TCP, DoH (DNS-over-HTTPS), DoT (DNS-over-TLS), DoQ (DNS-over-QUIC), and H3 (DNS-over-HTTP/3).
 
@@ -84,16 +86,20 @@ The system SHALL support user-defined DNS routing rules. Each rule maps a match 
 - **WHEN** a DNS rule matches domain suffix "example.com" to server tag "domestic"
 - **THEN** DNS queries for example.com and all its subdomains SHALL be routed to the "domestic" DNS server
 
-### Requirement: Detour is sing-box only
-The optional detour field on DNS servers SHALL only be used by the sing-box config generator. V2ray and xray generators SHALL ignore the detour field.
+### Requirement: DNS server detour per backend
+The optional detour field on DNS servers SHALL be honored by the sing-box and xray config generators and ignored by the v2ray generator. sing-box SHALL emit it as a `detour` field on the server object. xray has no per-server detour field, so a detour of "direct" SHALL be expressed as a `tag` on the server object plus a routing rule sending that tag to the direct outbound; any other detour value SHALL be ignored, because it names the default route. A server with no detour SHALL keep the default behaviour of traversing the proxy.
 
 #### Scenario: Detour emitted for sing-box
 - **WHEN** a DNS server has a detour set and the backend is sing-box
 - **THEN** the generated server object SHALL include a "detour" field: "direct" passes through unchanged, and any other value resolves to the tag of the first proxy outbound
 
+#### Scenario: Direct detour becomes a tag and a rule for xray
+- **WHEN** a DNS server has a detour of "direct" and the backend is xray
+- **THEN** the generated server object SHALL carry a tag identifying it as directly routed, and `routing.rules` SHALL contain a rule sending that `inboundTag` to the direct outbound ahead of the internal-resolver rule
+
 #### Scenario: Detour ignored for v2ray/xray
-- **WHEN** a DNS server has a detour configured and the backend is v2ray or xray
-- **THEN** the generated DNS config SHALL NOT include any detour-related fields for that server
+- **WHEN** a DNS server has a detour the backend cannot express — any value for v2ray, or any value other than "direct" for xray
+- **THEN** the generated DNS config SHALL NOT include any detour-related field or tag for that server, and the query SHALL follow the backend's default routing
 
 ### Requirement: FakeIP configuration
 The system SHALL support FakeIP configuration for the sing-box backend. FakeIP SHALL have an enable toggle, IPv4 range, and IPv6 range.
@@ -129,7 +135,7 @@ The system SHALL support an optional EDNS client subnet IP address for geo-aware
 - **THEN** the generated config SHALL include the client subnet IP in the appropriate backend field (clientIp for v2ray, client_subnet for sing-box)
 
 ### Requirement: Static host overrides
-The system SHALL support static domain-to-IP mappings that override DNS resolution.
+The system SHALL support static domain-to-IP mappings that override DNS resolution. A mapping SHALL only be emitted for the address family the configured query strategy selects, because a host override that resolves to nothing usable is answered authoritatively as empty rather than falling through to the configured servers. A domain left with no address of the selected family SHALL be omitted from the generated mapping.
 
 #### Scenario: Host override applied in v2ray/xray
 - **WHEN** the user adds a host override "ads.example.com" → "127.0.0.1" and the backend is v2ray or xray
@@ -142,6 +148,10 @@ The system SHALL support static domain-to-IP mappings that override DNS resoluti
 #### Scenario: No host overrides by default
 - **WHEN** no host overrides are configured
 - **THEN** the hosts section SHALL be omitted from the generated config
+
+#### Scenario: Override addresses of the wrong family are dropped
+- **WHEN** a static host override maps a domain only to addresses the query strategy will not use
+- **THEN** that domain SHALL be absent from the generated mapping
 
 ### Requirement: Backward-compatible deserialization with migration
 The system SHALL deserialize existing settings.toml files (with the old minimal DnsConfig format) without error, migrating old field values to the new model.
@@ -195,4 +205,3 @@ The system SHALL define per-backend DNS protocol support normatively: sing-box s
 #### Scenario: sing-box passes protocols through natively
 - **WHEN** a DNS server is configured with any supported protocol and the backend is sing-box
 - **THEN** the generated config SHALL use the configured protocol without downgrade
-

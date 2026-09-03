@@ -2,7 +2,7 @@ use adw::prelude::*;
 use ipnet::{Ipv4Net, Ipv6Net};
 use relm4::adw;
 use relm4::gtk;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr;
@@ -80,10 +80,19 @@ pub(super) fn build_dns_page(
 
     drop(s);
 
+    // GTK setters emit their notify signals synchronously, so a programmatic
+    // update re-enters the handler below. Raised while the page drives its own
+    // widgets; the handlers bail out instead of writing the value back.
+    let suppress = Rc::new(Cell::new(false));
+
     {
         let st = state.clone();
         let cb = cb.clone();
+        let suppress = suppress.clone();
         enable_row.connect_active_notify(move |row| {
+            if suppress.get() {
+                return;
+            }
             st.borrow_mut().dns.enabled = row.is_active();
             emit(&st, &cb);
         });
@@ -91,7 +100,11 @@ pub(super) fn build_dns_page(
     {
         let st = state.clone();
         let cb = cb.clone();
+        let suppress = suppress.clone();
         strategy_row.connect_selected_notify(move |row| {
+            if suppress.get() {
+                return;
+            }
             st.borrow_mut().dns.strategy = index_to_strategy(row.selected());
             emit(&st, &cb);
         });
@@ -433,6 +446,8 @@ pub(super) fn build_dns_page(
     let dns_ctx = DnsRenderCtx {
         state: state.clone(),
         cb: cb.clone(),
+        suppress: suppress.clone(),
+        enable_row: enable_row.clone(),
         servers_group: servers_group.clone(),
         rules_group: rules_group.clone(),
         hosts_group: hosts_group.clone(),
@@ -573,6 +588,8 @@ pub(super) fn build_dns_page(
 struct DnsRenderCtx {
     state: Rc<RefCell<AppSettings>>,
     cb: SettingsCallback,
+    suppress: Rc<Cell<bool>>,
+    enable_row: adw::SwitchRow,
     servers_group: adw::PreferencesGroup,
     rules_group: adw::PreferencesGroup,
     hosts_group: adw::PreferencesGroup,
@@ -584,6 +601,13 @@ struct DnsRenderCtx {
     added_servers: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_rules: Rc<RefCell<Vec<adw::ActionRow>>>,
     added_hosts: Rc<RefCell<Vec<adw::ActionRow>>>,
+}
+
+/// Drives widgets whose handlers write back into the shared settings state.
+fn without_handlers(suppress: &Cell<bool>, update: impl FnOnce()) {
+    suppress.set(true);
+    update();
+    suppress.set(false);
 }
 
 fn strategy_to_index(s: DnsStrategy) -> u32 {
@@ -795,7 +819,7 @@ fn dns_server_from_inputs(
     protocol_combo: &adw::ComboRow,
     address_entry: &adw::EntryRow,
     port_spin: &adw::SpinRow,
-    is_singbox: bool,
+    honors_detour: bool,
     detour_combo: &adw::ComboRow,
 ) -> Result<DnsServerConfig, String> {
     let tag = tag_entry.text().trim().to_string();
@@ -816,7 +840,7 @@ fn dns_server_from_inputs(
         Some(port_value)
     };
 
-    let detour = if is_singbox {
+    let detour = if honors_detour {
         Some(if detour_combo.selected() == 1 {
             "direct".to_string()
         } else {
@@ -1168,8 +1192,10 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         None => (String::new(), 0, String::new(), 0u16, String::new()),
     };
 
-    let is_singbox = ctx.state.borrow().backend.backend_type == BackendType::SingBox;
     let backend = ctx.state.borrow().backend.backend_type;
+    // sing-box emits `detour` on the server; xray expresses a direct detour as
+    // a routing rule. v2ray has neither.
+    let honors_detour = matches!(backend, BackendType::SingBox | BackendType::Xray);
 
     let dialog = adw::AlertDialog::builder()
         .heading(if is_edit {
@@ -1231,7 +1257,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
 
     let detour_combo = adw::ComboRow::builder()
         .title("Detour")
-        .visible(is_singbox)
+        .visible(honors_detour)
         .model(&gtk::StringList::new(&["proxy", "direct"]))
         .selected(if init_detour == "direct" { 1 } else { 0 })
         .build();
@@ -1297,7 +1323,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
                 &protocol_combo,
                 &address_entry,
                 &port_spin,
-                is_singbox,
+                honors_detour,
                 &detour_combo,
             )?;
 
@@ -1740,9 +1766,14 @@ fn show_dns_providers_dialog(ctx: &DnsRenderCtx) {
                     render_dns_servers(&ctx_inner);
                     render_dns_rules(&ctx_inner);
                     render_primary_dns_servers(&ctx_inner);
-                    ctx_inner
-                        .strategy_row
-                        .set_selected(strategy_to_index(ctx_inner.state.borrow().dns.strategy));
+                    let (enabled, strategy) = {
+                        let s = ctx_inner.state.borrow();
+                        (s.dns.enabled, strategy_to_index(s.dns.strategy))
+                    };
+                    without_handlers(&ctx_inner.suppress, || {
+                        ctx_inner.enable_row.set_active(enabled);
+                        ctx_inner.strategy_row.set_selected(strategy);
+                    });
                     pd.close();
                 }
             });
@@ -1762,4 +1793,60 @@ fn show_dns_providers_dialog(ctx: &DnsRenderCtx) {
 
     dialog.set_extra_child(Some(&scrolled));
     dialog.present(crate::active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The crash this guard exists for: `set_selected` emits `notify::selected`
+    /// synchronously, so a handler holding the shared state would re-enter and
+    /// panic. GTK is needed for the real signal emission, so skip where there
+    /// is no display to initialize against.
+    #[test]
+    fn programmatic_selection_does_not_re_enter_the_handler() {
+        if gtk::init().is_err() {
+            eprintln!("no display, skipping");
+            return;
+        }
+
+        let state = Rc::new(RefCell::new(AppSettings::default()));
+        let suppress = Rc::new(Cell::new(false));
+        let writes = Rc::new(Cell::new(0u32));
+
+        let row = adw::ComboRow::builder()
+            .model(&gtk::StringList::new(&[
+                "Prefer IPv4",
+                "Prefer IPv6",
+                "IPv4 Only",
+                "IPv6 Only",
+            ]))
+            .selected(strategy_to_index(DnsStrategy::Ipv4Only))
+            .build();
+
+        {
+            let state = state.clone();
+            let suppress = suppress.clone();
+            let writes = writes.clone();
+            row.connect_selected_notify(move |row| {
+                if suppress.get() {
+                    return;
+                }
+                // Would panic if a borrow were still alive from the caller.
+                state.borrow_mut().dns.strategy = index_to_strategy(row.selected());
+                writes.set(writes.get() + 1);
+            });
+        }
+
+        state.borrow_mut().dns.strategy = DnsStrategy::PreferIpv4;
+        // Deliberately the shape that used to abort: a live borrow across the
+        // setter. Safe only because the handler bails out before taking one.
+        without_handlers(&suppress, || {
+            row.set_selected(strategy_to_index(state.borrow().dns.strategy))
+        });
+
+        assert_eq!(row.selected(), strategy_to_index(DnsStrategy::PreferIpv4));
+        assert_eq!(writes.get(), 0, "the handler must not write the value back");
+        assert!(!suppress.get(), "the guard must be released");
+    }
 }

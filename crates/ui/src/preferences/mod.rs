@@ -93,11 +93,15 @@ pub fn show_preferences(
 }
 
 pub(crate) fn emit(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) {
-    cb(state.borrow().clone());
+    // Bound first: as a temporary the borrow would outlive the call, and the
+    // observers it fans out to are free to take the state mutably.
+    let snapshot = state.borrow().clone();
+    cb(snapshot);
 }
 
 pub(crate) fn emit_routing(state: &Rc<RefCell<RoutingRuleSet>>, cb: &RoutingCallback) {
-    cb(state.borrow().clone());
+    let snapshot = state.borrow().clone();
+    cb(snapshot);
 }
 
 pub(crate) fn subscribe_settings(

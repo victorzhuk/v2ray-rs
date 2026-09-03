@@ -242,6 +242,39 @@ running executable before elevating; it never passes a bare/relative name to the
 root `setcap`/`chown`/`chmod`, which would otherwise resolve against the process
 CWD.
 
+### Name resolution under TUN
+
+Under TUN the backend must never lean on the OS resolver: with sing-box's
+`auto_route` or netctl's rules in place, an unmarked resolver socket is captured
+into the tunnel. Both generators therefore emit a full DNS plane even when the
+DNS feature is off. For xray that plane is tagged `dns-internal` and routed to
+the first proxy outbound, which creates a circularity for the proxy's own
+hostname. Three mechanisms break it, in order of consultation:
+
+1. **Connect-time pin.** `connection.rs` resolves every hostname-addressed node
+   through the OS resolver before the route helper runs and writes the answers,
+   both families, into `dns.hosts` of the effective settings. The xray generator
+   keeps the family its `queryStrategy` uses (`Prefer*` collapses to one there)
+   and drops a domain left with nothing usable, since a `hosts` hit is an
+   authoritative answer rather than a fall-through; sing-box takes both families
+   in its `hosts` server.
+2. **Bootstrap resolvers (xray).** A pair of scoped server objects sharing
+   `tag: "dns-direct"` — plain UDP `1.1.1.1` first, DoH second, `skipFallback`
+   on both and `finalQuery` on the last — with `domains` limited to the proxy
+   and DNS-server hostnames. A routing rule at index 0 sends that tag to
+   `direct`, whose `sockopt.mark` reaches the real default route through the
+   pref-9000 rule. It sits ahead of the port-53 hijack rule, which carries no
+   `inboundTag` and would otherwise swallow the UDP entry. sing-box has its own
+   equivalent (`sys-dns-bootstrap` + `route.default_domain_resolver`).
+3. **Direct detour.** A DNS server with `detour: "direct"` gets the same tag on
+   xray and a `detour` field on sing-box; every other value is the default
+   route. Names in `tun.exclude_domains` bind to that server when one exists.
+
+`capture_dns` for netctl is derived from the generated config, not from the
+lookup: it is armed only when every hostname node has an override xray can
+answer with, and the `TunRuntime` is built from the same effective settings the
+config was generated from.
+
 ### Relocating the helper off a `nosuid` mount
 
 An AppImage's squashfs is mounted `nosuid` by the kernel and its mount point

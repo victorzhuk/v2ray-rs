@@ -3,9 +3,9 @@ use std::process::Command;
 
 use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig, ProxyNode,
-    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings, TransportSettings,
-    VlessConfig, WsSettings,
+    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig, HostOverride,
+    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings,
+    TransportSettings, VlessConfig, WsSettings,
 };
 
 fn xray_available() -> bool {
@@ -34,12 +34,29 @@ fn check_with_rules(name: &str, settings: &AppSettings, rules: &[RoutingRule]) {
     check_with_nodes(name, settings, rules, &[ss_node()]);
 }
 
+/// `xray run -test` starts the servers, so every case needs listen ports and a
+/// TUN name of its own — otherwise it collides with a running instance of the
+/// app, or with an earlier case, and fails for reasons that have nothing to do
+/// with the config being checked.
+fn isolate(name: &str, settings: &AppSettings) -> AppSettings {
+    let slot: u16 = name
+        .bytes()
+        .fold(0u16, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u16))
+        % 400;
+    let mut isolated = settings.clone();
+    isolated.socks_port = 39000 + slot;
+    isolated.http_port = 39400 + slot;
+    isolated.tun.interface_name = format!("xchk{slot}");
+    isolated
+}
+
 fn check_with_nodes(
     name: &str,
     settings: &AppSettings,
     rules: &[RoutingRule],
     nodes: &[ProxyNode],
 ) {
+    let settings = &isolate(name, settings);
     let config = XrayGenerator
         .generate(nodes, rules, settings)
         .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
@@ -105,6 +122,35 @@ fn generated_xray_configs_pass_xray_test() {
         },
     ];
     cases.push(("tun-user-dns-hijack", tun_user_dns));
+
+    let mut tun_pinned = AppSettings::default();
+    tun_pinned.tun.enabled = true;
+    tun_pinned.dns.hosts = vec![HostOverride {
+        domain: "ss.example.com".to_string(),
+        ip: "203.0.113.9".to_string(),
+    }];
+    cases.push(("tun-derived-dns-with-pinned-hosts", tun_pinned));
+
+    let mut tun_direct_detour = AppSettings::default();
+    tun_direct_detour.tun.enabled = true;
+    tun_direct_detour.dns.enabled = true;
+    tun_direct_detour.dns.servers = vec![
+        DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "dns.adguard.com".to_string(),
+            port: None,
+            detour: None,
+        },
+        DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".to_string(),
+            port: None,
+            detour: Some("direct".to_string()),
+        },
+    ];
+    cases.push(("tun-user-dns-direct-detour", tun_direct_detour));
 
     for (name, settings) in &cases {
         check(name, settings);
