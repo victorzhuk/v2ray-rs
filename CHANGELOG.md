@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.4] - 2026-09-04
+
 ### Fixed
 - A DNS server set to a "direct" detour no longer produces a sing-box config
   that refuses to start. The backend rejects a DNS server detoured to an
@@ -634,7 +636,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.3...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.4...HEAD
+[0.17.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.2...v0.17.3
 [0.17.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.1...v0.17.2
 [0.17.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.0...v0.17.1
