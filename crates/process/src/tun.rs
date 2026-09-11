@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
 
@@ -8,6 +11,9 @@ use v2ray_rs_core::models::BackendType;
 
 /// How long to wait for an xray TUN device to appear after spawn before giving up.
 pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a route helper invocation may run before it is killed.
+pub(crate) const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 const HELPER_BIN: &str = "v2ray-rs-netctl";
 const RUN_BIN: &str = "v2ray-rs-run";
@@ -202,13 +208,15 @@ fn device_path(iface: &str) -> String {
     format!("/sys/class/net/{iface}")
 }
 
+/// Captured output and outcome of one route helper invocation.
+pub(crate) struct HelperRun {
+    pub output: Vec<String>,
+    pub result: Result<(), String>,
+}
+
 /// Runs `netctl xray-up` to assign the address and split routes.
-pub async fn xray_up(rt: &TunRuntime) -> std::io::Result<bool> {
-    Ok(Command::new(&rt.helper_path)
-        .args(xray_up_args(rt))
-        .status()
-        .await?
-        .success())
+pub(crate) async fn xray_up(rt: &TunRuntime) -> HelperRun {
+    run_helper(&rt.helper_path, &xray_up_args(rt), HELPER_TIMEOUT).await
 }
 
 pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
@@ -235,14 +243,90 @@ pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
 }
 
 /// Runs `netctl xray-down` to remove the device (idempotent).
-pub async fn xray_down(rt: &TunRuntime) -> std::io::Result<bool> {
-    Ok(Command::new(&rt.helper_path)
-        .arg("xray-down")
-        .arg("--iface")
-        .arg(&rt.iface)
-        .status()
-        .await?
-        .success())
+pub(crate) async fn xray_down(rt: &TunRuntime) -> HelperRun {
+    let args = [
+        "xray-down".to_string(),
+        "--iface".to_string(),
+        rt.iface.clone(),
+    ];
+    run_helper(&rt.helper_path, &args, HELPER_TIMEOUT).await
+}
+
+/// Runs the route helper with its output captured and its lifetime bounded.
+/// `kill_on_drop` covers a caller that abandons the future mid-run; the
+/// timeout covers a helper wedged in a netlink call.
+pub(crate) async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> HelperRun {
+    let verb = args.first().map_or("helper", String::as_str);
+    let spawned = crate::spawn::spawn_with_etxtbsy_retry(|| {
+        let mut cmd = Command::new(helper);
+        cmd.args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        cmd
+    })
+    .await;
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            return HelperRun {
+                output: Vec::new(),
+                result: Err(format!("{verb}: {e}")),
+            };
+        }
+    };
+
+    // Readers own the buffer outside the timed wait, so lines printed before a
+    // timeout survive it.
+    let output = Arc::new(Mutex::new(Vec::new()));
+    let readers: Vec<_> = [
+        child
+            .stdout
+            .take()
+            .map(|s| spawn_reader(s, Arc::clone(&output))),
+        child
+            .stderr
+            .take()
+            .map(|s| spawn_reader(s, Arc::clone(&output))),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    let result = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => Ok(()),
+        Ok(Ok(status)) => Err(format!("{verb} exited with {status}")),
+        Ok(Err(e)) => Err(format!("{verb}: {e}")),
+        Err(_) => {
+            let _ = child.kill().await;
+            Err(format!("{verb} timed out after {timeout:?}"))
+        }
+    };
+
+    for reader in readers {
+        let abort = reader.abort_handle();
+        if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, reader)
+            .await
+            .is_err()
+        {
+            abort.abort();
+        }
+    }
+    let output = std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner()));
+    HelperRun { output, result }
+}
+
+fn spawn_reader<R>(stream: R, sink: Arc<Mutex<Vec<String>>>) -> tokio::task::JoinHandle<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stream).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+        }
+    })
 }
 
 #[cfg(test)]
@@ -392,5 +476,60 @@ mod tests {
             xray_up_args(&rt),
             ["xray-up", "--iface", "tun0", "--addr", "172.19.0.1/30"]
         );
+    }
+
+    fn write_helper(dir: &Path, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("netctl");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn helper_killed_after_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let helper = write_helper(
+            dir.path(),
+            &format!("echo $$ > {}\nexec sleep 30\n", pid_file.display()),
+        );
+
+        let started = Instant::now();
+        let run = run_helper(
+            &helper,
+            &["xray-up".to_string()],
+            Duration::from_millis(200),
+        )
+        .await;
+        let err = run.result.expect_err("a hung helper must fail");
+        assert!(err.contains("timed out"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_output_is_captured() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let helper = write_helper(dir.path(), "echo up-ok\necho 'netctl: boom' >&2\nexit 1\n");
+
+        let run = run_helper(&helper, &["xray-up".to_string()], HELPER_TIMEOUT).await;
+        assert!(run.output.iter().any(|l| l == "up-ok"), "{:?}", run.output);
+        assert!(
+            run.output.iter().any(|l| l == "netctl: boom"),
+            "{:?}",
+            run.output
+        );
+        let err = run.result.expect_err("a non-zero exit must fail");
+        assert!(err.contains("exit status"), "{err}");
     }
 }

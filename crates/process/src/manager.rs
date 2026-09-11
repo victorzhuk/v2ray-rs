@@ -13,7 +13,7 @@ use tokio::time::sleep;
 use crate::log_buffer::{LogBuffer, LogLine, LogSource};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
-use crate::tun::{self, TunRuntime};
+use crate::tun::{self, HelperRun, TunRuntime};
 use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
 
 fn format_triple((major, minor, patch): (u32, u32, u32)) -> String {
@@ -343,18 +343,12 @@ impl ProcessManager {
                 self.teardown_tun().await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
             }
-            match tun::xray_up(&rt).await {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.graceful_stop().await;
-                    self.teardown_tun().await;
-                    return Err(ProcessError::TunHelper("xray-up reported failure".into()));
-                }
-                Err(e) => {
-                    self.graceful_stop().await;
-                    self.teardown_tun().await;
-                    return Err(ProcessError::TunHelper(e.to_string()));
-                }
+            let run = tun::xray_up(&rt).await;
+            self.log_helper("xray-up", &run);
+            if let Err(e) = run.result {
+                self.graceful_stop().await;
+                self.teardown_tun().await;
+                return Err(ProcessError::TunHelper(e));
             }
         }
 
@@ -560,7 +554,24 @@ impl ProcessManager {
         if let Some(rt) = self.tun.clone()
             && rt.needs_helper()
         {
-            let _ = tun::xray_down(&rt).await;
+            let run = tun::xray_down(&rt).await;
+            self.log_helper("xray-down", &run);
+        }
+    }
+
+    fn log_helper(&self, verb: &str, run: &HelperRun) {
+        let failure = run
+            .result
+            .as_ref()
+            .err()
+            .map(|e| format!("{verb} failed: {e}"));
+        for content in run.output.iter().cloned().chain(failure) {
+            let line = LogLine::stderr(content);
+            self.log_buffer
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(line.clone());
+            self.state.emit(ProcessEvent::LogLine(line));
         }
     }
 
@@ -763,6 +774,45 @@ mod tests {
         // stop() is idempotent on an already-Stopped manager.
         mgr.stop().await.unwrap();
         assert_eq!(mgr.state(), ProcessState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn teardown_failure_is_logged() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "exec sleep 30\n");
+        mgr.start().await.unwrap();
+
+        let calls = dir.path().join("calls");
+        let helper = dir.path().join("netctl");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho \"$1\" >> {}\nexit 1\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        mgr.tun = Some(TunRuntime {
+            backend: BackendType::Xray,
+            iface: "lo".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: helper,
+            bypass_uid: None,
+            capture_dns: false,
+            strict: true,
+        });
+
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "xray-down\n");
+        let logged = mgr
+            .log_buffer()
+            .lock()
+            .unwrap()
+            .last_n(10)
+            .iter()
+            .any(|l| l.content.contains("xray-down failed"));
+        assert!(logged, "expected the teardown failure in the log buffer");
     }
 
     #[test]
