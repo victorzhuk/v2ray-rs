@@ -114,7 +114,7 @@ pub enum AppMsg {
     TrayQuit,
     ActiveNodesChanged(bool),
     ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
-    ProcessLogLine(String),
+    ProcessLogLine(u64, String),
     OpenPreferences,
     ViewGeneratedConfig,
     PreferencesClosed,
@@ -1179,7 +1179,7 @@ impl SimpleComponent for App {
                 // A superseded connection keeps reporting until its teardown
                 // finishes; acting on its terminal state would clear the handle
                 // of the connection that replaced it.
-                if generation != self.connection_generation {
+                if !is_current_generation(generation, self.connection_generation) {
                     return;
                 }
                 let was_stopping = matches!(self.process_state, ProcessState::Stopping);
@@ -1277,7 +1277,12 @@ impl SimpleComponent for App {
                     self.window.destroy();
                 }
             }
-            AppMsg::ProcessLogLine(line) => {
+            AppMsg::ProcessLogLine(generation, line) => {
+                // A superseded connection keeps streaming until its teardown
+                // finishes; drop what it logged meanwhile.
+                if !is_current_generation(generation, self.connection_generation) {
+                    return;
+                }
                 self.logs_page.emit(LogsMsg::AppendLine(line));
             }
             AppMsg::CloseRequested => {
@@ -1492,6 +1497,12 @@ fn falls_back_to_planner(origin: ConnectOrigin) -> bool {
 /// only while no connection is up.
 fn auto_reconnect_fires(message: u32, current: u32, has_handle: bool) -> bool {
     message == current && !has_handle
+}
+
+/// Log and state messages carry the generation of the connection that
+/// produced them; only the app's current one is live.
+fn is_current_generation(message: u64, current: u64) -> bool {
+    message == current
 }
 
 /// TUN follows the session that is running: the launched snapshot decides,
@@ -2019,6 +2030,17 @@ mod tests {
         ));
         assert!(auto_reconnect_fires(generation, generation, false));
         assert!(!auto_reconnect_fires(generation, generation, true));
+    }
+
+    #[test]
+    fn interleaved_generations_keep_only_current() {
+        let lines = [(6, "old"), (7, "new"), (6, "late")];
+        let kept: Vec<&str> = lines
+            .into_iter()
+            .filter(|(generation, _)| is_current_generation(*generation, 7))
+            .map(|(_, line)| line)
+            .collect();
+        assert_eq!(kept, ["new"]);
     }
 
     #[test]
