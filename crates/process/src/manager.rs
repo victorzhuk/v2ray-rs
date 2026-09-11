@@ -84,6 +84,7 @@ pub struct ProcessManager {
     geodata_dir: Option<PathBuf>,
     crash_times: Vec<Instant>,
     auto_restart: bool,
+    restart_delay: Duration,
     log_handles: Vec<tokio::task::JoinHandle<()>>,
     current_connection: Option<ConnectionMetadata>,
     tun: Option<TunRuntime>,
@@ -107,6 +108,7 @@ impl ProcessManager {
             geodata_dir,
             crash_times: Vec::new(),
             auto_restart: true,
+            restart_delay: CRASH_RESTART_DELAY,
             log_handles: Vec::new(),
             current_connection: None,
             tun: None,
@@ -244,7 +246,7 @@ impl ProcessManager {
             return Err(e);
         }
 
-        match self.spawn_process().await {
+        match self.launch().await {
             Ok(()) => {
                 self.state.transition(ProcessState::Running, connection)?;
                 Ok(())
@@ -326,7 +328,20 @@ impl ProcessManager {
         Ok(exit_code)
     }
 
-    async fn spawn_process(&mut self) -> Result<(), ProcessError> {
+    /// Relaunches after a crash with the inputs the last start already checked:
+    /// no version, capability or config probe, so a flapping backend cannot
+    /// stall the restart on a slow preflight.
+    async fn respawn(&mut self) -> Result<(), ProcessError> {
+        self.launch().await?;
+        self.state
+            .transition(ProcessState::Running, self.current_connection.clone())?;
+        Ok(())
+    }
+
+    // A launch failure leaves routing state in place: during a respawn the
+    // fail-closed routes must survive until the next attempt, and stop() owns
+    // the teardown.
+    async fn launch(&mut self) -> Result<(), ProcessError> {
         let mut child = self.try_spawn().await?;
 
         if let Some(pid) = child.id()
@@ -347,14 +362,12 @@ impl ProcessManager {
         {
             if !tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await {
                 self.graceful_stop().await;
-                self.teardown_tun().await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
             }
             let run = tun::xray_up(&rt).await;
             self.log_helper("xray-up", &run);
             if let Err(e) = run.result {
                 self.graceful_stop().await;
-                self.teardown_tun().await;
                 return Err(ProcessError::TunHelper(e));
             }
         }
@@ -522,39 +535,50 @@ impl ProcessManager {
         // crash — including a signal death (OOM, segfault, external kill), which
         // reports exit_code == None on Unix and must not be mistaken for a clean
         // stop.
-        self.crash_times.push(Instant::now());
-        self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
-
-        // Roll back any TUN routing state the dead backend left behind before we
-        // relaunch or give up: xray_up installs host-wide policy rules that
-        // outlive the device and is not idempotent across a dirty restart.
-        self.teardown_tun().await;
+        //
+        // Routing state stays in place across the respawn and on give-up: a
+        // teardown here would drop the tunnel's fail-closed routes and leak
+        // traffic; only stop() releases them.
+        self.record_crash();
 
         if !self.auto_restart {
             let _ = self.state.transition(ProcessState::Error(msg), None);
             return;
         }
 
-        if self.crash_times.len() >= MAX_CRASHES {
-            let _ = self.state.transition(
-                ProcessState::Error(format!(
-                    "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
-                )),
-                None,
-            );
-            return;
-        }
+        loop {
+            if self.crash_times.len() >= MAX_CRASHES {
+                let _ = self.state.transition(
+                    ProcessState::Error(format!(
+                        "{MAX_CRASHES} crashes within {CRASH_WINDOW:?}: {msg}"
+                    )),
+                    None,
+                );
+                return;
+            }
 
-        sleep(CRASH_RESTART_DELAY * self.crash_times.len() as u32).await;
+            if self.state.state() == ProcessState::Running {
+                let _ = self
+                    .state
+                    .transition(ProcessState::Starting, self.current_connection.clone());
+            }
 
-        if let Err(e) = self
-            .start_with_connection(self.current_connection.clone())
-            .await
-        {
-            let _ = self
-                .state
-                .transition(ProcessState::Error(format!("restart failed: {e}")), None);
+            sleep(self.restart_delay * self.crash_times.len() as u32).await;
+
+            match self.respawn().await {
+                Ok(()) => return,
+                Err(e) => {
+                    msg = format!("restart failed: {e}");
+                    log::warn!("{msg}");
+                    self.record_crash();
+                }
+            }
         }
+    }
+
+    fn record_crash(&mut self) {
+        self.crash_times.push(Instant::now());
+        self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
     }
 
     async fn teardown_tun(&self) {
@@ -712,6 +736,159 @@ mod tests {
             }
             other => panic!("expected Error state, got {other:?}"),
         }
+    }
+
+    fn stub_helper(dir: &std::path::Path, body: &str) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let calls = dir.join("calls");
+        let helper = dir.join("netctl");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho \"$1\" >> {}\n{body}", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (helper, calls)
+    }
+
+    fn xray_on_lo(helper: PathBuf) -> TunRuntime {
+        TunRuntime {
+            backend: BackendType::Xray,
+            iface: "lo".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: helper,
+            bypass_uid: None,
+            capture_dns: false,
+            strict: false,
+        }
+    }
+
+    fn crashing_backend(dir: &std::path::Path, crashes: usize) -> String {
+        let runs = dir.join("runs");
+        format!(
+            "echo run >> {runs}\nn=$(wc -l < {runs})\n[ $n -le {crashes} ] && exit 1\nexec sleep 30\n",
+            runs = runs.display()
+        )
+    }
+
+    fn read_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    async fn wait_for_lines(path: &std::path::Path, n: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let lines = read_lines(path);
+            if lines.len() >= n || Instant::now() >= deadline {
+                return lines;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn respawn_skips_preflight() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fresh = ProcessManager::new(
+            dir.path().join("b"),
+            dir.path().join("c"),
+            dir.path().join("p"),
+            None,
+        );
+        assert_eq!(fresh.restart_delay, CRASH_RESTART_DELAY);
+
+        let checks = dir.path().join("checks");
+        let script = format!(
+            "if [ \"$1\" = check ]; then echo check >> {}; exit 0; fi\n{}",
+            checks.display(),
+            crashing_backend(dir.path(), 1)
+        );
+        let mut mgr = manager_for(&dir, &script).with_backend(BackendType::SingBox);
+        mgr.restart_delay = Duration::from_millis(50);
+
+        mgr.start().await.unwrap();
+        mgr.wait_and_handle_exit().await.unwrap();
+
+        assert_eq!(mgr.state(), ProcessState::Running);
+        assert_eq!(read_lines(&checks).len(), 1);
+        assert_eq!(wait_for_lines(&dir.path().join("runs"), 2).await.len(), 2);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn failed_respawn_is_retried() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &crashing_backend(dir.path(), 1));
+        mgr.restart_delay = Duration::from_millis(50);
+        mgr.start().await.unwrap();
+
+        let ups = dir.path().join("ups");
+        let (helper, calls) = stub_helper(
+            dir.path(),
+            &format!(
+                "[ \"$1\" = xray-up ] || exit 0\necho up >> {ups}\n[ $(wc -l < {ups}) -le 1 ] && exit 1\nexit 0\n",
+                ups = ups.display()
+            ),
+        );
+        mgr.tun = Some(xray_on_lo(helper));
+
+        let mut rx = mgr.subscribe();
+        mgr.wait_and_handle_exit().await.unwrap();
+
+        assert_eq!(mgr.state(), ProcessState::Running);
+        assert_eq!(
+            drain_states(&mut rx),
+            [ProcessState::Starting, ProcessState::Running]
+        );
+        assert_eq!(read_lines(&calls), ["xray-up", "xray-up"]);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn respawn_budget_exhaustion_errors() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "exit 1\n");
+        mgr.restart_delay = Duration::from_millis(50);
+        mgr.start().await.unwrap();
+        let (helper, calls) = stub_helper(dir.path(), "");
+        mgr.tun = Some(xray_on_lo(helper));
+
+        while mgr.state() == ProcessState::Running {
+            mgr.wait_and_handle_exit().await.unwrap();
+        }
+
+        match mgr.state() {
+            ProcessState::Error(msg) => assert!(msg.contains("3 crashes within 60s"), "{msg}"),
+            other => panic!("expected Error state, got {other:?}"),
+        }
+        let calls = read_lines(&calls);
+        assert_eq!(calls, ["xray-up", "xray-up"]);
+        assert!(!calls.iter().any(|c| c == "xray-down"));
+    }
+
+    #[tokio::test]
+    async fn stop_during_respawn_wait_reaches_stopped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &crashing_backend(dir.path(), 1));
+        mgr.restart_delay = Duration::from_secs(5);
+        mgr.start().await.unwrap();
+        let (helper, calls) = stub_helper(dir.path(), "");
+        mgr.tun = Some(xray_on_lo(helper));
+
+        let waited =
+            tokio::time::timeout(Duration::from_millis(300), mgr.wait_and_handle_exit()).await;
+        assert!(waited.is_err(), "respawn should still be waiting");
+        assert_eq!(mgr.state(), ProcessState::Starting);
+
+        mgr.shutdown().await;
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(read_lines(&calls), ["xray-down"]);
+        assert_eq!(read_lines(&dir.path().join("runs")).len(), 1);
     }
 
     #[tokio::test]
