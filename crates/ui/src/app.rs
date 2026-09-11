@@ -96,6 +96,9 @@ pub enum ConnectOrigin {
     User,
     /// Fired by the reconnect timer: keeps the attempt budget intact.
     AutoReconnect,
+    /// Applies-and-restarts the anchored session: keeps the chosen node and
+    /// falls back to the configured strategy when it no longer resolves.
+    Restart,
 }
 
 #[derive(Debug)]
@@ -1115,7 +1118,15 @@ impl SimpleComponent for App {
                 let Some(candidate) =
                     resolve_candidate(target, &subscriptions, &manual_nodes, &snapshot)
                 else {
-                    self.show_toast("Node not available or disabled");
+                    if falls_back_to_planner(origin) {
+                        self.show_toast(
+                            "Chosen node is unavailable, reconnecting with the configured strategy",
+                        );
+                        self.session_target = None;
+                        sender.input(AppMsg::Connect(origin));
+                    } else {
+                        self.show_toast("Node not available or disabled");
+                    }
                     return;
                 };
 
@@ -1223,7 +1234,7 @@ impl SimpleComponent for App {
                 }
                 if reconnect_after_stop(&state, self.reconnect_pending) {
                     self.reconnect_pending = false;
-                    sender.input(AppMsg::Connect(ConnectOrigin::User));
+                    sender.input(reconnect_msg(self.session_target, ConnectOrigin::Restart));
                 } else {
                     match &state {
                         ProcessState::Running => {
@@ -1258,7 +1269,10 @@ impl SimpleComponent for App {
                     self.reconnect_generation,
                     self.process_handle.is_some(),
                 ) {
-                    sender.input(AppMsg::Connect(ConnectOrigin::AutoReconnect));
+                    sender.input(reconnect_msg(
+                        self.session_target,
+                        ConnectOrigin::AutoReconnect,
+                    ));
                 }
             }
             AppMsg::TunReleased => {
@@ -1457,11 +1471,26 @@ fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
 }
 
-/// Only a user-initiated connect invalidates a pending auto-reconnect; the
-/// timer's own connect must leave the attempt budget counting toward
-/// MAX_AUTO_RECONNECTS.
+/// Only user- and restart-initiated connects invalidate a pending
+/// auto-reconnect; the timer's own connect must leave the attempt budget
+/// counting toward MAX_AUTO_RECONNECTS.
 fn cancels_auto_reconnect(origin: ConnectOrigin) -> bool {
     origin != ConnectOrigin::AutoReconnect
+}
+
+/// The message a terminal state reconnects with: an anchored session goes
+/// back to its own node; a plan without a target replans.
+fn reconnect_msg(target: Option<SessionTarget>, origin: ConnectOrigin) -> AppMsg {
+    match target {
+        Some(session) => AppMsg::ConnectToNode(session.node, origin),
+        None => AppMsg::Connect(origin),
+    }
+}
+
+/// A lost node surfaces to the user only when the user picked it; restarts
+/// and auto-reconnects fall back to the configured strategy instead.
+fn falls_back_to_planner(origin: ConnectOrigin) -> bool {
+    origin != ConnectOrigin::User
 }
 
 /// The scheduled timer fires only for the generation it was armed with and
@@ -1924,6 +1953,46 @@ mod tests {
     #[test]
     fn auto_reconnect_connect_keeps_budget() {
         assert!(!cancels_auto_reconnect(ConnectOrigin::AutoReconnect));
+    }
+
+    #[test]
+    fn restart_origin_cancels_like_user() {
+        assert!(cancels_auto_reconnect(ConnectOrigin::Restart));
+        assert!(!direct_session(session_target_node(), ConnectOrigin::Restart).established);
+    }
+
+    #[test]
+    fn reconnect_msg_targets_the_chosen_node_when_set() {
+        let target = direct_session(session_target_node(), ConnectOrigin::User);
+
+        assert!(matches!(
+            reconnect_msg(Some(target), ConnectOrigin::Restart),
+            AppMsg::ConnectToNode(node, ConnectOrigin::Restart) if node == session_target_node()
+        ));
+        assert!(matches!(
+            reconnect_msg(Some(target), ConnectOrigin::AutoReconnect),
+            AppMsg::ConnectToNode(node, ConnectOrigin::AutoReconnect)
+                if node == session_target_node()
+        ));
+    }
+
+    #[test]
+    fn reconnect_msg_without_target_replans() {
+        assert!(matches!(
+            reconnect_msg(None, ConnectOrigin::Restart),
+            AppMsg::Connect(ConnectOrigin::Restart)
+        ));
+        assert!(matches!(
+            reconnect_msg(None, ConnectOrigin::AutoReconnect),
+            AppMsg::Connect(ConnectOrigin::AutoReconnect)
+        ));
+    }
+
+    #[test]
+    fn planner_fallback_skips_user_clicks() {
+        assert!(!falls_back_to_planner(ConnectOrigin::User));
+        assert!(falls_back_to_planner(ConnectOrigin::Restart));
+        assert!(falls_back_to_planner(ConnectOrigin::AutoReconnect));
     }
 
     #[test]
