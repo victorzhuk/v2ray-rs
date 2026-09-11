@@ -2716,6 +2716,26 @@ mod tests {
     }
 
     #[test]
+    fn test_xray_freedom_has_no_domain_strategy_without_tun() {
+        let config = crate::config::xray::XrayGenerator
+            .generate(&[ss_node()], &[], &default_settings())
+            .unwrap();
+
+        let freedom = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert!(freedom["settings"].get("domainStrategy").is_none());
+        assert!(
+            freedom["streamSettings"]["sockopt"]
+                .get("domainStrategy")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_xray_no_dns_hardening_without_tun() {
         let config = generate_v2ray_family_config(
             &[ss_node()],
