@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use crate::models::{
     AppSettings, AutoResolveStrategy, BackendType, DnsConfig, ManualNode, RoutingRuleSet,
-    Subscription,
+    Subscription, TunConfig,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -18,6 +18,9 @@ pub struct RuntimeConfigSnapshot {
     pub subscriptions: Vec<Subscription>,
     pub auto_resolve_strategy: AutoResolveStrategy,
     pub use_real_delay_for_lowest_latency: bool,
+    pub tun: TunConfig,
+    pub idle_timeout_secs: u32,
+    pub ws_heartbeat_secs: u32,
     pub timestamp: i64,
 }
 
@@ -40,6 +43,9 @@ impl RuntimeConfigSnapshot {
             || !subscriptions_runtime_state_eq(&self.subscriptions, subscriptions)
             || self.auto_resolve_strategy != settings.auto_resolve_strategy
             || self.use_real_delay_for_lowest_latency != settings.real_delay.use_for_lowest_latency
+            || self.tun != settings.tun
+            || self.idle_timeout_secs != settings.idle_timeout_secs
+            || self.ws_heartbeat_secs != settings.ws_heartbeat_secs
     }
 
     pub fn restore_settings(&self, settings: &mut AppSettings) {
@@ -51,6 +57,9 @@ impl RuntimeConfigSnapshot {
         settings.dns = self.dns.clone();
         settings.auto_resolve_strategy = self.auto_resolve_strategy;
         settings.real_delay.use_for_lowest_latency = self.use_real_delay_for_lowest_latency;
+        settings.tun = self.tun.clone();
+        settings.idle_timeout_secs = self.idle_timeout_secs;
+        settings.ws_heartbeat_secs = self.ws_heartbeat_secs;
     }
 
     pub fn restore_manual_nodes(&self) -> Vec<ManualNode> {
@@ -88,6 +97,9 @@ mod tests {
             subscriptions: Vec::new(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
+            tun: TunConfig::default(),
+            idle_timeout_secs: AppSettings::default().idle_timeout_secs,
+            ws_heartbeat_secs: 0,
             timestamp: 1234567890,
         }
     }
@@ -156,6 +168,9 @@ mod tests {
             subscriptions: Vec::new(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
+            tun: TunConfig::default(),
+            idle_timeout_secs: AppSettings::default().idle_timeout_secs,
+            ws_heartbeat_secs: 0,
             timestamp: 1234567890,
         };
 
@@ -262,6 +277,9 @@ mod tests {
             subscriptions: Vec::new(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
+            tun: TunConfig::default(),
+            idle_timeout_secs: AppSettings::default().idle_timeout_secs,
+            ws_heartbeat_secs: 0,
             timestamp: 1234567890,
         };
 
@@ -330,9 +348,103 @@ mod tests {
             subscriptions: Vec::new(),
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
+            tun: TunConfig::default(),
+            idle_timeout_secs: AppSettings::default().idle_timeout_secs,
+            ws_heartbeat_secs: 0,
             timestamp: 1234567890,
         };
 
         assert_eq!(snapshot.restore_manual_nodes(), manual_nodes);
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_tun_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.tun.enabled = true;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.tun = TunConfig::default();
+        settings.tun.interface_name = "tun9".to_string();
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.tun = TunConfig::default();
+        settings.tun.strict_route = false;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_idle_timeout_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.idle_timeout_secs = snapshot.idle_timeout_secs + 300;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_ws_heartbeat_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.ws_heartbeat_secs = 15;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_restores_tun_and_timeouts() {
+        let tun = TunConfig {
+            enabled: true,
+            interface_name: "tun9".to_string(),
+            ..TunConfig::default()
+        };
+
+        let snapshot = RuntimeConfigSnapshot {
+            tun,
+            idle_timeout_secs: 300,
+            ws_heartbeat_secs: 15,
+            ..make_snapshot(BackendType::Xray, "/usr/bin/xray")
+        };
+
+        let mut settings = AppSettings {
+            idle_timeout_secs: 1200,
+            ws_heartbeat_secs: 30,
+            ..AppSettings::default()
+        };
+
+        snapshot.restore_settings(&mut settings);
+
+        assert!(settings.tun.enabled);
+        assert_eq!(settings.tun.interface_name, "tun9");
+        assert_eq!(settings.idle_timeout_secs, 300);
+        assert_eq!(settings.ws_heartbeat_secs, 15);
     }
 }

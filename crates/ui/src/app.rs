@@ -498,6 +498,9 @@ impl App {
             subscriptions,
             auto_resolve_strategy: self.settings.auto_resolve_strategy,
             use_real_delay_for_lowest_latency: self.settings.real_delay.use_for_lowest_latency,
+            tun: self.settings.tun.clone(),
+            idle_timeout_secs: self.settings.idle_timeout_secs,
+            ws_heartbeat_secs: self.settings.ws_heartbeat_secs,
             timestamp: chrono::Utc::now().timestamp(),
         });
 
