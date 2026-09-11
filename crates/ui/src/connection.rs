@@ -3,13 +3,14 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::task::JoinHandle;
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
     ManualNode, ProxyNode, RoutingRule, Subscription, resolve_effective_config,
 };
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
-use v2ray_rs_process::{ProcessEvent, ProcessState, TunRuntime};
+use v2ray_rs_process::{ProcessEvent, ProcessManager, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
 
@@ -78,15 +79,16 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         // `return`s below, so the next connect cannot start setting up while
         // this one is still tearing down.
         let _lifecycle = lifecycle.lock().await;
+        let report = |state: ProcessState, connection: Option<ConnectionMetadata>| {
+            sender.emit(AppMsg::ProcessStateConnection(
+                generation, state, connection,
+            ));
+        };
 
         // A Stop that arrived while we were queued behind the previous
         // connection's teardown must not be answered by starting anyway.
         if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
-            sender.emit(AppMsg::ProcessStateConnection(
-                generation,
-                ProcessState::Stopped,
-                None,
-            ));
+            report(ProcessState::Stopped, None);
             return;
         }
 
@@ -102,14 +104,16 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         }
 
         let mut failures = Vec::new();
+        // A failed candidate keeps its routing state while the next one starts,
+        // so traffic does not leak between attempts; only a Stop releases it.
+        let mut parked: Option<ProcessManager> = None;
 
         for candidate in candidates {
             if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
-                sender.emit(AppMsg::ProcessStateConnection(
-                    generation,
-                    ProcessState::Stopped,
-                    None,
-                ));
+                if let Some(mut failed) = parked.take() {
+                    failed.shutdown().await;
+                }
+                report(ProcessState::Stopped, None);
                 return;
             }
             let candidate_label = candidate
@@ -162,52 +166,58 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 connected_since: chrono::Utc::now(),
             };
 
-            let mut mgr = v2ray_rs_process::ProcessManager::new(
+            let tun = build_tun_runtime(&effective_settings, pinned);
+            let mut mgr = ProcessManager::new(
                 binary_path.clone(),
                 config_path,
                 pid_path.clone(),
                 Some(geodata_dir.clone()),
             )
-            .with_tun(build_tun_runtime(&effective_settings, pinned))
+            .with_tun(tun)
             .with_backend(settings.backend.backend_type);
 
-            match mgr.start_with_connection(Some(meta.clone())).await {
+            let started = tokio::select! {
+                biased;
+                Some(ConnectionCmd::Stop) = cmd_rx.recv() => {
+                    mgr.shutdown().await;
+                    if let Some(mut failed) = parked.take() {
+                        failed.shutdown().await;
+                    }
+                    report(ProcessState::Stopped, None);
+                    return;
+                }
+                started = mgr.start_with_connection(Some(meta.clone())) => started,
+            };
+
+            match started {
                 Ok(()) => {
                     // A Disconnect clicked while the start was in flight sits
                     // queued until here; honor it instead of flashing the UI
                     // back to Connected with a dead handle.
                     if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
                         mgr.shutdown().await;
-                        sender.emit(AppMsg::ProcessStateConnection(
-                            generation,
-                            ProcessState::Stopped,
-                            None,
-                        ));
+                        report(ProcessState::Stopped, None);
                         return;
                     }
-                    sender.emit(AppMsg::ProcessStateConnection(
-                        generation,
-                        ProcessState::Running,
-                        Some(meta.clone()),
-                    ));
+                    report(ProcessState::Running, Some(meta.clone()));
                 }
                 Err(e) => {
                     failures.push(format!("{candidate_label}: {e}"));
-                    mgr.shutdown().await;
+                    parked = Some(mgr);
                     continue;
                 }
             }
 
             let state_sender = sender.clone();
             let mut state_rx = mgr.subscribe();
-            tokio::spawn(async move {
+            let state_forwarder = tokio::spawn(async move {
                 loop {
                     match state_rx.recv().await {
                         Ok(ProcessEvent::StateChanged { to, connection, .. }) => {
-                            // Terminal errors stay with the supervising loop,
+                            // Terminal states stay with the supervising loop,
                             // which may fail over to the next candidate; only
                             // it decides what the app finally sees.
-                            if !matches!(to, ProcessState::Error(_)) {
+                            if relays(&to) {
                                 state_sender.emit(AppMsg::ProcessStateConnection(
                                     generation, to, connection,
                                 ));
@@ -222,7 +232,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
 
             let log_sender = sender.clone();
             let mut log_rx = mgr.subscribe_logs();
-            tokio::spawn(async move {
+            let log_forwarder = tokio::spawn(async move {
                 loop {
                     match log_rx.recv().await {
                         Ok(ProcessEvent::LogLine(line)) => {
@@ -235,16 +245,13 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 }
             });
 
-            let mut stop_requested = false;
             loop {
                 tokio::select! {
-                    Some(cmd) = cmd_rx.recv() => {
-                        match cmd {
-                            ConnectionCmd::Stop => {
-                                mgr.shutdown().await;
-                                return;
-                            }
-                        }
+                    Some(ConnectionCmd::Stop) = cmd_rx.recv() => {
+                        mgr.shutdown().await;
+                        halt(state_forwarder).await;
+                        report(ProcessState::Stopped, None);
+                        return;
                     }
                     _ = mgr.wait_and_handle_exit() => {
                         // The manager restarts in place on an unexpected exit; if
@@ -258,25 +265,20 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                                 break;
                             }
                             _ => {
-                                stop_requested = true;
-                                break;
+                                halt(state_forwarder).await;
+                                report(ProcessState::Stopped, None);
+                                return;
                             }
                         }
                     }
                 }
             }
-            if stop_requested {
-                return;
-            }
-            mgr.shutdown().await;
+            halt(state_forwarder).await;
+            halt(log_forwarder).await;
+            parked = Some(mgr);
         }
 
-        let msg = summarize_failures(&failures);
-        sender.emit(AppMsg::ProcessStateConnection(
-            generation,
-            ProcessState::Error(msg),
-            None,
-        ));
+        report(ProcessState::Error(summarize_failures(&failures)), None);
     });
 
     ConnectionHandle { cmd_tx }
@@ -370,6 +372,20 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
     })
 }
 
+fn relays(state: &ProcessState) -> bool {
+    matches!(
+        state,
+        ProcessState::Starting | ProcessState::Running | ProcessState::Stopping
+    )
+}
+
+/// Stops a forwarder and waits until it can no longer emit, so nothing it
+/// relays can land after the terminal state that follows.
+async fn halt(task: JoinHandle<()>) {
+    task.abort();
+    let _ = task.await;
+}
+
 fn summarize_failures(failures: &[String]) -> String {
     if failures.is_empty() {
         return "All candidates failed".into();
@@ -392,7 +408,173 @@ fn summarize_failures(failures: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
     use v2ray_rs_core::models::{DnsStrategy, ShadowsocksConfig, TunConfig};
+    use v2ray_rs_core::persistence::AppPaths;
+    use v2ray_rs_core::profile::AppProfile;
+
+    const GENERATION: u64 = 7;
+    const RECV_TIMEOUT: Duration = Duration::from_secs(20);
+
+    struct Stub {
+        _tmp: tempfile::TempDir,
+        paths: AppPaths,
+        binary: PathBuf,
+    }
+
+    fn stub(script: &str) -> Stub {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        paths.ensure_dirs().unwrap();
+        let binary = tmp.path().join("backend");
+        std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Stub {
+            _tmp: tmp,
+            paths,
+            binary,
+        }
+    }
+
+    fn candidate(address: &str) -> ConnectionCandidate {
+        ConnectionCandidate {
+            node_ref: ConnectionNodeRef::Manual {
+                node_id: uuid::Uuid::new_v4(),
+            },
+            source_name: "test".into(),
+            node: node(address),
+            latency_ms: None,
+            real_delay_ms: None,
+        }
+    }
+
+    fn connect(
+        stub: &Stub,
+        settings: AppSettings,
+        candidates: Vec<ConnectionCandidate>,
+    ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let handle = spawn(
+            ConnectionRequest {
+                binary_path: stub.binary.clone(),
+                candidates,
+                writer: ConfigWriter::new(&settings, &stub.paths),
+                pid_path: stub.paths.pid_file_path(),
+                geodata_dir: stub.paths.geodata_dir(),
+                settings,
+                enabled_rules: Vec::new(),
+                subscriptions: Vec::new(),
+                manual_nodes: Vec::new(),
+                lifecycle: TunLifecycle::default(),
+                generation: GENERATION,
+            },
+            tx,
+        );
+        (handle, rx)
+    }
+
+    fn singbox_settings() -> AppSettings {
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings
+    }
+
+    async fn next_state(
+        rx: &relm4::Receiver<AppMsg>,
+    ) -> (ProcessState, Option<ConnectionMetadata>) {
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("no state reported in time")
+                .expect("connection task ended without a terminal state");
+            if let AppMsg::ProcessStateConnection(generation, state, connection) = msg {
+                assert_eq!(generation, GENERATION);
+                return (state, connection);
+            }
+        }
+    }
+
+    /// The task drops every sender when it returns, so a closed channel with
+    /// no state in between proves nothing followed the terminal state.
+    async fn assert_nothing_after_terminal(rx: &relm4::Receiver<AppMsg>) {
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => return,
+                Some(AppMsg::ProcessStateConnection(_, state, _)) => {
+                    panic!("{state:?} reported after the terminal state")
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    #[test]
+    fn forwarder_relays_only_nonterminal_states() {
+        assert!(relays(&ProcessState::Starting));
+        assert!(relays(&ProcessState::Running));
+        assert!(relays(&ProcessState::Stopping));
+        assert!(!relays(&ProcessState::Stopped));
+        assert!(!relays(&ProcessState::Error("boom".into())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_reports_no_stopped_and_stop_reports_one() {
+        let stub = stub(
+            r#"[ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+        );
+        let (handle, rx) = connect(
+            &stub,
+            singbox_settings(),
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+
+        loop {
+            let (state, connection) = next_state(&rx).await;
+            assert!(relays(&state), "failover reported {state:?}");
+            if matches!(state, ProcessState::Running)
+                && connection.is_some_and(|c| c.node_address == "203.0.113.2")
+            {
+                break;
+            }
+        }
+
+        handle.stop();
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+        assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn last_candidate_failure_reports_one_error() {
+        let stub = stub(
+            r#"[ "$1" = check ] && { grep -q 203.0.113.3 "$3" && exit 1; exit 0; }; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+        );
+        let (_handle, rx) = connect(
+            &stub,
+            singbox_settings(),
+            vec![candidate("203.0.113.1"), candidate("203.0.113.3")],
+        );
+
+        let msg = loop {
+            match next_state(&rx).await {
+                (ProcessState::Error(msg), _) => break msg,
+                (state, _) => assert!(relays(&state), "failover reported {state:?}"),
+            }
+        };
+        assert!(msg.starts_with("All candidates failed"), "{msg}");
+        assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
+        assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
+        assert_nothing_after_terminal(&rx).await;
+    }
 
     fn node(address: &str) -> ProxyNode {
         ProxyNode::Shadowsocks(ShadowsocksConfig {
