@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::IpProtocol;
-use rtnetlink::packet_route::route::{RouteAttribute, RouteScope};
+use rtnetlink::packet_route::route::{RouteAttribute, RouteScope, RouteType};
 use rtnetlink::packet_route::rule::{
     RuleAction, RuleAttribute, RuleMessage, RulePortRange, RuleUidRange,
 };
@@ -43,6 +43,11 @@ const RULE_PREF_BYPASS: u32 = 9000;
 const RULE_PREF_MAIN: u32 = 9001;
 const RULE_PREF_TUN: u32 = 9002;
 
+/// Metric of the strict-mode `unreachable` default in [`XRAY_ROUTE_TABLE`]. The
+/// highest possible value sorts it behind the TUN device route, so it only
+/// answers once the kernel has dropped that route along with the device.
+const FALLBACK_METRIC: u32 = u32::MAX;
+
 const EEXIST: i32 = -17;
 const ENODEV: i32 = -19;
 
@@ -57,7 +62,11 @@ pub fn connect() -> Result<Handle, String> {
 /// address), installs the TUN default route into [`XRAY_ROUTE_TABLE`], and adds
 /// the policy rules that exempt xray's own marked sockets from the tunnel (so
 /// `direct` traffic egresses the real interface instead of looping back in).
-/// Every step is idempotent.
+///
+/// With `strict`, an `unreachable` default is added to the tunnel table for both
+/// families and the IPv6 policy rules are installed even without an IPv6
+/// address, so traffic fails closed instead of leaking out `main` when the device
+/// disappears. Every step is idempotent.
 pub async fn xray_up(
     handle: &Handle,
     iface: &str,
@@ -65,6 +74,7 @@ pub async fn xray_up(
     v6: Option<(IpAddr, u8)>,
     bypass_uid: Option<u32>,
     capture_dns: bool,
+    strict: bool,
 ) -> Result<(), String> {
     let index = link_index(handle, iface)
         .await?
@@ -90,12 +100,18 @@ pub async fn xray_up(
     if let Some(uid) = bypass_uid {
         add_bypass_uid_rule(handle, AddressFamily::Inet, uid).await?;
     }
+    if strict {
+        add_fallback_route_v4(handle).await?;
+        add_fallback_route_v6(handle).await?;
+    }
     if v6.is_some() {
         add_default_route_v6(handle, index).await?;
-        add_xray_rules(handle, AddressFamily::Inet6).await?;
         if capture_dns {
             add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
         }
+    }
+    if v6.is_some() || strict {
+        add_xray_rules(handle, AddressFamily::Inet6).await?;
         if let Some(uid) = bypass_uid {
             add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
         }
@@ -194,6 +210,34 @@ async fn add_default_route_v6(handle: &Handle, index: u32) -> Result<(), String>
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
         Err(e) => Err(format!("add tun default route (v6): {e}")),
+    }
+}
+
+async fn add_fallback_route_v4(handle: &Handle) -> Result<(), String> {
+    let route = RouteMessageBuilder::<Ipv4Addr>::new()
+        .destination_prefix(Ipv4Addr::UNSPECIFIED, 0)
+        .table_id(XRAY_ROUTE_TABLE)
+        .kind(RouteType::Unreachable)
+        .priority(FALLBACK_METRIC)
+        .build();
+    match handle.route().add(route).execute().await {
+        Ok(()) => Ok(()),
+        Err(e) if is_exists(&e) => Ok(()),
+        Err(e) => Err(format!("add fallback route (v4): {e}")),
+    }
+}
+
+async fn add_fallback_route_v6(handle: &Handle) -> Result<(), String> {
+    let route = RouteMessageBuilder::<Ipv6Addr>::new()
+        .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
+        .table_id(XRAY_ROUTE_TABLE)
+        .kind(RouteType::Unreachable)
+        .priority(FALLBACK_METRIC)
+        .build();
+    match handle.route().add(route).execute().await {
+        Ok(()) => Ok(()),
+        Err(e) if is_exists(&e) => Ok(()),
+        Err(e) => Err(format!("add fallback route (v6): {e}")),
     }
 }
 

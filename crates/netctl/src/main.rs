@@ -31,6 +31,11 @@ enum Command {
         /// local subnet is reached through the tunnel like everything else.
         #[arg(long)]
         capture_dns: bool,
+        /// Add an unreachable default to the tunnel table (IPv4 and IPv6) and
+        /// install the IPv6 policy rules even without --addr6, so traffic fails
+        /// closed instead of leaking out the real interface once the device is gone.
+        #[arg(long)]
+        strict: bool,
     },
     /// Remove the xray TUN device (no-op if absent).
     XrayDown {
@@ -74,6 +79,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             addr6,
             bypass_uid,
             capture_dns,
+            strict,
         } => {
             validate::validate_iface(&iface)?;
             // The named device must be a TUN device the backend already created;
@@ -85,7 +91,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             let handle = net::connect()?;
-            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns).await
+            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns, strict).await
         }
         Command::XrayDown { iface } => {
             validate::validate_iface(&iface)?;
@@ -101,5 +107,36 @@ async fn run(cli: Cli) -> Result<(), String> {
                 net::recover_xray(&handle, &iface).await
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Command};
+    use clap::Parser;
+
+    fn parse(extra: &[&str]) -> Cli {
+        let mut args = vec![
+            "v2ray-rs-netctl",
+            "xray-up",
+            "--iface",
+            "xtun0",
+            "--addr",
+            "172.19.0.1/30",
+        ];
+        args.extend_from_slice(extra);
+        Cli::try_parse_from(args).unwrap()
+    }
+
+    #[test]
+    fn xray_up_parses_strict_flag() {
+        assert!(matches!(
+            parse(&["--strict"]).command,
+            Command::XrayUp { strict: true, .. }
+        ));
+        assert!(matches!(
+            parse(&[]).command,
+            Command::XrayUp { strict: false, .. }
+        ));
     }
 }

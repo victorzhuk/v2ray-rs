@@ -12,6 +12,7 @@ const NS: &str = "nctl-test-ns";
 /// Second namespace so the DNS-capture test can run alongside the idempotency
 /// one without the two fighting over the same rules.
 const NS_DNS: &str = "nctl-dns-ns";
+const NS_STRICT: &str = "nctl-strict-ns";
 const IFACE: &str = "nctltest0";
 const ADDR: &str = "172.31.255.1/30";
 const ADDR6: &str = "fd00:ffff::1/64";
@@ -116,6 +117,18 @@ fn up_down_is_idempotent_in_namespace() {
     assert!(
         tun_table.contains(IFACE),
         "tun default route missing from table 2023: {tun_table}"
+    );
+
+    // Without --strict nothing fails closed: no fallback route, no IPv6 rules.
+    let tun_table_v6 = ip_in_ns_output(&["-6", "route", "show", "table", "2023"]);
+    assert!(
+        !tun_table.contains("unreachable") && !tun_table_v6.contains("unreachable"),
+        "fallback route present without --strict: {tun_table} / {tun_table_v6}"
+    );
+    let v6_rules = ip_in_ns_output(&["-6", "rule", "show"]);
+    assert!(
+        !v6_rules.contains("9002:"),
+        "IPv6 capture rule present without --strict or --addr6: {v6_rules}"
     );
 
     // down deletes the live device; a second down is a clean no-op.
@@ -267,5 +280,81 @@ fn capture_dns_steers_port_53_into_the_tunnel_table() {
     assert!(
         !after.contains("8999:"),
         "dns capture rules leaked after recover --xray: {after}"
+    );
+}
+
+/// Lines of `ip [-6] route show table 2023` that are the strict fallback route.
+fn fallback_lines(ns: &str, family: &str) -> Vec<String> {
+    ip_in_output(ns, &[family, "route", "show", "table", "2023"])
+        .lines()
+        .filter(|l| l.starts_with("unreachable default"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn strict_up_installs_fallback_routes_and_v6_rules() {
+    let _ = run("ip", &["netns", "del", NS_STRICT]);
+    if !run("ip", &["netns", "add", NS_STRICT]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_STRICT);
+
+    if !ip_in(NS_STRICT, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+
+    assert!(netctl_in(
+        NS_STRICT,
+        &[
+            "xray-up",
+            "--iface",
+            IFACE,
+            "--addr",
+            ADDR,
+            "--bypass-uid",
+            "999990",
+            "--capture-dns",
+            "--strict",
+        ]
+    ));
+
+    for family in ["-4", "-6"] {
+        let fallback = fallback_lines(NS_STRICT, family);
+        assert_eq!(
+            fallback.len(),
+            1,
+            "expected one fallback route ({family}): {fallback:?}"
+        );
+        assert!(
+            fallback[0].contains("metric 4294967295"),
+            "fallback route must carry the maximum metric ({family}): {fallback:?}"
+        );
+    }
+
+    // No --addr6: the IPv6 table holds only the fallback, never a device route.
+    let v6_table = ip_in_output(NS_STRICT, &["-6", "route", "show", "table", "2023"]);
+    assert!(
+        !v6_table.contains(IFACE),
+        "IPv6 device route present without --addr6: {v6_table}"
+    );
+
+    let v6_rules = ip_in_output(NS_STRICT, &["-6", "rule", "show"]);
+    for pref in ["8998:", "9000:", "9001:", "9002:"] {
+        assert!(
+            v6_rules.contains(pref),
+            "IPv6 rule {pref} missing under --strict: {v6_rules}"
+        );
+    }
+    assert!(
+        !v6_rules.contains("8999:"),
+        "IPv6 dns capture rule present without --addr6: {v6_rules}"
+    );
+    let v4_rules = ip_in_output(NS_STRICT, &["rule", "show"]);
+    assert!(
+        v4_rules.contains("8999:"),
+        "IPv4 dns capture rule missing: {v4_rules}"
     );
 }
