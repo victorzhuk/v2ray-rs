@@ -136,19 +136,14 @@ fn query_strategy_str(strategy: DnsStrategy) -> &'static str {
     }
 }
 
-/// `freedom` with the default `AsIs` hands sniffed hostnames to the OS
-/// resolver at dial time; `UseIP` forces the built-in (proxy-routed) resolver.
-/// Under `Hijack`, a `dns` outbound answers TUN-captured udp/53 with that same
-/// resolver.
+/// Under `Hijack`, a `dns` outbound answers TUN-captured udp/53 with the
+/// built-in resolver. `freedom` deliberately gets no `settings.domainStrategy`:
+/// xray 26.9.8+ copies a non-`AsIs` value over `streamSettings.sockopt.domainStrategy`,
+/// which already keeps its dial-time lookups off the OS resolver.
 fn harden_tun_outbounds(config: &mut Value, settings: &AppSettings) {
     let Some(outbounds) = config["outbounds"].as_array_mut() else {
         return;
     };
-    for outbound in outbounds.iter_mut() {
-        if outbound["protocol"] == "freedom" {
-            outbound["settings"]["domainStrategy"] = json!("UseIP");
-        }
-    }
     if settings.tun.dns_hijack == DnsHijackMode::Hijack {
         outbounds.push(json!({
             "protocol": "dns",
@@ -2692,19 +2687,32 @@ mod tests {
 
     #[test]
     fn test_xray_tun_freedom_uses_builtin_resolver() {
-        let mut settings = default_settings();
-        settings.tun.enabled = true;
+        for (strategy, expected) in [
+            (DnsStrategy::PreferIpv4, "UseIPv4"),
+            (DnsStrategy::Ipv4Only, "UseIPv4"),
+            (DnsStrategy::PreferIpv6, "UseIPv6"),
+            (DnsStrategy::Ipv6Only, "UseIPv6"),
+        ] {
+            let mut settings = default_settings();
+            settings.tun.enabled = true;
+            settings.dns.strategy = strategy;
 
-        let config =
-            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+            let config = crate::config::xray::XrayGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
 
-        let freedom = config["outbounds"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|o| o["protocol"] == "freedom")
-            .unwrap();
-        assert_eq!(freedom["settings"]["domainStrategy"], "UseIP");
+            let freedom = config["outbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["protocol"] == "freedom")
+                .unwrap();
+            assert_eq!(
+                freedom["streamSettings"]["sockopt"]["domainStrategy"], expected,
+                "{strategy:?}"
+            );
+            assert!(freedom["settings"].get("domainStrategy").is_none());
+        }
     }
 
     #[test]
