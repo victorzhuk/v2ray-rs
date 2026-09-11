@@ -83,7 +83,7 @@ pub struct App {
     geodata_service: GeodataRefreshService,
     pending_exit: bool,
     pending_direct_target: Option<ConnectionNodeRef>,
-    direct_connect_in_flight: bool,
+    session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
     auto_reconnect_attempts: u32,
     reconnect_generation: u32,
@@ -901,7 +901,7 @@ impl SimpleComponent for App {
             geodata_service,
             pending_exit: false,
             pending_direct_target: None,
-            direct_connect_in_flight: false,
+            session_target: None,
             settings_debounce: None,
             auto_reconnect_attempts: 0,
             reconnect_generation: 0,
@@ -1080,6 +1080,7 @@ impl SimpleComponent for App {
                     self.cancel_auto_reconnect();
                 }
                 let _ = self.start_connection(candidates, subscriptions, manual_nodes, &sender);
+                self.session_target = None;
             }
             AppMsg::ConnectToNode(target, origin) => {
                 if self.tun_release_in_flight {
@@ -1133,14 +1134,15 @@ impl SimpleComponent for App {
                 }
                 self.reconnect_pending = false;
 
-                if self
+                self.session_target = self
                     .start_connection(vec![candidate], subscriptions, manual_nodes, &sender)
-                    .is_ok()
-                {
-                    self.direct_connect_in_flight = true;
-                }
+                    .ok()
+                    .map(|_| direct_session(target, origin));
             }
             AppMsg::Disconnect => {
+                let reconnect_pending = self.reconnect_pending;
+                self.session_target =
+                    session_target_after_stop(self.session_target, reconnect_pending);
                 self.clear_restart_flow();
                 self.cancel_auto_reconnect();
                 match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
@@ -1208,11 +1210,9 @@ impl SimpleComponent for App {
                     self.window.destroy();
                     return;
                 }
-                if let Some(target) = consume_terminal_direct_state(
-                    &state,
-                    &mut self.direct_connect_in_flight,
-                    &mut self.pending_direct_target,
-                ) {
+                if let Some(target) =
+                    consume_terminal_direct_state(&state, &mut self.pending_direct_target)
+                {
                     self.reconnect_pending = false;
                     self.cancel_auto_reconnect();
                     sender.input(AppMsg::ConnectToNode(target, ConnectOrigin::User));
@@ -1228,24 +1228,25 @@ impl SimpleComponent for App {
                     match &state {
                         ProcessState::Running => {
                             self.cancel_auto_reconnect();
-                            self.direct_connect_in_flight = false;
+                            self.session_target = session_target_after_running(self.session_target);
                         }
                         ProcessState::Error(_) => {
-                            let retry = if self.direct_connect_in_flight {
-                                self.direct_connect_in_flight = false;
-                                false
-                            } else {
-                                let left = MAX_AUTO_RECONNECTS
-                                    .saturating_sub(self.auto_reconnect_attempts);
-                                !release_on_error(was_stopping, left)
-                                    && self.schedule_auto_reconnect(&sender)
-                            };
-                            if !retry && self.tun_marker_present() {
-                                self.release_tun_session(&sender);
+                            let left =
+                                MAX_AUTO_RECONNECTS.saturating_sub(self.auto_reconnect_attempts);
+                            let retry = retry_after_error(self.session_target, was_stopping, left)
+                                && self.schedule_auto_reconnect(&sender);
+                            if !retry {
+                                self.session_target = None;
+                                if self.tun_marker_present() {
+                                    self.release_tun_session(&sender);
+                                }
                             }
                         }
                         ProcessState::Stopped => {
-                            self.direct_connect_in_flight = false;
+                            self.session_target = session_target_after_stop(
+                                self.session_target,
+                                self.reconnect_pending,
+                            );
                         }
                         _ => {}
                     }
@@ -1502,33 +1503,65 @@ fn release_on_error(app_state_stopping: bool, reconnects_left: u32) -> bool {
     app_state_stopping || reconnects_left == 0
 }
 
-/// Pure helper for terminal-state direct-connect bookkeeping.
-///
-/// - `Stopped` with a pending direct target replays that target and clears the
-///   in-flight flag so the revalidation path decides the next state.
-/// - `Stopped` without a pending target clears a stale in-flight flag.
-/// - `Error` with a pending direct target replays that target exactly once and
-///   clears the in-flight flag, suppressing generic auto-reconnect.
-/// - `Error` without a pending target leaves `direct_connect_in_flight` alone
-///   so the caller can decide whether to suppress planner auto-reconnect.
+/// The node the current session attempt is anchored to, and whether it ever
+/// reached `Running`. An established target survives backend errors and is
+/// retried within the auto-reconnect budget; an unestablished one surfaces
+/// the failure immediately. A session the user ended drops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SessionTarget {
+    node: ConnectionNodeRef,
+    established: bool,
+}
+
+/// A direct connect starts unestablished; only the reconnect timer re-enters
+/// a session that had already been established.
+fn direct_session(node: ConnectionNodeRef, origin: ConnectOrigin) -> SessionTarget {
+    SessionTarget {
+        node,
+        established: origin == ConnectOrigin::AutoReconnect,
+    }
+}
+
+/// `Running` anchors the session: its target becomes established.
+fn session_target_after_running(target: Option<SessionTarget>) -> Option<SessionTarget> {
+    target.map(|mut session| {
+        session.established = true;
+        session
+    })
+}
+
+/// A stop keeps the target only while a restart will follow; a session the
+/// user ended drops it.
+fn session_target_after_stop(
+    target: Option<SessionTarget>,
+    reconnect_pending: bool,
+) -> Option<SessionTarget> {
+    if reconnect_pending { target } else { None }
+}
+
+/// An unestablished direct target must surface its failure instead of
+/// retrying; established and planned sessions follow the normal release
+/// decision.
+fn retry_after_error(
+    target: Option<SessionTarget>,
+    app_state_stopping: bool,
+    reconnects_left: u32,
+) -> bool {
+    match target {
+        Some(session) if !session.established => false,
+        _ => !release_on_error(app_state_stopping, reconnects_left),
+    }
+}
+
+/// Pure helper for terminal-state direct-connect bookkeeping: a terminal
+/// `Stopped` or `Error` replays a pending direct target exactly once, so the
+/// revalidation path decides the next state.
 fn consume_terminal_direct_state(
     state: &ProcessState,
-    direct_connect_in_flight: &mut bool,
     pending_direct_target: &mut Option<ConnectionNodeRef>,
 ) -> Option<ConnectionNodeRef> {
     match state {
-        ProcessState::Stopped => {
-            let target = pending_direct_target.take();
-            *direct_connect_in_flight = false;
-            target
-        }
-        ProcessState::Error(_) => {
-            let target = pending_direct_target.take();
-            if target.is_some() {
-                *direct_connect_in_flight = false;
-            }
-            target
-        }
+        ProcessState::Stopped | ProcessState::Error(_) => pending_direct_target.take(),
         _ => None,
     }
 }
@@ -1655,67 +1688,113 @@ mod tests {
         assert!(!reconnect_after_stop(&ProcessState::Stopping, true));
     }
 
+    fn session_target_node() -> ConnectionNodeRef {
+        ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::nil(),
+        }
+    }
+
+    #[test]
+    fn direct_session_establishment_follows_origin() {
+        assert!(!direct_session(session_target_node(), ConnectOrigin::User).established);
+        assert!(direct_session(session_target_node(), ConnectOrigin::AutoReconnect).established);
+        let session = direct_session(session_target_node(), ConnectOrigin::User);
+        assert_eq!(session.node, session_target_node());
+    }
+
+    #[test]
+    fn running_establishes_the_session_target() {
+        let node = session_target_node();
+        let target = direct_session(node, ConnectOrigin::User);
+
+        assert_eq!(
+            session_target_after_running(Some(target)),
+            Some(SessionTarget {
+                node,
+                established: true
+            })
+        );
+        assert_eq!(session_target_after_running(None), None);
+    }
+
+    #[test]
+    fn user_disconnect_clears_target_and_restart_keeps_it() {
+        let target = direct_session(session_target_node(), ConnectOrigin::User);
+
+        assert_eq!(session_target_after_stop(Some(target), true), Some(target));
+        assert_eq!(session_target_after_stop(Some(target), false), None);
+        assert_eq!(session_target_after_stop(None, true), None);
+    }
+
+    #[test]
+    fn error_retry_suppressed_for_unestablished_direct_target() {
+        let unestablished = direct_session(session_target_node(), ConnectOrigin::User);
+        let established = SessionTarget {
+            node: session_target_node(),
+            established: true,
+        };
+
+        assert!(!retry_after_error(
+            Some(unestablished),
+            false,
+            MAX_AUTO_RECONNECTS
+        ));
+        assert!(retry_after_error(
+            Some(established),
+            false,
+            MAX_AUTO_RECONNECTS
+        ));
+        assert!(!retry_after_error(
+            Some(established),
+            true,
+            MAX_AUTO_RECONNECTS
+        ));
+        assert!(!retry_after_error(Some(established), false, 0));
+        assert!(retry_after_error(None, false, MAX_AUTO_RECONNECTS));
+        assert!(!retry_after_error(None, true, 0));
+    }
+
     #[test]
     fn direct_error_leaves_in_flight_for_caller_suppression() {
-        let mut in_flight = true;
         let mut pending = None;
 
-        let replay = consume_terminal_direct_state(
-            &ProcessState::Error("boom".into()),
-            &mut in_flight,
-            &mut pending,
-        );
+        let replay =
+            consume_terminal_direct_state(&ProcessState::Error("boom".into()), &mut pending);
 
         assert!(replay.is_none());
-        assert!(in_flight);
         assert!(pending.is_none());
     }
 
     #[test]
     fn error_replays_pending_direct_target_before_any_other_reconnect() {
-        let target = ConnectionNodeRef::Manual {
-            node_id: uuid::Uuid::nil(),
-        };
-        let mut in_flight = true;
+        let target = session_target_node();
         let mut pending = Some(target);
 
-        let replay = consume_terminal_direct_state(
-            &ProcessState::Error("boom".into()),
-            &mut in_flight,
-            &mut pending,
-        );
+        let replay =
+            consume_terminal_direct_state(&ProcessState::Error("boom".into()), &mut pending);
 
         assert_eq!(replay, Some(target));
-        assert!(!in_flight);
         assert!(pending.is_none());
     }
 
     #[test]
     fn stopped_clears_stale_direct_in_flight_when_nothing_pending() {
-        let mut in_flight = true;
         let mut pending = None;
 
-        let replay =
-            consume_terminal_direct_state(&ProcessState::Stopped, &mut in_flight, &mut pending);
+        let replay = consume_terminal_direct_state(&ProcessState::Stopped, &mut pending);
 
         assert!(replay.is_none());
-        assert!(!in_flight);
         assert!(pending.is_none());
     }
 
     #[test]
     fn stopped_replays_pending_direct_target_before_any_other_reconnect() {
-        let target = ConnectionNodeRef::Manual {
-            node_id: uuid::Uuid::nil(),
-        };
-        let mut in_flight = false;
+        let target = session_target_node();
         let mut pending = Some(target);
 
-        let replay =
-            consume_terminal_direct_state(&ProcessState::Stopped, &mut in_flight, &mut pending);
+        let replay = consume_terminal_direct_state(&ProcessState::Stopped, &mut pending);
 
         assert_eq!(replay, Some(target));
-        assert!(!in_flight);
         assert!(pending.is_none());
     }
 
