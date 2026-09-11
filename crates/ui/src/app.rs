@@ -87,6 +87,7 @@ pub struct App {
     settings_debounce: Option<glib::SourceId>,
     auto_reconnect_attempts: u32,
     reconnect_generation: u32,
+    tun_release_in_flight: bool,
 }
 
 #[derive(Debug)]
@@ -116,6 +117,7 @@ pub enum AppMsg {
     ShowToast(String),
     FlushSettings(AppSettings),
     AutoReconnect(u32),
+    TunReleased,
 }
 
 impl App {
@@ -238,9 +240,9 @@ impl App {
 
     /// Schedules a bounded retry after the backend gives up (terminal Error),
     /// so a flaky upstream reconnects on its own and can pick a fresh candidate.
-    fn schedule_auto_reconnect(&mut self, sender: &ComponentSender<Self>) {
-        if self.pending_exit || self.auto_reconnect_attempts >= MAX_AUTO_RECONNECTS {
-            return;
+    fn schedule_auto_reconnect(&mut self, sender: &ComponentSender<Self>) -> bool {
+        if !auto_reconnect_allowed(self.pending_exit, self.auto_reconnect_attempts) {
+            return false;
         }
         self.auto_reconnect_attempts += 1;
         let generation = self.reconnect_generation;
@@ -248,6 +250,49 @@ impl App {
         glib::timeout_add_local_once(AUTO_RECONNECT_DELAY, move || {
             s.input(AppMsg::AutoReconnect(generation));
         });
+        true
+    }
+
+    fn tun_marker_present(&self) -> bool {
+        self.paths.tun_session_path().exists()
+    }
+
+    /// Releases TUN routes left installed by a session that ended without a
+    /// clean stop. Takes the lifecycle lock like the startup pass so it cannot
+    /// flush routes from under a connection that is starting.
+    fn release_tun_session(&mut self, sender: &ComponentSender<Self>) {
+        if self.tun_release_in_flight {
+            return;
+        }
+        self.tun_release_in_flight = true;
+        let paths = self.paths.clone();
+        let lifecycle = self.tun_lifecycle.clone();
+        let s = sender.input_sender().clone();
+        tokio::spawn(async move {
+            let _lifecycle = lifecycle.lock().await;
+            let _ = tokio::task::spawn_blocking(move || {
+                recover_tun_session(&paths, &v2ray_rs_process::helper_path());
+            })
+            .await;
+            s.emit(AppMsg::TunReleased);
+        });
+    }
+
+    fn quit(&mut self, sender: &ComponentSender<Self>) {
+        self.cancel_auto_reconnect();
+        if self.tun_release_in_flight {
+            self.pending_exit = true;
+            return;
+        }
+        if let Some(handle) = self.process_handle.take() {
+            self.pending_exit = true;
+            handle.stop();
+        } else if self.tun_marker_present() {
+            self.pending_exit = true;
+            self.release_tun_session(sender);
+        } else {
+            self.window.destroy();
+        }
     }
 
     fn persist_settings(&mut self, settings: AppSettings) -> Result<(), String> {
@@ -759,7 +804,7 @@ impl SimpleComponent for App {
                     if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&bg_paths) {
                         log::warn!("failed to clean orphaned backend process: {err}");
                     }
-                    recover_tun_session(&bg_paths);
+                    recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path());
                 })
                 .await;
             });
@@ -858,6 +903,7 @@ impl SimpleComponent for App {
             settings_debounce: None,
             auto_reconnect_attempts: 0,
             reconnect_generation: 0,
+            tun_release_in_flight: false,
         };
 
         let toast_overlay = &model.toast_overlay;
@@ -981,7 +1027,7 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::Connect => {
-                if self.process_handle.is_some() {
+                if self.process_handle.is_some() || self.tun_release_in_flight {
                     return;
                 }
 
@@ -1031,6 +1077,9 @@ impl SimpleComponent for App {
                 let _ = self.start_connection(candidates, subscriptions, manual_nodes, &sender);
             }
             AppMsg::ConnectToNode(target) => {
+                if self.tun_release_in_flight {
+                    return;
+                }
                 // Resolve the requested node before touching any connection state.
                 // An invalid target must toast and exit without canceling reconnects,
                 // setting a pending target, or tearing down an existing session.
@@ -1085,12 +1134,22 @@ impl SimpleComponent for App {
             AppMsg::Disconnect => {
                 self.clear_restart_flow();
                 self.cancel_auto_reconnect();
-                if let Some(handle) = self.process_handle.take() {
-                    self.apply_state(&ProcessState::Stopping);
-                    handle.stop();
-                } else {
-                    self.reconnect_pending = false;
-                    self.show_toast("Not connected");
+                match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
+                    DisconnectPlan::Stop => {
+                        if let Some(handle) = self.process_handle.take() {
+                            self.apply_state(&ProcessState::Stopping);
+                            handle.stop();
+                        }
+                    }
+                    DisconnectPlan::Release => {
+                        self.reconnect_pending = false;
+                        self.apply_state(&ProcessState::Stopped);
+                        self.release_tun_session(&sender);
+                    }
+                    DisconnectPlan::Nothing => {
+                        self.reconnect_pending = false;
+                        self.show_toast("Not connected");
+                    }
                 }
             }
             AppMsg::ProcessStateConnection(generation, state, connection) => {
@@ -1100,14 +1159,15 @@ impl SimpleComponent for App {
                 if generation != self.connection_generation {
                     return;
                 }
+                let was_stopping = matches!(self.process_state, ProcessState::Stopping);
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
                 if stopped {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
-                    // Clear the TUN recovery marker only on a clean stop. On a
-                    // crash give-up (Error) keep it so the next launch runs the
-                    // route-recovery pass in case teardown didn't complete.
+                    // Clear the TUN recovery marker only on a clean stop. On
+                    // Error the routes stay installed as a kill switch while a
+                    // retry follows; the release pass clears it on give-up.
                     if matches!(state, ProcessState::Stopped) {
                         let _ = v2ray_rs_core::persistence::clear_tun_session(&self.paths);
                     }
@@ -1131,6 +1191,10 @@ impl SimpleComponent for App {
                 }
                 self.apply_state(&state);
                 if stopped && self.pending_exit {
+                    if matches!(state, ProcessState::Error(_)) && self.tun_marker_present() {
+                        self.release_tun_session(&sender);
+                        return;
+                    }
                     self.pending_exit = false;
                     self.window.destroy();
                     return;
@@ -1158,10 +1222,17 @@ impl SimpleComponent for App {
                             self.direct_connect_in_flight = false;
                         }
                         ProcessState::Error(_) => {
-                            if self.direct_connect_in_flight {
+                            let retry = if self.direct_connect_in_flight {
                                 self.direct_connect_in_flight = false;
+                                false
                             } else {
-                                self.schedule_auto_reconnect(&sender);
+                                let left = MAX_AUTO_RECONNECTS
+                                    .saturating_sub(self.auto_reconnect_attempts);
+                                !release_on_error(was_stopping, left)
+                                    && self.schedule_auto_reconnect(&sender)
+                            };
+                            if !retry && self.tun_marker_present() {
+                                self.release_tun_session(&sender);
                             }
                         }
                         ProcessState::Stopped => {
@@ -1176,17 +1247,21 @@ impl SimpleComponent for App {
                     sender.input(AppMsg::Connect);
                 }
             }
+            AppMsg::TunReleased => {
+                self.tun_release_in_flight = false;
+                if self.pending_exit {
+                    self.pending_exit = false;
+                    self.window.destroy();
+                }
+            }
             AppMsg::ProcessLogLine(line) => {
                 self.logs_page.emit(LogsMsg::AppendLine(line));
             }
             AppMsg::CloseRequested => {
                 if self.settings.minimize_to_tray && tray_available() {
                     self.window.set_visible(false);
-                } else if let Some(handle) = self.process_handle.take() {
-                    self.pending_exit = true;
-                    handle.stop();
                 } else {
-                    self.window.destroy();
+                    self.quit(&sender);
                 }
             }
             AppMsg::TrayShowWindow => {
@@ -1194,12 +1269,7 @@ impl SimpleComponent for App {
                 self.window.present();
             }
             AppMsg::TrayQuit => {
-                if let Some(handle) = self.process_handle.take() {
-                    self.pending_exit = true;
-                    handle.stop();
-                } else {
-                    self.window.destroy();
-                }
+                self.quit(&sender);
             }
             AppMsg::OpenPreferences => {
                 if let Some(dialog) = &self.preferences_dialog {
@@ -1335,6 +1405,34 @@ fn restart_banner_visible_for_state(restart_required: bool, state: &ProcessState
 
 fn reconnect_after_stop(state: &ProcessState, reconnect_pending: bool) -> bool {
     reconnect_pending && matches!(state, ProcessState::Stopped | ProcessState::Error(_))
+}
+
+fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
+    !pending_exit && attempts < MAX_AUTO_RECONNECTS
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DisconnectPlan {
+    Stop,
+    Release,
+    Nothing,
+}
+
+fn disconnect_plan(has_handle: bool, marker_present: bool) -> DisconnectPlan {
+    if has_handle {
+        DisconnectPlan::Stop
+    } else if marker_present {
+        DisconnectPlan::Release
+    } else {
+        DisconnectPlan::Nothing
+    }
+}
+
+/// An Error that arrives while the user is disconnecting, or after the
+/// automatic reconnect budget is spent, gets no retry, so the kill-switch
+/// routes must be released.
+fn release_on_error(app_state_stopping: bool, reconnects_left: u32) -> bool {
+    app_state_stopping || reconnects_left == 0
 }
 
 /// Pure helper for terminal-state direct-connect bookkeeping.
@@ -1535,6 +1633,88 @@ mod tests {
 
         assert!(active_nodes_available(&[subscription], &manual_nodes));
     }
+
+    #[test]
+    fn auto_reconnect_exhausted_after_three_attempts() {
+        let mut attempts = 0;
+        while auto_reconnect_allowed(false, attempts) {
+            attempts += 1;
+        }
+        assert_eq!(attempts, 3);
+        assert!(!auto_reconnect_allowed(false, MAX_AUTO_RECONNECTS));
+    }
+
+    #[test]
+    fn auto_reconnect_suppressed_on_exit() {
+        assert!(!auto_reconnect_allowed(true, 0));
+    }
+
+    #[test]
+    fn disconnect_without_handle_releases_marker() {
+        assert_eq!(disconnect_plan(false, true), DisconnectPlan::Release);
+        assert_eq!(disconnect_plan(false, false), DisconnectPlan::Nothing);
+        assert_eq!(disconnect_plan(true, true), DisconnectPlan::Stop);
+        assert_eq!(disconnect_plan(true, false), DisconnectPlan::Stop);
+    }
+
+    #[test]
+    fn error_while_stopping_releases_without_retry() {
+        assert!(release_on_error(true, MAX_AUTO_RECONNECTS));
+        assert!(release_on_error(true, 0));
+    }
+
+    #[test]
+    fn error_with_reconnects_left_keeps_killswitch() {
+        assert!(!release_on_error(false, 1));
+        assert!(!release_on_error(false, MAX_AUTO_RECONNECTS));
+        assert!(release_on_error(false, 0));
+    }
+
+    fn paths_with_marker(tmp: &tempfile::TempDir) -> AppPaths {
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        v2ray_rs_core::persistence::save_tun_session(
+            &paths,
+            &v2ray_rs_core::persistence::TunSession {
+                backend: v2ray_rs_core::models::BackendType::Xray,
+                iface: "tun9".into(),
+            },
+        )
+        .unwrap();
+        paths
+    }
+
+    fn stub_helper(tmp: &tempfile::TempDir, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let helper = tmp.path().join("netctl");
+        std::fs::write(&helper, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        helper
+    }
+
+    #[test]
+    fn recover_runs_helper_and_clears_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let args = tmp.path().join("args");
+        let helper = stub_helper(&tmp, &format!("echo \"$@\" > {}", args.display()));
+
+        recover_tun_session(&paths, &helper);
+
+        let recorded = std::fs::read_to_string(&args).unwrap();
+        assert_eq!(recorded.trim_end(), "recover --xray --iface tun9");
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+    }
+
+    #[test]
+    fn recover_clears_marker_when_helper_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let helper = stub_helper(&tmp, "exit 1");
+
+        recover_tun_session(&paths, &helper);
+
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+    }
 }
 
 fn tray_available() -> bool {
@@ -1558,9 +1738,12 @@ fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
     pid_file.check_and_kill_orphaned()
 }
 
-/// On startup, if the previous run left a TUN session marker (an unclean
-/// shutdown), run the route helper's recovery pass and clear the marker.
-fn recover_tun_session(paths: &AppPaths) {
+/// If a TUN session marker is present, run the route helper's recovery pass
+/// and clear the marker. Runs at startup after an unclean shutdown and
+/// whenever a TUN session ends without a clean stop. The marker is cleared
+/// even when the helper fails or hangs, so a broken helper cannot wedge
+/// every later launch.
+fn recover_tun_session(paths: &AppPaths, helper: &std::path::Path) {
     let Some(session) = v2ray_rs_core::persistence::load_tun_session(paths) else {
         return;
     };
@@ -1568,7 +1751,7 @@ fn recover_tun_session(paths: &AppPaths) {
         v2ray_rs_core::models::BackendType::SingBox => "--singbox",
         _ => "--xray",
     };
-    let mut cmd = std::process::Command::new(v2ray_rs_process::helper_path());
+    let mut cmd = std::process::Command::new(helper);
     cmd.arg("recover")
         .arg(backend_flag)
         .arg("--iface")
