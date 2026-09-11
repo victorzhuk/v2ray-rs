@@ -34,6 +34,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   starting. Xray-core 26.6.22 and later reject `allowInsecure`; such a node is
   now skipped for xray with an error naming it, and connection planning moves on
   to the next candidate. The v2ray backend is unchanged.
+- Apply & Restart and an automatic reconnect keep the directly chosen node.
+- Editing TUN, idle-timeout or heartbeat settings while connected raises the
+  restart banner.
+- Saving Preferences no longer rolls back the last successful node.
+- A manual Connect cancels a pending automatic reconnect.
+- Log lines from a replaced connection no longer appear.
 
 ## [0.17.4] - 2026-09-04
 
