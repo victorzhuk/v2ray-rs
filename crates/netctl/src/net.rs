@@ -50,6 +50,20 @@ const FALLBACK_METRIC: u32 = u32::MAX;
 
 const EEXIST: i32 = -17;
 const ENODEV: i32 = -19;
+const EAFNOSUPPORT: i32 = -97;
+
+/// A failed netlink step, kept unformatted so a caller can still match on the
+/// kernel's error code.
+struct StepError {
+    context: String,
+    source: rtnetlink::Error,
+}
+
+impl From<StepError> for String {
+    fn from(e: StepError) -> Self {
+        format!("{}: {}", e.context, e.source)
+    }
+}
 
 pub fn connect() -> Result<Handle, String> {
     let (connection, handle, _) =
@@ -66,7 +80,8 @@ pub fn connect() -> Result<Handle, String> {
 /// With `strict`, an `unreachable` default is added to the tunnel table for both
 /// families and the IPv6 policy rules are installed even without an IPv6
 /// address, so traffic fails closed instead of leaking out `main` when the device
-/// disappears. Every step is idempotent.
+/// disappears; without an IPv6 address those IPv6 steps are skipped when IPv6 is
+/// disabled on the host. Every step is idempotent.
 pub async fn xray_up(
     handle: &Handle,
     iface: &str,
@@ -102,18 +117,23 @@ pub async fn xray_up(
     }
     if strict {
         add_fallback_route_v4(handle).await?;
-        add_fallback_route_v6(handle).await?;
     }
     if v6.is_some() {
+        if strict {
+            add_fallback_route_v6(handle).await?;
+        }
         add_default_route_v6(handle, index).await?;
         if capture_dns {
             add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
         }
-    }
-    if v6.is_some() || strict {
-        add_xray_rules(handle, AddressFamily::Inet6).await?;
-        if let Some(uid) = bypass_uid {
-            add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
+        add_v6_rules(handle, bypass_uid).await?;
+    } else if strict {
+        // A host booted with IPv6 disabled refuses every IPv6 route and rule,
+        // and has no IPv6 traffic to leak in the first place.
+        match add_strict_v6(handle, bypass_uid).await {
+            Ok(()) => {}
+            Err(e) if is_af_unsupported(&e.source) => {}
+            Err(e) => return Err(e.into()),
         }
     }
 
@@ -231,7 +251,7 @@ async fn add_fallback_route_v4(handle: &Handle) -> Result<(), String> {
     }
 }
 
-async fn add_fallback_route_v6(handle: &Handle) -> Result<(), String> {
+async fn add_fallback_route_v6(handle: &Handle) -> Result<(), StepError> {
     let route = RouteMessageBuilder::<Ipv6Addr>::new()
         .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
         .table_id(XRAY_ROUTE_TABLE)
@@ -241,8 +261,25 @@ async fn add_fallback_route_v6(handle: &Handle) -> Result<(), String> {
     match handle.route().add(route).execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(format!("add fallback route (v6): {e}")),
+        Err(e) => Err(StepError {
+            context: "add fallback route (v6)".into(),
+            source: e,
+        }),
     }
+}
+
+/// The strict-mode IPv6 steps for a tunnel without an IPv6 address.
+async fn add_strict_v6(handle: &Handle, bypass_uid: Option<u32>) -> Result<(), StepError> {
+    add_fallback_route_v6(handle).await?;
+    add_v6_rules(handle, bypass_uid).await
+}
+
+async fn add_v6_rules(handle: &Handle, bypass_uid: Option<u32>) -> Result<(), StepError> {
+    add_xray_rules(handle, AddressFamily::Inet6).await?;
+    if let Some(uid) = bypass_uid {
+        add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
+    }
+    Ok(())
 }
 
 /// Installs the three policy rules for one address family:
@@ -251,7 +288,7 @@ async fn add_fallback_route_v6(handle: &Handle) -> Result<(), String> {
 /// 2. unmarked packets look up `main` with the default route suppressed, so LAN
 ///    and link routes keep working;
 /// 3. everything else falls through to the tunnel's dedicated table.
-async fn add_xray_rules(handle: &Handle, family: AddressFamily) -> Result<(), String> {
+async fn add_xray_rules(handle: &Handle, family: AddressFamily) -> Result<(), StepError> {
     add_rule(
         handle,
         family,
@@ -307,7 +344,7 @@ async fn add_rule(
     table: u32,
     fwmark: Option<u32>,
     suppress_prefixlen: Option<u32>,
-) -> Result<(), String> {
+) -> Result<(), StepError> {
     let mut req = handle.rule().add();
     {
         let msg = req.message_mut();
@@ -329,7 +366,10 @@ async fn add_rule(
     match req.execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(format!("add policy rule (pref {priority}): {e}")),
+        Err(e) => Err(StepError {
+            context: format!("add policy rule (pref {priority})"),
+            source: e,
+        }),
     }
 }
 
@@ -340,7 +380,7 @@ async fn add_bypass_uid_rule(
     handle: &Handle,
     family: AddressFamily,
     uid: u32,
-) -> Result<(), String> {
+) -> Result<(), StepError> {
     let mut req = handle.rule().add();
     {
         let msg = req.message_mut();
@@ -357,9 +397,10 @@ async fn add_bypass_uid_rule(
     match req.execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(format!(
-            "add bypass-uid rule (pref {RULE_PREF_BYPASS_UID}): {e}"
-        )),
+        Err(e) => Err(StepError {
+            context: format!("add bypass-uid rule (pref {RULE_PREF_BYPASS_UID})"),
+            source: e,
+        }),
     }
 }
 
@@ -443,10 +484,18 @@ fn is_no_such_device(err: &rtnetlink::Error) -> bool {
     matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(ENODEV))
 }
 
+fn is_af_unsupported(err: &rtnetlink::Error) -> bool {
+    matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(EAFNOSUPPORT))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::XRAY_FWMARK;
+    use std::num::NonZeroI32;
+
+    use rtnetlink::packet_core::ErrorMessage;
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
+
+    use super::{EAFNOSUPPORT, EEXIST, XRAY_FWMARK, is_af_unsupported};
 
     /// Guards against the two fwmark constants drifting: xray stamps its own
     /// outbound sockets with one value and the route helper's bypass rule
@@ -455,5 +504,19 @@ mod tests {
     #[test]
     fn fwmark_matches_core() {
         assert_eq!(XRAY_FWMARK, XRAY_TUN_FWMARK);
+    }
+
+    fn netlink_error(code: i32) -> rtnetlink::Error {
+        let mut msg = ErrorMessage::default();
+        msg.code = NonZeroI32::new(code);
+        rtnetlink::Error::NetlinkError(msg)
+    }
+
+    #[test]
+    fn af_unsupported_matches_only_eafnosupport() {
+        assert!(is_af_unsupported(&netlink_error(EAFNOSUPPORT)));
+        assert!(!is_af_unsupported(&netlink_error(EEXIST)));
+        assert!(!is_af_unsupported(&netlink_error(-1)));
+        assert!(!is_af_unsupported(&rtnetlink::Error::RequestFailed));
     }
 }

@@ -11,8 +11,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **BREAKING:** under xray TUN with `strict_route` on, which is the default,
   IPv6 is refused unless an IPv6 tunnel address is set, and the host has no
   connectivity outside the tunnel while a session reconnects. Set an IPv6
-  address, or turn `strict_route` off, to get the previous behavior.
-  `strict_route` now applies to xray as well as sing-box: the route helper adds
+  address, or turn `strict_route` off, to get the previous behavior. Hosts with
+  IPv6 disabled need neither. `strict_route` now applies to xray as well as sing-box: the route helper adds
   a fail-closed fallback, so traffic stops rather than leaking out the real
   interface when the tunnel device goes away.
 
