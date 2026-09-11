@@ -74,11 +74,23 @@ fn check_with_nodes(
         .output()
         .unwrap();
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "{name}: xray run -test failed\nstdout: {}\nstderr: {}\nconfig: {json}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        "{name}: xray run -test failed\nstdout: {stdout}\nstderr: {stderr}\nconfig: {json}",
+    );
+
+    let deprecated: Vec<&str> = stdout
+        .lines()
+        .chain(stderr.lines())
+        .filter(|line| line.to_ascii_lowercase().contains("deprecated"))
+        .filter(|line| !deprecated_node_feature(line))
+        .collect();
+    assert!(
+        deprecated.is_empty(),
+        "{name}: xray reports deprecated settings\n{}\nconfig: {json}",
+        deprecated.join("\n"),
     );
 }
 
@@ -155,6 +167,62 @@ fn generated_xray_configs_pass_xray_test() {
     for (name, settings) in &cases {
         check(name, settings);
     }
+}
+
+// Upstream deprecates these protocols; they come from the user's node, and a
+// generator cannot remove them.
+const DEPRECATED_NODE_FEATURES: &[&str] = &["Shadowsocks", "WebSocket transport"];
+
+fn deprecated_node_feature(line: &str) -> bool {
+    line.split_once("The feature ").is_some_and(|(_, rest)| {
+        DEPRECATED_NODE_FEATURES.iter().any(|name| {
+            rest.strip_prefix(name)
+                .is_some_and(|tail| tail.starts_with([' ', '(']))
+        })
+    })
+}
+
+fn reality_node() -> ProxyNode {
+    ProxyNode::Vless(VlessConfig {
+        address: "reality.example.com".into(),
+        port: 443,
+        uuid: "550e8400-e29b-41d4-a716-446655440000".into(),
+        encryption: Some("none".into()),
+        flow: Some("xtls-rprx-vision".into()),
+        transport: TransportSettings::Tcp,
+        tls: Some(TlsSettings {
+            server_name: Some("www.microsoft.com".into()),
+            fingerprint: Some("chrome".into()),
+            reality: true,
+            public_key: Some("y4cM6qskQWOzeSG4ri9BPfEJm7ZJEXH8cUrRhse5nyI".into()),
+            short_id: Some("6ba85179e30d4fc2".into()),
+            ..Default::default()
+        }),
+        remark: Some("REALITY".into()),
+    })
+}
+
+#[test]
+fn tun_without_dns_and_hostname_reality_node_pass_xray_test() {
+    if !xray_available() {
+        eprintln!("xray not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.tun.enabled = true;
+    settings.dns.enabled = false;
+    settings.dns.hosts = vec![HostOverride {
+        domain: "reality.example.com".to_string(),
+        ip: "203.0.113.10".to_string(),
+    }];
+
+    check_with_nodes(
+        "tun-no-dns-hostname-reality",
+        &settings,
+        &[],
+        &[reality_node()],
+    );
 }
 
 fn ws_node() -> ProxyNode {
