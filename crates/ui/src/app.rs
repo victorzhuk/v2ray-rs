@@ -991,6 +991,7 @@ impl SimpleComponent for App {
             }
             AppMsg::FlushSettings(settings) => {
                 self.settings_debounce = None;
+                let settings = keep_last_success(settings, &self.settings);
                 if let Err(err) = self.persist_settings(settings) {
                     log::error!("save settings: {err}");
                     self.show_toast(&format!("Failed to save settings: {err}"));
@@ -1197,13 +1198,7 @@ impl SimpleComponent for App {
                 if connection.is_some() {
                     self.connection_status = connection;
                     if let Some(meta) = &self.connection_status {
-                        let node_ref = meta.node_ref;
-                        let connected_at = meta.connected_since;
-                        let mut settings = self.settings.clone();
-                        settings.last_success = Some(LastSuccessMetadata {
-                            node_ref,
-                            connected_at,
-                        });
+                        let settings = last_success_settings(&self.settings, meta);
                         if let Err(err) = self.persist_settings(settings) {
                             log::error!("save settings: {err}");
                         }
@@ -1593,6 +1588,25 @@ fn consume_terminal_direct_state(
         ProcessState::Stopped | ProcessState::Error(_) => pending_direct_target.take(),
         _ => None,
     }
+}
+
+/// A settings flush from the preferences dialog carries a copy taken when the
+/// dialog opened; a connection may have refreshed `last_success` since, so the
+/// stale copy must not overwrite the app's current record.
+fn keep_last_success(mut incoming: AppSettings, current: &AppSettings) -> AppSettings {
+    incoming.last_success = current.last_success.clone();
+    incoming
+}
+
+/// A session that reached `Running` records which node last served traffic,
+/// seeding the `LastSuccessful` auto-resolve strategy.
+fn last_success_settings(current: &AppSettings, meta: &ConnectionMetadata) -> AppSettings {
+    let mut settings = current.clone();
+    settings.last_success = Some(LastSuccessMetadata {
+        node_ref: meta.node_ref,
+        connected_at: meta.connected_since,
+    });
+    settings
 }
 
 fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[ManualNode]) -> bool {
@@ -2072,6 +2086,81 @@ mod tests {
         recover_tun_session(&paths, &helper);
 
         assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+    }
+    fn last_success_at(at: chrono::DateTime<chrono::Utc>) -> LastSuccessMetadata {
+        LastSuccessMetadata {
+            node_ref: session_target_node(),
+            connected_at: at,
+        }
+    }
+
+    #[test]
+    fn flush_keeps_current_last_success() {
+        let stale_at = chrono::Utc::now() - chrono::Duration::hours(1);
+        let fresh_at = chrono::Utc::now();
+        let current = AppSettings {
+            last_success: Some(last_success_at(fresh_at)),
+            ..AppSettings::default()
+        };
+        let incoming = AppSettings {
+            last_success: Some(last_success_at(stale_at)),
+            ..AppSettings::default()
+        };
+
+        let kept = keep_last_success(incoming, &current);
+        assert_eq!(kept.last_success, current.last_success);
+    }
+
+    #[test]
+    fn flush_does_not_invent_last_success() {
+        let incoming = AppSettings {
+            last_success: Some(last_success_at(chrono::Utc::now())),
+            ..AppSettings::default()
+        };
+
+        assert_eq!(
+            keep_last_success(incoming, &AppSettings::default()).last_success,
+            None
+        );
+    }
+
+    #[test]
+    fn flush_keeps_other_fields() {
+        let incoming = AppSettings {
+            socks_port: 2080,
+            ..AppSettings::default()
+        };
+
+        let kept = keep_last_success(incoming, &AppSettings::default());
+        assert_eq!(kept.socks_port, 2080);
+    }
+
+    #[test]
+    fn direct_session_success_records_last_success() {
+        let node = session_target_node();
+        let now = chrono::Utc::now();
+        let connection = ConnectionMetadata {
+            node_ref: node,
+            source: "manual".into(),
+            source_id: String::new(),
+            node_name: "node".into(),
+            node_address: "127.0.0.1".into(),
+            node_port: 1080,
+            backend: BackendType::Xray,
+            strategy: AutoResolveStrategy::default(),
+            latency_ms: None,
+            connected_since: now,
+        };
+
+        let recorded = last_success_settings(&AppSettings::default(), &connection);
+
+        assert_eq!(
+            recorded.last_success,
+            Some(LastSuccessMetadata {
+                node_ref: node,
+                connected_at: now,
+            })
+        );
     }
 }
 
