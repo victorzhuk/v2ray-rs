@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING:** under xray TUN with `strict_route` on, which is the default,
+  IPv6 is refused unless an IPv6 tunnel address is set, and the host has no
+  connectivity outside the tunnel while a session reconnects. Set an IPv6
+  address, or turn `strict_route` off, to get the previous behavior.
+  `strict_route` now applies to xray as well as sing-box: the route helper adds
+  a fail-closed fallback, so traffic stops rather than leaking out the real
+  interface when the tunnel device goes away.
+
 ### Fixed
+- Disconnect during a crash respawn or during a start now always ends
+  Disconnected, instead of leaving the state stuck.
+- Failing over to the next node no longer drops the connection handle, so the
+  app no longer loses track of a connection that is still coming up.
+- A respawn that fails after a crash is retried within the crash budget
+  instead of ending the session on the first failure.
+- Route helper calls time out after 10 seconds, and their output reaches the
+  log.
+- Disconnect is available while connecting.
 - xray configs no longer carry `freedom.domainStrategy`. Xray-core 26.9.8 and
   later deprecate it and copy it over the direct outbound's socket strategy, so
   under TUN direct dials resolved both address families regardless of the DNS

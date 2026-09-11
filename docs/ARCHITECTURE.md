@@ -102,26 +102,37 @@ and two `tokio::broadcast` channels for `ProcessEvent`: one for state
 (StateChanged, ProcessExited), one higher-capacity channel for LogLine, so a
 burst of backend output can never lag the state channel and drop a terminal
 transition. State machine: Stopped → Starting → Running → Stopping → Stopped,
-plus Running → Starting for a supervised in-place restart and Running/Starting
-→ Error.
+plus Running → Starting for a supervised in-place restart, Starting → Stopping
+so a stop can cancel a start or a pending respawn, and Running/Starting → Error.
+`stop()` reaches Stopped from every state, including Error with no child.
 
 Crash recovery: any exit while the state is still Running counts as an
 unexpected crash — including a signal death (OOM/segfault/external kill, which
-report no exit code on Unix). Each crash is retried with a backoff that scales
-with the number of recent crashes (2s, then 4s), up to 3 crashes per 60s before
-entering Error. A successful restart re-enters Running with no user-visible
-disconnect. Graceful stop: SIGTERM → 5s timeout → SIGKILL. ETXTBSY on spawn is
-retried (overlayfs/Docker edge case).
+report no exit code on Unix). The manager respawns in a loop with a backoff that
+scales with the number of recent crashes (2s, then 4s). A respawn reuses the
+inputs the last start already checked — no version, capability, or config probe —
+and a failed respawn counts as a crash. 3 crashes per 60s end in Error. Nothing
+is torn down between a crash and its respawn, or on give-up: the tunnel's routes
+stay in place so traffic cannot leak around it, and only `stop()` releases them.
+A successful restart re-enters Running with no user-visible disconnect. Graceful
+stop: SIGTERM → 5s timeout → SIGKILL. ETXTBSY on spawn is retried
+(overlayfs/Docker edge case).
 
 The UI adds a second, bounded layer: after the manager gives up (Error), it
 schedules up to 3 whole-connection retries (5s apart, re-planning candidates),
-reset on a successful connect and cancelled on an explicit Disconnect.
+reset on a successful connect and cancelled on an explicit Disconnect. Only the
+connection task reports terminal states: one Stopped per requested stop and one
+Error once the last candidate has failed. Failing over to the next candidate is
+never reported as Stopped, and a failed candidate keeps its routing state until
+a stop releases it.
 
 `privilege.rs` reads binary file capabilities via `getcap` and grants them via
 a single `pkexec` elevation (one shell invocation, paths passed as positional
 args to avoid injection). `tun.rs` holds `TunRuntime` and the xray-specific
 helpers: `wait_for_device()` polls `/sys/class/net/<iface>`, then invokes
-`netctl xray-up`. sing-box programs its own routes via `auto_route`.
+`netctl xray-up`. sing-box programs its own routes via `auto_route`. Each
+helper call is bounded at 10s, killed and reaped on timeout, and its output goes
+to the process log stream.
 
 Connection setup and teardown are serialized by a single lock held for a
 connection's whole lifetime, and the startup route-recovery pass takes the same
@@ -145,7 +156,7 @@ dependencies — deliberately minimal (rtnetlink, tokio current-thread, clap).
 
 Three subcommands, all idempotent and input-validated before any netlink call:
 
-- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns]`: brings the
+- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns] [--strict]`: brings the
   link up, assigns the address, and installs the tunnel default route into table
   2023 plus the policy rules that steer traffic into it:
   - 9000 — `fwmark 0xff` → `main`, so xray's own sockets reach the real default
@@ -158,11 +169,22 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   matched on `fwmark 0/0xff`: rule 9001 would otherwise send DNS to a resolver on
   the local subnet out the LAN route, leaving host name resolution as the one
   thing the tunnel never sees, while the fwmark match keeps the proxy's own
-  upstream queries on the 9000 bypass. Because the rules resolve to table 2023,
-  an unclean exit leaves entries that match nothing rather than blackholing DNS.
-- `xray-down --iface`: removes the device (no-op if already gone).
+  upstream queries on the 9000 bypass. Without `--strict`, because the rules
+  resolve to table 2023, an unclean exit leaves entries that match nothing
+  rather than blackholing DNS.
+
+  `--strict` (set from `strict_route`) is the kill-switch. It adds an
+  `unreachable` default to table 2023 for IPv4 and IPv6 at the highest metric,
+  behind the tunnel route, so once the device is gone traffic fails closed
+  instead of falling through to `main`. It also installs the IPv6 9000–9002
+  rules (and 8998 with `--bypass-uid`) without `--addr6`, so IPv6 with no tunnel
+  address is refused rather than sent out the real interface.
+- `xray-down --iface`: removes the policy rules, flushes table 2023 for both
+  families, then deletes the device (no-op when all are gone). The flush comes
+  first so a failing device delete cannot leave the fallback blackholing traffic.
 - `recover --iface --singbox|--xray`: cleans up leftover TUN state after an
-  unclean shutdown; for sing-box also flushes its `auto_route` table/rules.
+  unclean shutdown; for xray it leaves table 2023 and prefs 8998–9002 empty in
+  both families, for sing-box it flushes the `auto_route` table/rules.
 
 `xray-up` refuses any `--iface` that is not a TUN device (checked via
 `/sys/class/net/<iface>/tun_flags`), and the device-delete in `xray-down` /
@@ -227,15 +249,24 @@ The xray start sequence in `ProcessManager`:
 4. `netctl xray-up` — program address and split routes.
 
 Stop: SIGTERM lets xray close its TUN fd (kernel drops device-scoped routes),
-then `netctl xray-down` runs as a safeguard. The same teardown runs on every
-exit path that leaves the tunnel — a crash restart, a partial `xray-up`
-startup failure, and the crash give-up — so host-wide policy rules never
-outlive the device.
+then `netctl xray-down` removes the policy rules and the strict fallback.
+`stop()` is the only place that teardown runs. A crash, a failed respawn, a
+partial `xray-up`, and the crash give-up all leave routing in place, so with
+`strict_route` the host stays fail-closed until the session is stopped or
+released.
 
-`tun_session.json` in `state_dir` is written at TUN connect and removed only on
-a clean stop; it is kept on a crash give-up (Error) so the next launch runs the
-route-recovery pass even if in-process teardown didn't complete. Its presence at
-startup triggers that pass.
+Releasing the kill-switch when no stop follows is the app's job. When an Error
+is not followed by a reconnect — the retry budget is spent, the Error arrived
+while a stop was in progress, or a Quit is pending — the app runs the
+marker-driven route-recovery pass under the connection lock and clears the
+marker. Disconnect with no live connection but a marker present, and Quit with a
+leftover marker, take the same path. Quit while Stopping waits for Stopped, and
+Connect is refused while a release runs.
+
+`tun_session.json` in `state_dir` is written by the connection task from the
+`TunRuntime` right before the backend starts, so a failure or crash mid-start
+still leaves one. A clean stop and the release pass remove it; a crash give-up
+keeps it until then. Its presence at startup triggers the route-recovery pass.
 
 The grant flow resolves the helper and SUID wrapper to absolute paths beside the
 running executable before elevating; it never passes a bare/relative name to the
