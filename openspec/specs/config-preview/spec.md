@@ -1,7 +1,7 @@
 # config-preview Specification
 
 ## Purpose
-TBD - created by archiving change add-config-preview. Update Purpose after archive.
+Gives the user a read-only window onto the exact config file the app generated for the active backend, so what the proxy binary actually consumes can be inspected (and its path shared) without leaving the app. Credential values are masked by default with an explicit reveal, and the view always re-reads from disk rather than a regenerated copy.
 ## Requirements
 ### Requirement: View the generated config from the main window
 The system SHALL provide a "View Generated Config" action in the main window menu that opens a dialog showing the generated configuration file for the active backend in a monospace, scrollable, read-only view. The dialog SHALL show the literal on-disk file contents (re-read from disk), SHALL offer a Refresh action, and SHALL offer an action that copies the file's path.

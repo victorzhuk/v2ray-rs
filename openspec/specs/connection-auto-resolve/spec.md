@@ -1,6 +1,8 @@
 ## Purpose
 Define how available nodes are resolved and used for connection attempts.
+
 ## Requirements
+
 ### Requirement: Build ordered connection candidates
 The system SHALL build an ordered list of connection candidates from enabled subscription nodes and enabled manual nodes according to the selected strategy. The Lowest Latency strategy SHALL be configurable via the `use_real_delay_for_lowest_latency` app setting: when the setting is true and a node has a recorded `last_real_delay_ms`, the system SHALL rank by Real Delay; otherwise it SHALL fall back to `last_latency_ms` (TCP). Nodes with neither sample SHALL be placed last.
 
@@ -37,7 +39,7 @@ The system SHALL build an ordered list of connection candidates from enabled sub
 - **THEN** the stored last-success reference still points to the same subscription node by stable node ID
 
 ### Requirement: Direct connection to a chosen node
-The system SHALL let the user connect directly to a specific enabled node, using that node as the only connection candidate for the attempt. The action SHALL NOT change the configured auto-resolve strategy, and subsequent ordinary connects SHALL use the configured strategy unchanged.
+The system SHALL let the user connect directly to a specific enabled node, using that node as the only connection candidate for the attempt. The action SHALL NOT change the configured auto-resolve strategy, and subsequent ordinary connects SHALL use the configured strategy unchanged. Reconnects the system starts on the user's behalf for that session — applying pending changes and automatic reconnects after a failure — SHALL target the same node as the sole candidate.
 
 #### Scenario: Connect to a specific node
 - **WHEN** the user invokes Connect on a specific enabled node
@@ -55,6 +57,10 @@ The system SHALL let the user connect directly to a specific enabled node, using
 - **WHEN** a direct connection succeeds
 - **THEN** the system SHALL record it as the last successful node, the same as any other successful connection
 
+#### Scenario: Automatic reconnect keeps the chosen node
+- **WHEN** a session started by a direct connection gives up after crashes and an automatic reconnect runs
+- **THEN** the reconnect SHALL target the directly chosen node as the sole candidate
+
 ### Requirement: Strategy changes take effect on the next connection
 A change to the auto-resolve strategy SHALL take effect at the next connection attempt. While a connection is active, the system SHALL NOT automatically disconnect to apply a strategy change; the running session continues under the strategy it was started with until the user explicitly applies the change or reconnects.
 
@@ -66,3 +72,20 @@ A change to the auto-resolve strategy SHALL take effect at the next connection a
 - **WHEN** a new connection starts after a strategy change (explicit apply, manual reconnect, or a later connect)
 - **THEN** candidate ordering SHALL follow the new strategy
 
+### Requirement: Last-success metadata is owned by connection outcomes
+The last-success record SHALL change only when a connection succeeds. Saving settings from the preferences dialog SHALL NOT modify it.
+
+#### Scenario: Preferences opened before a connect
+- **WHEN** the preferences dialog is open, a connection to node B succeeds, and the user then changes any preference
+- **THEN** the persisted last-success record SHALL still name node B
+
+### Requirement: Automatic reconnect yields to the user
+A pending automatic reconnect SHALL be cancelled by any user-initiated Connect, direct connect, or Disconnect, so user retries neither trigger an extra immediate attempt nor consume the automatic-reconnect budget.
+
+#### Scenario: Manual connect during the reconnect delay
+- **WHEN** an automatic reconnect is scheduled and the user invokes Connect before it fires
+- **THEN** the scheduled reconnect SHALL NOT fire, and only the user's attempt SHALL run
+
+#### Scenario: Disconnect during the reconnect delay
+- **WHEN** an automatic reconnect is scheduled and the user invokes Disconnect
+- **THEN** the scheduled reconnect SHALL NOT fire
