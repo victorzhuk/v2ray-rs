@@ -90,13 +90,21 @@ pub struct App {
     tun_release_in_flight: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectOrigin {
+    /// Started by the user: cancels a pending auto-reconnect.
+    User,
+    /// Fired by the reconnect timer: keeps the attempt budget intact.
+    AutoReconnect,
+}
+
 #[derive(Debug)]
 pub enum AppMsg {
     OnboardingComplete(AppSettings, Option<(String, SubscriptionSource)>),
     SettingsChanged(AppSettings),
     ToggleConnection,
-    Connect,
-    ConnectToNode(ConnectionNodeRef),
+    Connect(ConnectOrigin),
+    ConnectToNode(ConnectionNodeRef, ConnectOrigin),
     Disconnect,
     CloseRequested,
     TrayShowWindow,
@@ -765,7 +773,7 @@ impl SimpleComponent for App {
                     match action {
                         TrayAction::ShowWindow => s.emit(AppMsg::TrayShowWindow),
                         TrayAction::Quit => s.emit(AppMsg::TrayQuit),
-                        TrayAction::Connect => s.emit(AppMsg::Connect),
+                        TrayAction::Connect => s.emit(AppMsg::Connect(ConnectOrigin::User)),
                         TrayAction::Disconnect => s.emit(AppMsg::Disconnect),
                     }
                 }
@@ -809,12 +817,13 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |msg| match msg {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 SubscriptionsOutput::SubscriptionsChanged => AppMsg::SubscriptionsChanged,
-                SubscriptionsOutput::ConnectNode(sub_id, node_id) => {
-                    AppMsg::ConnectToNode(ConnectionNodeRef::Subscription {
+                SubscriptionsOutput::ConnectNode(sub_id, node_id) => AppMsg::ConnectToNode(
+                    ConnectionNodeRef::Subscription {
                         subscription_id: sub_id,
                         node_id,
-                    })
-                }
+                    },
+                    ConnectOrigin::User,
+                ),
                 SubscriptionsOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
@@ -823,9 +832,10 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |msg| match msg {
                 NodesOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 NodesOutput::NodesChanged => AppMsg::ManualNodesChanged,
-                NodesOutput::ConnectNode(node_id) => {
-                    AppMsg::ConnectToNode(ConnectionNodeRef::Manual { node_id })
-                }
+                NodesOutput::ConnectNode(node_id) => AppMsg::ConnectToNode(
+                    ConnectionNodeRef::Manual { node_id },
+                    ConnectOrigin::User,
+                ),
                 NodesOutput::Notice(message) => AppMsg::ShowToast(message),
             });
 
@@ -1015,10 +1025,10 @@ impl SimpleComponent for App {
                 if self.connected {
                     sender.input(AppMsg::Disconnect);
                 } else {
-                    sender.input(AppMsg::Connect);
+                    sender.input(AppMsg::Connect(ConnectOrigin::User));
                 }
             }
-            AppMsg::Connect => {
+            AppMsg::Connect(origin) => {
                 if self.process_handle.is_some() || self.tun_release_in_flight {
                     return;
                 }
@@ -1066,9 +1076,12 @@ impl SimpleComponent for App {
                     return;
                 }
 
+                if cancels_auto_reconnect(origin) {
+                    self.cancel_auto_reconnect();
+                }
                 let _ = self.start_connection(candidates, subscriptions, manual_nodes, &sender);
             }
-            AppMsg::ConnectToNode(target) => {
+            AppMsg::ConnectToNode(target, origin) => {
                 if self.tun_release_in_flight {
                     return;
                 }
@@ -1106,14 +1119,18 @@ impl SimpleComponent for App {
                 };
 
                 if self.process_handle.is_some() {
-                    self.cancel_auto_reconnect();
+                    if cancels_auto_reconnect(origin) {
+                        self.cancel_auto_reconnect();
+                    }
                     self.reconnect_pending = false;
                     self.pending_direct_target = Some(target);
                     sender.input(AppMsg::Disconnect);
                     return;
                 }
 
-                self.cancel_auto_reconnect();
+                if cancels_auto_reconnect(origin) {
+                    self.cancel_auto_reconnect();
+                }
                 self.reconnect_pending = false;
 
                 if self
@@ -1198,7 +1215,7 @@ impl SimpleComponent for App {
                 ) {
                     self.reconnect_pending = false;
                     self.cancel_auto_reconnect();
-                    sender.input(AppMsg::ConnectToNode(target));
+                    sender.input(AppMsg::ConnectToNode(target, ConnectOrigin::User));
                     return;
                 }
                 if stopped && !self.reconnect_pending {
@@ -1206,7 +1223,7 @@ impl SimpleComponent for App {
                 }
                 if reconnect_after_stop(&state, self.reconnect_pending) {
                     self.reconnect_pending = false;
-                    sender.input(AppMsg::Connect);
+                    sender.input(AppMsg::Connect(ConnectOrigin::User));
                 } else {
                     match &state {
                         ProcessState::Running => {
@@ -1235,8 +1252,12 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::AutoReconnect(generation) => {
-                if generation == self.reconnect_generation && self.process_handle.is_none() {
-                    sender.input(AppMsg::Connect);
+                if auto_reconnect_fires(
+                    generation,
+                    self.reconnect_generation,
+                    self.process_handle.is_some(),
+                ) {
+                    sender.input(AppMsg::Connect(ConnectOrigin::AutoReconnect));
                 }
             }
             AppMsg::TunReleased => {
@@ -1433,6 +1454,19 @@ fn connect_toggle(state: &ProcessState) -> (bool, bool) {
 
 fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
+}
+
+/// Only a user-initiated connect invalidates a pending auto-reconnect; the
+/// timer's own connect must leave the attempt budget counting toward
+/// MAX_AUTO_RECONNECTS.
+fn cancels_auto_reconnect(origin: ConnectOrigin) -> bool {
+    origin != ConnectOrigin::AutoReconnect
+}
+
+/// The scheduled timer fires only for the generation it was armed with and
+/// only while no connection is up.
+fn auto_reconnect_fires(message: u32, current: u32, has_handle: bool) -> bool {
+    message == current && !has_handle
 }
 
 /// TUN follows the session that is running: the launched snapshot decides,
@@ -1801,6 +1835,28 @@ mod tests {
     #[test]
     fn auto_reconnect_suppressed_on_exit() {
         assert!(!auto_reconnect_allowed(true, 0));
+    }
+
+    #[test]
+    fn user_connect_cancels_pending_auto_reconnect() {
+        assert!(cancels_auto_reconnect(ConnectOrigin::User));
+    }
+
+    #[test]
+    fn auto_reconnect_connect_keeps_budget() {
+        assert!(!cancels_auto_reconnect(ConnectOrigin::AutoReconnect));
+    }
+
+    #[test]
+    fn auto_reconnect_fires_only_for_current_generation_without_handle() {
+        let generation = 7_u32;
+        assert!(!auto_reconnect_fires(
+            generation,
+            generation.wrapping_add(1),
+            false
+        ));
+        assert!(auto_reconnect_fires(generation, generation, false));
+        assert!(!auto_reconnect_fires(generation, generation, true));
     }
 
     #[test]
