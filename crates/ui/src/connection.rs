@@ -246,8 +246,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 loop {
                     match log_rx.recv().await {
                         Ok(ProcessEvent::LogLine(line)) => {
-                            log_sender
-                                .emit(AppMsg::ProcessLogLine(generation, line.content));
+                            log_sender.emit(AppMsg::ProcessLogLine(generation, line.content));
                         }
                         Ok(_) => {}
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -597,9 +596,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn log_lines_carry_connection_generation() {
-        let stub = stub(
-            r#"[ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.2; done"#,
-        );
+        let stub =
+            stub(r#"[ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.2; done"#);
         let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
 
         loop {
