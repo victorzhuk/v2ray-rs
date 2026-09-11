@@ -124,7 +124,7 @@ pub(super) fn build_tun_page(
         .build();
 
     let advanced_note = adw::ActionRow::builder()
-        .title("These options apply to sing-box only")
+        .title("Stack applies to sing-box only")
         .sensitive(false)
         .visible(backend == BackendType::Xray)
         .build();
@@ -139,6 +139,10 @@ pub(super) fn build_tun_page(
 
     let strict_row = adw::SwitchRow::builder()
         .title("Strict route")
+        .subtitle(
+            "Applies to sing-box and xray. With xray, traffic is blocked while the tunnel \
+             reconnects, and IPv6 is blocked without an IPv6 tunnel address",
+        )
         .active(state.borrow().tun.strict_route)
         .build();
     advanced.add_row(&strict_row);
@@ -722,7 +726,7 @@ pub(super) fn build_tun_page(
             run_group.set_visible(backend == BackendType::Xray);
             apps_note.set_visible(backend == BackendType::Xray);
             stack_row.set_sensitive(singbox_only);
-            strict_row.set_sensitive(singbox_only);
+            strict_row.set_sensitive(strict_route_applies(backend));
             hijack_row.set_sensitive(backend != BackendType::V2ray);
             routes_group.set_sensitive(backend != BackendType::V2ray);
             domains_group.set_sensitive(backend != BackendType::V2ray);
@@ -733,13 +737,17 @@ pub(super) fn build_tun_page(
     // Apply the initial backend gating for the advanced rows.
     let singbox_only = backend == BackendType::SingBox;
     stack_row.set_sensitive(singbox_only);
-    strict_row.set_sensitive(singbox_only);
+    strict_row.set_sensitive(strict_route_applies(backend));
     hijack_row.set_sensitive(backend != BackendType::V2ray);
     routes_group.set_sensitive(backend != BackendType::V2ray);
     domains_group.set_sensitive(backend != BackendType::V2ray);
     apps_group.set_sensitive(singbox_only);
 
     page
+}
+
+fn strict_route_applies(backend: BackendType) -> bool {
+    matches!(backend, BackendType::SingBox | BackendType::Xray)
 }
 
 fn apply_tun_mutation<F>(
@@ -787,5 +795,17 @@ fn index_to_hijack(index: u32) -> DnsHijackMode {
         1 => DnsHijackMode::Native,
         2 => DnsHijackMode::Disabled,
         _ => DnsHijackMode::Hijack,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_route_row_sensitive_for_xray() {
+        assert!(strict_route_applies(BackendType::Xray));
+        assert!(strict_route_applies(BackendType::SingBox));
+        assert!(!strict_route_applies(BackendType::V2ray));
     }
 }
