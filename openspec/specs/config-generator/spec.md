@@ -5,7 +5,7 @@ Defines how the system generates backend-specific JSON configurations for sing-b
 ## Requirements
 
 ### Requirement: Generate v2ray-compatible configuration
-The system SHALL generate a valid JSON configuration file for v2ray/xray containing inbound, outbound, routing, and DNS sections. When DNS is enabled, the DNS section SHALL reflect the full DNS configuration model including multiple servers, query strategy, hosts, cache settings, and client IP. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the SOCKS-capable inbound SHALL declare `settings.udp = true`.
+The system SHALL generate a valid JSON configuration file for v2ray/xray containing inbound, outbound, routing, and DNS sections. When DNS is enabled, the DNS section SHALL reflect the full DNS configuration model including multiple servers, query strategy, hosts, cache settings, and client IP. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the SOCKS-capable inbound SHALL declare `settings.udp = true`. TLS outbounds SHALL carry `allowInsecure` only for the v2ray backend; for xray, which rejects `allowInsecure: true` as a removed feature, the field SHALL NOT be emitted and a node with certificate verification disabled SHALL fail config generation for that candidate with an error naming the node.
 
 #### Scenario: Basic SOCKS5 + HTTP inbound with single proxy outbound
 - **WHEN** the user has one enabled VLESS node and default settings (SOCKS5 port 1080, HTTP port 1081, listen address 127.0.0.1)
@@ -46,6 +46,18 @@ The system SHALL generate a valid JSON configuration file for v2ray/xray contain
 #### Scenario: Detour ignored for v2ray/xray
 - **WHEN** a DNS server has a detour configured and backend is v2ray or xray
 - **THEN** the generated DNS config SHALL NOT include any detour field
+
+#### Scenario: xray TLS outbound omits allowInsecure
+- **WHEN** the backend is xray and a TLS node has certificate verification enabled
+- **THEN** its `tlsSettings` SHALL NOT contain `allowInsecure`
+
+#### Scenario: xray refuses a node with verification disabled
+- **WHEN** the backend is xray and the candidate is a TLS node with certificate verification disabled
+- **THEN** config generation for that candidate SHALL fail with an error naming the node and stating that the backend does not support disabled verification, and connection planning SHALL continue with the next candidate
+
+#### Scenario: v2ray keeps allowInsecure
+- **WHEN** the backend is v2ray and a TLS node has certificate verification disabled
+- **THEN** its `tlsSettings` SHALL contain `"allowInsecure": true`
 
 ### Requirement: Generate sing-box configuration
 The system SHALL generate a valid JSON configuration file in sing-box's configuration schema. When DNS is enabled, the DNS section SHALL include typed server objects, DNS rules, strategy, FakeIP, cache settings, and client subnet, and the route section SHALL include `default_domain_resolver` set to the tag of the first DNS server whose address is a literal IP, falling back to the first server's tag. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the `mixed` inbound SHALL NOT emit `udp_disabled: true` so UDP remains enabled.
@@ -246,7 +258,7 @@ used.
 - **THEN** neither generator SHALL emit exclusion rules derived from `exclude_processes`, `exclude_domains`, or `exclude_routes`
 
 ### Requirement: TUN mode DNS resolution is self-contained
-When TUN is enabled, the generated config SHALL NOT depend on the operating-system resolver for any resolution that feeds routing decisions or direct dials. When the DNS feature is disabled in settings, the generator SHALL derive a minimal DNS configuration — a DoH server at an IP-literal endpoint (`https://1.1.1.1/dns-query`) whose queries travel through the first proxy outbound — for the duration of config generation, without mutating settings. For xray this means: a `dns` section with `tag: "dns-internal"` plus a routing rule sending `inboundTag: ["dns-internal"]` to the first proxy outbound ahead of all user rules, and `"domainStrategy": "UseIP"` on the `freedom` direct outbound. For sing-box this means: the `dns` section, `dns.final`, and `route.default_domain_resolver` are emitted with the derived server (detour = first proxy outbound) even though the DNS feature is off.
+When TUN is enabled, the generated config SHALL NOT depend on the operating-system resolver for any resolution that feeds routing decisions or direct dials. When the DNS feature is disabled in settings, the generator SHALL derive a minimal DNS configuration — a DoH server at an IP-literal endpoint (`https://1.1.1.1/dns-query`) whose queries travel through the first proxy outbound — for the duration of config generation, without mutating settings. For xray this means: a `dns` section with `tag: "dns-internal"` plus a routing rule sending `inboundTag: ["dns-internal"]` to the first proxy outbound ahead of all user rules, and the `freedom` direct outbound resolving through the built-in resolver via `streamSettings.sockopt.domainStrategy`, set from the query strategy like every other dialing outbound; the deprecated `settings.domainStrategy` SHALL NOT be emitted, because current Xray-core copies it over the `sockopt` value. For sing-box this means: the `dns` section, `dns.final`, and `route.default_domain_resolver` are emitted with the derived server (detour = first proxy outbound) even though the DNS feature is off.
 
 Static host overrides, cache control and the EDNS client subnet SHALL be emitted on both the derived and the user-configured path, for both backends, so a connect-time host pin reaches the generated config regardless of whether the DNS feature is enabled. For xray, host overrides SHALL be filtered to the address family the query strategy selects, and a domain left with no address of that family SHALL be omitted rather than emitted empty, because xray answers a `hosts` hit authoritatively against a single-family strategy. For sing-box every pinned address SHALL be carried, because the backend applies its strategy after the lookup and would otherwise lose its fallback family.
 
@@ -288,7 +300,7 @@ For xray under TUN the generator SHALL emit bootstrap DNS servers for every name
 
 #### Scenario: xray direct outbound never uses the OS resolver under TUN
 - **WHEN** TUN is enabled and the backend is xray
-- **THEN** the `freedom` outbound SHALL carry `"domainStrategy": "UseIP"`, and SHALL NOT carry it when TUN is disabled
+- **THEN** the `freedom` outbound SHALL carry `streamSettings.sockopt.domainStrategy` of `"UseIPv6"` when the query strategy prefers or requires IPv6 and `"UseIPv4"` otherwise, SHALL NOT carry `settings.domainStrategy`, and SHALL carry neither when TUN is disabled
 
 #### Scenario: sing-box TUN with DNS settings off derives a DNS plane
 - **WHEN** TUN is enabled, the DNS feature is disabled, and the backend is sing-box
@@ -324,3 +336,14 @@ When generating a sing-box config, each referenced GeoIP/GeoSite rule-set SHALL 
 #### Scenario: Mixed local and remote sets coexist
 - **WHEN** some referenced tags are cached and others are not
 - **THEN** the config SHALL contain local entries for the cached tags and remote entries for the rest, and `experimental.cache_file` SHALL be enabled while any remote entry is present
+
+### Requirement: Generated xray configs load without deprecation warnings
+Every xray config the system generates SHALL load on the installed Xray-core without the backend reporting a deprecated or automatically migrated setting, so that a field's removal upstream cannot silently change or break a working configuration. Deprecation notices about a proxy protocol or transport that the user's node itself uses (for example Shadowsocks or WebSocket) are outside this requirement: no generator change can remove them.
+
+#### Scenario: Protocol-level notices are tolerated
+- **WHEN** a generated config for a Shadowsocks node or a WebSocket-transport node is checked on Xray-core 26.9.9
+- **THEN** the check SHALL succeed, and the only deprecation notices in its output SHALL be the ones naming that protocol or transport
+
+#### Scenario: TUN config on current Xray-core
+- **WHEN** an xray TUN config with the DNS feature off and a hostname-addressed REALITY node is checked with `xray run -test` on Xray-core 26.9.9
+- **THEN** the check SHALL succeed and its output SHALL contain no line reporting a deprecated setting
