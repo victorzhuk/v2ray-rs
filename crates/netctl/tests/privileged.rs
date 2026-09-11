@@ -14,7 +14,11 @@ const NS: &str = "nctl-test-ns";
 const NS_DNS: &str = "nctl-dns-ns";
 const NS_STRICT: &str = "nctl-strict-ns";
 const NS_CLEAR: &str = "nctl-clear-ns";
+const NS_REUP: &str = "nctl-reup-ns";
+const NS_GONE: &str = "nctl-gone-ns";
 const IFACE: &str = "nctltest0";
+/// Stand-in for the physical uplink that owns the `main` default route.
+const MAIN_IFACE: &str = "nctlmain0";
 const ADDR: &str = "172.31.255.1/30";
 const ADDR6: &str = "fd00:ffff::1/64";
 
@@ -50,6 +54,22 @@ fn ip_in_output(ns: &str, args: &[&str]) -> String {
 
 fn ip_in_ns_output(args: &[&str]) -> String {
     ip_in_output(NS, args)
+}
+
+/// Runs `ip <args>` inside the given namespace and returns whether it succeeded
+/// together with its stdout and stderr, since `ip route get` reports routing
+/// errors only on stderr.
+fn ip_in_full(ns: &str, args: &[&str]) -> (bool, String) {
+    let mut full = vec!["netns", "exec", ns, "ip"];
+    full.extend_from_slice(args);
+    match Command::new("ip").args(&full).output() {
+        Ok(o) => {
+            let mut text = String::from_utf8_lossy(&o.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&o.stderr));
+            (o.status.success(), text)
+        }
+        Err(e) => (false, e.to_string()),
+    }
 }
 
 /// Runs the netctl binary inside the given namespace, so its netlink socket
@@ -420,4 +440,143 @@ fn down_and_recover_clear_strict_state_both_families() {
     ));
     assert!(!ip_in(NS_CLEAR, &["link", "show", IFACE]));
     assert_xray_state_cleared(NS_CLEAR, "recover --xray");
+}
+
+/// Sorted policy rules and table-2023 routes of both families, each line
+/// prefixed with its family.
+fn xray_state(ns: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for family in ["-4", "-6"] {
+        for args in [
+            vec![family, "rule", "show"],
+            vec![family, "route", "show", "table", "2023"],
+        ] {
+            lines.extend(
+                ip_in_output(ns, &args)
+                    .lines()
+                    .map(|l| format!("{family} {}", l.trim())),
+            );
+        }
+    }
+    lines.sort();
+    lines
+}
+
+#[test]
+fn reup_across_recreated_device_leaves_one_copy() {
+    let _ = run("ip", &["netns", "del", NS_REUP]);
+    if !run("ip", &["netns", "add", NS_REUP]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_REUP);
+
+    let strict_up = [
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--bypass-uid",
+        "999990",
+        "--strict",
+    ];
+
+    if !ip_in(NS_REUP, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+    assert!(netctl_in(NS_REUP, &strict_up));
+    let fresh = xray_state(NS_REUP);
+
+    // The rules and the fallback route outlive the device, so the second up
+    // meets them already present and must not stack a second copy.
+    assert!(ip_in(
+        NS_REUP,
+        &["tuntap", "del", "dev", IFACE, "mode", "tun"]
+    ));
+    assert!(ip_in(
+        NS_REUP,
+        &["tuntap", "add", "dev", IFACE, "mode", "tun"]
+    ));
+    assert!(netctl_in(NS_REUP, &strict_up));
+    let reup = xray_state(NS_REUP);
+    assert_eq!(reup, fresh, "state after re-up differs from a single up");
+
+    for family in ["-4", "-6"] {
+        let rules = ip_in_output(NS_REUP, &[family, "rule", "show"]);
+        for pref in ["8998:", "9000:", "9001:", "9002:"] {
+            let count = rules.lines().filter(|l| l.starts_with(pref)).count();
+            assert_eq!(count, 1, "rule {pref} count ({family}): {rules}");
+        }
+
+        let table = ip_in_output(NS_REUP, &[family, "route", "show", "table", "2023"]);
+        let mut routes: Vec<&str> = table.lines().map(str::trim).collect();
+        assert!(!routes.is_empty(), "table 2023 empty ({family})");
+        routes.sort_unstable();
+        let total = routes.len();
+        routes.dedup();
+        assert_eq!(
+            routes.len(),
+            total,
+            "duplicate table 2023 route ({family}): {table}"
+        );
+    }
+}
+
+#[test]
+fn strict_state_refuses_unmarked_traffic_without_device() {
+    let _ = run("ip", &["netns", "del", NS_GONE]);
+    if !run("ip", &["netns", "add", NS_GONE]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_GONE);
+
+    if !ip_in(NS_GONE, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+    assert!(ip_in(
+        NS_GONE,
+        &["tuntap", "add", "dev", MAIN_IFACE, "mode", "tun"]
+    ));
+    assert!(ip_in(
+        NS_GONE,
+        &["addr", "add", "10.99.0.1/24", "dev", MAIN_IFACE]
+    ));
+    assert!(ip_in(NS_GONE, &["link", "set", MAIN_IFACE, "up"]));
+    assert!(ip_in(
+        NS_GONE,
+        &["route", "add", "default", "dev", MAIN_IFACE]
+    ));
+
+    assert!(netctl_in(
+        NS_GONE,
+        &["xray-up", "--iface", IFACE, "--addr", ADDR, "--strict"]
+    ));
+    assert!(ip_in(NS_GONE, &["link", "del", IFACE]));
+
+    // Unmarked traffic skips main's default route and lands on the fallback.
+    let (ok, out) = ip_in_full(NS_GONE, &["-4", "route", "get", "198.51.100.1"]);
+    assert!(
+        !ok && (out.contains("No route to host") || out.contains("unreachable")),
+        "unmarked IPv4 lookup must fail closed: {out}"
+    );
+
+    // The proxy's own marked sockets still reach the uplink through main.
+    let (ok, out) = ip_in_full(
+        NS_GONE,
+        &["-4", "route", "get", "198.51.100.1", "mark", "255"],
+    );
+    assert!(
+        ok && out.contains(&format!("dev {MAIN_IFACE}")),
+        "marked IPv4 lookup must reach main: {out}"
+    );
+
+    let (ok, out) = ip_in_full(NS_GONE, &["-6", "route", "get", "2001:db8::1"]);
+    assert!(
+        !ok || out.contains("unreachable"),
+        "unmarked IPv6 lookup must fail closed: {out}"
+    );
 }
