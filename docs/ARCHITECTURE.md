@@ -178,7 +178,9 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   behind the tunnel route, so once the device is gone traffic fails closed
   instead of falling through to `main`. It also installs the IPv6 9000–9002
   rules (and 8998 with `--bypass-uid`) without `--addr6`, so IPv6 with no tunnel
-  address is refused rather than sent out the real interface.
+  address is refused rather than sent out the real interface. On a host with
+  IPv6 disabled (no `/proc/sys/net/ipv6`) the IPv6 fallback and rules are
+  skipped.
 - `xray-down --iface`: removes the policy rules, flushes table 2023 for both
   families, then deletes the device (no-op when all are gone). The flush comes
   first so a failing device delete cannot leave the fallback blackholing traffic.

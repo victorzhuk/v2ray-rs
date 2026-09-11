@@ -50,20 +50,6 @@ const FALLBACK_METRIC: u32 = u32::MAX;
 
 const EEXIST: i32 = -17;
 const ENODEV: i32 = -19;
-const EAFNOSUPPORT: i32 = -97;
-
-/// A failed netlink step, kept unformatted so a caller can still match on the
-/// kernel's error code.
-struct StepError {
-    context: String,
-    source: rtnetlink::Error,
-}
-
-impl From<StepError> for String {
-    fn from(e: StepError) -> Self {
-        format!("{}: {}", e.context, e.source)
-    }
-}
 
 pub fn connect() -> Result<Handle, String> {
     let (connection, handle, _) =
@@ -80,8 +66,9 @@ pub fn connect() -> Result<Handle, String> {
 /// With `strict`, an `unreachable` default is added to the tunnel table for both
 /// families and the IPv6 policy rules are installed even without an IPv6
 /// address, so traffic fails closed instead of leaking out `main` when the device
-/// disappears; without an IPv6 address those IPv6 steps are skipped when IPv6 is
-/// disabled on the host. Every step is idempotent.
+/// disappears. Without an IPv6 address those IPv6 steps are skipped when the host
+/// has IPv6 disabled; otherwise an IPv6 failure fails the start. Every step is
+/// idempotent.
 pub async fn xray_up(
     handle: &Handle,
     iface: &str,
@@ -115,29 +102,40 @@ pub async fn xray_up(
     if let Some(uid) = bypass_uid {
         add_bypass_uid_rule(handle, AddressFamily::Inet, uid).await?;
     }
+    let v6_rules = v6_rules_needed(v6.is_some(), strict, host_has_ipv6());
     if strict {
         add_fallback_route_v4(handle).await?;
-    }
-    if v6.is_some() {
-        if strict {
+        if v6_rules {
             add_fallback_route_v6(handle).await?;
         }
+    }
+    if v6.is_some() {
         add_default_route_v6(handle, index).await?;
         if capture_dns {
             add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
         }
-        add_v6_rules(handle, bypass_uid).await?;
-    } else if strict {
-        // A host booted with IPv6 disabled refuses every IPv6 route and rule,
-        // and has no IPv6 traffic to leak in the first place.
-        match add_strict_v6(handle, bypass_uid).await {
-            Ok(()) => {}
-            Err(e) if is_af_unsupported(&e.source) => {}
-            Err(e) => return Err(e.into()),
+    }
+    if v6_rules {
+        add_xray_rules(handle, AddressFamily::Inet6).await?;
+        if let Some(uid) = bypass_uid {
+            add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
         }
     }
 
     Ok(())
+}
+
+/// Whether `xray_up` installs the IPv6 policy rules (and, with `strict`, the
+/// IPv6 fallback route). An explicit IPv6 address always wants them; strict mode
+/// wants them to refuse IPv6, unless the host has no IPv6 to leak.
+fn v6_rules_needed(v6_requested: bool, strict: bool, host_has_ipv6: bool) -> bool {
+    v6_requested || (strict && host_has_ipv6)
+}
+
+/// `/proc/sys/net/ipv6` is absent when the kernel boots with `ipv6.disable=1`,
+/// and is per network namespace.
+fn host_has_ipv6() -> bool {
+    std::path::Path::new("/proc/sys/net/ipv6").exists()
 }
 
 /// Removes the policy rules, flushes [`XRAY_ROUTE_TABLE`] for both families and
@@ -251,7 +249,7 @@ async fn add_fallback_route_v4(handle: &Handle) -> Result<(), String> {
     }
 }
 
-async fn add_fallback_route_v6(handle: &Handle) -> Result<(), StepError> {
+async fn add_fallback_route_v6(handle: &Handle) -> Result<(), String> {
     let route = RouteMessageBuilder::<Ipv6Addr>::new()
         .destination_prefix(Ipv6Addr::UNSPECIFIED, 0)
         .table_id(XRAY_ROUTE_TABLE)
@@ -261,25 +259,8 @@ async fn add_fallback_route_v6(handle: &Handle) -> Result<(), StepError> {
     match handle.route().add(route).execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(StepError {
-            context: "add fallback route (v6)".into(),
-            source: e,
-        }),
+        Err(e) => Err(format!("add fallback route (v6): {e}")),
     }
-}
-
-/// The strict-mode IPv6 steps for a tunnel without an IPv6 address.
-async fn add_strict_v6(handle: &Handle, bypass_uid: Option<u32>) -> Result<(), StepError> {
-    add_fallback_route_v6(handle).await?;
-    add_v6_rules(handle, bypass_uid).await
-}
-
-async fn add_v6_rules(handle: &Handle, bypass_uid: Option<u32>) -> Result<(), StepError> {
-    add_xray_rules(handle, AddressFamily::Inet6).await?;
-    if let Some(uid) = bypass_uid {
-        add_bypass_uid_rule(handle, AddressFamily::Inet6, uid).await?;
-    }
-    Ok(())
 }
 
 /// Installs the three policy rules for one address family:
@@ -288,7 +269,7 @@ async fn add_v6_rules(handle: &Handle, bypass_uid: Option<u32>) -> Result<(), St
 /// 2. unmarked packets look up `main` with the default route suppressed, so LAN
 ///    and link routes keep working;
 /// 3. everything else falls through to the tunnel's dedicated table.
-async fn add_xray_rules(handle: &Handle, family: AddressFamily) -> Result<(), StepError> {
+async fn add_xray_rules(handle: &Handle, family: AddressFamily) -> Result<(), String> {
     add_rule(
         handle,
         family,
@@ -344,7 +325,7 @@ async fn add_rule(
     table: u32,
     fwmark: Option<u32>,
     suppress_prefixlen: Option<u32>,
-) -> Result<(), StepError> {
+) -> Result<(), String> {
     let mut req = handle.rule().add();
     {
         let msg = req.message_mut();
@@ -366,10 +347,7 @@ async fn add_rule(
     match req.execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(StepError {
-            context: format!("add policy rule (pref {priority})"),
-            source: e,
-        }),
+        Err(e) => Err(format!("add policy rule (pref {priority}): {e}")),
     }
 }
 
@@ -380,7 +358,7 @@ async fn add_bypass_uid_rule(
     handle: &Handle,
     family: AddressFamily,
     uid: u32,
-) -> Result<(), StepError> {
+) -> Result<(), String> {
     let mut req = handle.rule().add();
     {
         let msg = req.message_mut();
@@ -397,10 +375,9 @@ async fn add_bypass_uid_rule(
     match req.execute().await {
         Ok(()) => Ok(()),
         Err(e) if is_exists(&e) => Ok(()),
-        Err(e) => Err(StepError {
-            context: format!("add bypass-uid rule (pref {RULE_PREF_BYPASS_UID})"),
-            source: e,
-        }),
+        Err(e) => Err(format!(
+            "add bypass-uid rule (pref {RULE_PREF_BYPASS_UID}): {e}"
+        )),
     }
 }
 
@@ -484,18 +461,10 @@ fn is_no_such_device(err: &rtnetlink::Error) -> bool {
     matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(ENODEV))
 }
 
-fn is_af_unsupported(err: &rtnetlink::Error) -> bool {
-    matches!(err, rtnetlink::Error::NetlinkError(msg) if msg.code.map(|c| c.get()) == Some(EAFNOSUPPORT))
-}
-
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroI32;
-
-    use rtnetlink::packet_core::ErrorMessage;
+    use super::{XRAY_FWMARK, v6_rules_needed};
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
-
-    use super::{EAFNOSUPPORT, EEXIST, XRAY_FWMARK, is_af_unsupported};
 
     /// Guards against the two fwmark constants drifting: xray stamps its own
     /// outbound sockets with one value and the route helper's bypass rule
@@ -506,17 +475,25 @@ mod tests {
         assert_eq!(XRAY_FWMARK, XRAY_TUN_FWMARK);
     }
 
-    fn netlink_error(code: i32) -> rtnetlink::Error {
-        let mut msg = ErrorMessage::default();
-        msg.code = NonZeroI32::new(code);
-        rtnetlink::Error::NetlinkError(msg)
-    }
-
     #[test]
-    fn af_unsupported_matches_only_eafnosupport() {
-        assert!(is_af_unsupported(&netlink_error(EAFNOSUPPORT)));
-        assert!(!is_af_unsupported(&netlink_error(EEXIST)));
-        assert!(!is_af_unsupported(&netlink_error(-1)));
-        assert!(!is_af_unsupported(&rtnetlink::Error::RequestFailed));
+    fn v6_rules_follow_address_strict_and_host_support() {
+        let cases = [
+            // (v6_requested, strict, host_has_ipv6, want)
+            (true, true, true, true),
+            (true, true, false, true),
+            (true, false, true, true),
+            (true, false, false, true),
+            (false, true, true, true),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, false),
+        ];
+        for (v6_requested, strict, host_has_ipv6, want) in cases {
+            assert_eq!(
+                v6_rules_needed(v6_requested, strict, host_has_ipv6),
+                want,
+                "v6_requested={v6_requested} strict={strict} host_has_ipv6={host_has_ipv6}"
+            );
+        }
     }
 }
