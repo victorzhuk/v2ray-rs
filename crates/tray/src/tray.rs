@@ -95,28 +95,18 @@ impl Tray for AppTray {
     }
 
     fn menu(&self) -> Vec<MenuItem<Self>> {
-        let connected = self.process_state == ProcessState::Running;
-
-        let toggle = if connected {
+        let toggle = {
+            let (action, enabled) = toggle_action(&self.process_state);
+            let label = match action {
+                TrayAction::Disconnect => "Disconnect",
+                _ => "Connect",
+            };
             let cb = Arc::clone(&self.on_action);
             StandardItem {
-                label: "Disconnect".into(),
+                label: label.into(),
+                enabled,
                 activate: Box::new(move |_| {
-                    (cb)(TrayAction::Disconnect);
-                }),
-                ..Default::default()
-            }
-        } else {
-            let starting = matches!(
-                self.process_state,
-                ProcessState::Starting | ProcessState::Stopping
-            );
-            let cb = Arc::clone(&self.on_action);
-            StandardItem {
-                label: "Connect".into(),
-                enabled: !starting,
-                activate: Box::new(move |_| {
-                    (cb)(TrayAction::Connect);
+                    (cb)(action.clone());
                 }),
                 ..Default::default()
             }
@@ -171,6 +161,16 @@ impl Tray for AppTray {
             show_window.into(),
             quit.into(),
         ]
+    }
+}
+
+/// `Starting` offers Disconnect so a slow connect can be cancelled;
+/// `Stopping` has nothing left to cancel.
+fn toggle_action(state: &ProcessState) -> (TrayAction, bool) {
+    match state {
+        ProcessState::Running | ProcessState::Starting => (TrayAction::Disconnect, true),
+        ProcessState::Stopping => (TrayAction::Connect, false),
+        ProcessState::Stopped | ProcessState::Error(_) => (TrayAction::Connect, true),
     }
 }
 
@@ -404,5 +404,31 @@ mod tests {
         let description = tooltip_description(&meta);
         assert!(description.starts_with("Manual\nTest Node"));
         assert!(description.contains("Latency: 42 ms"));
+    }
+
+    #[test]
+    fn toggle_is_enabled_disconnect_while_starting() {
+        assert!(matches!(
+            toggle_action(&ProcessState::Starting),
+            (TrayAction::Disconnect, true)
+        ));
+        assert!(matches!(
+            toggle_action(&ProcessState::Running),
+            (TrayAction::Disconnect, true)
+        ));
+        assert!(matches!(
+            toggle_action(&ProcessState::Stopped),
+            (TrayAction::Connect, true)
+        ));
+        assert!(matches!(
+            toggle_action(&ProcessState::Error("boom".into())),
+            (TrayAction::Connect, true)
+        ));
+    }
+
+    #[test]
+    fn toggle_disabled_while_stopping() {
+        let (_, enabled) = toggle_action(&ProcessState::Stopping);
+        assert!(!enabled);
     }
 }

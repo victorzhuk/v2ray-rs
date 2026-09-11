@@ -127,28 +127,9 @@ impl App {
 
     fn apply_state(&mut self, state: &ProcessState) {
         let from = self.process_state.clone();
-        match state {
-            ProcessState::Stopped => {
-                self.connected = false;
-                self.button_sensitive = true;
-            }
-            ProcessState::Starting => {
-                self.connected = false;
-                self.button_sensitive = false;
-            }
-            ProcessState::Running => {
-                self.connected = true;
-                self.button_sensitive = true;
-            }
-            ProcessState::Stopping => {
-                self.connected = true;
-                self.button_sensitive = false;
-            }
-            ProcessState::Error(msg) => {
-                self.connected = false;
-                self.button_sensitive = true;
-                self.show_toast(&format!("Error: {msg}"));
-            }
+        (self.connected, self.button_sensitive) = connect_toggle(state);
+        if let ProcessState::Error(msg) = state {
+            self.show_toast(&format!("Error: {msg}"));
         }
         self.process_state = state.clone();
 
@@ -1439,6 +1420,16 @@ fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> Qu
     }
 }
 
+/// Returns `(shows_disconnect, sensitive)`. `Starting` offers Disconnect so a
+/// slow connect can be cancelled; `Stopping` has nothing left to cancel.
+fn connect_toggle(state: &ProcessState) -> (bool, bool) {
+    match state {
+        ProcessState::Stopped | ProcessState::Error(_) => (false, true),
+        ProcessState::Starting | ProcessState::Running => (true, true),
+        ProcessState::Stopping => (true, false),
+    }
+}
+
 fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
 }
@@ -1533,6 +1524,23 @@ mod tests {
             false,
             &ProcessState::Running
         ));
+    }
+
+    #[test]
+    fn toggle_is_actionable_disconnect_while_starting() {
+        assert_eq!(connect_toggle(&ProcessState::Starting), (true, true));
+        assert_eq!(connect_toggle(&ProcessState::Running), (true, true));
+        assert_eq!(connect_toggle(&ProcessState::Stopped), (false, true));
+        assert_eq!(
+            connect_toggle(&ProcessState::Error("boom".into())),
+            (false, true)
+        );
+    }
+
+    #[test]
+    fn toggle_disabled_while_stopping() {
+        let (_, sensitive) = connect_toggle(&ProcessState::Stopping);
+        assert!(!sensitive);
     }
 
     #[test]
