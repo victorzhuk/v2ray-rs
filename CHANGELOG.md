@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- xray configs no longer carry `freedom.domainStrategy`. Xray-core 26.9.8 and
+  later deprecate it and copy it over the direct outbound's socket strategy, so
+  under TUN direct dials resolved both address families regardless of the DNS
+  strategy. The direct outbound now follows the configured DNS strategy.
+- A TLS node with certificate verification turned off no longer stops xray from
+  starting. Xray-core 26.6.22 and later reject `allowInsecure`; such a node is
+  now skipped for xray with an error naming it, and connection planning moves on
+  to the next candidate. The v2ray backend is unchanged.
+
 ## [0.17.4] - 2026-09-04
 
 ### Fixed
