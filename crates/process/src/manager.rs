@@ -892,6 +892,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_without_restart_keeps_routing_state() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "exit 1\n");
+        mgr.set_auto_restart(false);
+        mgr.start().await.unwrap();
+        let (helper, calls) = stub_helper(dir.path(), "");
+        mgr.tun = Some(xray_on_lo(helper));
+
+        mgr.wait_and_handle_exit().await.unwrap();
+
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(
+            read_lines(&calls).is_empty(),
+            "give-up must not call the helper"
+        );
+    }
+
+    #[tokio::test]
     async fn tun_start_refuses_without_capability() {
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.json");
