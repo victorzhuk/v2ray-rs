@@ -43,6 +43,10 @@ pub enum ConfigError {
     },
     #[error("transport not supported by backend {backend} for node '{node}'")]
     UnsupportedTransport { backend: BackendType, node: String },
+    #[error(
+        "node '{node}' disables certificate verification, which backend {backend} does not support; enable verification or use sing-box"
+    )]
+    UnsupportedTlsVerification { backend: BackendType, node: String },
     #[error("serialize config: {0}")]
     Serialize(#[from] serde_json::Error),
     #[error("write config: {0}")]

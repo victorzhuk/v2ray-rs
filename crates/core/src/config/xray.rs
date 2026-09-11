@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
 use crate::config::{ConfigError, ConfigGenerator};
-use crate::models::{AppSettings, ProxyNode, RoutingRule, VlessConfig};
+use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule, VlessConfig};
 
 pub struct XrayGenerator;
 
@@ -22,6 +22,12 @@ impl ConfigGenerator for XrayGenerator {
         if nodes.is_empty() {
             return Err(ConfigError::NoNodes);
         }
+        if let Some(node) = nodes.iter().find(|n| disables_tls_verification(n)) {
+            return Err(ConfigError::UnsupportedTlsVerification {
+                backend: BackendType::Xray,
+                node: node.remark().unwrap_or(node.address()).to_string(),
+            });
+        }
 
         let mut config =
             generate_v2ray_family_config(nodes, rules, settings, V2rayFamilyBackend::Xray);
@@ -35,6 +41,20 @@ impl ConfigGenerator for XrayGenerator {
 
         Ok(config)
     }
+}
+
+/// xray 26.6.22+ removed `allowInsecure` with no drop-in replacement, so a node
+/// that opts out of verification cannot be expressed. Failing beats emitting a
+/// config that silently verifies what the user asked not to. REALITY has no
+/// such knob and is unaffected.
+fn disables_tls_verification(node: &ProxyNode) -> bool {
+    let tls = match node {
+        ProxyNode::Vless(c) => c.tls.as_ref(),
+        ProxyNode::Vmess(c) => c.tls.as_ref(),
+        ProxyNode::Trojan(c) => c.tls.as_ref(),
+        ProxyNode::Shadowsocks(_) => None,
+    };
+    tls.is_some_and(|t| !t.reality && !t.verify)
 }
 
 /// Stamps every dialing outbound with the TUN fwmark via `streamSettings.sockopt.mark`
@@ -375,6 +395,75 @@ mod tests {
         let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
         assert!(tls.is_object());
         assert!(tls.get("allowInsecure").is_none(), "{tls}");
+    }
+
+    fn insecure_trojan(reality: bool) -> ProxyNode {
+        ProxyNode::Trojan(TrojanConfig {
+            address: "insecure.example.com".into(),
+            port: 443,
+            password: "trojan-pass".into(),
+            transport: TransportSettings::Tcp,
+            tls: Some(TlsSettings {
+                server_name: Some("insecure.example.com".into()),
+                verify: false,
+                reality,
+                public_key: reality.then(|| "pbk".into()),
+                ..Default::default()
+            }),
+            remark: Some("Insecure Node".into()),
+        })
+    }
+
+    #[test]
+    fn test_xray_rejects_disabled_tls_verification() {
+        let err = XrayGenerator
+            .generate(
+                &[xray_vless_with_xtls(), insecure_trojan(false)],
+                &[],
+                &AppSettings::default(),
+            )
+            .unwrap_err();
+
+        match &err {
+            ConfigError::UnsupportedTlsVerification { backend, node } => {
+                assert_eq!(*backend, BackendType::Xray);
+                assert_eq!(node, "Insecure Node");
+            }
+            other => panic!("expected UnsupportedTlsVerification, got {other:?}"),
+        }
+        assert_eq!(
+            err.to_string(),
+            "node 'Insecure Node' disables certificate verification, which backend xray does not \
+             support; enable verification or use sing-box"
+        );
+    }
+
+    #[test]
+    fn test_write_config_rejects_disabled_tls_verification_for_xray() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = crate::config::ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::Xray;
+
+        let result = writer.write_config(&[insecure_trojan(false)], &[], &settings);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::UnsupportedTlsVerification { .. })
+        ));
+        assert!(!writer.output_path(BackendType::Xray).exists());
+    }
+
+    #[test]
+    fn test_xray_reality_ignores_verify_flag() {
+        let config = XrayGenerator
+            .generate(&[insecure_trojan(true)], &[], &AppSettings::default())
+            .unwrap();
+
+        assert_eq!(
+            config["outbounds"][0]["streamSettings"]["security"],
+            "reality"
+        );
     }
 
     #[test]
