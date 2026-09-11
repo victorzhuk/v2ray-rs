@@ -22,6 +22,7 @@ impl ProcessState {
                 | (Stopped, Error(_))
                 | (Starting, Running)
                 | (Starting, Error(_))
+                | (Starting, Stopping)
                 // supervised in-place restart after an unexpected exit: the
                 // manager relaunches without a user-visible disconnect blip
                 | (Running, Starting)
@@ -150,6 +151,16 @@ mod tests {
 
         assert!(state.transition(ProcessState::Stopped).is_ok());
         assert_eq!(state, ProcessState::Stopped);
+    }
+
+    #[test]
+    fn starting_can_move_to_stopping() {
+        let mut state = ProcessState::Starting;
+        assert!(state.transition(ProcessState::Stopping).is_ok());
+        assert_eq!(state, ProcessState::Stopping);
+
+        let mut state = ProcessState::Starting;
+        assert!(state.transition(ProcessState::Stopped).is_err());
     }
 
     #[test]

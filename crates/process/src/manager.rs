@@ -259,16 +259,23 @@ impl ProcessManager {
     }
 
     pub async fn stop(&mut self) -> Result<(), ProcessError> {
-        if self.child.is_none() {
+        match self.state() {
+            ProcessState::Stopped if self.child.is_none() => return Ok(()),
             // A preflight failure or crash-budget exhaustion leaves the manager
-            // in Error with no child: drive it to Stopped so the state machine
-            // reaches a terminal state instead of parking in Error.
-            if matches!(self.state(), ProcessState::Error(_)) {
+            // in Error with no child: release any routing state and reach a
+            // terminal state instead of parking in Error.
+            ProcessState::Error(_) if self.child.is_none() => {
+                self.teardown_tun().await;
                 self.state.transition(ProcessState::Stopped, None)?;
+                return Ok(());
             }
-            return Ok(());
+            // A cancelled start or an exit whose wait future was dropped leaves
+            // Starting/Running/Stopping with no child; finish the stop anyway.
+            ProcessState::Stopping => {}
+            _ => {
+                self.state.transition(ProcessState::Stopping, None)?;
+            }
         }
-        self.state.transition(ProcessState::Stopping, None)?;
         self.graceful_stop().await;
         self.teardown_tun().await;
         self.state.transition(ProcessState::Stopped, None)?;
@@ -774,6 +781,100 @@ mod tests {
         // stop() is idempotent on an already-Stopped manager.
         mgr.stop().await.unwrap();
         assert_eq!(mgr.state(), ProcessState::Stopped);
+    }
+
+    fn drain_states(rx: &mut broadcast::Receiver<ProcessEvent>) -> Vec<ProcessState> {
+        let mut states = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProcessEvent::StateChanged { to, .. } = event {
+                states.push(to);
+            }
+        }
+        states
+    }
+
+    #[tokio::test]
+    async fn stop_from_starting_without_child_reaches_stopped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "[ \"$1\" = check ] && exec sleep 30\nexec sleep 30\n")
+            .with_backend(BackendType::SingBox);
+
+        let started =
+            tokio::time::timeout(Duration::from_millis(300), mgr.start_with_connection(None)).await;
+        assert!(
+            started.is_err(),
+            "start should still be checking the config"
+        );
+        assert_eq!(mgr.state(), ProcessState::Starting);
+        assert!(mgr.child.is_none());
+
+        let mut rx = mgr.subscribe();
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(
+            drain_states(&mut rx),
+            [ProcessState::Stopping, ProcessState::Stopped]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_from_running_without_child_reaches_stopped() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "exec sleep 30\n");
+        mgr.start().await.unwrap();
+        let mut child = mgr.child.take().unwrap();
+        child.kill().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+
+        let mut rx = mgr.subscribe();
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(
+            drain_states(&mut rx),
+            [ProcessState::Stopping, ProcessState::Stopped]
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_from_error_releases_tun_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        let mut mgr = ProcessManager::new(
+            dir.path().join("nonexistent-binary"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        );
+        assert!(mgr.start().await.is_err());
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+
+        let calls = dir.path().join("calls");
+        let helper = dir.path().join("netctl");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho \"$1\" >> {}\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        mgr.tun = Some(TunRuntime {
+            backend: BackendType::Xray,
+            iface: "lo".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: helper,
+            bypass_uid: None,
+            capture_dns: false,
+            strict: false,
+        });
+
+        let mut rx = mgr.subscribe();
+        mgr.stop().await.unwrap();
+        mgr.stop().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(drain_states(&mut rx), [ProcessState::Stopped]);
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "xray-down\n");
     }
 
     #[tokio::test]
