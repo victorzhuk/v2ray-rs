@@ -59,7 +59,7 @@ pub(crate) fn generate_v2ray_family_config(
             "levels": { "0": { "connIdle": settings.idle_timeout_secs } }
         },
         "inbounds": build_inbounds(settings, dns_backend),
-        "outbounds": build_outbounds(nodes),
+        "outbounds": build_outbounds(nodes, dns_backend),
         "routing": build_routing(
             rules,
             &first_proxy_tag,
@@ -195,13 +195,13 @@ fn build_xray_tun_inbound(tun: &TunConfig) -> Value {
     })
 }
 
-fn build_outbounds(nodes: &[ProxyNode]) -> Value {
+fn build_outbounds(nodes: &[ProxyNode], backend: V2rayFamilyBackend) -> Value {
     let mut outbounds: Vec<Value> = nodes
         .iter()
         .enumerate()
         .map(|(i, node)| {
             let tag = super::common::outbound_tag(node, i);
-            build_outbound(node, &tag)
+            build_outbound(node, &tag, backend)
         })
         .collect();
 
@@ -219,22 +219,26 @@ fn build_outbounds(nodes: &[ProxyNode]) -> Value {
     Value::Array(outbounds)
 }
 
-fn build_outbound(node: &ProxyNode, tag: &str) -> Value {
+fn build_outbound(node: &ProxyNode, tag: &str, backend: V2rayFamilyBackend) -> Value {
     match node {
-        ProxyNode::Vless(c) => build_vless_outbound(c, tag),
-        ProxyNode::Vmess(c) => build_vmess_outbound(c, tag),
+        ProxyNode::Vless(c) => build_vless_outbound(c, tag, backend),
+        ProxyNode::Vmess(c) => build_vmess_outbound(c, tag, backend),
         ProxyNode::Shadowsocks(c) => build_ss_outbound(c, tag),
-        ProxyNode::Trojan(c) => build_trojan_outbound(c, tag),
+        ProxyNode::Trojan(c) => build_trojan_outbound(c, tag, backend),
     }
 }
 
 /// Builds a single v2ray-family outbound for the given node and tag. Shared
 /// with the xray probe config generator.
-pub(crate) fn build_family_outbound(node: &ProxyNode, tag: &str) -> Value {
-    build_outbound(node, tag)
+pub(crate) fn build_family_outbound(
+    node: &ProxyNode,
+    tag: &str,
+    backend: V2rayFamilyBackend,
+) -> Value {
+    build_outbound(node, tag, backend)
 }
 
-fn build_vless_outbound(c: &VlessConfig, tag: &str) -> Value {
+fn build_vless_outbound(c: &VlessConfig, tag: &str, backend: V2rayFamilyBackend) -> Value {
     let mut user = json!({
         "id": c.uuid,
         "encryption": c.encryption.as_deref().unwrap_or("none"),
@@ -255,11 +259,11 @@ fn build_vless_outbound(c: &VlessConfig, tag: &str) -> Value {
         },
     });
 
-    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref());
+    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref(), backend);
     outbound
 }
 
-fn build_vmess_outbound(c: &VmessConfig, tag: &str) -> Value {
+fn build_vmess_outbound(c: &VmessConfig, tag: &str, backend: V2rayFamilyBackend) -> Value {
     let mut outbound = json!({
         "tag": tag,
         "protocol": "vmess",
@@ -276,7 +280,7 @@ fn build_vmess_outbound(c: &VmessConfig, tag: &str) -> Value {
         },
     });
 
-    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref());
+    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref(), backend);
     outbound
 }
 
@@ -295,7 +299,7 @@ fn build_ss_outbound(c: &ShadowsocksConfig, tag: &str) -> Value {
     })
 }
 
-fn build_trojan_outbound(c: &TrojanConfig, tag: &str) -> Value {
+fn build_trojan_outbound(c: &TrojanConfig, tag: &str, backend: V2rayFamilyBackend) -> Value {
     let mut outbound = json!({
         "tag": tag,
         "protocol": "trojan",
@@ -308,7 +312,7 @@ fn build_trojan_outbound(c: &TrojanConfig, tag: &str) -> Value {
         },
     });
 
-    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref());
+    apply_stream_settings(&mut outbound, &c.transport, c.tls.as_ref(), backend);
     outbound
 }
 
@@ -316,6 +320,7 @@ fn apply_stream_settings(
     outbound: &mut Value,
     transport: &TransportSettings,
     tls: Option<&crate::models::TlsSettings>,
+    backend: V2rayFamilyBackend,
 ) {
     let mut stream = json!({});
 
@@ -370,7 +375,10 @@ fn apply_stream_settings(
             if !tls_cfg.alpn.is_empty() {
                 tls_obj["alpn"] = json!(tls_cfg.alpn);
             }
-            tls_obj["allowInsecure"] = json!(!tls_cfg.verify);
+            // xray 26.6.22+ rejects the whole config when this field is present.
+            if backend == V2rayFamilyBackend::V2ray {
+                tls_obj["allowInsecure"] = json!(!tls_cfg.verify);
+            }
             if let Some(fp) = &tls_cfg.fingerprint {
                 tls_obj["fingerprint"] = json!(fp);
             }
@@ -975,6 +983,21 @@ mod tests {
         assert!(config["inbounds"].is_array());
         assert!(config["outbounds"].is_array());
         assert!(config["routing"].is_object());
+    }
+
+    #[test]
+    fn test_v2ray_verify_off_emits_allow_insecure() {
+        let ProxyNode::Vless(mut c) = vless_node() else {
+            unreachable!()
+        };
+        c.tls.as_mut().unwrap().verify = false;
+
+        let config = V2rayGenerator
+            .generate(&[ProxyNode::Vless(c)], &[], &default_settings())
+            .unwrap();
+
+        let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
+        assert_eq!(tls["allowInsecure"], true);
     }
 
     #[test]

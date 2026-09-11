@@ -109,7 +109,8 @@ fn apply_ws_heartbeat(outbound: &mut Value, secs: u32) {
 /// XTLS flow extensions) for the given node and tag. Shared with the Real Delay
 /// probe config generator.
 pub(crate) fn build_xray_outbound(node: &ProxyNode, tag: &str) -> Value {
-    let mut outbound = crate::config::v2ray::build_family_outbound(node, tag);
+    let mut outbound =
+        crate::config::v2ray::build_family_outbound(node, tag, V2rayFamilyBackend::Xray);
     if let ProxyNode::Vless(c) = node {
         apply_xray_vless_extensions(&mut outbound, c);
     }
@@ -363,6 +364,17 @@ mod tests {
         let user = &outbound["settings"]["vnext"][0]["users"][0];
         assert_eq!(user["flow"], "xtls-rprx-vision");
         assert_eq!(outbound["streamSettings"]["security"], "tls");
+    }
+
+    #[test]
+    fn test_xray_verify_on_omits_allow_insecure() {
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &AppSettings::default())
+            .unwrap();
+
+        let tls = &config["outbounds"][0]["streamSettings"]["tlsSettings"];
+        assert!(tls.is_object());
+        assert!(tls.get("allowInsecure").is_none(), "{tls}");
     }
 
     #[test]

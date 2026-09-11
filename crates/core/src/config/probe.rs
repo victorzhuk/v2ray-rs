@@ -151,7 +151,13 @@ impl ProbeConfigGenerator for V2rayProbeGenerator {
         let outbounds: Vec<Value> = nodes
             .iter()
             .enumerate()
-            .map(|(i, node)| crate::config::v2ray::build_family_outbound(&node.node, &probe_tag(i)))
+            .map(|(i, node)| {
+                crate::config::v2ray::build_family_outbound(
+                    &node.node,
+                    &probe_tag(i),
+                    crate::config::v2ray::V2rayFamilyBackend::V2ray,
+                )
+            })
             .collect();
 
         json!({
