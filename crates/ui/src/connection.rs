@@ -9,6 +9,7 @@ use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
     ManualNode, ProxyNode, RoutingRule, Subscription, resolve_effective_config,
 };
+use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
 use v2ray_rs_process::{ProcessEvent, ProcessManager, ProcessState, TunRuntime};
 
@@ -34,6 +35,7 @@ pub(super) struct ConnectionRequest {
     pub binary_path: PathBuf,
     pub candidates: Vec<ConnectionCandidate>,
     pub writer: ConfigWriter,
+    pub paths: AppPaths,
     pub pid_path: PathBuf,
     pub geodata_dir: PathBuf,
     pub settings: AppSettings,
@@ -63,6 +65,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         binary_path,
         candidates,
         writer,
+        paths,
         pid_path,
         geodata_dir,
         settings,
@@ -167,6 +170,13 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
             };
 
             let tun = build_tun_runtime(&effective_settings, pinned);
+            // Written before the backend or the route helper touches the kernel,
+            // so a crash mid-start still leaves the next launch a recovery pass.
+            if let Some(rt) = &tun
+                && let Err(err) = save_tun_session(&paths, &tun_session_for(rt))
+            {
+                log::warn!("save tun session marker: {err}");
+            }
             let mut mgr = ProcessManager::new(
                 binary_path.clone(),
                 config_path,
@@ -379,6 +389,13 @@ fn relays(state: &ProcessState) -> bool {
     )
 }
 
+fn tun_session_for(rt: &TunRuntime) -> TunSession {
+    TunSession {
+        backend: rt.backend,
+        iface: rt.iface.clone(),
+    }
+}
+
 /// Stops a forwarder and waits until it can no longer emit, so nothing it
 /// relays can land after the terminal state that follows.
 async fn halt(task: JoinHandle<()>) {
@@ -411,7 +428,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use v2ray_rs_core::models::{DnsStrategy, ShadowsocksConfig, TunConfig};
-    use v2ray_rs_core::persistence::AppPaths;
+    use v2ray_rs_core::persistence::load_tun_session;
     use v2ray_rs_core::profile::AppProfile;
 
     const GENERATION: u64 = 7;
@@ -460,6 +477,7 @@ mod tests {
                 binary_path: stub.binary.clone(),
                 candidates,
                 writer: ConfigWriter::new(&settings, &stub.paths),
+                paths: stub.paths.clone(),
                 pid_path: stub.paths.pid_file_path(),
                 geodata_dir: stub.paths.geodata_dir(),
                 settings,
@@ -573,6 +591,32 @@ mod tests {
         assert!(msg.starts_with("All candidates failed"), "{msg}");
         assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
         assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
+        assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marker_written_from_runtime_before_start() {
+        let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "v2rstest0".into();
+        let (_handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        let (state, _) = next_state(&rx).await;
+        let ProcessState::Error(msg) = state else {
+            panic!("expected the capability gate to fail the start, got {state:?}");
+        };
+        assert!(
+            msg.contains("CAP_NET_ADMIN") || msg.contains("TUN capabilities"),
+            "start should fail at the capability gate: {msg}"
+        );
+        assert_eq!(
+            load_tun_session(&stub.paths),
+            Some(TunSession {
+                backend: BackendType::Xray,
+                iface: "v2rstest0".into(),
+            })
+        );
         assert_nothing_after_terminal(&rx).await;
     }
 

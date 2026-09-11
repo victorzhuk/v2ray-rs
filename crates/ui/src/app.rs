@@ -479,6 +479,7 @@ impl App {
                 binary_path,
                 candidates,
                 writer,
+                paths: self.paths.clone(),
                 pid_path,
                 geodata_dir,
                 settings,
@@ -1123,21 +1124,6 @@ impl SimpleComponent for App {
                         });
                         if let Err(err) = self.persist_settings(settings) {
                             log::error!("save settings: {err}");
-                        }
-                    }
-                    if matches!(state, ProcessState::Running)
-                        && self.settings.tun.enabled
-                        && self.settings.backend.backend_type
-                            != v2ray_rs_core::models::BackendType::V2ray
-                    {
-                        let session = v2ray_rs_core::persistence::TunSession {
-                            backend: self.settings.backend.backend_type,
-                            iface: self.settings.tun.interface_name.clone(),
-                        };
-                        if let Err(err) =
-                            v2ray_rs_core::persistence::save_tun_session(&self.paths, &session)
-                        {
-                            log::warn!("save tun session marker: {err}");
                         }
                     }
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
