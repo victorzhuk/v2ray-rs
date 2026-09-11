@@ -620,6 +620,21 @@ mod tests {
         assert_nothing_after_terminal(&rx).await;
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_marker_when_launched_without_tun() {
+        let stub = stub("exit 1");
+        let (_handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
+
+        loop {
+            match next_state(&rx).await {
+                (ProcessState::Error(_), _) => break,
+                (state, _) => assert!(relays(&state), "reported {state:?}"),
+            }
+        }
+        assert_eq!(load_tun_session(&stub.paths), None);
+        assert_nothing_after_terminal(&rx).await;
+    }
+
     fn node(address: &str) -> ProxyNode {
         ProxyNode::Shadowsocks(ShadowsocksConfig {
             address: address.into(),

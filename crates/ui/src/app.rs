@@ -150,9 +150,7 @@ impl App {
             .emit(SubscriptionsMsg::SetActiveNode(sub_active));
         self.nodes_page.emit(NodesMsg::SetActiveNode(manual_active));
 
-        let tun_active = matches!(state, ProcessState::Running)
-            && self.settings.tun.enabled
-            && self.settings.backend.backend_type != v2ray_rs_core::models::BackendType::V2ray;
+        let tun_active = tun_active_for(state, self.runtime_snapshot.as_ref());
         self.subscriptions_page
             .emit(SubscriptionsMsg::SetTunActive(tun_active));
 
@@ -1437,6 +1435,15 @@ fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
 }
 
+/// TUN follows the session that is running: the launched snapshot decides,
+/// not the current settings, which may already have been edited mid-session.
+fn tun_active_for(state: &ProcessState, snapshot: Option<&RuntimeConfigSnapshot>) -> bool {
+    matches!(state, ProcessState::Running)
+        && snapshot.is_some_and(|s| {
+            s.tun.enabled && s.backend_type != v2ray_rs_core::models::BackendType::V2ray
+        })
+}
+
 #[derive(Debug, PartialEq, Eq)]
 enum DisconnectPlan {
     Stop,
@@ -1503,7 +1510,10 @@ fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[Manual
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
-    use v2ray_rs_core::models::{ProxyNode, SubscriptionNode, TransportSettings, VlessConfig};
+    use v2ray_rs_core::models::{
+        AutoResolveStrategy, BackendType, DnsConfig, ProxyNode, SubscriptionNode,
+        TransportSettings, TunConfig, VlessConfig,
+    };
 
     #[test]
     fn restart_banner_only_visible_while_runtime_is_active() {
@@ -1544,6 +1554,59 @@ mod tests {
     fn toggle_disabled_while_stopping() {
         let (_, sensitive) = connect_toggle(&ProcessState::Stopping);
         assert!(!sensitive);
+    }
+
+    fn snapshot(backend: BackendType, tun_enabled: bool) -> RuntimeConfigSnapshot {
+        RuntimeConfigSnapshot {
+            backend_type: backend,
+            binary_path: None,
+            socks_port: 1080,
+            http_port: 1081,
+            listen_address: "127.0.0.1".into(),
+            dns: DnsConfig::default(),
+            routing: RoutingRuleSet::default(),
+            manual_nodes: Vec::new(),
+            subscriptions: Vec::new(),
+            auto_resolve_strategy: AutoResolveStrategy::default(),
+            use_real_delay_for_lowest_latency: false,
+            tun: TunConfig {
+                enabled: tun_enabled,
+                ..TunConfig::default()
+            },
+            idle_timeout_secs: 300,
+            ws_heartbeat_secs: 30,
+            timestamp: 0,
+        }
+    }
+
+    #[test]
+    fn tun_active_follows_launched_snapshot() {
+        assert!(!tun_active_for(
+            &ProcessState::Running,
+            Some(&snapshot(BackendType::Xray, false))
+        ));
+        assert!(tun_active_for(
+            &ProcessState::Running,
+            Some(&snapshot(BackendType::Xray, true))
+        ));
+        assert!(!tun_active_for(
+            &ProcessState::Running,
+            Some(&snapshot(BackendType::V2ray, true))
+        ));
+    }
+
+    #[test]
+    fn tun_active_false_outside_running() {
+        let snap = snapshot(BackendType::Xray, true);
+        for state in [
+            ProcessState::Starting,
+            ProcessState::Stopping,
+            ProcessState::Stopped,
+            ProcessState::Error("boom".into()),
+        ] {
+            assert!(!tun_active_for(&state, Some(&snap)));
+        }
+        assert!(!tun_active_for(&ProcessState::Running, None));
     }
 
     #[test]
