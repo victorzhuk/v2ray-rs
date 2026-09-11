@@ -284,14 +284,24 @@ impl App {
             self.pending_exit = true;
             return;
         }
-        if let Some(handle) = self.process_handle.take() {
-            self.pending_exit = true;
-            handle.stop();
-        } else if self.tun_marker_present() {
-            self.pending_exit = true;
-            self.release_tun_session(sender);
-        } else {
-            self.window.destroy();
+        let plan = quit_plan(
+            self.process_handle.is_some(),
+            &self.process_state,
+            self.tun_marker_present(),
+        );
+        match plan {
+            QuitPlan::Stop => {
+                self.pending_exit = true;
+                if let Some(handle) = self.process_handle.take() {
+                    handle.stop();
+                }
+            }
+            QuitPlan::AwaitStopped => self.pending_exit = true,
+            QuitPlan::Release => {
+                self.pending_exit = true;
+                self.release_tun_session(sender);
+            }
+            QuitPlan::Exit => self.window.destroy(),
         }
     }
 
@@ -1407,6 +1417,28 @@ fn reconnect_after_stop(state: &ProcessState, reconnect_pending: bool) -> bool {
     reconnect_pending && matches!(state, ProcessState::Stopped | ProcessState::Error(_))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum QuitPlan {
+    Stop,
+    AwaitStopped,
+    Release,
+    Exit,
+}
+
+/// A Disconnect already took the handle while the app is `Stopping`; the
+/// window must outlive that stop so its teardown and marker clear finish.
+fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> QuitPlan {
+    if has_handle {
+        QuitPlan::Stop
+    } else if matches!(state, ProcessState::Stopping) {
+        QuitPlan::AwaitStopped
+    } else if marker_present {
+        QuitPlan::Release
+    } else {
+        QuitPlan::Exit
+    }
+}
+
 fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool {
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
 }
@@ -1632,6 +1664,54 @@ mod tests {
         )];
 
         assert!(active_nodes_available(&[subscription], &manual_nodes));
+    }
+
+    #[test]
+    fn quit_while_stopping_waits_for_stopped() {
+        assert_eq!(
+            quit_plan(false, &ProcessState::Stopping, false),
+            QuitPlan::AwaitStopped
+        );
+        assert_eq!(
+            quit_plan(false, &ProcessState::Stopping, true),
+            QuitPlan::AwaitStopped
+        );
+    }
+
+    #[test]
+    fn quit_with_handle_stops_first() {
+        assert_eq!(
+            quit_plan(true, &ProcessState::Running, true),
+            QuitPlan::Stop
+        );
+        assert_eq!(
+            quit_plan(true, &ProcessState::Starting, false),
+            QuitPlan::Stop
+        );
+    }
+
+    #[test]
+    fn quit_with_leftover_marker_releases_first() {
+        assert_eq!(
+            quit_plan(false, &ProcessState::Error("boom".into()), true),
+            QuitPlan::Release
+        );
+        assert_eq!(
+            quit_plan(false, &ProcessState::Stopped, true),
+            QuitPlan::Release
+        );
+    }
+
+    #[test]
+    fn quit_idle_exits() {
+        assert_eq!(
+            quit_plan(false, &ProcessState::Stopped, false),
+            QuitPlan::Exit
+        );
+        assert_eq!(
+            quit_plan(false, &ProcessState::Error("boom".into()), false),
+            QuitPlan::Exit
+        );
     }
 
     #[test]
