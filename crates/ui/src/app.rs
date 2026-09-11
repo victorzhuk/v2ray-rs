@@ -1755,7 +1755,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_error_leaves_in_flight_for_caller_suppression() {
+    fn error_without_pending_target_replays_nothing() {
         let mut pending = None;
 
         let replay =
@@ -1778,7 +1778,7 @@ mod tests {
     }
 
     #[test]
-    fn stopped_clears_stale_direct_in_flight_when_nothing_pending() {
+    fn stopped_without_pending_target_replays_nothing() {
         let mut pending = None;
 
         let replay = consume_terminal_direct_state(&ProcessState::Stopped, &mut pending);
