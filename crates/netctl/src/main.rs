@@ -37,7 +37,8 @@ enum Command {
         #[arg(long)]
         strict: bool,
     },
-    /// Remove the xray TUN device (no-op if absent).
+    /// Remove the xray policy rules, flush the tunnel table (IPv4 and IPv6) and
+    /// delete the xray TUN device (no-op if absent).
     XrayDown {
         #[arg(long)]
         iface: String,

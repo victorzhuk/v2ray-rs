@@ -120,11 +120,15 @@ pub async fn xray_up(
     Ok(())
 }
 
-/// Removes the policy rules and deletes the interface (which drops its addresses
-/// and device-scoped routes). The rules outlive the device, so they are torn down
-/// explicitly. A no-op when both are already absent.
+/// Removes the policy rules, flushes [`XRAY_ROUTE_TABLE`] for both families and
+/// deletes the interface (which drops its addresses and device-scoped routes).
+/// The rules and the strict fallback routes outlive the device, so they are torn
+/// down explicitly. A no-op when all are already absent.
 pub async fn xray_down(handle: &Handle, iface: &str) -> Result<(), String> {
     del_xray_rules(handle).await;
+    // Flushed before the device delete, so a failing delete cannot leave the
+    // fallback routes blackholing traffic after the session ended.
+    flush_table_routes(handle, XRAY_ROUTE_TABLE).await;
 
     // Only ever delete a TUN device. If the name resolves to something else
     // (a bridge, a WireGuard link, a physical NIC) leave it alone — rules are

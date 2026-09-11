@@ -13,6 +13,7 @@ const NS: &str = "nctl-test-ns";
 /// one without the two fighting over the same rules.
 const NS_DNS: &str = "nctl-dns-ns";
 const NS_STRICT: &str = "nctl-strict-ns";
+const NS_CLEAR: &str = "nctl-clear-ns";
 const IFACE: &str = "nctltest0";
 const ADDR: &str = "172.31.255.1/30";
 const ADDR6: &str = "fd00:ffff::1/64";
@@ -357,4 +358,66 @@ fn strict_up_installs_fallback_routes_and_v6_rules() {
         v4_rules.contains("8999:"),
         "IPv4 dns capture rule missing: {v4_rules}"
     );
+}
+
+/// Asserts that no xray route or policy rule is left in either family.
+fn assert_xray_state_cleared(ns: &str, after: &str) {
+    for family in ["-4", "-6"] {
+        let table = ip_in_output(ns, &[family, "route", "show", "table", "2023"]);
+        assert!(
+            table.trim().is_empty(),
+            "table 2023 not empty after {after} ({family}): {table}"
+        );
+        let rules = ip_in_output(ns, &[family, "rule", "show"]);
+        for pref in ["8998:", "8999:", "9000:", "9001:", "9002:"] {
+            assert!(
+                !rules.contains(pref),
+                "rule {pref} leaked after {after} ({family}): {rules}"
+            );
+        }
+    }
+}
+
+#[test]
+fn down_and_recover_clear_strict_state_both_families() {
+    let _ = run("ip", &["netns", "del", NS_CLEAR]);
+    if !run("ip", &["netns", "add", NS_CLEAR]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_CLEAR);
+
+    let strict_up = [
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--bypass-uid",
+        "999990",
+        "--capture-dns",
+        "--strict",
+    ];
+
+    if !ip_in(NS_CLEAR, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+    assert!(netctl_in(NS_CLEAR, &strict_up));
+    assert!(netctl_in(NS_CLEAR, &["xray-down", "--iface", IFACE]));
+    assert!(!ip_in(NS_CLEAR, &["link", "show", IFACE]));
+    assert_xray_state_cleared(NS_CLEAR, "xray-down");
+    assert!(netctl_in(NS_CLEAR, &["xray-down", "--iface", IFACE]));
+
+    assert!(ip_in(
+        NS_CLEAR,
+        &["tuntap", "add", "dev", IFACE, "mode", "tun"]
+    ));
+    assert!(netctl_in(NS_CLEAR, &strict_up));
+    assert!(netctl_in(
+        NS_CLEAR,
+        &["recover", "--xray", "--iface", IFACE]
+    ));
+    assert!(!ip_in(NS_CLEAR, &["link", "show", IFACE]));
+    assert_xray_state_cleared(NS_CLEAR, "recover --xray");
 }
