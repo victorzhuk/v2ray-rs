@@ -366,6 +366,7 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
         capture_dns: backend == BackendType::Xray
             && settings.tun.dns_hijack == DnsHijackMode::Hijack
             && nodes_pinned,
+        strict: settings.tun.strict_route,
     })
 }
 

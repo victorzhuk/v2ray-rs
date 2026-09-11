@@ -33,6 +33,9 @@ pub struct TunRuntime {
     /// local subnet is reached through the preserved LAN route, so the host
     /// resolves every name outside the tunnel.
     pub capture_dns: bool,
+    /// Install the fail-closed fallback routes, so traffic has nowhere to go
+    /// while the tunnel device is missing. xray only.
+    pub strict: bool,
 }
 
 impl TunRuntime {
@@ -201,22 +204,34 @@ fn device_path(iface: &str) -> String {
 
 /// Runs `netctl xray-up` to assign the address and split routes.
 pub async fn xray_up(rt: &TunRuntime) -> std::io::Result<bool> {
-    let mut cmd = Command::new(&rt.helper_path);
-    cmd.arg("xray-up")
-        .arg("--iface")
-        .arg(&rt.iface)
-        .arg("--addr")
-        .arg(&rt.addr_v4);
+    Ok(Command::new(&rt.helper_path)
+        .args(xray_up_args(rt))
+        .status()
+        .await?
+        .success())
+}
+
+pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
+    let mut args = vec![
+        "xray-up".to_string(),
+        "--iface".to_string(),
+        rt.iface.clone(),
+        "--addr".to_string(),
+        rt.addr_v4.clone(),
+    ];
     if let Some(v6) = &rt.addr_v6 {
-        cmd.arg("--addr6").arg(v6);
+        args.extend(["--addr6".to_string(), v6.clone()]);
     }
     if let Some(uid) = rt.bypass_uid {
-        cmd.arg("--bypass-uid").arg(uid.to_string());
+        args.extend(["--bypass-uid".to_string(), uid.to_string()]);
     }
     if rt.capture_dns {
-        cmd.arg("--capture-dns");
+        args.push("--capture-dns".to_string());
     }
-    Ok(cmd.status().await?.success())
+    if rt.strict {
+        args.push("--strict".to_string());
+    }
+    args
 }
 
 /// Runs `netctl xray-down` to remove the device (idempotent).
@@ -326,8 +341,56 @@ mod tests {
             helper_path: PathBuf::from("v2ray-rs-netctl"),
             bypass_uid: None,
             capture_dns: false,
+            strict: false,
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());
+    }
+
+    fn xray_rt(strict: bool) -> TunRuntime {
+        TunRuntime {
+            backend: BackendType::Xray,
+            iface: "tun0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: Some("fdfe:dcba:9876::1/126".into()),
+            helper_path: PathBuf::from("/nonexistent/v2ray-rs-netctl"),
+            bypass_uid: Some(967),
+            capture_dns: true,
+            strict,
+        }
+    }
+
+    #[test]
+    fn xray_up_args_include_strict_when_set() {
+        assert_eq!(
+            xray_up_args(&xray_rt(true)),
+            [
+                "xray-up",
+                "--iface",
+                "tun0",
+                "--addr",
+                "172.19.0.1/30",
+                "--addr6",
+                "fdfe:dcba:9876::1/126",
+                "--bypass-uid",
+                "967",
+                "--capture-dns",
+                "--strict",
+            ]
+        );
+    }
+
+    #[test]
+    fn xray_up_args_omit_strict_when_off() {
+        let rt = TunRuntime {
+            addr_v6: None,
+            bypass_uid: None,
+            capture_dns: false,
+            ..xray_rt(false)
+        };
+        assert_eq!(
+            xray_up_args(&rt),
+            ["xray-up", "--iface", "tun0", "--addr", "172.19.0.1/30"]
+        );
     }
 }
