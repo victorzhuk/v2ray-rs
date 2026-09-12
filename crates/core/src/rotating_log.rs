@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use chrono::Utc;
 
@@ -23,9 +24,16 @@ pub const ROTATIONS_KEPT: u32 = 3;
 /// `x.log.N+1`, the active file becomes `x.log.1`, and a fresh file is
 /// opened. Write and rotation failures are reported to stderr once and then
 /// ignored, so `append` never fails, panics, or retries.
+///
+/// The lock lives inside the writer: `&self` methods are safe to share
+/// across threads via `Arc<RotatingFileWriter>`.
 pub struct RotatingFileWriter {
     path: PathBuf,
     max_bytes: u64,
+    inner: Mutex<Inner>,
+}
+
+struct Inner {
     file: Option<fs::File>,
     bytes: u64,
     warned: bool,
@@ -58,78 +66,91 @@ impl RotatingFileWriter {
         Ok(Self {
             path,
             max_bytes,
-            file: Some(file),
-            bytes,
-            warned: false,
+            inner: Mutex::new(Inner {
+                file: Some(file),
+                bytes,
+                warned: false,
+            }),
         })
     }
 
-    /// Appends one record, prefixed with an RFC 3339 timestamp; a trailing
-    /// newline is added when the record lacks one.
-    pub fn append(&mut self, record: &[u8]) {
-        let timestamp = Utc::now().to_rfc3339();
-        let needs_newline = record.last() != Some(&b'\n');
-        let needed = (timestamp.len() + 1 + record.len() + usize::from(needs_newline)) as u64;
+    /// Appends one record prefixed with an RFC 3339 timestamp and a trailing
+    /// newline. Equivalent to `append_line("", content)`.
+    pub fn append(&self, content: &str) {
+        self.append_line("", content);
+    }
 
-        if self.bytes + needed > self.max_bytes {
-            self.rotate();
+    /// Appends one record prefixed with an RFC 3339 timestamp, an optional
+    /// stream tag, and a trailing newline. The on-disk shape is
+    /// `<rfc3339> [<stream>] <content>\n`; an empty `stream` omits the tag.
+    pub fn append_line(&self, stream: &str, content: &str) {
+        let timestamp = Utc::now().to_rfc3339();
+        let line = if stream.is_empty() {
+            format!("{timestamp} {content}\n")
+        } else {
+            format!("{timestamp} {stream} {content}\n")
+        };
+
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let inner = &mut *guard;
+
+        let needed = line.len() as u64;
+        if inner.bytes + needed > self.max_bytes {
+            Self::rotate(&self.path, inner);
         }
 
-        let Some(file) = self.file.as_mut() else {
+        let Some(file) = inner.file.as_mut() else {
             return;
         };
 
-        let mut line = Vec::with_capacity(needed as usize);
-        line.extend_from_slice(timestamp.as_bytes());
-        line.push(b' ');
-        line.extend_from_slice(record);
-        if needs_newline {
-            line.push(b'\n');
-        }
-
-        match file.write_all(&line) {
-            Ok(()) => self.bytes += needed,
-            Err(e) => self.report("write", e),
+        match file.write_all(line.as_bytes()) {
+            Ok(()) => inner.bytes += needed,
+            Err(e) => Self::report(&self.path, &mut inner.warned, "write", e),
         }
     }
 
-    /// Appends one line, prefixed with an RFC 3339 timestamp.
-    pub fn append_line(&mut self, line: &str) {
-        self.append(line.as_bytes());
-    }
+    /// Bails at the first non-NotFound filesystem error and only resets the
+    /// byte counter after the active file was successfully retired AND a
+    /// replacement opened; that keeps a partial rotation from leaving the
+    /// writer with a missing file handle and a wrong offset. `append` stays
+    /// nonfatal: a failed rotation drops the active handle, so subsequent
+    /// writes are silently skipped until the next append re-triggers a
+    /// rotation that can succeed.
+    fn rotate(path: &Path, inner: &mut Inner) {
+        inner.file = None;
 
-    fn rotate(&mut self) {
-        self.file = None;
-
-        let oldest = rotated_path(&self.path, ROTATIONS_KEPT);
+        let oldest = rotated_path(path, ROTATIONS_KEPT);
         if let Err(e) = fs::remove_file(&oldest)
             && e.kind() != io::ErrorKind::NotFound
         {
-            self.report("rotate: remove oldest", e);
+            Self::report(path, &mut inner.warned, "rotate: remove oldest", e);
+            return;
         }
 
         for generation in (1..ROTATIONS_KEPT).rev() {
-            let from = rotated_path(&self.path, generation);
-            let to = rotated_path(&self.path, generation + 1);
+            let from = rotated_path(path, generation);
+            let to = rotated_path(path, generation + 1);
             if let Err(e) = fs::rename(&from, &to)
                 && e.kind() != io::ErrorKind::NotFound
             {
-                self.report("rotate: shift", e);
+                Self::report(path, &mut inner.warned, "rotate: shift", e);
+                return;
             }
         }
 
-        if let Err(e) = fs::rename(&self.path, rotated_path(&self.path, 1))
+        if let Err(e) = fs::rename(path, rotated_path(path, 1))
             && e.kind() != io::ErrorKind::NotFound
         {
-            self.report("rotate: retire active", e);
+            Self::report(path, &mut inner.warned, "rotate: retire active", e);
+            return;
         }
 
-        match Self::open_file(&self.path) {
+        match Self::open_file(path) {
             Ok(file) => {
-                self.file = Some(file);
-                self.bytes = 0;
+                inner.file = Some(file);
+                inner.bytes = 0;
             }
-            Err(e) => self.report("rotate: reopen", e),
+            Err(e) => Self::report(path, &mut inner.warned, "rotate: reopen", e),
         }
     }
 
@@ -141,12 +162,12 @@ impl RotatingFileWriter {
             .open(path)
     }
 
-    fn report(&mut self, what: &str, error: io::Error) {
-        if !self.warned {
-            self.warned = true;
+    fn report(path: &Path, warned: &mut bool, what: &str, error: io::Error) {
+        if !*warned {
+            *warned = true;
             eprintln!(
                 "rotating log {}: {what} failed, giving up: {error}",
-                self.path.display()
+                path.display()
             );
         }
     }
@@ -158,8 +179,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn line_len() -> u64 {
-        // RFC 3339 timestamp (<= 35 chars) + separator + marker + newline.
-        35 + 1 + 48 + 1
+        // RFC 3339 timestamp (<= 35 chars) + separator + stream tag +
+        // separator + 48-char marker + newline.
+        35 + 1 + 1 + 1 + 48 + 1
     }
 
     #[test]
@@ -167,15 +189,15 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("x.log");
         let max_bytes = 200;
-        let mut writer = RotatingFileWriter::open(&path, max_bytes).unwrap();
+        let writer = RotatingFileWriter::open(&path, max_bytes).unwrap();
 
         let marker = "A".repeat(48);
-        writer.append_line(&marker);
-        writer.append_line(&marker);
+        writer.append_line("m", &marker);
+        writer.append_line("m", &marker);
 
         assert!(!rotated_path(&path, 1).exists());
 
-        writer.append_line(&marker);
+        writer.append_line("m", &marker);
 
         assert!(rotated_path(&path, 1).exists());
         assert_eq!(
@@ -195,10 +217,10 @@ mod tests {
     fn rotating_writer_keeps_at_most_three_rotations() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("x.log");
-        let mut writer = RotatingFileWriter::open(&path, 64).unwrap();
+        let writer = RotatingFileWriter::open(&path, 64).unwrap();
 
         for marker in ["m1", "m2", "m3", "m4", "m5", "m6"] {
-            writer.append_line(marker);
+            writer.append_line("m", marker);
         }
 
         let mut entries: Vec<String> = fs::read_dir(tmp.path())
@@ -227,8 +249,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let dir = tmp.path().join("nested/sub");
         let path = dir.join("x.log");
-        let mut writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
-        writer.append_line("secret");
+        let writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
+        writer.append_line("p", "secret");
         drop(writer);
 
         let dir_mode = fs::metadata(&dir).unwrap().permissions().mode();
@@ -244,21 +266,63 @@ mod tests {
         let path = tmp.path().join("x.log");
 
         {
-            let mut writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
-            writer.append_line("first");
+            let writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
+            writer.append_line("p", "first");
         }
         {
-            let mut writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
-            writer.append_line("second");
+            let writer = RotatingFileWriter::open(&path, DEFAULT_MAX_BYTES).unwrap();
+            writer.append_line("p", "second");
         }
 
         let content = fs::read_to_string(&path).unwrap();
         let mut lines = content.lines();
         for expected in ["first", "second"] {
             let line = lines.next().unwrap();
-            let timestamp = line.strip_suffix(expected).unwrap().trim_end();
-            chrono::DateTime::parse_from_rfc3339(timestamp).unwrap();
+            let (timestamp, rest) = line.split_once(' ').unwrap();
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .expect("record must carry an RFC 3339 timestamp");
+            assert!(
+                rest.ends_with(expected),
+                "expected {expected:?} at end of {rest:?}"
+            );
         }
         assert!(lines.next().is_none());
+    }
+
+    #[test]
+    fn rotating_writer_survives_rotate_failure() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("x.log");
+        // Block the retire rename by placing a directory at x.log.1: a
+        // file -> non-empty-directory rename is the textbook non-NotFound
+        // failure rotate() must survive without panicking.
+        std::fs::create_dir(rotated_path(&path, 1)).unwrap();
+
+        let writer = RotatingFileWriter::open(&path, 200).unwrap();
+        let marker = "A".repeat(48);
+        writer.append_line("m", &marker);
+        writer.append_line("m", &marker);
+        // Third write forces a rotation; the rename collides with the
+        // directory at x.log.1, so rotate() bails. Further appends must not
+        // panic even though no bytes can land until the blocker clears.
+        writer.append_line("m", &marker);
+        writer.append_line("m", &marker);
+
+        // The retire-rename keeps failing as long as a directory sits at
+        // x.log.1, so a fresh open with the blocker still in place must
+        // continue to recover: dropping it just reopens the active file
+        // (which survived the failed shifts) and accepts appends again.
+        let writer2 = RotatingFileWriter::open(&path, 200).unwrap();
+        writer2.append_line("m", "recovered");
+
+        // Clearing the blocker is what unblocks subsequent rotations; the
+        // recovered record itself was written before that.
+        std::fs::remove_file(rotated_path(&path, 1)).unwrap();
+
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("recovered"),
+            "writer reopened after rotate failure must still append: {content}"
+        );
     }
 }

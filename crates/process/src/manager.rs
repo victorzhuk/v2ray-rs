@@ -91,7 +91,7 @@ pub struct ProcessManager {
     current_connection: Option<ConnectionMetadata>,
     tun: Option<TunRuntime>,
     backend: Option<BackendType>,
-    log_writer: Option<Arc<Mutex<RotatingFileWriter>>>,
+    log_writer: Option<Arc<RotatingFileWriter>>,
     cached_version: Option<Option<String>>,
 }
 
@@ -136,7 +136,7 @@ impl ProcessManager {
 
     /// Attaches a shared writer so backend output, session and exit records
     /// land in the backend log file.
-    pub fn with_log_file(mut self, writer: Option<Arc<Mutex<RotatingFileWriter>>>) -> Self {
+    pub fn with_log_file(mut self, writer: Option<Arc<RotatingFileWriter>>) -> Self {
         self.log_writer = writer;
         self
     }
@@ -766,16 +766,9 @@ fn exit_status_field(status: Option<&ExitStatus>) -> String {
 // Mirrors one backend or helper line into the log file, ordered before the
 // buffer push: the broadcast channel can lag or drop, the file must not. The
 // writer is sync and infallible, so callers never await on it.
-fn write_stream_line(
-    writer: &Option<Arc<Mutex<RotatingFileWriter>>>,
-    stream: &str,
-    line: &str,
-) {
+fn write_stream_line(writer: &Option<Arc<RotatingFileWriter>>, stream: &str, line: &str) {
     if let Some(writer) = writer {
-        writer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .append_line(&format!("{stream} {line}"));
+        writer.append_line(stream, line);
     }
 }
 
@@ -817,13 +810,9 @@ mod tests {
         ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
     }
 
-    const VERSION_STUB: &str =
-        "if [ \"$1\" = version ]; then echo 'Xray 26.3.27 (Xray, Penetrates Everything.)'; exit 0; fi\n";
-
-    fn backend_log(dir: &std::path::Path) -> Arc<Mutex<RotatingFileWriter>> {
-        Arc::new(Mutex::new(
-            RotatingFileWriter::open(dir.join("backend.log"), DEFAULT_MAX_BYTES).unwrap(),
-        ))
+    const VERSION_STUB: &str = "if [ \"$1\" = version ]; then echo 'Xray 26.3.27 (Xray, Penetrates Everything.)'; exit 0; fi\n";
+    fn backend_log(dir: &std::path::Path) -> Arc<RotatingFileWriter> {
+        Arc::new(RotatingFileWriter::open(dir.join("backend.log"), DEFAULT_MAX_BYTES).unwrap())
     }
 
     #[tokio::test]
@@ -880,13 +869,16 @@ mod tests {
     #[tokio::test]
     async fn backend_log_captures_all_lines_under_load() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut mgr =
-            manager_for(&dir, &format!("{VERSION_STUB}seq 1 20000; exec sleep 30\n"))
-                .with_log_file(Some(backend_log(dir.path())));
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}seq 1 20000; exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
 
         mgr.start().await.unwrap();
         let lines = wait_for_lines(&dir.path().join("backend.log"), 20_001).await;
-        assert_eq!(lines.len(), 20_001, "session record plus 20,000 stdout lines");
+        assert_eq!(
+            lines.len(),
+            20_001,
+            "session record plus 20,000 stdout lines"
+        );
         assert!(lines[0].contains("session backend="), "{}", lines[0]);
         for (i, line) in lines[1..].iter().enumerate() {
             assert!(

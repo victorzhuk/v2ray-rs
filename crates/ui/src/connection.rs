@@ -116,7 +116,7 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         let backend_log =
             match RotatingFileWriter::open(paths.logs_dir().join("backend.log"), DEFAULT_MAX_BYTES)
             {
-                Ok(writer) => Some(Arc::new(std::sync::Mutex::new(writer))),
+                Ok(writer) => Some(Arc::new(writer)),
                 Err(err) => {
                     log::warn!("open backend log: {err}");
                     None

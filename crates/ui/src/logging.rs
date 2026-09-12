@@ -50,7 +50,7 @@ impl Log for AppLogger {
         if let Ok(mut writer) = self.writer.lock()
             && let Some(file) = writer.as_mut()
         {
-            file.append_line(&line);
+            file.append(&line);
         }
     }
 
@@ -68,7 +68,7 @@ fn parse_level(value: &str) -> Option<LevelFilter> {
     }
 }
 
-fn resolve_level(value: Option<&str>) -> LevelFilter {
+pub(crate) fn resolve_level(value: Option<&str>) -> LevelFilter {
     value.and_then(parse_level).unwrap_or(LevelFilter::Info)
 }
 

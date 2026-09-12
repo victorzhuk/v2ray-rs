@@ -40,6 +40,6 @@ mod tests {
     fn success_while_clean_stays_clean() {
         let mut streak = FailureStreak::new();
         streak.record_success();
-        assert!(!streak.failed);
+        assert!(streak.record_failure());
     }
 }

@@ -53,7 +53,7 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
         if e.is_timeout() {
             FetchError::Timeout
         } else if e.is_builder() {
-            FetchError::RequestBuildError(e.to_string())
+            FetchError::RequestBuildError(e.without_url().to_string())
         } else {
             FetchError::NetworkError(e.without_url().to_string())
         }
@@ -351,12 +351,25 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_error_display_omits_subscription_url() {
-        let client = test_client();
-        let result = fetch_with_client(&client, "http://127.0.0.1:9/sub").await;
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let url = format!("http://{addr}/sub");
+        // Drop the listener without accepting so the connect refuses
+        // immediately with a deterministic "connection refused" instead
+        // of stalling on a half-closed accepted socket.
+        drop(listener);
+
+        let _ = test_client();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+        let result = fetch_with_client(&client, &url).await;
         let err = result.expect_err("connecting to a closed port must fail");
         let msg = err.to_string();
         assert!(
-            !msg.contains("127.0.0.1:9"),
+            !msg.contains(&addr.to_string()),
             "network error must not embed the subscription URL: {msg}"
         );
     }
