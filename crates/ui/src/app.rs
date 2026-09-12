@@ -2349,6 +2349,13 @@ fn try_run() -> Result<(), String> {
         .ensure_dirs()
         .map_err(|err| format!("failed to create directories: {err}"))?;
 
+    crate::logging::init_logging(&paths);
+    log::info!(
+        "v2ray-rs {} starting, profile '{}'",
+        env!("CARGO_PKG_VERSION"),
+        profile.qualifier()
+    );
+
     if cli_args.reset_instance {
         reset_instance(&paths, &profile, cli_args.i_understand)
             .map_err(|e| format!("failed to reset instance: {e}"))?;
