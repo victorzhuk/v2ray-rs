@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -91,6 +92,7 @@ pub struct ProcessManager {
     tun: Option<TunRuntime>,
     backend: Option<BackendType>,
     log_writer: Option<Arc<Mutex<RotatingFileWriter>>>,
+    cached_version: Option<Option<String>>,
 }
 
 impl ProcessManager {
@@ -116,6 +118,7 @@ impl ProcessManager {
             tun: None,
             backend: None,
             log_writer: None,
+            cached_version: None,
         }
     }
 
@@ -318,6 +321,7 @@ impl ProcessManager {
             Ok(status) => status,
             Err(err) => {
                 self.cleanup_after_exit().await;
+                self.write_exit_record(false, None);
                 let error = ProcessError::Wait(err);
                 let _ = self
                     .state
@@ -332,7 +336,7 @@ impl ProcessManager {
         self.state.emit(ProcessEvent::ProcessExited { exit_code });
 
         if self.state.state() == ProcessState::Running {
-            self.handle_unexpected_exit(exit_code).await;
+            self.handle_unexpected_exit(status).await;
         }
 
         Ok(exit_code)
@@ -352,6 +356,7 @@ impl ProcessManager {
     // fail-closed routes must survive until the next attempt, and stop() owns
     // the teardown.
     async fn launch(&mut self) -> Result<(), ProcessError> {
+        self.write_session_record().await;
         let mut child = self.try_spawn().await?;
 
         if let Some(pid) = child.id()
@@ -383,6 +388,80 @@ impl ProcessManager {
         }
 
         Ok(())
+    }
+
+    // Exactly one per launch, before the backend can produce output: the
+    // counterpart every exit record refers back to.
+    async fn write_session_record(&mut self) {
+        if self.log_writer.is_none() {
+            return;
+        }
+        let version = self.backend_version().await;
+        let backend = self
+            .backend
+            .map(|b| b.to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let node = self
+            .current_connection
+            .as_ref()
+            .map(|c| truncate_reason(&c.node_name))
+            .unwrap_or_else(|| "none".into());
+        let tun = if self.tun.is_some() { "on" } else { "off" };
+        write_stream_line(
+            &self.log_writer,
+            "session",
+            &format!("backend={backend} version={version} node={node} tun={tun}"),
+        );
+    }
+
+    // Diagnostics-only probe for the session record: runs at most once per
+    // manager, only when a backend log is attached (stub backends in tests are
+    // never probed), and is bounded by CONFIG_CHECK_TIMEOUT so a wedged
+    // `version` subcommand costs the first start once but never blocks it.
+    async fn backend_version(&mut self) -> String {
+        if let Some(cached) = &self.cached_version {
+            return cached.clone().unwrap_or_else(|| "unknown".into());
+        }
+        let probe = tokio::time::timeout(
+            CONFIG_CHECK_TIMEOUT,
+            Command::new(&self.binary_path)
+                .arg("version")
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .map(|out| {
+            let first = String::from_utf8_lossy(&out.stdout);
+            let line = first.lines().next().unwrap_or("").trim();
+            match parse_semver_triple(line) {
+                Some(triple) => format_triple(triple),
+                None if !line.is_empty() => truncate_reason(line),
+                None => String::from("unknown"),
+            }
+        });
+        self.cached_version = Some(probe.clone());
+        probe.unwrap_or_else(|| "unknown".into())
+    }
+
+    // Only after cleanup_after_exit has drained the readers, so last_output is
+    // the child's final line rather than a stale snapshot.
+    fn write_exit_record(&self, requested: bool, status: Option<&ExitStatus>) {
+        if self.log_writer.is_none() {
+            return;
+        }
+        let last = self.last_output_line().unwrap_or_else(|| "none".into());
+        write_stream_line(
+            &self.log_writer,
+            "exit",
+            &format!(
+                "requested={requested} {} crashes_in_window={} last_output={last}",
+                exit_status_field(status),
+                self.crash_times.len()
+            ),
+        );
     }
 
     /// Probes the xray binary's version for the TUN preflight. Best-effort: an
@@ -516,7 +595,7 @@ impl ProcessManager {
     }
 
     async fn graceful_stop(&mut self) {
-        let Some(ref mut child) = self.child else {
+        let Some(child) = &mut self.child else {
             return;
         };
 
@@ -524,17 +603,21 @@ impl ProcessManager {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGTERM);
         }
 
-        let wait_result = tokio::time::timeout(STOP_TIMEOUT, child.wait()).await;
-
-        if wait_result.is_err() {
+        let mut status = tokio::time::timeout(STOP_TIMEOUT, child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok);
+        if status.is_none() {
             child.kill().await.ok();
-            child.wait().await.ok();
+            status = child.wait().await.ok();
         }
 
         self.cleanup_after_exit().await;
+        self.write_exit_record(true, status.as_ref());
     }
 
-    async fn handle_unexpected_exit(&mut self, exit_code: Option<i32>) {
+    async fn handle_unexpected_exit(&mut self, status: ExitStatus) {
+        let exit_code = status.code();
         let mut msg = match exit_code {
             Some(code) => format!("process exited with code {code}"),
             None => "process killed by signal".into(),
@@ -554,6 +637,7 @@ impl ProcessManager {
         // teardown here would drop the tunnel's fail-closed routes and leak
         // traffic; only stop() releases them.
         self.record_crash();
+        self.write_exit_record(false, Some(&status));
 
         if !self.auto_restart {
             let _ = self.state.transition(ProcessState::Error(msg), None);
@@ -662,6 +746,20 @@ fn truncate_reason(line: &str) -> String {
         format!("{cut}…")
     } else {
         line.to_string()
+    }
+}
+
+fn exit_status_field(status: Option<&ExitStatus>) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    let Some(status) = status else {
+        return "code=none".to_string();
+    };
+    if let Some(code) = status.code() {
+        format!("code={code}")
+    } else if let Some(signal) = status.signal() {
+        format!("signal={signal}")
+    } else {
+        "code=none".to_string()
     }
 }
 
@@ -787,9 +885,10 @@ mod tests {
                 .with_log_file(Some(backend_log(dir.path())));
 
         mgr.start().await.unwrap();
-        let lines = wait_for_lines(&dir.path().join("backend.log"), 20_000).await;
-        assert_eq!(lines.len(), 20_000, "expected all 20,000 stdout lines");
-        for (i, line) in lines.iter().enumerate() {
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 20_001).await;
+        assert_eq!(lines.len(), 20_001, "session record plus 20,000 stdout lines");
+        assert!(lines[0].contains("session backend="), "{}", lines[0]);
+        for (i, line) in lines[1..].iter().enumerate() {
             assert!(
                 line.ends_with(&format!("stdout {}", i + 1)),
                 "out of order at position {}: {line}",
@@ -797,6 +896,79 @@ mod tests {
             );
         }
         mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_record_precedes_spawn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{VERSION_STUB}echo out-line\necho err-line >&2\nexec sleep 30\n"),
+        )
+        .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 3).await;
+        let session = &lines[0];
+        assert!(session.contains("session backend=unknown"), "{session}");
+        assert!(session.contains("version=26.3.27"), "{session}");
+        assert!(session.contains("node=none"), "{session}");
+        assert!(session.contains("tun=off"), "{session}");
+        assert!(
+            lines[1..].iter().any(|l| l.contains("stdout out-line")),
+            "{lines:?}"
+        );
+        assert!(
+            lines[1..].iter().any(|l| l.contains("stderr err-line")),
+            "{lines:?}"
+        );
+        mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exit_record_marks_requested_stop() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        assert!(lines[0].contains("session backend="), "{}", lines[0]);
+        let exit = lines
+            .iter()
+            .find(|l| l.contains("exit requested="))
+            .expect("exit record");
+        assert!(exit.contains("exit requested=true"), "{exit}");
+        assert!(exit.contains("signal=15"), "{exit}");
+        assert!(exit.contains("crashes_in_window=0"), "{exit}");
+    }
+
+    #[tokio::test]
+    async fn exit_record_marks_unrequested_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{VERSION_STUB}echo 'fatal: tls handshake exploded' >&2\nexit 3\n"),
+        )
+        .with_log_file(Some(backend_log(dir.path())));
+        mgr.set_auto_restart(false);
+
+        mgr.start().await.unwrap();
+        mgr.wait_and_handle_exit().await.unwrap();
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        assert!(lines[0].contains("session backend="), "{}", lines[0]);
+        let exit = lines
+            .iter()
+            .find(|l| l.contains("exit requested="))
+            .expect("exit record");
+        assert!(exit.contains("exit requested=false"), "{exit}");
+        assert!(exit.contains("code=3"), "{exit}");
+        assert!(exit.contains("crashes_in_window=1"), "{exit}");
+        assert!(
+            exit.contains("last_output=fatal: tls handshake exploded"),
+            "{exit}"
+        );
     }
 
     fn stub_helper(dir: &std::path::Path, body: &str) -> (PathBuf, PathBuf) {
