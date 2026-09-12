@@ -44,7 +44,8 @@ impl Log for AppLogger {
         if !self.enabled(record.metadata()) {
             return;
         }
-        let line = format!("{} {} {}", record.level(), record.target(), record.args());
+        let line = format!("{} {} {}", record.level(), record.target(), record.args())
+            .replace(['\r', '\n'], " ");
         eprintln!("{} {}", chrono::Utc::now().to_rfc3339(), line);
         if let Some(writer) = self.writer.as_ref() {
             writer.append(&line);
@@ -138,6 +139,26 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(timestamp)
             .expect("record must carry exactly one RFC 3339 timestamp from the writer");
         assert_eq!(rest, "WARN test-target beware");
+    }
+
+    #[test]
+    fn app_logger_scrubs_newlines_from_record_text() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(LOG_FILE_NAME);
+        let logger = AppLogger::new(path.clone(), LevelFilter::Info).unwrap();
+
+        log_record(&logger, Level::Warn, "evil\nforge\r\nmore");
+
+        let content = fs::read_to_string(&path).unwrap();
+        let mut lines = content.lines();
+        let (timestamp, rest) = lines.next().unwrap().split_once(' ').unwrap();
+        assert!(
+            lines.next().is_none(),
+            "a record containing a newline must yield exactly one file line"
+        );
+        chrono::DateTime::parse_from_rfc3339(timestamp)
+            .expect("record must carry exactly one RFC 3339 timestamp from the writer");
+        assert_eq!(rest, "WARN test-target evil forge  more");
     }
 
     #[test]
