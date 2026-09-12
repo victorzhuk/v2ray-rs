@@ -427,10 +427,38 @@ $XDG_STATE_HOME/v2ray-rs/
   instance.json              — InstanceStamp (version, first/last started)
   tun_session.json           — TUN active marker
   latency_snapshot.json      — per-node TCP latency cache
+  logs/
+    v2ray-rs.log             — app log (rotated: .1–.3 kept at 5 MiB each)
+    backend.log              — backend output + session/exit records (same)
 ```
 
 Dev mode (`AppProfile::Development`) uses the qualifier `v2ray-rs-dev`,
 keeping its paths fully separate from production.
+
+## Logging
+
+The app keeps two size-rotated logs under `$XDG_STATE_HOME/v2ray-rs/logs/`
+(`<state_dir>/logs`). Each rotates when the next record would push the active
+file past 5 MiB: the oldest generation is deleted, `.2`→`.3`, `.1`→`.2`, the
+active file becomes `.1` (newest first), and a fresh file is opened — four
+files, ~20 MiB per log name. Both files are created 0o600 in a 0o700
+directory and appended to across runs.
+
+- **`v2ray-rs.log`** — the app's own log records, mirrored to stderr.
+  Installed right after path resolution, before the first persistence call,
+  so early startup failures land in the file; an unwritable file degrades to
+  stderr-only. `V2RAY_RS_LOG` selects the level case-insensitively
+  (`trace`, `debug`, `info`, `warn`, `error`; default `info`; an invalid
+  value falls back to `info` with one stderr note).
+
+- **`backend.log`** — everything the backend process prints, with each line
+  tagged by its stream (`stdout`/`stderr`) or the route-helper tag. The
+  connection task opens one shared writer, so failover between candidates
+  appends to the same file. Interspersed diagnostics records: one `session`
+  line per launch (`backend=… version=… node=… tun=…`; the version probe runs
+  at most once per manager) and one `exit` line per exit (exit code or
+  signal, whether the stop was requested, crashes in the restart window, and
+  the backend's last output line).
 
 ## Cross-cutting patterns
 

@@ -8,9 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- The app keeps a rotating log file (`v2ray-rs.log` under the state directory)
+- The app keeps a rotating log file (`v2ray-rs.log` under `<state_dir>/logs/`)
   mirroring its log records, with the level selectable via `V2RAY_RS_LOG`
   (`trace`, `debug`, `info`, `warn`, `error`; default `info`).
+- Backend output is mirrored to a rotating `<state_dir>/logs/backend.log`:
+  every stdout/stderr line the backend prints, route-helper output, a
+  `session` record per launch (backend, probed version, node, TUN state) and
+  an `exit` record per exit (code or signal, whether the stop was requested,
+  crashes in the restart window, last output line), so a crash stays
+  diagnosable after the fact.
+- Geodata refresh and subscription auto-update failures now surface one
+  failure toast per failure streak instead of one per failed attempt; a
+  success clears the streak.
 
 ### Changed
 - **BREAKING:** under xray TUN with `strict_route` on, which is the default,
