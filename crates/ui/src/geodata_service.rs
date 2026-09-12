@@ -1,3 +1,4 @@
+use crate::failure_streak::FailureStreak;
 use std::time::Duration;
 
 use v2ray_rs_core::models::{
@@ -174,6 +175,28 @@ mod tests {
 
         assert!(tags.is_empty());
     }
+
+    #[test]
+    fn geodata_failure_toasts_once_per_streak() {
+        let mut streak = FailureStreak::new();
+        assert_eq!(
+            refresh_outcome_toast(&mut streak, &Err("boom".into())),
+            Some("Geodata refresh failed: boom".to_string())
+        );
+        assert_eq!(
+            refresh_outcome_toast(&mut streak, &Err("boom".into())),
+            None
+        );
+        assert_eq!(
+            refresh_outcome_toast(&mut streak, &Err("boom".into())),
+            None
+        );
+        assert_eq!(refresh_outcome_toast(&mut streak, &Ok(())), None);
+        assert_eq!(
+            refresh_outcome_toast(&mut streak, &Err("boom".into())),
+            Some("Geodata refresh failed: boom".to_string())
+        );
+    }
 }
 
 #[derive(Clone)]
@@ -182,10 +205,13 @@ pub struct GeodataRefreshService {
 }
 
 impl GeodataRefreshService {
-    pub fn spawn(initial: GeodataRefreshConfig) -> Self {
+    pub fn spawn(
+        initial: GeodataRefreshConfig,
+        toasts: tokio::sync::mpsc::UnboundedSender<String>,
+    ) -> Self {
         let (config_tx, config_rx) = tokio::sync::watch::channel(initial);
         tokio::spawn(async move {
-            run_loop(config_rx).await;
+            run_loop(config_rx, toasts).await;
         });
         Self { config_tx }
     }
@@ -195,7 +221,26 @@ impl GeodataRefreshService {
     }
 }
 
-async fn run_loop(mut config_rx: tokio::sync::watch::Receiver<GeodataRefreshConfig>) {
+fn refresh_outcome_toast(
+    streak: &mut FailureStreak,
+    outcome: &Result<(), String>,
+) -> Option<String> {
+    match outcome {
+        Ok(()) => {
+            streak.record_success();
+            None
+        }
+        Err(err) => streak
+            .record_failure()
+            .then(|| format!("Geodata refresh failed: {err}")),
+    }
+}
+
+async fn run_loop(
+    mut config_rx: tokio::sync::watch::Receiver<GeodataRefreshConfig>,
+    toasts: tokio::sync::mpsc::UnboundedSender<String>,
+) {
+    let mut streak = FailureStreak::new();
     loop {
         let config = config_rx.borrow().clone();
         if !config.enabled {
@@ -207,10 +252,19 @@ async fn run_loop(mut config_rx: tokio::sync::watch::Receiver<GeodataRefreshConf
 
         let refresh_config = config.clone();
         let result = tokio::task::spawn_blocking(move || refresh_once(refresh_config)).await;
-        match result {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => log::warn!("geodata refresh failed: {err}"),
-            Err(err) => log::warn!("geodata refresh task failed: {err}"),
+        let outcome: Result<(), String> = match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => {
+                log::warn!("geodata refresh failed: {err}");
+                Err(err)
+            }
+            Err(err) => {
+                log::warn!("geodata refresh task failed: {err}");
+                Err(err.to_string())
+            }
+        };
+        if let Some(toast) = refresh_outcome_toast(&mut streak, &outcome) {
+            let _ = toasts.send(toast);
         }
 
         let sleep = tokio::time::sleep(Duration::from_secs(config.interval_secs));

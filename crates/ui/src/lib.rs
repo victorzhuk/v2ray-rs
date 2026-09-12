@@ -2,6 +2,7 @@ pub(crate) mod app;
 mod cli;
 mod config_preview;
 mod connection;
+pub(crate) mod failure_streak;
 mod geodata_service;
 pub mod i18n;
 pub(crate) mod logging;

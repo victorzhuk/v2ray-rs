@@ -866,12 +866,23 @@ impl SimpleComponent for App {
             Vec::new()
         });
         let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
-        let geodata_service = GeodataRefreshService::spawn(GeodataRefreshConfig::from_settings(
-            &paths,
-            &settings,
-            &store.load_routing_rules().unwrap_or_default(),
-            &subscriptions,
-        ));
+        let (geodata_toasts, mut geodata_toast_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let geodata_service = GeodataRefreshService::spawn(
+            GeodataRefreshConfig::from_settings(
+                &paths,
+                &settings,
+                &store.load_routing_rules().unwrap_or_default(),
+                &subscriptions,
+            ),
+            geodata_toasts,
+        );
+        let geodata_toast_forwarder = sender.clone();
+        tokio::spawn(async move {
+            while let Some(toast) = geodata_toast_rx.recv().await {
+                geodata_toast_forwarder.input(AppMsg::ShowToast(toast));
+            }
+        });
 
         let model = App {
             settings,
