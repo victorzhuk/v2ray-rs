@@ -219,6 +219,10 @@ impl AppPaths {
         self.state_dir.join("latency_snapshot.json")
     }
 
+    pub fn logs_dir(&self) -> PathBuf {
+        self.state_dir.join("logs")
+    }
+
     pub fn pid_file_path(&self) -> PathBuf {
         self.runtime_dir.join("backend.pid")
     }
@@ -253,6 +257,7 @@ impl AppPaths {
         create_dir_with_permissions(&self.cache_dir)?;
         create_dir_with_permissions(&self.runtime_dir)?;
         create_dir_with_permissions(&self.state_dir)?;
+        create_dir_with_permissions(&self.logs_dir())?;
         create_dir_with_permissions(&self.subscription_blobs_dir())?;
         self.relocate_legacy_files();
         Ok(())
@@ -515,6 +520,10 @@ mod tests {
         let state_perms = fs::metadata(paths.state_dir()).unwrap().permissions();
         assert_eq!(state_perms.mode() & 0o777, 0o700);
 
+        assert!(paths.logs_dir().exists());
+        let logs_perms = fs::metadata(paths.logs_dir()).unwrap().permissions();
+        assert_eq!(logs_perms.mode() & 0o777, 0o700);
+
         assert!(paths.subscription_blobs_dir().exists());
         let blobs_perms = fs::metadata(paths.subscription_blobs_dir())
             .unwrap()
@@ -650,6 +659,32 @@ mod tests {
             paths.state_dir(),
             PathBuf::from("/tmp/xdg-state").join(AppProfile::Production.qualifier())
         );
+    }
+
+    #[test]
+    fn apppaths_logs_dir_per_profile() {
+        let mut env = MockEnv::new();
+        env.set("XDG_STATE_HOME", "/tmp/xdg-state");
+
+        let production = AppPaths::for_profile_with_env(AppProfile::Production, &env).unwrap();
+        assert_eq!(
+            production.logs_dir(),
+            PathBuf::from("/tmp/xdg-state")
+                .join(AppProfile::Production.qualifier())
+                .join("logs")
+        );
+
+        let development = AppPaths::for_profile_with_env(AppProfile::Development, &env).unwrap();
+        assert_eq!(
+            development.logs_dir(),
+            PathBuf::from("/tmp/xdg-state")
+                .join(AppProfile::Development.qualifier())
+                .join("logs")
+        );
+
+        let (_tmp, test) = test_paths();
+        assert_eq!(test.logs_dir(), test.state_dir().join("logs"));
+        assert_eq!(AppProfile::Test.qualifier(), "v2ray-rs-test");
     }
 
     #[test]
