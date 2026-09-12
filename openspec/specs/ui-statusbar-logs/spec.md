@@ -22,6 +22,10 @@ The connect/disconnect button SHALL display both a symbolic icon and a text labe
 - **WHEN** the proxy is connected
 - **THEN** the button shows `network-wireless-disabled-symbolic` icon with "Disconnect" label and `"destructive-action"` styling
 
+#### Scenario: Starting state button is actionable
+- **WHEN** the connection is starting, including an in-place crash respawn
+- **THEN** the button shows the "Disconnect" label with `"destructive-action"` styling, stays sensitive, and invoking it cancels the attempt
+
 ### Requirement: Logs empty state uses Stack with crossfade
 The logs page SHALL use `gtk::Stack` with crossfade transition to switch between the log view and the "Process Not Running" empty state.
 
