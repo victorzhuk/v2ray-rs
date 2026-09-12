@@ -15,6 +15,7 @@ use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, HelperRun, TunRuntime};
 use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
+use v2ray_rs_core::rotating_log::RotatingFileWriter;
 
 fn format_triple((major, minor, patch): (u32, u32, u32)) -> String {
     format!("{major}.{minor}.{patch}")
@@ -89,6 +90,7 @@ pub struct ProcessManager {
     current_connection: Option<ConnectionMetadata>,
     tun: Option<TunRuntime>,
     backend: Option<BackendType>,
+    log_writer: Option<Arc<Mutex<RotatingFileWriter>>>,
 }
 
 impl ProcessManager {
@@ -113,6 +115,7 @@ impl ProcessManager {
             current_connection: None,
             tun: None,
             backend: None,
+            log_writer: None,
         }
     }
 
@@ -125,6 +128,13 @@ impl ProcessManager {
     /// Enables the pre-spawn config check using the backend's own validator.
     pub fn with_backend(mut self, backend: BackendType) -> Self {
         self.backend = Some(backend);
+        self
+    }
+
+    /// Attaches a shared writer so backend output, session and exit records
+    /// land in the backend log file.
+    pub fn with_log_file(mut self, writer: Option<Arc<Mutex<RotatingFileWriter>>>) -> Self {
+        self.log_writer = writer;
         self
     }
 
@@ -469,10 +479,12 @@ impl ProcessManager {
         if let Some(stdout) = child.stdout.take() {
             let tx = self.state.log_sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
+            let writer = self.log_writer.clone();
             self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    write_stream_line(&writer, "stdout", &line);
                     let log_line = LogLine::stdout(&line);
                     let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
                     buffer
@@ -486,10 +498,12 @@ impl ProcessManager {
         if let Some(stderr) = child.stderr.take() {
             let tx = self.state.log_sender().clone();
             let buffer = Arc::clone(&self.log_buffer);
+            let writer = self.log_writer.clone();
             self.log_handles.push(tokio::spawn(async move {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    write_stream_line(&writer, "stderr", &line);
                     let log_line = LogLine::stderr(&line);
                     let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
                     buffer
@@ -597,6 +611,7 @@ impl ProcessManager {
             .err()
             .map(|e| format!("{verb} failed: {e}"));
         for content in run.output.iter().cloned().chain(failure) {
+            write_stream_line(&self.log_writer, "helper", &content);
             let line = LogLine::stderr(content);
             self.log_buffer
                 .lock()
@@ -650,6 +665,22 @@ fn truncate_reason(line: &str) -> String {
     }
 }
 
+// Mirrors one backend or helper line into the log file, ordered before the
+// buffer push: the broadcast channel can lag or drop, the file must not. The
+// writer is sync and infallible, so callers never await on it.
+fn write_stream_line(
+    writer: &Option<Arc<Mutex<RotatingFileWriter>>>,
+    stream: &str,
+    line: &str,
+) {
+    if let Some(writer) = writer {
+        writer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .append_line(&format!("{stream} {line}"));
+    }
+}
+
 impl Drop for ProcessManager {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.child {
@@ -671,6 +702,7 @@ mod tests {
     use super::*;
     use crate::tun::TunRuntime;
     use v2ray_rs_core::models::BackendType;
+    use v2ray_rs_core::rotating_log::DEFAULT_MAX_BYTES;
 
     fn write_script(dir: &std::path::Path, body: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
@@ -685,6 +717,15 @@ mod tests {
         std::fs::write(&config, "{}").unwrap();
         let binary = write_script(dir.path(), script_body);
         ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
+    }
+
+    const VERSION_STUB: &str =
+        "if [ \"$1\" = version ]; then echo 'Xray 26.3.27 (Xray, Penetrates Everything.)'; exit 0; fi\n";
+
+    fn backend_log(dir: &std::path::Path) -> Arc<Mutex<RotatingFileWriter>> {
+        Arc::new(Mutex::new(
+            RotatingFileWriter::open(dir.join("backend.log"), DEFAULT_MAX_BYTES).unwrap(),
+        ))
     }
 
     #[tokio::test]
@@ -736,6 +777,26 @@ mod tests {
             }
             other => panic!("expected Error state, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn backend_log_captures_all_lines_under_load() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr =
+            manager_for(&dir, &format!("{VERSION_STUB}seq 1 20000; exec sleep 30\n"))
+                .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 20_000).await;
+        assert_eq!(lines.len(), 20_000, "expected all 20,000 stdout lines");
+        for (i, line) in lines.iter().enumerate() {
+            assert!(
+                line.ends_with(&format!("stdout {}", i + 1)),
+                "out of order at position {}: {line}",
+                i + 1
+            );
+        }
+        mgr.stop().await.unwrap();
     }
 
     fn stub_helper(dir: &std::path::Path, body: &str) -> (PathBuf, PathBuf) {
