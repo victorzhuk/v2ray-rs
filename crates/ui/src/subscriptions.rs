@@ -893,8 +893,14 @@ impl Component for SubscriptionsPage {
                         }
                     }
                 }
+                let name = self
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("unknown");
                 log::info!(
-                    "updated subscription {id}: +{} -{} ={} failed={}",
+                    "updated subscription {name}: +{} -{} ={} failed={}",
                     result.added,
                     result.removed,
                     result.unchanged,
@@ -978,7 +984,13 @@ impl Component for SubscriptionsPage {
                 }
             }
             SubscriptionsCmdOutput::RefreshFailed(id, error) => {
-                log::error!("failed to update subscription {id}: {error}");
+                let name = self
+                    .subscriptions
+                    .iter()
+                    .find(|s| s.id == id)
+                    .map(|s| s.name.as_str())
+                    .unwrap_or("unknown");
+                log::error!("failed to update subscription {name}: {error}");
                 let _ = sender.output(SubscriptionsOutput::Notice(format_subscription_error(
                     &error,
                 )));
@@ -1013,14 +1025,20 @@ impl Component for SubscriptionsPage {
                             let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
                         }
                         for (id, result) in &results {
+                            let name = self
+                                .subscriptions
+                                .iter()
+                                .find(|s| s.id == *id)
+                                .map(|s| s.name.as_str())
+                                .unwrap_or("unknown");
                             match result {
                                 Ok((_, r)) => log::info!(
-                                    "auto-updated {id}: +{} -{} ={}",
+                                    "auto-updated {name}: +{} -{} ={}",
                                     r.added,
                                     r.removed,
                                     r.unchanged
                                 ),
-                                Err(e) => log::warn!("auto-update {id} failed: {e}"),
+                                Err(e) => log::warn!("auto-update {name} failed: {e}"),
                             }
                         }
                     }

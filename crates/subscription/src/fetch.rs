@@ -55,7 +55,7 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
         } else if e.is_builder() {
             FetchError::RequestBuildError(e.to_string())
         } else {
-            FetchError::NetworkError(e.to_string())
+            FetchError::NetworkError(e.without_url().to_string())
         }
     })?;
 
@@ -79,7 +79,7 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
     let mut data = Vec::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| FetchError::NetworkError(e.to_string()))?;
+        let chunk = chunk.map_err(|e| FetchError::NetworkError(e.without_url().to_string()))?;
         data.extend_from_slice(&chunk);
         if data.len() as u64 > MAX_SUBSCRIPTION_SIZE {
             return Err(FetchError::NetworkError(format!(
@@ -346,6 +346,18 @@ mod tests {
         assert!(
             matches!(result, Err(FetchError::InvalidUrl(_))),
             "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_error_display_omits_subscription_url() {
+        let client = test_client();
+        let result = fetch_with_client(&client, "http://127.0.0.1:9/sub").await;
+        let err = result.expect_err("connecting to a closed port must fail");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("127.0.0.1:9"),
+            "network error must not embed the subscription URL: {msg}"
         );
     }
 }
