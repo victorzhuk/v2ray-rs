@@ -4,6 +4,7 @@ mod config_preview;
 mod connection;
 mod geodata_service;
 pub mod i18n;
+pub(crate) mod logging;
 mod logs;
 mod nodes;
 mod preferences;

@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The app keeps a rotating log file (`v2ray-rs.log` under the state directory)
+  mirroring its log records, with the level selectable via `V2RAY_RS_LOG`
+  (`trace`, `debug`, `info`, `warn`, `error`; default `info`).
+
 ### Changed
 - **BREAKING:** under xray TUN with `strict_route` on, which is the default,
   IPv6 is refused unless an IPv6 tunnel address is set, and the host has no
