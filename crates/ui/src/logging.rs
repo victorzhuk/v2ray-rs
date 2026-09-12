@@ -5,7 +5,6 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use log::{LevelFilter, Log, Metadata, Record};
 use v2ray_rs_core::persistence::AppPaths;
@@ -15,7 +14,7 @@ const LEVEL_ENV: &str = "V2RAY_RS_LOG";
 const LOG_FILE_NAME: &str = "v2ray-rs.log";
 
 pub struct AppLogger {
-    writer: Mutex<Option<RotatingFileWriter>>,
+    writer: Option<RotatingFileWriter>,
     max_level: LevelFilter,
 }
 
@@ -23,14 +22,14 @@ impl AppLogger {
     fn new(path: PathBuf, max_level: LevelFilter) -> io::Result<Self> {
         let writer = RotatingFileWriter::open(path, DEFAULT_MAX_BYTES)?;
         Ok(Self {
-            writer: Mutex::new(Some(writer)),
+            writer: Some(writer),
             max_level,
         })
     }
 
     fn stderr_only(max_level: LevelFilter) -> Self {
         Self {
-            writer: Mutex::new(None),
+            writer: None,
             max_level,
         }
     }
@@ -46,11 +45,9 @@ impl Log for AppLogger {
             return;
         }
         let line = format!("{} {} {}", record.level(), record.target(), record.args());
-        eprintln!("{line}");
-        if let Ok(mut writer) = self.writer.lock()
-            && let Some(file) = writer.as_mut()
-        {
-            file.append(&line);
+        eprintln!("{} {}", chrono::Utc::now().to_rfc3339(), line);
+        if let Some(writer) = self.writer.as_ref() {
+            writer.append(&line);
         }
     }
 

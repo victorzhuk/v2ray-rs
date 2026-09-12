@@ -293,36 +293,48 @@ mod tests {
     fn rotating_writer_survives_rotate_failure() {
         let tmp = tempfile::TempDir::new().unwrap();
         let path = tmp.path().join("x.log");
-        // Block the retire rename by placing a directory at x.log.1: a
-        // file -> non-empty-directory rename is the textbook non-NotFound
-        // failure rotate() must survive without panicking.
-        std::fs::create_dir(rotated_path(&path, 1)).unwrap();
+        // Block the rotation at its first step: a directory at x.log.3 makes the
+        // oldest-generation removal fail deterministically, so rotate() bails
+        // before touching the active file.
+        std::fs::create_dir(rotated_path(&path, 3)).unwrap();
 
         let writer = RotatingFileWriter::open(&path, 200).unwrap();
         let marker = "A".repeat(48);
         writer.append_line("m", &marker);
         writer.append_line("m", &marker);
-        // Third write forces a rotation; the rename collides with the
-        // directory at x.log.1, so rotate() bails. Further appends must not
+        // Third write crosses the threshold; removing x.log.3 hits the directory
+        // and rotate() bails, dropping this record. Further appends must not
         // panic even though no bytes can land until the blocker clears.
         writer.append_line("m", &marker);
         writer.append_line("m", &marker);
 
-        // The retire-rename keeps failing as long as a directory sits at
-        // x.log.1, so a fresh open with the blocker still in place must
-        // continue to recover: dropping it just reopens the active file
-        // (which survived the failed shifts) and accepts appends again.
-        let writer2 = RotatingFileWriter::open(&path, 200).unwrap();
-        writer2.append_line("m", "recovered");
+        // The failed rotation left the active file and its records untouched.
+        let survivors = fs::read_to_string(&path).unwrap();
+        assert!(
+            survivors.contains(&marker),
+            "records written before the failed rotation must survive: {survivors}"
+        );
+        assert_eq!(survivors.lines().count(), 2, "{survivors}");
+        assert!(
+            !rotated_path(&path, 1).exists(),
+            "a failed rotation must not retire the active file"
+        );
 
-        // Clearing the blocker is what unblocks subsequent rotations; the
-        // recovered record itself was written before that.
-        std::fs::remove_file(rotated_path(&path, 1)).unwrap();
+        // Clearing the blocker lets the same writer recover: the next threshold
+        // crossing rotates, the survivors move to x.log.1, and appends land again.
+        std::fs::remove_dir(rotated_path(&path, 3)).unwrap();
+        writer.append_line("m", "recovered");
 
+        let rotated = fs::read_to_string(rotated_path(&path, 1)).unwrap();
+        assert!(
+            rotated.contains(&marker),
+            "survivors must be retired to x.log.1 once rotation succeeds: {rotated}"
+        );
+        writer.append_line("m", "post");
         let content = fs::read_to_string(&path).unwrap();
         assert!(
-            content.contains("recovered"),
-            "writer reopened after rotate failure must still append: {content}"
+            content.contains("recovered") && content.contains("post"),
+            "the same writer must accept appends after recovery: {content}"
         );
     }
 }

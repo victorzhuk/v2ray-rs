@@ -741,11 +741,17 @@ fn last_nonempty_line(text: &str) -> Option<&str> {
 }
 
 fn truncate_reason(line: &str) -> String {
-    if line.chars().count() > REASON_MAX_CHARS {
-        let cut: String = line.chars().take(REASON_MAX_CHARS).collect();
+    // Records are single-line: newlines in attacker-controlled free text
+    // (subscription node names, backend output) must not forge extra lines.
+    let sanitized: String = line
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect();
+    if sanitized.chars().count() > REASON_MAX_CHARS {
+        let cut: String = sanitized.chars().take(REASON_MAX_CHARS).collect();
         format!("{cut}…")
     } else {
-        line.to_string()
+        sanitized
     }
 }
 
@@ -915,6 +921,47 @@ mod tests {
             "{lines:?}"
         );
         mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_record_sanitizes_node_name_newlines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
+        let connection: ConnectionMetadata = serde_json::from_str(
+            r#"{
+                "node_ref": {"type": "manual", "node_id": "00000000-0000-0000-0000-000000000000"},
+                "source": "Manual",
+                "source_id": "00000000-0000-0000-0000-000000000001",
+                "node_name": "evil\nnode\rname",
+                "node_address": "example.com",
+                "node_port": 443,
+                "backend": "xray",
+                "strategy": "list-order",
+                "latency_ms": null,
+                "connected_since": "2026-01-01T00:00:00Z"
+            }"#,
+        )
+        .unwrap();
+
+        mgr.start_with_connection(Some(connection)).await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        let sessions: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("session backend="))
+            .collect();
+        assert_eq!(
+            sessions.len(),
+            1,
+            "a newline in the node name must not forge extra record lines: {lines:?}"
+        );
+        assert!(
+            sessions[0].contains("node=evil node name"),
+            "{}",
+            sessions[0]
+        );
     }
 
     #[tokio::test]
