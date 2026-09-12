@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use log::{LevelFilter, Log, Metadata, Record};
 use v2ray_rs_core::persistence::AppPaths;
-use v2ray_rs_core::rotating_log::{RotatingFileWriter, DEFAULT_MAX_BYTES};
+use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 
 const LEVEL_ENV: &str = "V2RAY_RS_LOG";
 const LOG_FILE_NAME: &str = "v2ray-rs.log";
@@ -88,7 +88,10 @@ pub fn init_logging(paths: &AppPaths) {
     let logger = match AppLogger::new(log_path.clone(), max_level) {
         Ok(logger) => logger,
         Err(err) => {
-            eprintln!("v2ray-rs: cannot open {}: {err}, logging to stderr only", log_path.display());
+            eprintln!(
+                "v2ray-rs: cannot open {}: {err}, logging to stderr only",
+                log_path.display()
+            );
             AppLogger::stderr_only(max_level)
         }
     };
