@@ -9,5 +9,6 @@ pub mod models;
 pub mod persistence;
 pub mod profile;
 pub mod resolve;
+pub mod rotating_log;
 pub mod routing_manager;
 pub mod runtime_snapshot;
