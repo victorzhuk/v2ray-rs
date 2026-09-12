@@ -37,6 +37,11 @@ struct Inner {
     file: Option<fs::File>,
     bytes: u64,
     warned: bool,
+    /// True once the destructive chain has retired the active file to `.1`
+    /// but the fresh open failed. While set, subsequent rotates only retry
+    /// the open — they MUST NOT repeat the rename chain, which would shift
+    /// `x.log.1` → `x.log.2` again and corrupt the rotation set.
+    pending_reopen: bool,
 }
 
 fn rotated_path(base: &Path, generation: u32) -> PathBuf {
@@ -70,6 +75,7 @@ impl RotatingFileWriter {
                 file: Some(file),
                 bytes,
                 warned: false,
+                pending_reopen: false,
             }),
         })
     }
@@ -116,7 +122,28 @@ impl RotatingFileWriter {
     /// nonfatal: a failed rotation drops the active handle, so subsequent
     /// writes are silently skipped until the next append re-triggers a
     /// rotation that can succeed.
+    ///
+    /// Once the destructive chain has retired the active file (renamed to
+    /// `.1`) but the fresh open fails, `pending_reopen` is set and later
+    /// threshold crossings skip the rename chain entirely — they only retry
+    /// the open. This stops a reopen failure after retirement from causing
+    /// `x.log.1` to shift to `x.log.2` on every subsequent append.
     fn rotate(path: &Path, inner: &mut Inner) {
+        if inner.pending_reopen {
+            // Active file is already retired at `.1`; only retry the open.
+            // The destructive chain must not run again — that would shift
+            // x.log.1 → x.log.2 a second time.
+            match Self::open_file(path) {
+                Ok(file) => {
+                    inner.file = Some(file);
+                    inner.bytes = 0;
+                    inner.pending_reopen = false;
+                }
+                Err(e) => Self::report(path, &mut inner.warned, "rotate: reopen", e),
+            }
+            return;
+        }
+
         inner.file = None;
 
         let oldest = rotated_path(path, ROTATIONS_KEPT);
@@ -145,10 +172,16 @@ impl RotatingFileWriter {
             return;
         }
 
+        // Retirement succeeded; mark the writer so the next rotate does not
+        // re-run the rename chain. The reopen below either clears the flag
+        // (success) or leaves it set with `inner.file = None` (failure → the
+        // next append will retry only the open).
+        inner.pending_reopen = true;
         match Self::open_file(path) {
             Ok(file) => {
                 inner.file = Some(file);
                 inner.bytes = 0;
+                inner.pending_reopen = false;
             }
             Err(e) => Self::report(path, &mut inner.warned, "rotate: reopen", e),
         }
@@ -169,6 +202,26 @@ impl RotatingFileWriter {
                 "rotating log {}: {what} failed, giving up: {error}",
                 path.display()
             );
+        }
+    }
+}
+
+#[cfg(test)]
+impl RotatingFileWriter {
+    /// Test-only constructor that places the writer in the post-retirement,
+    /// reopen-failed state. The destructive chain is treated as already
+    /// complete, so the very next threshold crossing must skip the rename
+    /// chain and retry only the open.
+    pub(crate) fn _with_pending_reopen_for_test(path: PathBuf, max_bytes: u64) -> Self {
+        Self {
+            path,
+            max_bytes,
+            inner: Mutex::new(Inner {
+                file: None,
+                bytes: u64::MAX / 2,
+                warned: false,
+                pending_reopen: true,
+            }),
         }
     }
 }
@@ -335,6 +388,130 @@ mod tests {
         assert!(
             content.contains("recovered") && content.contains("post"),
             "the same writer must accept appends after recovery: {content}"
+        );
+    }
+
+    #[test]
+    fn rotating_writer_pending_reopen_skips_destructive_shift() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("x.log");
+
+        // Recreate the state right after a successful retirement + failed
+        // reopen: x.log.1 holds the just-retired active file, x.log.2 and
+        // x.log.3 hold earlier generations. A directory at the active path
+        // keeps the reopen failing (append on a directory is an error), which
+        // is what makes the pending state real; while it holds, the
+        // destructive chain must not re-run — that would shift x.log.1 →
+        // x.log.2 again and corrupt the rotation set.
+        fs::write(rotated_path(&path, 1), b"retired-active\n").unwrap();
+        fs::write(rotated_path(&path, 2), b"sentinel.2\n").unwrap();
+        fs::write(rotated_path(&path, 3), b"sentinel.3\n").unwrap();
+        fs::create_dir(&path).unwrap();
+
+        let s1_content = fs::read_to_string(rotated_path(&path, 1)).unwrap();
+        let s2_content = fs::read_to_string(rotated_path(&path, 2)).unwrap();
+        let s3_content = fs::read_to_string(rotated_path(&path, 3)).unwrap();
+        let s1_mtime = fs::metadata(rotated_path(&path, 1))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let s2_mtime = fs::metadata(rotated_path(&path, 2))
+            .unwrap()
+            .modified()
+            .unwrap();
+        let s3_mtime = fs::metadata(rotated_path(&path, 3))
+            .unwrap()
+            .modified()
+            .unwrap();
+
+        let writer = RotatingFileWriter::_with_pending_reopen_for_test(path.clone(), 64);
+
+        // Records that would normally trigger another rotate must be dropped
+        // silently while the reopen keeps failing: nothing may land anywhere,
+        // and the rotation set must not shift.
+        let big = "B".repeat(96);
+        writer.append_line("m", &big);
+        writer.append_line("m", &big);
+
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 1)).unwrap(),
+            s1_content,
+            "x.log.1 must not be shifted while a reopen is pending",
+        );
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 2)).unwrap(),
+            s2_content,
+            "x.log.2 must not be re-shifted while a reopen is pending",
+        );
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 3)).unwrap(),
+            s3_content,
+            "x.log.3 must not be re-shifted while a reopen is pending",
+        );
+        assert_eq!(
+            fs::metadata(rotated_path(&path, 1))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            s1_mtime,
+            "x.log.1 mtime must not change while a reopen is pending",
+        );
+        assert_eq!(
+            fs::metadata(rotated_path(&path, 2))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            s2_mtime,
+            "x.log.2 mtime must not change while a reopen is pending",
+        );
+        assert_eq!(
+            fs::metadata(rotated_path(&path, 3))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            s3_mtime,
+            "x.log.3 mtime must not change while a reopen is pending",
+        );
+        assert!(
+            fs::read_dir(&path).unwrap().next().is_none(),
+            "blocked appends must not write records anywhere",
+        );
+
+        // Removing the obstruction lets the next threshold crossing succeed:
+        // the pending flag clears, a fresh x.log receives the record, and the
+        // rotation set stays untouched by the recovery.
+        fs::remove_dir(&path).unwrap();
+        writer.append_line("m", &big);
+        let active = fs::read_to_string(&path).unwrap();
+        assert!(
+            active.contains(&big),
+            "active file must receive records once reopen succeeds: {active}",
+        );
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 1)).unwrap(),
+            s1_content,
+            "recovery must not shift the rotation set",
+        );
+
+        // With the flag cleared, a further threshold crossing rotates
+        // normally: the recovered active file retires to x.log.1 and the set
+        // shifts exactly one generation.
+        writer.append_line("m", "post");
+        assert!(
+            fs::read_to_string(rotated_path(&path, 1))
+                .unwrap()
+                .contains(&big),
+            "recovered active file must retire to x.log.1 on a normal rotation",
+        );
+        assert_eq!(
+            fs::read_to_string(rotated_path(&path, 2)).unwrap(),
+            s1_content,
+            "normal rotation must shift the set exactly one generation",
+        );
+        assert_eq!(
+            fs::read_to_string(&path).unwrap().lines().count(),
+            1,
+            "fresh active file must hold only the post-recovery record",
         );
     }
 }
