@@ -11,6 +11,7 @@ use v2ray_rs_core::models::{
 };
 use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
+use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_process::{ProcessEvent, ProcessManager, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
@@ -110,6 +111,17 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
         // A failed candidate keeps its routing state while the next one starts,
         // so traffic does not leak between attempts; only a Stop releases it.
         let mut parked: Option<ProcessManager> = None;
+        // One writer spans every candidate attempt so failovers append to the
+        // same backend.log; an open failure only costs the file diagnostics.
+        let backend_log =
+            match RotatingFileWriter::open(paths.logs_dir().join("backend.log"), DEFAULT_MAX_BYTES)
+            {
+                Ok(writer) => Some(Arc::new(std::sync::Mutex::new(writer))),
+                Err(err) => {
+                    log::warn!("open backend log: {err}");
+                    None
+                }
+            };
 
         for candidate in candidates {
             if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
@@ -184,7 +196,8 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                 Some(geodata_dir.clone()),
             )
             .with_tun(tun)
-            .with_backend(settings.backend.backend_type);
+            .with_backend(settings.backend.backend_type)
+            .with_log_file(backend_log.clone());
 
             let started = tokio::select! {
                 biased;
@@ -654,6 +667,47 @@ mod tests {
         }
         assert_eq!(load_tun_session(&stub.paths), None);
         assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_connect_writes_backend_diagnostics() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box 1.11.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+        );
+        let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+            assert!(relays(&state), "reported {state:?}");
+        }
+
+        let contents = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        let session_at = contents.find(" session ").expect("session record");
+        assert_eq!(contents.matches(" session ").count(), 1, "{contents}");
+        assert!(
+            contents.contains("backend=sing-box version=1.11.0 node=203.0.113.1 tun=off"),
+            "{contents}"
+        );
+
+        handle.stop();
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+
+        let contents = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        let exit_at = contents.find(" exit ").expect("exit record");
+        assert_eq!(contents.matches(" exit ").count(), 1, "{contents}");
+        assert!(contents[exit_at..].contains("requested=true"), "{contents}");
+        assert!(session_at < exit_at, "{contents}");
     }
 
     fn node(address: &str) -> ProxyNode {
