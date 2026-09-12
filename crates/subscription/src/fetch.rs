@@ -9,11 +9,12 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION"));
 const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+const MAX_ERROR_BODY_SIZE: usize = 4096; // 4 KiB
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("network error: {0}")]
     NetworkError(String),
-    #[error("HTTP {status}: {body}")]
+    #[error("HTTP {status}: {}", body.replace(['\r', '\n'], " "))]
     HttpError { status: u16, body: String },
     #[error("file error: {0}")]
     FileError(#[from] std::io::Error),
@@ -61,7 +62,7 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
 
     let status = response.status();
     if !status.is_success() {
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response).await;
         return Err(FetchError::HttpError {
             status: status.as_u16(),
             body,
@@ -89,6 +90,20 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
     }
 
     String::from_utf8(data).map_err(|e| FetchError::NetworkError(e.to_string()))
+}
+
+async fn read_error_body(mut response: reqwest::Response) -> String {
+    let mut body = Vec::new();
+    while body.len() < MAX_ERROR_BODY_SIZE {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = (MAX_ERROR_BODY_SIZE - body.len()).min(chunk.len());
+                body.extend_from_slice(&chunk[..take]);
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&body).into_owned()
 }
 
 pub fn fetch_from_file(path: &str) -> Result<String, FetchError> {
@@ -372,5 +387,61 @@ mod tests {
             !msg.contains(&addr.to_string()),
             "network error must not embed the subscription URL: {msg}"
         );
+    }
+    #[test]
+    fn http_error_display_sanitizes_newlines() {
+        let err = FetchError::HttpError {
+            status: 500,
+            body: "boom\r\nline2\nline3".into(),
+        };
+        let msg = err.to_string();
+        assert!(
+            !msg.contains('\n') && !msg.contains('\r'),
+            "display must not embed raw newlines: {msg:?}"
+        );
+        assert!(msg.starts_with("HTTP 500: "), "{msg:?}");
+        for piece in ["boom", "line2", "line3"] {
+            assert!(msg.contains(piece), "{msg:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_error_body_is_capped_at_4096_bytes() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf); // request line + headers
+            let body = "x".repeat(64 * 1024);
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            // The client stops reading after the cap and may close the
+            // connection mid-write; a refused write is fine.
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        });
+
+        let _ = test_client();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = fetch_with_client(&client, &format!("http://{addr}/sub")).await;
+        let err = result.expect_err("HTTP 500 must fail");
+        server.await.unwrap();
+        let FetchError::HttpError { status, body } = err else {
+            panic!("expected HttpError, got: {err:?}")
+        };
+        assert_eq!(status, 500);
+        assert_eq!(body.len(), MAX_ERROR_BODY_SIZE);
+        assert!(body.chars().all(|c| c == 'x'));
     }
 }

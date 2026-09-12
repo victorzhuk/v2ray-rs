@@ -257,7 +257,6 @@ impl AppPaths {
         create_dir_with_permissions(&self.cache_dir)?;
         create_dir_with_permissions(&self.runtime_dir)?;
         create_dir_with_permissions(&self.state_dir)?;
-        create_dir_with_permissions(&self.logs_dir())?;
         create_dir_with_permissions(&self.subscription_blobs_dir())?;
         self.relocate_legacy_files();
         Ok(())
@@ -519,10 +518,6 @@ mod tests {
 
         let state_perms = fs::metadata(paths.state_dir()).unwrap().permissions();
         assert_eq!(state_perms.mode() & 0o777, 0o700);
-
-        assert!(paths.logs_dir().exists());
-        let logs_perms = fs::metadata(paths.logs_dir()).unwrap().permissions();
-        assert_eq!(logs_perms.mode() & 0o777, 0o700);
 
         assert!(paths.subscription_blobs_dir().exists());
         let blobs_perms = fs::metadata(paths.subscription_blobs_dir())

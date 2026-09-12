@@ -450,6 +450,8 @@ directory and appended to across runs.
   stderr-only. `V2RAY_RS_LOG` selects the level case-insensitively
   (`trace`, `debug`, `info`, `warn`, `error`; default `info`; an invalid
   value falls back to `info` with one stderr note).
+  Caveat: at `debug`/`trace` levels, library logs (hyper/reqwest) may include
+  request URLs that carry provider tokens; the file is user-private (0600).
 
 - **`backend.log`** — everything the backend process prints, with each line
   tagged by its stream (`stdout`/`stderr`) or the route-helper tag. The

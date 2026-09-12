@@ -2339,7 +2339,10 @@ mod tests {
             auto_update_outcome_toast(&mut streaks, other, "Other", &ok),
             None
         );
-        assert!(!streaks.contains_key(&other));
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, other, "Other", &fail),
+            Some("Auto-update failed for Other: timeout".to_string())
+        );
 
         assert_eq!(
             auto_update_outcome_toast(&mut streaks, id, "Corp", &fail),
