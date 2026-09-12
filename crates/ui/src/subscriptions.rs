@@ -17,6 +17,7 @@ use v2ray_rs_subscription::{
     UpdateError, UpdateResult, reconcile_nodes,
 };
 
+use crate::failure_streak::FailureStreak;
 use crate::workspace::WorkspaceStore;
 
 pub struct SubscriptionsPage {
@@ -28,6 +29,7 @@ pub struct SubscriptionsPage {
     auto_update_enabled: bool,
     auto_update_interval_secs: u64,
     auto_update_generation: u64,
+    auto_update_streaks: HashMap<Uuid, FailureStreak>,
     testing_latency: HashSet<Uuid>,
     testing_real_delay: HashMap<Uuid, u64>,
     real_delay_run_token: u64,
@@ -267,6 +269,7 @@ impl Component for SubscriptionsPage {
             auto_update_enabled: settings.auto_update_subscriptions,
             auto_update_interval_secs: settings.subscription_update_interval_secs,
             auto_update_generation: 0,
+            auto_update_streaks: HashMap::new(),
             testing_latency: HashSet::new(),
             testing_real_delay: HashMap::new(),
             real_delay_run_token: 0,
@@ -1002,6 +1005,8 @@ impl Component for SubscriptionsPage {
                 )));
             }
             SubscriptionsCmdOutput::AutoUpdateDone(results) => {
+                self.auto_update_streaks
+                    .retain(|id, _| self.subscriptions.iter().any(|s| s.id == *id));
                 if !results.is_empty() {
                     let previous = self.subscriptions.clone();
                     for (_, result) in &results {
@@ -1032,13 +1037,31 @@ impl Component for SubscriptionsPage {
                                 .map(|s| s.name.as_str())
                                 .unwrap_or("unknown");
                             match result {
-                                Ok((_, r)) => log::info!(
-                                    "auto-updated {name}: +{} -{} ={}",
-                                    r.added,
-                                    r.removed,
-                                    r.unchanged
-                                ),
-                                Err(e) => log::warn!("auto-update {name} failed: {e}"),
+                                Ok((_, r)) => {
+                                    log::info!(
+                                        "auto-updated {name}: +{} -{} ={}",
+                                        r.added,
+                                        r.removed,
+                                        r.unchanged
+                                    );
+                                    auto_update_outcome_toast(
+                                        &mut self.auto_update_streaks,
+                                        *id,
+                                        name,
+                                        result,
+                                    );
+                                }
+                                Err(e) => {
+                                    log::warn!("auto-update {name} failed: {e}");
+                                    if let Some(toast) = auto_update_outcome_toast(
+                                        &mut self.auto_update_streaks,
+                                        *id,
+                                        name,
+                                        result,
+                                    ) {
+                                        let _ = sender.output(SubscriptionsOutput::Notice(toast));
+                                    }
+                                }
                             }
                         }
                     }
@@ -1090,6 +1113,27 @@ impl Component for SubscriptionsPage {
                 tun_active: self.tun_active,
             },
         );
+    }
+}
+
+fn auto_update_outcome_toast(
+    streaks: &mut HashMap<Uuid, FailureStreak>,
+    id: Uuid,
+    name: &str,
+    result: &AutoUpdateRefreshResult,
+) -> Option<String> {
+    match result {
+        Ok(_) => {
+            if let Some(streak) = streaks.get_mut(&id) {
+                streak.record_success();
+            }
+            None
+        }
+        Err(err) => streaks
+            .entry(id)
+            .or_default()
+            .record_failure()
+            .then(|| format!("Auto-update failed for {name}: {err}")),
     }
 }
 
@@ -2259,6 +2303,48 @@ mod tests {
         }));
         node.enabled = enabled;
         node
+    }
+
+    #[test]
+    fn subscription_failure_toasts_once_per_streak() {
+        let mut streaks = HashMap::new();
+        let id = Uuid::new_v4();
+        let fail: AutoUpdateRefreshResult = Err("timeout".into());
+        let ok: AutoUpdateRefreshResult = Ok((
+            create_test_subscription("Corp", true, vec![]),
+            UpdateResult {
+                added: 0,
+                removed: 0,
+                unchanged: 0,
+                parse_failures: Vec::new(),
+                profile: None,
+            },
+        ));
+
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, id, "Corp", &fail),
+            Some("Auto-update failed for Corp: timeout".to_string())
+        );
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, id, "Corp", &fail),
+            None
+        );
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, id, "Corp", &ok),
+            None
+        );
+
+        let other = Uuid::new_v4();
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, other, "Other", &ok),
+            None
+        );
+        assert!(!streaks.contains_key(&other));
+
+        assert_eq!(
+            auto_update_outcome_toast(&mut streaks, id, "Corp", &fail),
+            Some("Auto-update failed for Corp: timeout".to_string())
+        );
     }
 
     #[test]
