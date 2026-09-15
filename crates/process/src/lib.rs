@@ -8,6 +8,8 @@ mod state;
 mod tun;
 
 pub use log_buffer::{LogBuffer, LogLine, LogSource};
+#[cfg(any(test, feature = "test-utils"))]
+pub use manager::HostProbe;
 pub use manager::{ProcessError, ProcessManager};
 pub use pid::PidFile;
 pub use privilege::{

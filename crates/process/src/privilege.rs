@@ -95,7 +95,11 @@ pub(crate) fn caps_check_needed(euid: u32) -> bool {
 /// file capabilities. Bounded by `GETCAP_TIMEOUT`; a wedged probe is killed
 /// (not abandoned) so it cannot outlive the start attempt.
 pub fn has_net_admin(path: &Path) -> Result<bool, PrivilegeError> {
-    let mut child = Command::new("getcap")
+    probe_net_admin(Path::new("getcap"), path)
+}
+
+pub(crate) fn probe_net_admin(getcap: &Path, path: &Path) -> Result<bool, PrivilegeError> {
+    let mut child = Command::new(getcap)
         .arg(path)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

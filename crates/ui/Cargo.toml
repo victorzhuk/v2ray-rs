@@ -23,6 +23,7 @@ percent-encoding.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+v2ray-rs-process = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = ["geodata-fetch"]

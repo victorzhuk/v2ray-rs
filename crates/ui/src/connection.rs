@@ -62,6 +62,16 @@ impl ConnectionHandle {
 }
 
 pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -> ConnectionHandle {
+    spawn_with(request, sender, |mgr| mgr)
+}
+
+/// `spawn` with a hook over every candidate's manager, applied after the
+/// production builder chain.
+fn spawn_with(
+    request: ConnectionRequest,
+    sender: relm4::Sender<AppMsg>,
+    configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
+) -> ConnectionHandle {
     let ConnectionRequest {
         binary_path,
         candidates,
@@ -189,15 +199,17 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
             {
                 log::warn!("save tun session marker: {err}");
             }
-            let mut mgr = ProcessManager::new(
-                binary_path.clone(),
-                config_path,
-                pid_path.clone(),
-                Some(geodata_dir.clone()),
-            )
-            .with_tun(tun)
-            .with_backend(settings.backend.backend_type)
-            .with_log_file(backend_log.clone());
+            let mut mgr = configure(
+                ProcessManager::new(
+                    binary_path.clone(),
+                    config_path,
+                    pid_path.clone(),
+                    Some(geodata_dir.clone()),
+                )
+                .with_tun(tun)
+                .with_backend(settings.backend.backend_type)
+                .with_log_file(backend_log.clone()),
+            );
 
             let started = tokio::select! {
                 biased;
@@ -490,6 +502,13 @@ mod tests {
         }
     }
 
+    fn executable(dir: &std::path::Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     fn candidate(address: &str) -> ConnectionCandidate {
         ConnectionCandidate {
             node_ref: ConnectionNodeRef::Manual {
@@ -507,8 +526,17 @@ mod tests {
         settings: AppSettings,
         candidates: Vec<ConnectionCandidate>,
     ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
+        connect_with(stub, settings, candidates, |mgr| mgr)
+    }
+
+    fn connect_with(
+        stub: &Stub,
+        settings: AppSettings,
+        candidates: Vec<ConnectionCandidate>,
+        configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
+    ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let handle = spawn(
+        let handle = spawn_with(
             ConnectionRequest {
                 binary_path: stub.binary.clone(),
                 candidates,
@@ -524,6 +552,7 @@ mod tests {
                 generation: GENERATION,
             },
             tx,
+            configure,
         );
         (handle, rx)
     }
@@ -658,13 +687,21 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn host_level_failure_stops_the_candidate_loop() {
         let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        // A getcap that prints nothing is the "no capabilities" verdict, and a
+        // present helper gets the start past the helper gates to that verdict.
+        let host = tempfile::tempdir().unwrap();
+        let probe = v2ray_rs_process::HostProbe {
+            getcap: executable(host.path(), "getcap"),
+            helper: executable(host.path(), "v2ray-rs-netctl"),
+        };
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
         settings.tun.interface_name = "v2rstest1".into();
-        let (_handle, rx) = connect(
+        let (_handle, rx) = connect_with(
             &stub,
             settings,
             vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
         );
 
         let mut granted = false;
@@ -693,15 +730,11 @@ mod tests {
             !msg.starts_with("All candidates failed"),
             "a host-level failure is reported on its own, not summarized: {msg}"
         );
-        // Hosts without working getcap or with a nosuid staging dir surface a
-        // different host-level variant, so the grant is asserted only when the
-        // error names the capability pair the grant fixes.
-        if msg.contains("lacks CAP_NET_ADMIN") {
-            assert!(
-                granted,
-                "grant-fixable failure must emit TunGrantRequired first: {msg}"
-            );
-        }
+        assert!(msg.contains("lacks CAP_NET_ADMIN"), "{msg}");
+        assert!(
+            granted,
+            "grant-fixable failure must emit TunGrantRequired first: {msg}"
+        );
         // Exactly one start attempt: the config on disk is still candidate
         // 1's; a second attempt would have overwritten it with candidate 2.
         let config = std::fs::read_to_string(stub.paths.generated_dir().join("xray.json"))

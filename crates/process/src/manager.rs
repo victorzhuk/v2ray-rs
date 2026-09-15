@@ -121,6 +121,18 @@ pub struct ProcessManager {
     backend: Option<BackendType>,
     log_writer: Option<Arc<RotatingFileWriter>>,
     cached_version: Option<Option<String>>,
+    #[cfg(any(test, feature = "test-utils"))]
+    host_probe: Option<HostProbe>,
+}
+
+/// Pins the host facts the TUN preflight reads, so a test can reach the
+/// capability verdict without depending on the mount table, the euid, or the
+/// `getcap` and route helper installed on the machine.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub struct HostProbe {
+    pub getcap: PathBuf,
+    pub helper: PathBuf,
 }
 
 impl ProcessManager {
@@ -147,7 +159,36 @@ impl ProcessManager {
             backend: None,
             log_writer: None,
             cached_version: None,
+            #[cfg(any(test, feature = "test-utils"))]
+            host_probe: None,
         }
+    }
+
+    /// Skips the mount gate, always runs the capability gate, probes with
+    /// `probe.getcap`, and points an attached TUN runtime at `probe.helper`.
+    /// Call after `with_tun`.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn with_host_probe(mut self, probe: HostProbe) -> Self {
+        if let Some(rt) = &mut self.tun {
+            rt.helper_path = probe.helper.clone();
+        }
+        self.host_probe = Some(probe);
+        self
+    }
+
+    fn host_pinned(&self) -> bool {
+        #[cfg(any(test, feature = "test-utils"))]
+        return self.host_probe.is_some();
+        #[cfg(not(any(test, feature = "test-utils")))]
+        false
+    }
+
+    fn getcap_program(&self) -> PathBuf {
+        #[cfg(any(test, feature = "test-utils"))]
+        if let Some(probe) = &self.host_probe {
+            return probe.getcap.clone();
+        }
+        PathBuf::from("getcap")
     }
 
     /// Attaches TUN runtime details so start/stop become TUN-aware.
@@ -261,9 +302,11 @@ impl ProcessManager {
             }
             // On a nosuid mount the getcap probes below would report the
             // backend as unprivileged no matter what was granted.
-            if !crate::privilege::file_caps_supported(
-                self.binary_path.parent().unwrap_or(Path::new("/")),
-            ) {
+            if !self.host_pinned()
+                && !crate::privilege::file_caps_supported(
+                    self.binary_path.parent().unwrap_or(Path::new("/")),
+                )
+            {
                 let error = ProcessError::TunMountUnsupported(
                     crate::privilege::PrivilegeError::Unsupported {
                         path: self.binary_path.clone(),
@@ -297,12 +340,16 @@ impl ProcessManager {
 
             // Root holds every capability in the process already, so probing
             // file capabilities there only adds a failure mode.
-            let caps_gate = crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw());
+            let caps_gate = self.host_pinned()
+                || crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw());
+            let getcap = self.getcap_program();
             if caps_gate {
                 let binary = self.binary_path.clone();
-                let probe =
-                    tokio::task::spawn_blocking(move || crate::privilege::has_net_admin(&binary))
-                        .await;
+                let getcap = getcap.clone();
+                let probe = tokio::task::spawn_blocking(move || {
+                    crate::privilege::probe_net_admin(&getcap, &binary)
+                })
+                .await;
                 let cap = match probe {
                     Ok(inner) => inner,
                     Err(join) => Err(crate::privilege::PrivilegeError::Probe(
@@ -328,7 +375,7 @@ impl ProcessManager {
             if caps_gate && let Some(helper_path) = helper {
                 let for_probe = helper_path.clone();
                 let probe = tokio::task::spawn_blocking(move || {
-                    crate::privilege::has_net_admin(&for_probe)
+                    crate::privilege::probe_net_admin(&getcap, &for_probe)
                 })
                 .await;
                 let cap = match probe {
