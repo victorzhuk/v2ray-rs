@@ -78,6 +78,24 @@ pub enum ProcessError {
     ConfigCheck(String),
 }
 
+impl ProcessError {
+    /// A host-level failure blocks every candidate node, so failover must
+    /// stop: the machine itself lacks the capability, helper, or backend
+    /// version that TUN needs. Everything else is per-candidate.
+    pub fn is_host_level(&self) -> bool {
+        matches!(
+            self,
+            ProcessError::TunCapabilityMissing(_)
+                | ProcessError::TunCapabilityProbe(_)
+                | ProcessError::TunMountUnsupported(_)
+                | ProcessError::TunHelperMissing
+                | ProcessError::TunHelperRelogin
+                | ProcessError::TunHelperCapabilityMissing(_)
+                | ProcessError::TunBackendTooOld { .. }
+        )
+    }
+}
+
 /// First Xray-core release shipping the `tun` inbound.
 const XRAY_TUN_MIN_VERSION: (u32, u32, u32) = (26, 1, 13);
 const XRAY_TUN_MIN_VERSION_STR: &str = "26.1.13";
@@ -1702,5 +1720,60 @@ mod tests {
             .iter()
             .any(|l| l.content.contains("Xray-core #6364"));
         assert!(warned, "expected a TUN panic advisory log line");
+    }
+
+    #[test]
+    fn is_host_level_classifies_every_variant() {
+        let cases: Vec<(ProcessError, bool)> = vec![
+            (
+                ProcessError::BinaryNotFound(PathBuf::from("/usr/bin/xray")),
+                false,
+            ),
+            (
+                ProcessError::ConfigMissing(PathBuf::from("/tmp/config.json")),
+                false,
+            ),
+            (ProcessError::Spawn(std::io::Error::other("denied")), false),
+            (ProcessError::Wait(std::io::Error::other("gone")), false),
+            (
+                ProcessError::Transition(TransitionError::Invalid {
+                    from: ProcessState::Running,
+                    to: ProcessState::Stopped,
+                }),
+                false,
+            ),
+            (
+                ProcessError::TunCapabilityMissing(PathBuf::from("/usr/bin/xray")),
+                true,
+            ),
+            (
+                ProcessError::TunCapabilityProbe("getcap not found".into()),
+                true,
+            ),
+            (
+                ProcessError::TunMountUnsupported("ignores file capabilities".into()),
+                true,
+            ),
+            (ProcessError::TunDeviceTimeout("tun-test".into()), false),
+            (ProcessError::TunHelper("helper exited 1".into()), false),
+            (ProcessError::TunHelperMissing, true),
+            (ProcessError::TunHelperRelogin, true),
+            (
+                ProcessError::TunHelperCapabilityMissing(PathBuf::from(
+                    "/usr/local/bin/v2ray-rs-netctl",
+                )),
+                true,
+            ),
+            (
+                ProcessError::TunBackendTooOld {
+                    installed: "25.12.8".into(),
+                },
+                true,
+            ),
+            (ProcessError::ConfigCheck("bad dns config".into()), false),
+        ];
+        for (error, host_level) in cases {
+            assert_eq!(error.is_host_level(), host_level, "{error}");
+        }
     }
 }
