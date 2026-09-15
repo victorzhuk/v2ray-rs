@@ -60,6 +60,14 @@ pub enum ProcessError {
     TunDeviceTimeout(String),
     #[error("TUN route helper failed: {0}")]
     TunHelper(String),
+    #[error("route helper v2ray-rs-netctl not found")]
+    TunHelperMissing,
+    #[error("log out and back in to finish enabling TUN")]
+    TunHelperRelogin,
+    #[error(
+        "route helper {0} lacks CAP_NET_ADMIN required for TUN mode; grant TUN privileges first"
+    )]
+    TunHelperCapabilityMissing(PathBuf),
     #[error(
         "installed xray {installed} has no TUN inbound; TUN mode needs xray {XRAY_TUN_MIN_VERSION_STR} or newer"
     )]
@@ -215,30 +223,102 @@ impl ProcessManager {
                 }
             }
 
-            let binary = self.binary_path.clone();
-            let probe =
-                tokio::task::spawn_blocking(move || crate::privilege::has_net_admin(&binary)).await;
-            let cap = match probe {
-                Ok(inner) => inner,
-                Err(join) => Err(crate::privilege::PrivilegeError::Probe(
-                    self.binary_path.clone(),
-                    join.to_string(),
-                )),
+            // Only xray drives the privileged route helper; sing-box
+            // self-routes. The gates below check the stored runtime's copy —
+            // the exact path the launch path will execute — never a fresh
+            // resolution.
+            let helper = if self.backend == Some(BackendType::Xray) {
+                self.tun.as_ref().map(|rt| rt.helper_path.clone())
+            } else {
+                None
             };
-            match cap {
-                Ok(true) => {}
-                other => {
+            if let Some(helper) = &helper {
+                if !helper.is_absolute() || !helper.exists() {
                     self.state
                         .transition(ProcessState::Starting, connection.clone())?;
-                    let error = match other {
-                        Ok(false) => ProcessError::TunCapabilityMissing(self.binary_path.clone()),
-                        Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
-                        Ok(true) => unreachable!(),
-                    };
+                    let error = ProcessError::TunHelperMissing;
                     let _ = self
                         .state
                         .transition(ProcessState::Error(error.to_string()), None);
                     return Err(error);
+                }
+                // A freshly granted relocated helper is group-executable
+                // only; a session that has not picked up its new group yet
+                // cannot run it at all.
+                if nix::unistd::access(helper, nix::unistd::AccessFlags::X_OK).is_err() {
+                    self.state
+                        .transition(ProcessState::Starting, connection.clone())?;
+                    let error = ProcessError::TunHelperRelogin;
+                    let _ = self
+                        .state
+                        .transition(ProcessState::Error(error.to_string()), None);
+                    return Err(error);
+                }
+            }
+
+            // Root holds every capability in the process already, so probing
+            // file capabilities there only adds a failure mode.
+            let caps_gate = crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw());
+            if caps_gate {
+                let binary = self.binary_path.clone();
+                let probe =
+                    tokio::task::spawn_blocking(move || crate::privilege::has_net_admin(&binary))
+                        .await;
+                let cap = match probe {
+                    Ok(inner) => inner,
+                    Err(join) => Err(crate::privilege::PrivilegeError::Probe(
+                        self.binary_path.clone(),
+                        join.to_string(),
+                    )),
+                };
+                match cap {
+                    Ok(true) => {}
+                    other => {
+                        self.state
+                            .transition(ProcessState::Starting, connection.clone())?;
+                        let error = match other {
+                            Ok(false) => {
+                                ProcessError::TunCapabilityMissing(self.binary_path.clone())
+                            }
+                            Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
+                            Ok(true) => unreachable!(),
+                        };
+                        let _ = self
+                            .state
+                            .transition(ProcessState::Error(error.to_string()), None);
+                        return Err(error);
+                    }
+                }
+            }
+
+            if caps_gate && let Some(helper) = helper {
+                let for_probe = helper.clone();
+                let probe = tokio::task::spawn_blocking(move || {
+                    crate::privilege::has_net_admin(&for_probe)
+                })
+                .await;
+                let cap = match probe {
+                    Ok(inner) => inner,
+                    Err(join) => Err(crate::privilege::PrivilegeError::Probe(
+                        helper.clone(),
+                        join.to_string(),
+                    )),
+                };
+                match cap {
+                    Ok(true) => {}
+                    other => {
+                        self.state
+                            .transition(ProcessState::Starting, connection.clone())?;
+                        let error = match other {
+                            Ok(false) => ProcessError::TunHelperCapabilityMissing(helper),
+                            Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
+                            Ok(true) => unreachable!(),
+                        };
+                        let _ = self
+                            .state
+                            .transition(ProcessState::Error(error.to_string()), None);
+                        return Err(error);
+                    }
                 }
             }
         }
@@ -1216,6 +1296,119 @@ mod tests {
             "expected a TUN capability error, got {result:?}"
         );
         assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
+    }
+
+    #[tokio::test]
+    async fn tun_start_refuses_when_helper_is_missing() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        let mut mgr = ProcessManager::new(
+            PathBuf::from("/bin/sh"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        )
+        .with_tun(Some(TunRuntime {
+            backend: BackendType::Xray,
+            iface: "tun0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: dir.path().join("missing-netctl"),
+            bypass_uid: None,
+            capture_dns: false,
+            strict: false,
+        }))
+        .with_backend(BackendType::Xray)
+        .with_log_file(Some(backend_log(dir.path())));
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(result, Err(ProcessError::TunHelperMissing)),
+            "expected TunHelperMissing, got {result:?}"
+        );
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 0).await;
+        assert!(
+            !lines.iter().any(|l| l.contains("session")),
+            "a helper preflight failure must not write a session record: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tun_start_refuses_when_helper_not_yet_executable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+        // A freshly granted relocated helper is group-executable only, which a
+        // process that has not picked up the group yet cannot run: mode 0o644.
+        let helper = dir.path().join("netctl");
+        std::fs::write(&helper, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let mut mgr = ProcessManager::new(
+            PathBuf::from("/bin/sh"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        )
+        .with_tun(Some(xray_on_lo(helper)))
+        .with_backend(BackendType::Xray)
+        .with_log_file(Some(backend_log(dir.path())));
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(result, Err(ProcessError::TunHelperRelogin)),
+            "expected TunHelperRelogin, got {result:?}"
+        );
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 0).await;
+        assert!(
+            !lines.iter().any(|l| l.contains("session")),
+            "a helper preflight failure must not write a session record: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn singbox_tun_start_skips_helper_gates() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config = dir.path().join("config.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        // sing-box self-routes, so a missing helper must not block the start;
+        // the backend capability gate still applies.
+        let mut mgr = ProcessManager::new(
+            PathBuf::from("/bin/sh"),
+            config,
+            dir.path().join("backend.pid"),
+            None,
+        )
+        .with_tun(Some(TunRuntime {
+            backend: BackendType::SingBox,
+            iface: "tun0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: dir.path().join("missing-netctl"),
+            bypass_uid: None,
+            capture_dns: false,
+            strict: false,
+        }))
+        .with_backend(BackendType::SingBox);
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(
+                result,
+                Err(ProcessError::TunCapabilityMissing(_))
+                    | Err(ProcessError::TunCapabilityProbe(_))
+            ),
+            "expected a backend capability error, got {result:?}"
+        );
         assert!(mgr.child.is_none(), "no backend should have been spawned");
     }
 
