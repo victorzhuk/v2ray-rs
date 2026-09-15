@@ -271,7 +271,11 @@ impl App {
         let s = sender.input_sender().clone();
         tokio::spawn(async move {
             let _lifecycle = lifecycle.lock().await;
-            let _ = recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await;
+            if let Err(failure) =
+                recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await
+            {
+                s.emit(AppMsg::ShowToast(failure.toast()));
+            }
             s.emit(AppMsg::TunReleased);
         });
     }
@@ -842,6 +846,7 @@ impl SimpleComponent for App {
             let bg_paths = paths.clone();
             let skip_orphans = settings_load_error.is_some();
             let lifecycle = tun_lifecycle.clone();
+            let s = sender.input_sender().clone();
             tokio::spawn(async move {
                 let _lifecycle = lifecycle.lock().await;
                 let orphan_paths = bg_paths.clone();
@@ -851,7 +856,11 @@ impl SimpleComponent for App {
                     }
                 })
                 .await;
-                let _ = recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path()).await;
+                if let Err(failure) =
+                    recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path()).await
+                {
+                    s.emit(AppMsg::ShowToast(failure.toast()));
+                }
             });
         }
 
@@ -2535,6 +2544,54 @@ mod tests {
         assert!(log.contains(" helper recover ok"), "{log}");
     }
 
+    #[test]
+    fn recovery_hint_names_singbox_flag_and_iface() {
+        let session = TunSession {
+            backend: BackendType::SingBox,
+            iface: "tun0".into(),
+        };
+        assert_eq!(
+            recovery_hint(&session),
+            "v2ray-rs-netctl recover --singbox --iface tun0"
+        );
+    }
+
+    #[test]
+    fn recovery_hint_names_xray_flag_and_iface() {
+        let session = TunSession {
+            backend: BackendType::Xray,
+            iface: "tun9".into(),
+        };
+        assert_eq!(
+            recovery_hint(&session),
+            "v2ray-rs-netctl recover --xray --iface tun9"
+        );
+    }
+
+    #[test]
+    fn recovery_toast_distinguishes_timeout() {
+        let session = TunSession {
+            backend: BackendType::Xray,
+            iface: "tun9".into(),
+        };
+        let failed = RecoveryFailure {
+            session: session.clone(),
+            timed_out: false,
+        };
+        let timed_out = RecoveryFailure {
+            session,
+            timed_out: true,
+        };
+        assert_eq!(
+            failed.toast(),
+            "TUN route recovery failed: run v2ray-rs-netctl recover --xray --iface tun9"
+        );
+        assert_eq!(
+            timed_out.toast(),
+            "TUN route recovery timed out: run v2ray-rs-netctl recover --xray --iface tun9"
+        );
+    }
+
     #[tokio::test]
     async fn recover_without_marker_does_nothing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2648,6 +2705,25 @@ fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
 struct RecoveryFailure {
     session: TunSession,
     timed_out: bool,
+}
+
+impl RecoveryFailure {
+    fn toast(&self) -> String {
+        let hint = recovery_hint(&self.session);
+        if self.timed_out {
+            format!("TUN route recovery timed out: run {hint}")
+        } else {
+            format!("TUN route recovery failed: run {hint}")
+        }
+    }
+}
+
+fn recovery_hint(session: &TunSession) -> String {
+    format!(
+        "v2ray-rs-netctl recover {} --iface {}",
+        recover_flag(session.backend),
+        session.iface
+    )
 }
 
 fn recover_flag(backend: BackendType) -> &'static str {
