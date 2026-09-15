@@ -71,17 +71,21 @@ pub enum ProcessError {
     )]
     TunHelperCapabilityMissing(PathBuf),
     #[error(
-        "installed xray {installed} has no TUN inbound; TUN mode needs xray {XRAY_TUN_MIN_VERSION_STR} or newer"
+        "installed {backend} {installed} is too old; {backend} {required} or newer is required"
     )]
-    TunBackendTooOld { installed: String },
+    BackendTooOld {
+        backend: BackendType,
+        installed: String,
+        required: String,
+    },
     #[error("config rejected by backend: {0}")]
     ConfigCheck(String),
 }
 
 impl ProcessError {
     /// A host-level failure blocks every candidate node, so failover must
-    /// stop: the machine itself lacks the capability, helper, or backend
-    /// version that TUN needs. Everything else is per-candidate.
+    /// stop: the machine itself lacks the capability or helper TUN needs, or
+    /// has a backend too old to run at all. Everything else is per-candidate.
     pub fn is_host_level(&self) -> bool {
         matches!(
             self,
@@ -91,14 +95,15 @@ impl ProcessError {
                 | ProcessError::TunHelperMissing
                 | ProcessError::TunHelperRelogin
                 | ProcessError::TunHelperCapabilityMissing(_)
-                | ProcessError::TunBackendTooOld { .. }
+                | ProcessError::BackendTooOld { .. }
         )
     }
 }
 
 /// First Xray-core release shipping the `tun` inbound.
 const XRAY_TUN_MIN_VERSION: (u32, u32, u32) = (26, 1, 13);
-const XRAY_TUN_MIN_VERSION_STR: &str = "26.1.13";
+/// Oldest sing-box whose config schema the generator emits.
+const SINGBOX_MIN_VERSION: (u32, u32, u32) = (1, 13, 0);
 /// First Xray-core release with the fix for the TUN crash on quickly-closed
 /// connections (gVisor returns a nil RemoteAddr, Xray-core #6364): versions
 /// 26.1.13 through 26.6.22 panic and drop the tunnel until the crash-restart.
@@ -274,30 +279,32 @@ impl ProcessManager {
             return Err(error);
         }
 
-        if self.tun.is_some() {
-            if self.backend == Some(BackendType::Xray)
-                && let Some(triple) = self.xray_version_triple().await
-            {
-                if triple < XRAY_TUN_MIN_VERSION {
-                    self.state
-                        .transition(ProcessState::Starting, connection.clone())?;
-                    let error = ProcessError::TunBackendTooOld {
-                        installed: format_triple(triple),
-                    };
-                    let _ = self
-                        .state
-                        .transition(ProcessState::Error(error.to_string()), None);
-                    return Err(error);
+        if self.backend == Some(BackendType::SingBox) {
+            match self.version_triple().await {
+                Some(triple) if triple < SINGBOX_MIN_VERSION => {
+                    let error = too_old(BackendType::SingBox, triple, SINGBOX_MIN_VERSION);
+                    return self.fail_with(connection.as_ref(), error);
                 }
-                if triple < XRAY_TUN_PANIC_FIX_VERSION {
-                    let line = LogLine::stderr(format!(
-                        "warning: xray {} can crash the TUN tunnel on quickly-closed connections (Xray-core #6364, fixed in 26.6.27); occasional auto-reconnects are expected until xray is upgraded",
-                        format_triple(triple)
-                    ));
-                    if let Ok(mut buffer) = self.log_buffer.lock() {
-                        buffer.push(line.clone());
+                Some(_) => {}
+                None => self.push_notice(unreadable_version(BackendType::SingBox)),
+            }
+        }
+
+        if self.tun.is_some() {
+            if self.backend == Some(BackendType::Xray) {
+                match self.version_triple().await {
+                    Some(triple) if triple < XRAY_TUN_MIN_VERSION => {
+                        let error = too_old(BackendType::Xray, triple, XRAY_TUN_MIN_VERSION);
+                        return self.fail_with(connection.as_ref(), error);
                     }
-                    self.state.emit(ProcessEvent::LogLine(line));
+                    Some(triple) if triple < XRAY_TUN_PANIC_FIX_VERSION => {
+                        self.push_notice(format!(
+                            "warning: xray {} can crash the TUN tunnel on quickly-closed connections (Xray-core #6364, fixed in 26.6.27); occasional auto-reconnects are expected until xray is upgraded",
+                            format_triple(triple)
+                        ));
+                    }
+                    Some(_) => {}
+                    None => self.push_notice(unreadable_version(BackendType::Xray)),
                 }
             }
             // On a nosuid mount the getcap probes below would report the
@@ -620,22 +627,41 @@ impl ProcessManager {
         );
     }
 
-    /// Probes the xray binary's version for the TUN preflight. Best-effort: an
-    /// unreadable or unparsable `version` output yields `None` and does not
-    /// block the start — the pre-spawn config check still rejects configs the
-    /// binary cannot handle.
-    async fn xray_version_triple(&self) -> Option<(u32, u32, u32)> {
-        let output = tokio::time::timeout(
-            CONFIG_CHECK_TIMEOUT,
-            Command::new(&self.binary_path)
-                .arg("version")
+    /// Probes the backend's version for the minimum-version gates. Best-effort:
+    /// a probe that fails, times out, exits non-zero or prints no version
+    /// yields `None` and does not block the start — the pre-spawn config check
+    /// still rejects configs the binary cannot handle.
+    async fn version_triple(&self) -> Option<(u32, u32, u32)> {
+        let binary_path = self.binary_path.clone();
+        let child = crate::spawn::spawn_with_etxtbsy_retry(move || {
+            let mut cmd = Command::new(&binary_path);
+            cmd.arg("version")
                 .stdin(std::process::Stdio::null())
-                .output(),
-        )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true);
+            cmd
+        })
         .await
-        .ok()?
         .ok()?;
+        let output = tokio::time::timeout(CONFIG_CHECK_TIMEOUT, child.wait_with_output())
+            .await
+            .ok()?
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
         parse_semver_triple(&String::from_utf8_lossy(&output.stdout))
+    }
+
+    fn push_notice(&self, content: String) {
+        write_stream_line(&self.log_writer, "notice", &content);
+        let line = LogLine::stderr(content);
+        self.log_buffer
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(line.clone());
+        self.state.emit(ProcessEvent::LogLine(line));
     }
 
     async fn check_config(&self) -> Result<(), ProcessError> {
@@ -892,6 +918,22 @@ impl ProcessManager {
     }
 }
 
+fn too_old(
+    backend: BackendType,
+    installed: (u32, u32, u32),
+    required: (u32, u32, u32),
+) -> ProcessError {
+    ProcessError::BackendTooOld {
+        backend,
+        installed: format_triple(installed),
+        required: format_triple(required),
+    }
+}
+
+fn unreadable_version(backend: BackendType) -> String {
+    format!("warning: could not read {backend} version; minimum-version check skipped")
+}
+
 fn last_nonempty_line(text: &str) -> Option<&str> {
     text.lines().rev().map(str::trim).find(|l| !l.is_empty())
 }
@@ -973,6 +1015,8 @@ mod tests {
     }
 
     const VERSION_STUB: &str = "if [ \"$1\" = version ]; then echo 'Xray 26.3.27 (Xray, Penetrates Everything.)'; exit 0; fi\n";
+    const SINGBOX_VERSION_STUB: &str =
+        "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n";
     fn backend_log(dir: &std::path::Path) -> Arc<RotatingFileWriter> {
         Arc::new(RotatingFileWriter::open(dir.join("backend.log"), DEFAULT_MAX_BYTES).unwrap())
     }
@@ -982,7 +1026,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(
             &dir,
-            "if [ \"$1\" = check ]; then echo 'FATAL bad dns config' >&2; exit 1; fi\nexec sleep 30\n",
+            &format!("{SINGBOX_VERSION_STUB}if [ \"$1\" = check ]; then echo 'FATAL bad dns config' >&2; exit 1; fi\nexec sleep 30\n"),
         )
         .with_backend(BackendType::SingBox);
 
@@ -1001,8 +1045,11 @@ mod tests {
     #[tokio::test]
     async fn config_check_success_starts_backend() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut mgr = manager_for(&dir, "[ \"$1\" = check ] && exit 0\nexec sleep 30\n")
-            .with_backend(BackendType::SingBox);
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{SINGBOX_VERSION_STUB}[ \"$1\" = check ] && exit 0\nexec sleep 30\n"),
+        )
+        .with_backend(BackendType::SingBox);
 
         mgr.start_with_connection(None).await.unwrap();
         assert_eq!(mgr.state(), ProcessState::Running);
@@ -1232,7 +1279,7 @@ mod tests {
 
         let checks = dir.path().join("checks");
         let script = format!(
-            "if [ \"$1\" = check ]; then echo check >> {}; exit 0; fi\n{}",
+            "{SINGBOX_VERSION_STUB}if [ \"$1\" = check ]; then echo check >> {}; exit 0; fi\n{}",
             checks.display(),
             crashing_backend(dir.path(), 1)
         );
@@ -1546,8 +1593,11 @@ mod tests {
     #[tokio::test]
     async fn stop_from_starting_without_child_reaches_stopped() {
         let dir = tempfile::TempDir::new().unwrap();
-        let mut mgr = manager_for(&dir, "[ \"$1\" = check ] && exec sleep 30\nexec sleep 30\n")
-            .with_backend(BackendType::SingBox);
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{SINGBOX_VERSION_STUB}[ \"$1\" = check ] && exec sleep 30\nexec sleep 30\n"),
+        )
+        .with_backend(BackendType::SingBox);
 
         let started =
             tokio::time::timeout(Duration::from_millis(300), mgr.start_with_connection(None)).await;
@@ -1674,6 +1724,10 @@ mod tests {
         );
         assert_eq!(parse_semver_triple("Xray 25.12.8 (...)"), Some((25, 12, 8)));
         assert_eq!(parse_semver_triple("no version here"), None);
+        assert_eq!(
+            parse_semver_triple("sing-box version 1.13.0\n\nEnvironment: go1.24.1 linux/amd64"),
+            Some((1, 13, 0))
+        );
     }
 
     #[test]
@@ -1682,6 +1736,142 @@ mod tests {
         assert!((26, 1, 12) < XRAY_TUN_MIN_VERSION);
         assert!((26, 1, 13) >= XRAY_TUN_MIN_VERSION);
         assert!((26, 3, 27) >= XRAY_TUN_MIN_VERSION);
+    }
+
+    #[test]
+    fn singbox_minimum_version_comparison() {
+        assert!((1, 11, 0) < SINGBOX_MIN_VERSION);
+        assert!((1, 12, 4) < SINGBOX_MIN_VERSION);
+        assert!((1, 13, 0) >= SINGBOX_MIN_VERSION);
+        assert!((1, 14, 0) >= SINGBOX_MIN_VERSION);
+    }
+
+    fn contains_line(mgr: &ProcessManager, content: &str) -> bool {
+        mgr.log_buffer()
+            .lock()
+            .unwrap()
+            .last_n(10)
+            .iter()
+            .any(|l| l.content == content)
+    }
+
+    #[tokio::test]
+    async fn singbox_start_fails_before_check_on_old_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let checked = dir.path().join("checked");
+        let script = format!(
+            "[ \"$1\" = version ] && {{ echo 'sing-box version 1.12.4'; exit 0; }}\n[ \"$1\" = check ] && {{ touch {}; exit 0; }}\nexec sleep 30\n",
+            checked.display()
+        );
+        let mut mgr = manager_for(&dir, &script).with_backend(BackendType::SingBox);
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(
+                result,
+                Err(ProcessError::BackendTooOld { backend: BackendType::SingBox, ref installed, ref required })
+                    if installed == "1.12.4" && required == "1.13.0"
+            ),
+            "expected BackendTooOld, got {result:?}"
+        );
+        match mgr.state() {
+            ProcessState::Error(msg) => {
+                assert!(msg.contains("1.12.4") && msg.contains("1.13.0"), "{msg}")
+            }
+            other => panic!("expected Error state, got {other:?}"),
+        }
+        assert!(!checked.exists(), "config check must not run");
+        assert!(mgr.child.is_none(), "no backend should have been spawned");
+    }
+
+    #[tokio::test]
+    async fn singbox_start_proceeds_on_minimum_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{SINGBOX_VERSION_STUB}[ \"$1\" = check ] && exit 0\nexec sleep 30\n"),
+        )
+        .with_backend(BackendType::SingBox);
+
+        mgr.start_with_connection(None).await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        assert!(
+            !mgr.log_buffer()
+                .lock()
+                .unwrap()
+                .last_n(10)
+                .iter()
+                .any(|l| l.content.contains("minimum-version check skipped"))
+        );
+        mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn singbox_start_warns_on_unreadable_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            "[ \"$1\" = version ] && exit 0\n[ \"$1\" = check ] && exit 0\nexec sleep 30\n",
+        )
+        .with_backend(BackendType::SingBox)
+        .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start_with_connection(None).await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        let warning = "warning: could not read sing-box version; minimum-version check skipped";
+        assert!(
+            contains_line(&mgr, warning),
+            "expected the unreadable-version warning"
+        );
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.ends_with(&format!("notice {warning}"))),
+            "{lines:?}"
+        );
+        mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn xray_tun_start_warns_on_unreadable_version() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, "[ \"$1\" = version ] && exit 0\nexit 1\n")
+            .with_tun(Some(xray_on_lo(dir.path().join("missing-netctl"))))
+            .with_backend(BackendType::Xray)
+            .with_host_probe(HostProbe {
+                getcap: PathBuf::from("/bin/true"),
+                helper: dir.path().join("missing-netctl"),
+            });
+
+        let result = mgr.start_with_connection(None).await;
+        assert!(
+            matches!(result, Err(ProcessError::TunHelperMissing)),
+            "later TUN gates must still run, got {result:?}"
+        );
+        assert!(contains_line(
+            &mgr,
+            "warning: could not read xray version; minimum-version check skipped"
+        ));
+    }
+
+    #[tokio::test]
+    async fn xray_start_without_tun_skips_version_probe() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probed = dir.path().join("probed");
+        let script = format!(
+            "[ \"$1\" = version ] && {{ touch {}; exit 0; }}\n[ \"$2\" = -test ] && exit 0\nexec sleep 30\n",
+            probed.display()
+        );
+        let mut mgr = manager_for(&dir, &script).with_backend(BackendType::Xray);
+
+        mgr.start_with_connection(None).await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        assert!(
+            !probed.exists(),
+            "a non-TUN xray start must not probe the version"
+        );
+        mgr.stop().await.unwrap();
     }
 
     #[test]
@@ -1725,8 +1915,12 @@ mod tests {
 
         let result = mgr.start().await;
         assert!(
-            matches!(result, Err(ProcessError::TunBackendTooOld { ref installed }) if installed == "25.12.8"),
-            "expected TunBackendTooOld, got {result:?}"
+            matches!(
+                result,
+                Err(ProcessError::BackendTooOld { backend: BackendType::Xray, ref installed, ref required })
+                    if installed == "25.12.8" && required == "26.1.13"
+            ),
+            "expected BackendTooOld, got {result:?}"
         );
         assert!(mgr.child.is_none());
     }
@@ -1816,8 +2010,18 @@ mod tests {
                 true,
             ),
             (
-                ProcessError::TunBackendTooOld {
+                ProcessError::BackendTooOld {
+                    backend: BackendType::Xray,
                     installed: "25.12.8".into(),
+                    required: "26.1.13".into(),
+                },
+                true,
+            ),
+            (
+                ProcessError::BackendTooOld {
+                    backend: BackendType::SingBox,
+                    installed: "1.12.4".into(),
+                    required: "1.13.0".into(),
                 },
                 true,
             ),

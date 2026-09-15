@@ -607,7 +607,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn failover_reports_no_stopped_and_stop_reports_one() {
         let stub = stub(
-            r#"[ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
         );
         let (handle, rx) = connect(
             &stub,
@@ -639,7 +639,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn last_candidate_failure_reports_one_error() {
         let stub = stub(
-            r#"[ "$1" = check ] && { grep -q 203.0.113.3 "$3" && exit 1; exit 0; }; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && { grep -q 203.0.113.3 "$3" && exit 1; exit 0; }; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
         );
         let (_handle, rx) = connect(
             &stub,
@@ -674,8 +674,10 @@ mod tests {
             ProcessError::TunMountUnsupported("/dev/net/tun: required key not available".into()),
             ProcessError::TunHelperMissing,
             ProcessError::TunHelperRelogin,
-            ProcessError::TunBackendTooOld {
+            ProcessError::BackendTooOld {
+                backend: BackendType::Xray,
                 installed: "25.3.5".into(),
+                required: "26.1.13".into(),
             },
         ];
         assert!(other_host_level.iter().all(|e| !grant_fixable(e)));
@@ -751,8 +753,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn log_lines_carry_connection_generation() {
-        let stub =
-            stub(r#"[ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.2; done"#);
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.2; done"#,
+        );
         let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
 
         loop {
@@ -816,7 +819,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn live_connect_writes_backend_diagnostics() {
         let stub = stub(
-            r#"[ "$1" = version ] && echo "sing-box 1.11.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+            r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
         );
         let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
 
@@ -833,7 +836,7 @@ mod tests {
         let session_at = contents.find(" session ").expect("session record");
         assert_eq!(contents.matches(" session ").count(), 1, "{contents}");
         assert!(
-            contents.contains("backend=sing-box version=1.11.0 node=203.0.113.1 tun=off"),
+            contents.contains("backend=sing-box version=1.13.0 node=203.0.113.1 tun=off"),
             "{contents}"
         );
 
