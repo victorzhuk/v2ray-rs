@@ -581,6 +581,7 @@ impl App {
                 manual_nodes: connection_manual_nodes,
                 lifecycle: self.tun_lifecycle.clone(),
                 generation,
+                host_has_ipv6: v2ray_rs_process::host_has_ipv6(),
             },
             sender.input_sender().clone(),
         );

@@ -49,6 +49,7 @@ pub(super) struct ConnectionRequest {
     /// its own terminal state; the app drops those so a stale `Stopped` cannot
     /// clear the live connection's handle.
     pub generation: u64,
+    pub host_has_ipv6: bool,
 }
 
 enum ConnectionCmd {
@@ -85,6 +86,7 @@ fn spawn_with(
         manual_nodes,
         lifecycle,
         generation,
+        host_has_ipv6,
     } = request;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
 
@@ -133,6 +135,20 @@ fn spawn_with(
                 }
             };
 
+        // Decided once per connection so the notice cannot repeat per candidate.
+        let drop_strict_route = settings.tun.enabled
+            && settings.tun.strict_route
+            && !singbox_strict_route_allowed(settings.backend.backend_type, host_has_ipv6);
+        if drop_strict_route {
+            if let Some(log) = &backend_log {
+                log.append_line("notice", STRICT_ROUTE_NOTICE);
+            }
+            sender.emit(AppMsg::ProcessLogLine(
+                generation,
+                STRICT_ROUTE_NOTICE.into(),
+            ));
+        }
+
         for candidate in candidates {
             if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
                 if let Some(mut failed) = parked.take() {
@@ -163,6 +179,9 @@ fn spawn_with(
             // Must happen before the tunnel exists: once its rules are up, this
             // very lookup would be captured by the tunnel it is preparing.
             pin_node_addresses(&mut effective_settings, &nodes).await;
+            if drop_strict_route {
+                effective_settings.tun.strict_route = false;
+            }
             let pinned = hosts_cover_nodes(&effective_settings, &nodes);
             let config_path =
                 match writer.write_config(&nodes, &effective_rules, &effective_settings) {
@@ -333,6 +352,8 @@ fn spawn_with(
     ConnectionHandle { cmd_tx }
 }
 
+const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box strict_route turned off for this session (IPv4 routing unchanged)";
+
 const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Pins every hostname-addressed node to concrete IPs in `dns.hosts`. Every
@@ -421,6 +442,13 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
     })
 }
 
+/// sing-box cannot program its strict IPv6 rules on a host whose kernel has
+/// IPv6 disabled and fails to start; xray's strict routing is done by netctl,
+/// which already skips the IPv6 rules there.
+fn singbox_strict_route_allowed(backend: BackendType, host_has_ipv6: bool) -> bool {
+    backend != BackendType::SingBox || host_has_ipv6
+}
+
 fn relays(state: &ProcessState) -> bool {
     matches!(
         state,
@@ -475,7 +503,9 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
-    use v2ray_rs_core::models::{DnsStrategy, ShadowsocksConfig, TunConfig};
+    use v2ray_rs_core::models::{
+        DnsStrategy, ShadowsocksConfig, TransportSettings, TunConfig, VlessConfig, XhttpSettings,
+    };
     use v2ray_rs_core::persistence::load_tun_session;
     use v2ray_rs_core::profile::AppProfile;
 
@@ -529,6 +559,28 @@ mod tests {
         connect_with(stub, settings, candidates, |mgr| mgr)
     }
 
+    fn request(
+        stub: &Stub,
+        settings: AppSettings,
+        candidates: Vec<ConnectionCandidate>,
+    ) -> ConnectionRequest {
+        ConnectionRequest {
+            binary_path: stub.binary.clone(),
+            candidates,
+            writer: ConfigWriter::new(&settings, &stub.paths),
+            paths: stub.paths.clone(),
+            pid_path: stub.paths.pid_file_path(),
+            geodata_dir: stub.paths.geodata_dir(),
+            settings,
+            enabled_rules: Vec::new(),
+            subscriptions: Vec::new(),
+            manual_nodes: Vec::new(),
+            lifecycle: TunLifecycle::default(),
+            generation: GENERATION,
+            host_has_ipv6: true,
+        }
+    }
+
     fn connect_with(
         stub: &Stub,
         settings: AppSettings,
@@ -536,24 +588,7 @@ mod tests {
         configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
     ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let handle = spawn_with(
-            ConnectionRequest {
-                binary_path: stub.binary.clone(),
-                candidates,
-                writer: ConfigWriter::new(&settings, &stub.paths),
-                paths: stub.paths.clone(),
-                pid_path: stub.paths.pid_file_path(),
-                geodata_dir: stub.paths.geodata_dir(),
-                settings,
-                enabled_rules: Vec::new(),
-                subscriptions: Vec::new(),
-                manual_nodes: Vec::new(),
-                lifecycle: TunLifecycle::default(),
-                generation: GENERATION,
-            },
-            tx,
-            configure,
-        );
+        let handle = spawn_with(request(stub, settings, candidates), tx, configure);
         (handle, rx)
     }
 
@@ -602,6 +637,24 @@ mod tests {
         assert!(relays(&ProcessState::Stopping));
         assert!(!relays(&ProcessState::Stopped));
         assert!(!relays(&ProcessState::Error("boom".into())));
+    }
+
+    #[test]
+    fn strict_route_allowed_unless_singbox_lacks_ipv6() {
+        let cases = [
+            // (backend, host_has_ipv6, want)
+            (BackendType::SingBox, false, false),
+            (BackendType::SingBox, true, true),
+            (BackendType::Xray, false, true),
+            (BackendType::V2ray, false, true),
+        ];
+        for (backend, host_has_ipv6, want) in cases {
+            assert_eq!(
+                singbox_strict_route_allowed(backend, host_has_ipv6),
+                want,
+                "backend={backend:?} host_has_ipv6={host_has_ipv6}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -657,6 +710,131 @@ mod tests {
         assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
         assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
         assert_nothing_after_terminal(&rx).await;
+    }
+
+    /// Drains the connection until its channel closes, returning the terminal
+    /// state and every log line it emitted.
+    async fn drain(rx: &relm4::Receiver<AppMsg>) -> (Option<ProcessState>, Vec<String>) {
+        let mut terminal = None;
+        let mut lines = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => return (terminal, lines),
+                Some(AppMsg::ProcessLogLine(generation, line)) => {
+                    assert_eq!(generation, GENERATION);
+                    lines.push(line);
+                }
+                Some(AppMsg::ProcessStateConnection(generation, state, _)) => {
+                    assert_eq!(generation, GENERATION);
+                    if !relays(&state) {
+                        assert!(terminal.is_none(), "{state:?} after the terminal state");
+                        terminal = Some(state);
+                    }
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn strict_route_stub() -> Stub {
+        stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+        )
+    }
+
+    fn strict_route_settings() -> AppSettings {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings.tun.interface_name = "v2rstest2".into();
+        settings
+    }
+
+    fn capless_probe(mgr: ProcessManager) -> ProcessManager {
+        mgr.with_host_probe(v2ray_rs_process::HostProbe {
+            getcap: PathBuf::from("/bin/true"),
+            helper: PathBuf::from("/bin/true"),
+        })
+    }
+
+    fn xhttp_candidate(address: &str) -> ConnectionCandidate {
+        ConnectionCandidate {
+            node: ProxyNode::Vless(VlessConfig {
+                address: address.into(),
+                port: 443,
+                uuid: "b831381d-6324-4d53-ad4f-8cda48b30811".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Xhttp(XhttpSettings {
+                    path: "/x".into(),
+                    host: None,
+                    mode: "auto".into(),
+                }),
+                tls: None,
+                remark: None,
+            }),
+            ..candidate(address)
+        }
+    }
+
+    fn assert_error_terminal(terminal: Option<ProcessState>) {
+        assert!(
+            matches!(terminal, Some(ProcessState::Error(_))),
+            "expected an error terminal, got {terminal:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn singbox_tun_without_ipv6_turns_strict_route_off_once() {
+        let stub = strict_route_stub();
+        let settings = strict_route_settings();
+        let persisted = settings.clone();
+        let mut req = request(
+            &stub,
+            settings,
+            vec![xhttp_candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+        req.host_has_ipv6 = false;
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe);
+
+        let (terminal, lines) = drain(&rx).await;
+        assert_error_terminal(terminal);
+        assert!(persisted.tun.strict_route);
+
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("sing-box.json"))
+            .expect("generated config readable");
+        assert!(config.contains("203.0.113.2"), "{config}");
+        assert!(config.contains(r#""strict_route":false"#), "{config}");
+
+        let notices = lines.iter().filter(|l| *l == STRICT_ROUTE_NOTICE).count();
+        assert_eq!(notices, 1, "{lines:?}");
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(log.matches(STRICT_ROUTE_NOTICE).count(), 1, "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn singbox_tun_with_ipv6_keeps_strict_route() {
+        let stub = strict_route_stub();
+        let settings = strict_route_settings();
+        let mut req = request(&stub, settings, vec![candidate("203.0.113.2")]);
+        req.host_has_ipv6 = true;
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe);
+
+        let (terminal, lines) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("sing-box.json"))
+            .expect("generated config readable");
+        assert!(config.contains(r#""strict_route":true"#), "{config}");
+        assert!(!lines.iter().any(|l| l == STRICT_ROUTE_NOTICE), "{lines:?}");
+        let log =
+            std::fs::read_to_string(stub.paths.logs_dir().join("backend.log")).unwrap_or_default();
+        assert!(!log.contains(STRICT_ROUTE_NOTICE), "{log}");
     }
 
     #[test]
