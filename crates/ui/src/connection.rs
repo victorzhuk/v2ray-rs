@@ -746,7 +746,9 @@ mod tests {
             panic!("expected the capability gate to fail the start, got {state:?}");
         };
         assert!(
-            msg.contains("CAP_NET_ADMIN") || msg.contains("TUN capabilities"),
+            msg.contains("CAP_NET_ADMIN")
+                || msg.contains("TUN capabilities")
+                || msg.contains("ignores file capabilities"),
             "start should fail at the capability gate: {msg}"
         );
         assert_eq!(
