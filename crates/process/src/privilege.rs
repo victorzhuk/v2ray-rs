@@ -34,7 +34,7 @@ pub enum PrivilegeError {
     ProbeFailure(ProbeFailure),
     #[error(
         "{path} is on a filesystem that ignores file capabilities (e.g. mounted nosuid). \
-         Grant manually after moving the binary, or run: sudo setcap '{caps}' {path}"
+         Grant manually after moving the binary, or run: sudo setcap '{caps}' '{path}'"
     )]
     Unsupported { path: PathBuf, caps: String },
     #[error(
@@ -861,8 +861,10 @@ tmpfs /tmp/.mount_abc tmpfs rw,nosuid,nodev 0 0
         }
         .to_string();
         assert!(text.contains("ignores file capabilities"), "{text}");
-        assert!(text.contains("sudo setcap"), "{text}");
-        assert!(text.contains(backend.to_str().unwrap()), "{text}");
+        assert!(
+            text.ends_with(&manual_command(backend, BACKEND_CAPS)),
+            "{text}"
+        );
     }
 
     #[test]
