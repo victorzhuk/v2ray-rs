@@ -34,7 +34,8 @@ pub enum PrivilegeError {
     ProbeFailure(ProbeFailure),
     #[error(
         "{path} is on a filesystem that ignores file capabilities (e.g. mounted nosuid). \
-         Grant manually after moving the binary, or run: sudo setcap '{caps}' '{path}'"
+         Grant manually after moving the binary, or run: {}",
+        manual_command(.path, .caps)
     )]
     Unsupported { path: PathBuf, caps: String },
     #[error(
@@ -359,7 +360,17 @@ fn source_acceptable(
 /// The manual `setcap` command shown to the user when an automatic grant is not
 /// possible.
 pub fn manual_command(path: &Path, caps: &str) -> String {
-    format!("sudo setcap '{caps}' '{}'", path.display())
+    format!(
+        "sudo setcap {} {}",
+        shell_quote(caps),
+        shell_quote(&path.display().to_string())
+    )
+}
+
+/// Single-quotes `s` for a POSIX shell. The hint is meant to be pasted into a
+/// root shell, so an embedded `'` must not end the quoting early.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 /// Builds the `pkexec` argument vector. Every binary path is passed as a
@@ -799,6 +810,27 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn manual_hint_quotes_every_path_shape() {
+        let cases = [
+            ("/usr/bin/xray", "'/usr/bin/xray'"),
+            ("/opt/my apps/xray", "'/opt/my apps/xray'"),
+            ("/opt/x';id;'/xray", r"'/opt/x'\'';id;'\''/xray'"),
+            ("/opt/$(id)/xray", "'/opt/$(id)/xray'"),
+        ];
+        for (path, quoted) in cases {
+            let path = Path::new(path);
+            let command = manual_command(path, BACKEND_CAPS);
+            assert_eq!(command, format!("sudo setcap '{BACKEND_CAPS}' {quoted}"));
+            let text = PrivilegeError::Unsupported {
+                path: path.to_path_buf(),
+                caps: BACKEND_CAPS.to_string(),
+            }
+            .to_string();
+            assert!(text.ends_with(&command), "{text}");
+        }
     }
 
     #[test]
