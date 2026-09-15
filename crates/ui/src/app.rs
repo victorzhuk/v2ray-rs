@@ -19,11 +19,12 @@ use v2ray_rs_core::models::{
     LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
     SubscriptionSource, resolve_effective_config,
 };
-use v2ray_rs_core::persistence::AppPaths;
+use v2ray_rs_core::persistence::{AppPaths, TunSession};
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
 use v2ray_rs_core::resolve::{
     ConnectionCandidate, ConnectionPlanner, LatencySnapshot, resolve_candidate,
 };
+use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
 use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
@@ -36,7 +37,6 @@ const DEFAULT_WINDOW_HEIGHT: i32 = 650;
 const EVENT_CHANNEL_CAPACITY: usize = 16;
 const MAX_AUTO_RECONNECTS: u32 = 3;
 const AUTO_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-const RECOVER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct AppInit {
     pub paths: AppPaths,
@@ -271,10 +271,7 @@ impl App {
         let s = sender.input_sender().clone();
         tokio::spawn(async move {
             let _lifecycle = lifecycle.lock().await;
-            let _ = tokio::task::spawn_blocking(move || {
-                recover_tun_session(&paths, &v2ray_rs_process::helper_path());
-            })
-            .await;
+            let _ = recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await;
             s.emit(AppMsg::TunReleased);
         });
     }
@@ -836,7 +833,7 @@ impl SimpleComponent for App {
             }
         };
         // Off the GTK thread: orphan reaping can wait ~1.5s on a stubborn
-        // process and TUN recovery up to RECOVER_TIMEOUT. Recovery flushes the
+        // process and TUN recovery up to HELPER_TIMEOUT. Recovery flushes the
         // tunnel routing table wholesale, so it takes the lifecycle lock: an
         // early Connect must queue behind it rather than have its fresh rules
         // flushed out from under it.
@@ -847,13 +844,14 @@ impl SimpleComponent for App {
             let lifecycle = tun_lifecycle.clone();
             tokio::spawn(async move {
                 let _lifecycle = lifecycle.lock().await;
+                let orphan_paths = bg_paths.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&bg_paths) {
+                    if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&orphan_paths) {
                         log::warn!("failed to clean orphaned backend process: {err}");
                     }
-                    recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path());
                 })
                 .await;
+                let _ = recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path()).await;
             });
         }
 
@@ -2481,29 +2479,73 @@ mod tests {
         helper
     }
 
-    #[test]
-    fn recover_runs_helper_and_clears_marker() {
+    #[tokio::test]
+    async fn recover_runs_helper_and_clears_marker() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_marker(&tmp);
         let args = tmp.path().join("args");
         let helper = stub_helper(&tmp, &format!("echo \"$@\" > {}", args.display()));
 
-        recover_tun_session(&paths, &helper);
+        assert!(recover_tun_session(&paths, &helper).await.is_ok());
 
         let recorded = std::fs::read_to_string(&args).unwrap();
         assert_eq!(recorded.trim_end(), "recover --xray --iface tun9");
         assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
     }
 
-    #[test]
-    fn recover_clears_marker_when_helper_fails() {
+    #[tokio::test]
+    async fn recover_clears_marker_when_helper_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_marker(&tmp);
         let helper = stub_helper(&tmp, "exit 1");
 
-        recover_tun_session(&paths, &helper);
+        let failure = recover_tun_session(&paths, &helper).await.unwrap_err();
 
+        assert!(!failure.timed_out);
         assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_logs_helper_output_and_exit_status() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let helper = stub_helper(&tmp, "echo route-busy; exit 1");
+
+        let failure = recover_tun_session(&paths, &helper).await.unwrap_err();
+
+        assert!(!failure.timed_out);
+        let log = std::fs::read_to_string(paths.logs_dir().join("backend.log")).unwrap();
+        assert!(log.contains(" helper route-busy"), "{log}");
+        assert!(
+            log.contains(" helper recover exited with exit status: 1"),
+            "{log}"
+        );
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+    }
+
+    #[tokio::test]
+    async fn recover_logs_ok_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let helper = stub_helper(&tmp, "exit 0");
+
+        assert!(recover_tun_session(&paths, &helper).await.is_ok());
+
+        let log = std::fs::read_to_string(paths.logs_dir().join("backend.log")).unwrap();
+        assert!(log.contains(" helper recover ok"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn recover_without_marker_does_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        let args = tmp.path().join("args");
+        let helper = stub_helper(&tmp, &format!("echo \"$@\" > {}", args.display()));
+
+        assert!(recover_tun_session(&paths, &helper).await.is_ok());
+
+        assert!(!args.exists());
+        assert!(!paths.logs_dir().join("backend.log").exists());
     }
     fn last_success_at(at: chrono::DateTime<chrono::Utc>) -> LastSuccessMetadata {
         LastSuccessMetadata {
@@ -2603,53 +2645,63 @@ fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
     pid_file.check_and_kill_orphaned()
 }
 
+struct RecoveryFailure {
+    session: TunSession,
+    timed_out: bool,
+}
+
+fn recover_flag(backend: BackendType) -> &'static str {
+    match backend {
+        BackendType::SingBox => "--singbox",
+        _ => "--xray",
+    }
+}
+
 /// If a TUN session marker is present, run the route helper's recovery pass
 /// and clear the marker. Runs at startup after an unclean shutdown and
 /// whenever a TUN session ends without a clean stop. The marker is cleared
 /// even when the helper fails or hangs, so a broken helper cannot wedge
 /// every later launch.
-fn recover_tun_session(paths: &AppPaths, helper: &std::path::Path) {
+async fn recover_tun_session(
+    paths: &AppPaths,
+    helper: &std::path::Path,
+) -> Result<(), RecoveryFailure> {
     let Some(session) = v2ray_rs_core::persistence::load_tun_session(paths) else {
-        return;
+        return Ok(());
     };
-    let backend_flag = match session.backend {
-        v2ray_rs_core::models::BackendType::SingBox => "--singbox",
-        _ => "--xray",
-    };
-    let mut cmd = std::process::Command::new(helper);
-    cmd.arg("recover")
-        .arg(backend_flag)
-        .arg("--iface")
-        .arg(&session.iface);
-    match run_with_timeout(cmd, RECOVER_TIMEOUT) {
-        Ok(Some(status)) if status.success() => {
-            log::info!("recovered leftover TUN state on {}", session.iface)
+    let args = [
+        "recover".to_string(),
+        recover_flag(session.backend).to_string(),
+        "--iface".to_string(),
+        session.iface.clone(),
+    ];
+    let run = v2ray_rs_process::run_helper(helper, &args, v2ray_rs_process::HELPER_TIMEOUT).await;
+    let outcome = match &run.result {
+        Ok(()) => {
+            log::info!("recovered leftover TUN state on {}", session.iface);
+            "recover ok".to_string()
         }
-        Ok(Some(status)) => log::warn!("tun recover exited with {status}"),
-        Ok(None) => log::warn!("tun recover timed out after {RECOVER_TIMEOUT:?}"),
-        Err(err) => log::warn!("failed to run tun recover: {err}"),
+        Err(err) => {
+            log::warn!("tun {err}");
+            err.clone()
+        }
+    };
+    match RotatingFileWriter::open(paths.logs_dir().join("backend.log"), DEFAULT_MAX_BYTES) {
+        Ok(log) => {
+            for line in &run.output {
+                log.append_line("helper", line);
+            }
+            log.append_line("helper", &outcome);
+        }
+        Err(err) => log::warn!("open backend log: {err}"),
     }
     let _ = v2ray_rs_core::persistence::clear_tun_session(paths);
-}
-
-/// Runs a child process, killing it if it doesn't exit within `timeout`.
-/// Returns `Ok(None)` on timeout. Keeps a hung helper from blocking startup.
-fn run_with_timeout(
-    mut cmd: std::process::Command,
-    timeout: std::time::Duration,
-) -> std::io::Result<Option<std::process::ExitStatus>> {
-    let mut child = cmd.spawn()?;
-    let deadline = std::time::Instant::now() + timeout;
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(None);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    match run.result {
+        Ok(()) => Ok(()),
+        Err(_) => Err(RecoveryFailure {
+            session,
+            timed_out: run.timed_out,
+        }),
     }
 }
 
