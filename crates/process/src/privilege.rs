@@ -19,6 +19,9 @@ pub const HELPER_GROUP: &str = "v2ray-rs";
 
 #[derive(Debug, thiserror::Error)]
 pub enum PrivilegeError {
+    /// A probe could not produce a verdict at all: `getcap` failed to spawn,
+    /// or its `spawn_blocking` task was cancelled before finishing — the text
+    /// of that `JoinError` is carried the same way.
     #[error("read capabilities of {0}: {1}")]
     Probe(PathBuf, String),
     /// Outcome of a `getcap` invocation that did not complete normally:

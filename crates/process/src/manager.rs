@@ -193,6 +193,23 @@ impl ProcessManager {
         self.start_with_connection(None).await
     }
 
+    /// Terminal tail of a failed preflight: step through `Starting`, land in
+    /// `Error` with the error's own text, and hand the error to `return`. The
+    /// `Starting` hop keeps the transition history of a preflight rejection
+    /// identical to one that fails after launch.
+    fn fail_with(
+        &mut self,
+        connection: Option<&ConnectionMetadata>,
+        error: ProcessError,
+    ) -> Result<(), ProcessError> {
+        self.state
+            .transition(ProcessState::Starting, connection.cloned())?;
+        let _ = self
+            .state
+            .transition(ProcessState::Error(error.to_string()), None);
+        Err(error)
+    }
+
     pub async fn start_with_connection(
         &mut self,
         connection: Option<ConnectionMetadata>,
@@ -247,8 +264,6 @@ impl ProcessManager {
             if !crate::privilege::file_caps_supported(
                 self.binary_path.parent().unwrap_or(Path::new("/")),
             ) {
-                self.state
-                    .transition(ProcessState::Starting, connection.clone())?;
                 let error = ProcessError::TunMountUnsupported(
                     crate::privilege::PrivilegeError::Unsupported {
                         path: self.binary_path.clone(),
@@ -256,10 +271,7 @@ impl ProcessManager {
                     }
                     .to_string(),
                 );
-                let _ = self
-                    .state
-                    .transition(ProcessState::Error(error.to_string()), None);
-                return Err(error);
+                return self.fail_with(connection.as_ref(), error);
             }
 
             // Only xray drives the privileged route helper; sing-box
@@ -271,27 +283,15 @@ impl ProcessManager {
             } else {
                 None
             };
-            if let Some(helper) = &helper {
-                if !helper.is_absolute() || !helper.exists() {
-                    self.state
-                        .transition(ProcessState::Starting, connection.clone())?;
-                    let error = ProcessError::TunHelperMissing;
-                    let _ = self
-                        .state
-                        .transition(ProcessState::Error(error.to_string()), None);
-                    return Err(error);
+            if let Some(helper_path) = &helper {
+                if !helper_path.is_absolute() || !helper_path.exists() {
+                    return self.fail_with(connection.as_ref(), ProcessError::TunHelperMissing);
                 }
                 // A freshly granted relocated helper is group-executable
                 // only; a session that has not picked up its new group yet
                 // cannot run it at all.
-                if nix::unistd::access(helper, nix::unistd::AccessFlags::X_OK).is_err() {
-                    self.state
-                        .transition(ProcessState::Starting, connection.clone())?;
-                    let error = ProcessError::TunHelperRelogin;
-                    let _ = self
-                        .state
-                        .transition(ProcessState::Error(error.to_string()), None);
-                    return Err(error);
+                if nix::unistd::access(helper_path, nix::unistd::AccessFlags::X_OK).is_err() {
+                    return self.fail_with(connection.as_ref(), ProcessError::TunHelperRelogin);
                 }
             }
 
@@ -313,8 +313,6 @@ impl ProcessManager {
                 match cap {
                     Ok(true) => {}
                     other => {
-                        self.state
-                            .transition(ProcessState::Starting, connection.clone())?;
                         let error = match other {
                             Ok(false) => {
                                 ProcessError::TunCapabilityMissing(self.binary_path.clone())
@@ -322,16 +320,13 @@ impl ProcessManager {
                             Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
                             Ok(true) => unreachable!(),
                         };
-                        let _ = self
-                            .state
-                            .transition(ProcessState::Error(error.to_string()), None);
-                        return Err(error);
+                        return self.fail_with(connection.as_ref(), error);
                     }
                 }
             }
 
-            if caps_gate && let Some(helper) = helper {
-                let for_probe = helper.clone();
+            if caps_gate && let Some(helper_path) = helper {
+                let for_probe = helper_path.clone();
                 let probe = tokio::task::spawn_blocking(move || {
                     crate::privilege::has_net_admin(&for_probe)
                 })
@@ -339,24 +334,19 @@ impl ProcessManager {
                 let cap = match probe {
                     Ok(inner) => inner,
                     Err(join) => Err(crate::privilege::PrivilegeError::Probe(
-                        helper.clone(),
+                        helper_path.clone(),
                         join.to_string(),
                     )),
                 };
                 match cap {
                     Ok(true) => {}
                     other => {
-                        self.state
-                            .transition(ProcessState::Starting, connection.clone())?;
                         let error = match other {
-                            Ok(false) => ProcessError::TunHelperCapabilityMissing(helper),
+                            Ok(false) => ProcessError::TunHelperCapabilityMissing(helper_path),
                             Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
                             Ok(true) => unreachable!(),
                         };
-                        let _ = self
-                            .state
-                            .transition(ProcessState::Error(error.to_string()), None);
-                        return Err(error);
+                        return self.fail_with(connection.as_ref(), error);
                     }
                 }
             }
