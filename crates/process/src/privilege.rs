@@ -1,6 +1,8 @@
 use std::ffi::OsString;
+use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// File capabilities the backend binary needs for TUN: create the device
 /// (`cap_net_admin`), bind privileged ports (`cap_net_bind_service`), and open
@@ -19,6 +21,12 @@ pub const HELPER_GROUP: &str = "v2ray-rs";
 pub enum PrivilegeError {
     #[error("read capabilities of {0}: {1}")]
     Probe(PathBuf, String),
+    /// Outcome of a `getcap` invocation that did not complete normally:
+    /// the helper was missing, the timeout elapsed, or `getcap` exited
+    /// non-zero. Wrapped so its Display is the exact user-visible line that
+    /// the manager's `TunCapabilityProbe` passes through verbatim.
+    #[error("{0}")]
+    ProbeFailure(ProbeFailure),
     #[error(
         "{path} is on a filesystem that ignores file capabilities (e.g. mounted nosuid). \
          Grant manually after moving the binary, or run: sudo setcap '{caps}' {path}"
@@ -37,19 +45,91 @@ pub enum PrivilegeError {
     GrantFailed,
 }
 
+/// Bound on `getcap` execution. `kill` on expiry — not `drop` — so a wedged
+/// probe cannot keep its child alive past the start attempt.
+pub(crate) const GETCAP_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// How a `getcap` invocation failed to produce a capability verdict.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ProbeFailure {
+    /// The helper was still running at `GETCAP_TIMEOUT`.
+    Timeout,
+    /// The helper binary was not found on `PATH` (`ENOENT`); the user must
+    /// install libcap before TUN can start.
+    NotFound,
+    /// The helper exited non-zero. The detail is the trimmed stderr, which
+    /// may be empty.
+    Exit(String),
+}
+
+impl fmt::Display for ProbeFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&probe_error_text(self))
+    }
+}
+
+/// Maps a probe failure to the exact line the user sees. Two of the three
+/// arms are `'static` strings; only the non-zero-exit arm allocates, and only
+/// to interpolate the trimmed stderr.
+pub(crate) fn probe_error_text(failure: &ProbeFailure) -> String {
+    match failure {
+        ProbeFailure::Timeout => "could not verify TUN capabilities: getcap timed out".into(),
+        ProbeFailure::NotFound => "getcap not found; install libcap to use TUN".into(),
+        ProbeFailure::Exit(detail) => format!(
+            "could not verify TUN capabilities: getcap exited with {detail}"
+        ),
+    }
+}
+
+/// True when the process must read file capabilities before starting TUN.
+/// Root already holds every capability, so probing there only adds a failure
+/// mode without revealing anything.
+pub(crate) fn caps_check_needed(euid: u32) -> bool {
+    euid != 0
+}
+
+
 /// Reports whether the binary at `path` already holds `cap_net_admin` in its
-/// file capabilities.
+/// file capabilities. Bounded by `GETCAP_TIMEOUT`; a wedged probe is killed
+/// (not abandoned) so it cannot outlive the start attempt.
 pub fn has_net_admin(path: &Path) -> Result<bool, PrivilegeError> {
-    let output = Command::new("getcap")
+    let mut child = Command::new("getcap")
         .arg(path)
-        .output()
-        .map_err(|e| PrivilegeError::Spawn("getcap", e))?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                PrivilegeError::ProbeFailure(ProbeFailure::NotFound)
+            } else {
+                PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))
+            }
+        })?;
+
+    let deadline = Instant::now() + GETCAP_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(PrivilegeError::ProbeFailure(ProbeFailure::Timeout));
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(e) => return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))),
+        }
+    };
+
+    let output = status.and_then(|_| child.wait_with_output()).map_err(|e| {
+        PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))
+    })?;
 
     if !output.status.success() {
-        return Err(PrivilegeError::Probe(
-            path.to_path_buf(),
+        return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
-        ));
+        )));
     }
 
     Ok(getcap_has_cap(
@@ -787,5 +867,44 @@ rootfs / rootfs rw,nosuid 0 0
             mount_for_path(mounts, Path::new("/usr/local/lib/v2ray-rs/v2ray-rs-netctl")).as_deref(),
             Some("rw,relatime")
         );
+    }
+
+    #[test]
+    fn probe_error_text_pinpoints_timeout() {
+        assert_eq!(
+            probe_error_text(&ProbeFailure::Timeout),
+            "could not verify TUN capabilities: getcap timed out"
+        );
+    }
+
+    #[test]
+    fn probe_error_text_names_libcap_when_getcap_is_missing() {
+        assert_eq!(
+            probe_error_text(&ProbeFailure::NotFound),
+            "getcap not found; install libcap to use TUN"
+        );
+    }
+
+    #[test]
+    fn probe_error_text_interpolates_trimmed_stderr_on_non_zero_exit() {
+        assert_eq!(
+            probe_error_text(&ProbeFailure::Exit("exit status 1".into())),
+            "could not verify TUN capabilities: getcap exited with exit status 1"
+        );
+        // An empty stderr still produces the pinned prefix verbatim.
+        assert_eq!(
+            probe_error_text(&ProbeFailure::Exit(String::new())),
+            "could not verify TUN capabilities: getcap exited with "
+        );
+    }
+
+    #[test]
+    fn caps_check_needed_is_false_for_root() {
+        assert!(!caps_check_needed(0));
+    }
+
+    #[test]
+    fn caps_check_needed_is_true_for_a_normal_user() {
+        assert!(caps_check_needed(1000));
     }
 }
