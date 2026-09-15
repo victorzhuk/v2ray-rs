@@ -12,7 +12,7 @@ use v2ray_rs_core::models::{
 use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
-use v2ray_rs_process::{ProcessEvent, ProcessManager, ProcessState, TunRuntime};
+use v2ray_rs_process::{ProcessEvent, ProcessError, ProcessManager, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
 
@@ -225,6 +225,20 @@ pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -
                     report(ProcessState::Running, Some(meta.clone()));
                 }
                 Err(e) => {
+                    if e.is_host_level() {
+                        // A host-level failure blocks every candidate, so
+                        // failover is over: tear down what is parked and
+                        // report the host error itself, not a summary.
+                        mgr.shutdown().await;
+                        if let Some(mut failed) = parked.take() {
+                            failed.shutdown().await;
+                        }
+                        if grant_fixable(&e) {
+                            sender.emit(AppMsg::TunGrantRequired(generation));
+                        }
+                        report(ProcessState::Error(e.to_string()), None);
+                        return;
+                    }
                     failures.push(format!("{candidate_label}: {e}"));
                     parked = Some(mgr);
                     continue;
@@ -416,6 +430,15 @@ async fn halt(task: JoinHandle<()>) {
     let _ = task.await;
 }
 
+/// Whether a host-level TUN failure is fixed by granting capabilities to the
+/// backend and the route helper: the repair the grant prompt covers.
+fn grant_fixable(e: &ProcessError) -> bool {
+    matches!(
+        e,
+        ProcessError::TunCapabilityMissing(_) | ProcessError::TunHelperCapabilityMissing(_)
+    )
+}
+
 fn summarize_failures(failures: &[String]) -> String {
     if failures.is_empty() {
         return "All candidates failed".into();
@@ -604,6 +627,88 @@ mod tests {
         assert!(msg.starts_with("All candidates failed"), "{msg}");
         assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
         assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
+        assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[test]
+    fn grant_fixable_is_exactly_the_capability_pair() {
+        let fixable = [
+            ProcessError::TunCapabilityMissing(PathBuf::from("/usr/bin/xray")),
+            ProcessError::TunHelperCapabilityMissing(PathBuf::from(
+                "/usr/local/bin/v2ray-rs-netctl",
+            )),
+        ];
+        assert!(fixable.iter().all(grant_fixable));
+
+        let other_host_level = [
+            ProcessError::TunCapabilityProbe("getcap not installed".into()),
+            ProcessError::TunMountUnsupported("/dev/net/tun: required key not available".into()),
+            ProcessError::TunHelperMissing,
+            ProcessError::TunHelperRelogin,
+            ProcessError::TunBackendTooOld {
+                installed: "25.3.5".into(),
+            },
+        ];
+        assert!(other_host_level.iter().all(|e| !grant_fixable(e)));
+        assert!(!grant_fixable(&ProcessError::ConfigCheck("rejected".into())));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn host_level_failure_stops_the_candidate_loop() {
+        let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "v2rstest1".into();
+        let (_handle, rx) = connect(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+
+        let mut granted = false;
+        let terminal = loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("no message in time")
+                .expect("connection task ended without a terminal state");
+            match msg {
+                AppMsg::TunGrantRequired(generation) => {
+                    assert_eq!(generation, GENERATION);
+                    granted = true;
+                }
+                AppMsg::ProcessStateConnection(generation, state, _) => {
+                    assert_eq!(generation, GENERATION);
+                    break state;
+                }
+                _ => {}
+            }
+        };
+
+        let ProcessState::Error(msg) = terminal else {
+            panic!("expected the host-level gate to stop the loop, got {terminal:?}");
+        };
+        assert!(
+            !msg.starts_with("All candidates failed"),
+            "a host-level failure is reported on its own, not summarized: {msg}"
+        );
+        // Hosts without working getcap or with a nosuid staging dir surface a
+        // different host-level variant, so the grant is asserted only when the
+        // error names the capability pair the grant fixes.
+        if msg.contains("lacks CAP_NET_ADMIN") {
+            assert!(
+                granted,
+                "grant-fixable failure must emit TunGrantRequired first: {msg}"
+            );
+        }
+        // Exactly one start attempt: the config on disk is still candidate
+        // 1's; a second attempt would have overwritten it with candidate 2.
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("xray.json"))
+            .expect("generated config readable");
+        assert!(config.contains("203.0.113.1"), "{config}");
+        assert!(
+            !config.contains("203.0.113.2"),
+            "second candidate must not be attempted: {config}"
+        );
         assert_nothing_after_terminal(&rx).await;
     }
 

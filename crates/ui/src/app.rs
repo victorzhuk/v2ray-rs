@@ -129,6 +129,7 @@ pub enum AppMsg {
     FlushSettings(AppSettings),
     AutoReconnect(u32),
     TunReleased,
+    TunGrantRequired(u64),
 }
 
 impl App {
@@ -1288,6 +1289,7 @@ impl SimpleComponent for App {
                     self.window.destroy();
                 }
             }
+            AppMsg::TunGrantRequired(_) => {}
             AppMsg::ProcessLogLine(generation, line) => {
                 // A superseded connection keeps streaming until its teardown
                 // finishes; drop what it logged meanwhile.
