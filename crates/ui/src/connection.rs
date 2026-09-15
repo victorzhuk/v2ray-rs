@@ -12,7 +12,7 @@ use v2ray_rs_core::models::{
 use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
-use v2ray_rs_process::{ProcessEvent, ProcessError, ProcessManager, ProcessState, TunRuntime};
+use v2ray_rs_process::{ProcessError, ProcessEvent, ProcessManager, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
 
@@ -650,7 +650,9 @@ mod tests {
             },
         ];
         assert!(other_host_level.iter().all(|e| !grant_fixable(e)));
-        assert!(!grant_fixable(&ProcessError::ConfigCheck("rejected".into())));
+        assert!(!grant_fixable(&ProcessError::ConfigCheck(
+            "rejected".into()
+        )));
     }
 
     #[tokio::test(flavor = "multi_thread")]
