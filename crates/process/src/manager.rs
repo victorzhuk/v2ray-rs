@@ -321,19 +321,19 @@ impl ProcessManager {
             // self-routes. The gates below check the stored runtime's copy —
             // the exact path the launch path will execute — never a fresh
             // resolution.
-            let helper = if self.backend == Some(BackendType::Xray) {
+            let route_helper = if self.backend == Some(BackendType::Xray) {
                 self.tun.as_ref().map(|rt| rt.helper_path.clone())
             } else {
                 None
             };
-            if let Some(helper_path) = &helper {
-                if !helper_path.is_absolute() || !helper_path.exists() {
+            if let Some(installed) = &route_helper {
+                if !installed.is_absolute() || !installed.exists() {
                     return self.fail_with(connection.as_ref(), ProcessError::TunHelperMissing);
                 }
                 // A freshly granted relocated helper is group-executable
                 // only; a session that has not picked up its new group yet
                 // cannot run it at all.
-                if nix::unistd::access(helper_path, nix::unistd::AccessFlags::X_OK).is_err() {
+                if nix::unistd::access(installed, nix::unistd::AccessFlags::X_OK).is_err() {
                     return self.fail_with(connection.as_ref(), ProcessError::TunHelperRelogin);
                 }
             }
@@ -345,9 +345,9 @@ impl ProcessManager {
             let getcap = self.getcap_program();
             if caps_gate {
                 let binary = self.binary_path.clone();
-                let getcap = getcap.clone();
+                let program = getcap.clone();
                 let probe = tokio::task::spawn_blocking(move || {
-                    crate::privilege::probe_net_admin(&getcap, &binary)
+                    crate::privilege::probe_net_admin(&program, &binary)
                 })
                 .await;
                 let cap = match probe {
@@ -372,16 +372,16 @@ impl ProcessManager {
                 }
             }
 
-            if caps_gate && let Some(helper_path) = helper {
-                let for_probe = helper_path.clone();
+            if caps_gate && let Some(helper) = route_helper {
+                let target = helper.clone();
                 let probe = tokio::task::spawn_blocking(move || {
-                    crate::privilege::probe_net_admin(&getcap, &for_probe)
+                    crate::privilege::probe_net_admin(&getcap, &target)
                 })
                 .await;
                 let cap = match probe {
                     Ok(inner) => inner,
                     Err(join) => Err(crate::privilege::PrivilegeError::Probe(
-                        helper_path.clone(),
+                        helper.clone(),
                         join.to_string(),
                     )),
                 };
@@ -389,7 +389,7 @@ impl ProcessManager {
                     Ok(true) => {}
                     other => {
                         let error = match other {
-                            Ok(false) => ProcessError::TunHelperCapabilityMissing(helper_path),
+                            Ok(false) => ProcessError::TunHelperCapabilityMissing(helper),
                             Err(e) => ProcessError::TunCapabilityProbe(e.to_string()),
                             Ok(true) => unreachable!(),
                         };
