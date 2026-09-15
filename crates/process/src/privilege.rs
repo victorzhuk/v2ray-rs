@@ -57,7 +57,7 @@ pub(crate) const GETCAP_TIMEOUT: Duration = Duration::from_millis(5000);
 
 /// How a `getcap` invocation failed to produce a capability verdict.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ProbeFailure {
+pub enum ProbeFailure {
     /// The helper was still running at `GETCAP_TIMEOUT`.
     Timeout,
     /// The helper binary was not found on `PATH` (`ENOENT`); the user must
