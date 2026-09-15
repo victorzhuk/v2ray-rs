@@ -1430,14 +1430,28 @@ mod tests {
         .with_backend(BackendType::SingBox);
 
         let result = mgr.start_with_connection(None).await;
-        assert!(
-            matches!(
-                result,
-                Err(ProcessError::TunCapabilityMissing(_))
-                    | Err(ProcessError::TunCapabilityProbe(_))
-            ),
-            "expected a backend capability error, got {result:?}"
-        );
+        // Root skips the capability probe by design; what must hold on every
+        // host is that the missing helper never gates a sing-box start.
+        if crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw()) {
+            assert!(
+                matches!(
+                    result,
+                    Err(ProcessError::TunCapabilityMissing(_))
+                        | Err(ProcessError::TunCapabilityProbe(_))
+                ),
+                "expected a backend capability error, got {result:?}"
+            );
+        } else {
+            assert!(
+                !matches!(
+                    result,
+                    Err(ProcessError::TunHelperMissing)
+                        | Err(ProcessError::TunHelperRelogin)
+                        | Err(ProcessError::TunHelperCapabilityMissing(_))
+                ),
+                "the missing helper must not gate a sing-box start, got {result:?}"
+            );
+        }
         assert!(mgr.child.is_none(), "no backend should have been spawned");
     }
 
