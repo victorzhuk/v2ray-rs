@@ -208,6 +208,12 @@ fn device_path(iface: &str) -> String {
     format!("/sys/class/net/{iface}")
 }
 
+/// `/proc/sys/net/ipv6` is absent when the kernel boots with `ipv6.disable=1`,
+/// and is per network namespace.
+pub fn host_has_ipv6() -> bool {
+    Path::new("/proc/sys/net/ipv6").exists()
+}
+
 /// Captured output and outcome of one route helper invocation.
 pub struct HelperRun {
     pub output: Vec<String>,
