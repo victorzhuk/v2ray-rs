@@ -790,7 +790,7 @@ mod tests {
     async fn singbox_tun_without_ipv6_turns_strict_route_off_once() {
         let stub = strict_route_stub();
         let settings = strict_route_settings();
-        let persisted = settings.clone();
+        assert!(settings.tun.strict_route);
         let mut req = request(
             &stub,
             settings,
@@ -802,7 +802,6 @@ mod tests {
 
         let (terminal, lines) = drain(&rx).await;
         assert_error_terminal(terminal);
-        assert!(persisted.tun.strict_route);
 
         let config = std::fs::read_to_string(stub.paths.generated_dir().join("sing-box.json"))
             .expect("generated config readable");
@@ -832,8 +831,8 @@ mod tests {
             .expect("generated config readable");
         assert!(config.contains(r#""strict_route":true"#), "{config}");
         assert!(!lines.iter().any(|l| l == STRICT_ROUTE_NOTICE), "{lines:?}");
-        let log =
-            std::fs::read_to_string(stub.paths.logs_dir().join("backend.log")).unwrap_or_default();
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
         assert!(!log.contains(STRICT_ROUTE_NOTICE), "{log}");
     }
 

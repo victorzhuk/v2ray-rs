@@ -2305,6 +2305,12 @@ mod tests {
     }
 
     #[test]
+    fn tun_ipv6_disabled_error_names_kernel_state_and_setting() {
+        assert!(TUN_IPV6_DISABLED.contains("kernel has IPv6 disabled"));
+        assert!(TUN_IPV6_DISABLED.contains("clear the IPv6 address in TUN settings"));
+    }
+
+    #[test]
     fn tun_ipv6_unavailable_table() {
         use BackendType::{SingBox, V2ray, Xray};
         let v6 = Some("fd00::1/126".to_string());
