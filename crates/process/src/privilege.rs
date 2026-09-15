@@ -63,6 +63,8 @@ pub(crate) enum ProbeFailure {
     /// The helper binary was not found on `PATH` (`ENOENT`); the user must
     /// install libcap before TUN can start.
     NotFound,
+    /// The helper exists but could not be started (`EACCES`, `ETXTBSY`, ...).
+    Spawn(String),
     /// The helper exited non-zero. The detail is the trimmed stderr, which
     /// may be empty.
     Exit(String),
@@ -74,13 +76,14 @@ impl fmt::Display for ProbeFailure {
     }
 }
 
-/// Maps a probe failure to the exact line the user sees. Two of the three
-/// arms are `'static` strings; only the non-zero-exit arm allocates, and only
-/// to interpolate the trimmed stderr.
+/// Maps a probe failure to the exact line the user sees.
 pub(crate) fn probe_error_text(failure: &ProbeFailure) -> String {
     match failure {
         ProbeFailure::Timeout => "could not verify TUN capabilities: getcap timed out".into(),
         ProbeFailure::NotFound => "getcap not found; install libcap to use TUN".into(),
+        ProbeFailure::Spawn(err) => {
+            format!("could not verify TUN capabilities: cannot run getcap: {err}")
+        }
         ProbeFailure::Exit(detail) => {
             format!("could not verify TUN capabilities: getcap exited with {detail}")
         }
@@ -119,7 +122,7 @@ fn probe_net_admin_within(
             if e.kind() == std::io::ErrorKind::NotFound {
                 PrivilegeError::ProbeFailure(ProbeFailure::NotFound)
             } else {
-                PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))
+                PrivilegeError::ProbeFailure(ProbeFailure::Spawn(e.to_string()))
             }
         })?;
 
@@ -1002,6 +1005,28 @@ rootfs / rootfs rw,nosuid 0 0
         assert_eq!(
             probe_error_text(&ProbeFailure::Exit(String::new())),
             "could not verify TUN capabilities: getcap exited with "
+        );
+    }
+
+    #[test]
+    fn probe_error_text_says_getcap_could_not_run() {
+        let err = std::io::Error::from_raw_os_error(nix::libc::EACCES);
+        assert_eq!(
+            probe_error_text(&ProbeFailure::Spawn(err.to_string())),
+            format!("could not verify TUN capabilities: cannot run getcap: {err}")
+        );
+    }
+
+    #[test]
+    fn unrunnable_getcap_is_a_spawn_failure() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = probe_net_admin_within(dir.path(), Path::new("/usr/bin/xray"), GETCAP_TIMEOUT);
+        assert!(
+            matches!(
+                probe,
+                Err(PrivilegeError::ProbeFailure(ProbeFailure::Spawn(_)))
+            ),
+            "{probe:?}"
         );
     }
 
