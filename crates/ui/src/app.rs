@@ -17,7 +17,7 @@ use v2ray_rs_core::instance::{
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsConfig, DnsRuleMatch,
     LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
-    SubscriptionSource, resolve_effective_config,
+    SubscriptionSource, TunConfig, resolve_effective_config,
 };
 use v2ray_rs_core::persistence::{AppPaths, TunSession};
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -494,6 +494,16 @@ impl App {
             }
         };
 
+        let host_has_ipv6 = v2ray_rs_process::host_has_ipv6();
+        if tun_ipv6_unavailable(
+            &self.settings.tun,
+            self.settings.backend.backend_type,
+            host_has_ipv6,
+        ) {
+            self.show_toast(TUN_IPV6_DISABLED);
+            return Err(TUN_IPV6_DISABLED.into());
+        }
+
         let rules = match self.store.load_routing_rules() {
             Ok(rules) => rules,
             Err(err) => {
@@ -581,7 +591,7 @@ impl App {
                 manual_nodes: connection_manual_nodes,
                 lifecycle: self.tun_lifecycle.clone(),
                 generation,
-                host_has_ipv6: v2ray_rs_process::host_has_ipv6(),
+                host_has_ipv6,
             },
             sender.input_sender().clone(),
         );
@@ -1626,6 +1636,15 @@ fn error_toast_action(generation: u64, grant_generation: Option<u64>) -> Option<
     (grant_generation == Some(generation)).then_some(ToastAction::GrantTun)
 }
 
+const TUN_IPV6_DISABLED: &str = "TUN IPv6 address is set but the kernel has IPv6 disabled (ipv6.disable=1); clear the IPv6 address in TUN settings";
+
+fn tun_ipv6_unavailable(tun: &TunConfig, backend: BackendType, host_has_ipv6: bool) -> bool {
+    tun.enabled
+        && matches!(backend, BackendType::SingBox | BackendType::Xray)
+        && tun.address_v6.is_some()
+        && !host_has_ipv6
+}
+
 /// v2ray and xray read `geoip:`/`geosite:` references from local .dat files and
 /// refuse to start without them; sing-box rule-sets are fetched per tag elsewhere.
 fn missing_geodata(
@@ -2283,6 +2302,40 @@ mod tests {
             false,
             true
         ));
+    }
+
+    #[test]
+    fn tun_ipv6_unavailable_table() {
+        use BackendType::{SingBox, V2ray, Xray};
+        let v6 = Some("fd00::1/126".to_string());
+        let cases = [
+            (true, SingBox, v6.clone(), false, true),
+            (true, SingBox, v6.clone(), true, false),
+            (true, SingBox, None, false, false),
+            (true, SingBox, None, true, false),
+            (true, Xray, v6.clone(), false, true),
+            (true, Xray, v6.clone(), true, false),
+            (true, Xray, None, false, false),
+            (true, Xray, None, true, false),
+            (true, V2ray, v6.clone(), false, false),
+            (true, V2ray, v6.clone(), true, false),
+            (true, V2ray, None, false, false),
+            (true, V2ray, None, true, false),
+            (false, SingBox, v6.clone(), false, false),
+            (false, Xray, v6.clone(), false, false),
+        ];
+        for (enabled, backend, address_v6, host_has_ipv6, want) in cases {
+            let tun = TunConfig {
+                enabled,
+                address_v6: address_v6.clone(),
+                ..TunConfig::default()
+            };
+            assert_eq!(
+                tun_ipv6_unavailable(&tun, backend, host_has_ipv6),
+                want,
+                "enabled={enabled} backend={backend:?} v6={address_v6:?} host_v6={host_has_ipv6}"
+            );
+        }
     }
 
     #[test]
