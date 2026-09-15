@@ -1,7 +1,9 @@
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 /// File capabilities the backend binary needs for TUN: create the device
@@ -99,6 +101,14 @@ pub fn has_net_admin(path: &Path) -> Result<bool, PrivilegeError> {
 }
 
 pub(crate) fn probe_net_admin(getcap: &Path, path: &Path) -> Result<bool, PrivilegeError> {
+    probe_net_admin_within(getcap, path, GETCAP_TIMEOUT)
+}
+
+fn probe_net_admin_within(
+    getcap: &Path,
+    path: &Path,
+    timeout: Duration,
+) -> Result<bool, PrivilegeError> {
     let mut child = Command::new(getcap)
         .arg(path)
         .stdout(Stdio::piped())
@@ -112,10 +122,12 @@ pub(crate) fn probe_net_admin(getcap: &Path, path: &Path) -> Result<bool, Privil
             }
         })?;
 
-    let deadline = Instant::now() + GETCAP_TIMEOUT;
+    let deadline = Instant::now() + timeout;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
     let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
@@ -132,20 +144,49 @@ pub(crate) fn probe_net_admin(getcap: &Path, path: &Path) -> Result<bool, Privil
         }
     };
 
-    let output = status
-        .and_then(|_| child.wait_with_output())
-        .map_err(|e| PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string())))?;
-
-    if !output.status.success() {
+    let stdout = collect(&stdout, deadline)?;
+    let stderr = collect(&stderr, deadline)?;
+    if !status.success() {
         return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(
-            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+            String::from_utf8_lossy(&stderr).trim().to_string(),
         )));
     }
 
     Ok(getcap_has_cap(
-        &String::from_utf8_lossy(&output.stdout),
+        &String::from_utf8_lossy(&stdout),
         "cap_net_admin",
     ))
+}
+
+/// Reads a pipe to EOF on its own thread. An exited `getcap` does not close
+/// the pipe while a descendant still holds the inherited descriptor, so the
+/// read must never run on the caller's deadline-bound path. A reader left
+/// blocked that way ends once the last holder closes the descriptor.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    match pipe {
+        Some(mut pipe) => {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = pipe.read_to_end(&mut buf);
+                let _ = tx.send(buf);
+            });
+        }
+        None => {
+            let _ = tx.send(Vec::new());
+        }
+    }
+    rx
+}
+
+fn collect(output: &mpsc::Receiver<Vec<u8>>, deadline: Instant) -> Result<Vec<u8>, PrivilegeError> {
+    match output.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(buf) => Ok(buf),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(PrivilegeError::ProbeFailure(ProbeFailure::Timeout))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Ok(Vec::new()),
+    }
 }
 
 /// What a single `pkexec` elevation has to do.
@@ -928,6 +969,45 @@ rootfs / rootfs rw,nosuid 0 0
             probe_error_text(&ProbeFailure::Exit(String::new())),
             "could not verify TUN capabilities: getcap exited with "
         );
+    }
+
+    fn sh_probe(dir: &Path, script: &str, timeout: Duration) -> Result<bool, PrivilegeError> {
+        // `sh` reads the script as the probed path, so no freshly written file
+        // is ever exec'd (and no ETXTBSY race with parallel tests).
+        let path = dir.join("getcap.sh");
+        std::fs::write(&path, script).unwrap();
+        probe_net_admin_within(Path::new("/bin/sh"), &path, timeout)
+    }
+
+    #[test]
+    fn probe_reads_the_capset_from_stdout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let probe = sh_probe(dir.path(), "echo \"$0 cap_net_admin+ep\"\n", GETCAP_TIMEOUT);
+        assert!(probe.unwrap());
+    }
+
+    #[test]
+    fn probe_output_drain_is_bounded_by_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 &\necho $! > {}\nexit 0\n", pid_file.display());
+
+        let started = Instant::now();
+        let probe = sh_probe(dir.path(), &script, Duration::from_millis(300));
+        let elapsed = started.elapsed();
+
+        if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+            let pid = nix::unistd::Pid::from_raw(pid.trim().parse().unwrap());
+            let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        }
+        assert!(
+            matches!(
+                probe,
+                Err(PrivilegeError::ProbeFailure(ProbeFailure::Timeout))
+            ),
+            "{probe:?}"
+        );
+        assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
     }
 
     #[test]
