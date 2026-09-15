@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -56,6 +56,8 @@ pub enum ProcessError {
     TunCapabilityMissing(PathBuf),
     #[error("could not verify TUN capabilities: {0}")]
     TunCapabilityProbe(String),
+    #[error("TUN is unavailable: {0}")]
+    TunMountUnsupported(String),
     #[error("TUN device {0} did not appear")]
     TunDeviceTimeout(String),
     #[error("TUN route helper failed: {0}")]
@@ -221,6 +223,25 @@ impl ProcessManager {
                     }
                     self.state.emit(ProcessEvent::LogLine(line));
                 }
+            }
+            // On a nosuid mount the getcap probes below would report the
+            // backend as unprivileged no matter what was granted.
+            if !crate::privilege::file_caps_supported(
+                self.binary_path.parent().unwrap_or(Path::new("/")),
+            ) {
+                self.state
+                    .transition(ProcessState::Starting, connection.clone())?;
+                let error = ProcessError::TunMountUnsupported(
+                    crate::privilege::PrivilegeError::Unsupported {
+                        path: self.binary_path.clone(),
+                        caps: crate::privilege::BACKEND_CAPS.to_string(),
+                    }
+                    .to_string(),
+                );
+                let _ = self
+                    .state
+                    .transition(ProcessState::Error(error.to_string()), None);
+                return Err(error);
             }
 
             // Only xray drives the privileged route helper; sing-box
@@ -1592,6 +1613,17 @@ mod tests {
         assert!((26, 1, 12) < XRAY_TUN_MIN_VERSION);
         assert!((26, 1, 13) >= XRAY_TUN_MIN_VERSION);
         assert!((26, 3, 27) >= XRAY_TUN_MIN_VERSION);
+    }
+
+    #[test]
+    fn tun_mount_unsupported_carries_manual_setcap_wording() {
+        let unsupported = crate::privilege::PrivilegeError::Unsupported {
+            path: PathBuf::from("/tmp/.mount_abc/usr/bin/xray"),
+            caps: crate::privilege::BACKEND_CAPS.to_string(),
+        };
+        let text = ProcessError::TunMountUnsupported(unsupported.to_string()).to_string();
+        assert!(text.contains("ignores file capabilities"), "{text}");
+        assert!(text.contains("sudo setcap"), "{text}");
     }
 
     #[tokio::test]

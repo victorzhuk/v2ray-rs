@@ -796,6 +796,28 @@ tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
     }
 
     #[test]
+    fn nosuid_mount_drives_the_unsupported_error_text() {
+        let mounts = "\
+/dev/sda1 / ext4 rw 0 0
+tmpfs /tmp/.mount_abc tmpfs rw,nosuid,nodev 0 0
+";
+        let backend = Path::new("/tmp/.mount_abc/usr/bin/xray");
+        let opts = mount_for_path(mounts, backend).expect("backend sits under a mount");
+        assert!(opts.split(',').any(|o| o == "nosuid"), "{opts}");
+
+        // The manager carries this Display verbatim in its mount-unsupported
+        // ProcessError, so the manual setcap wording must survive the trip.
+        let text = PrivilegeError::Unsupported {
+            path: backend.to_path_buf(),
+            caps: BACKEND_CAPS.to_string(),
+        }
+        .to_string();
+        assert!(text.contains("ignores file capabilities"), "{text}");
+        assert!(text.contains("sudo setcap"), "{text}");
+        assert!(text.contains(backend.to_str().unwrap()), "{text}");
+    }
+
+    #[test]
     fn preflight_targets_includes_helper_and_optional_wrapper() {
         let backend = Path::new("/usr/bin/xray");
         let helper = Path::new("/usr/bin/v2ray-rs-netctl");
