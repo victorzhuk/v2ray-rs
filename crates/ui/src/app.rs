@@ -66,6 +66,7 @@ pub struct App {
     process_handle: Option<ConnectionHandle>,
     tun_lifecycle: crate::connection::TunLifecycle,
     connection_generation: u64,
+    grant_generation: Option<u64>,
     process_state: ProcessState,
     reconnect_pending: bool,
     connected: bool,
@@ -115,7 +116,7 @@ pub enum AppMsg {
     ActiveNodesChanged(bool),
     ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(u64, String),
-    OpenPreferences,
+    OpenPreferences(Option<&'static str>),
     ViewGeneratedConfig,
     PreferencesClosed,
     ResetBrokenSettings,
@@ -141,7 +142,13 @@ impl App {
         let from = self.process_state.clone();
         (self.connected, self.button_sensitive) = connect_toggle(state);
         if let ProcessState::Error(msg) = state {
-            self.show_toast(&format!("Error: {msg}"));
+            // An armed TUN grant is consumed here; the caller replaces the
+            // plain toast with the actionable one while the sender is alive.
+            if error_toast_action(self.connection_generation, self.grant_generation.take())
+                .is_none()
+            {
+                self.show_toast(&format!("Error: {msg}"));
+            }
         }
         self.process_state = state.clone();
 
@@ -494,6 +501,7 @@ impl App {
         let connection_subscriptions = subscriptions.clone();
         let connection_manual_nodes = manual_nodes.clone();
         self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.grant_generation = None;
         let generation = self.connection_generation;
 
         self.runtime_snapshot = Some(RuntimeConfigSnapshot {
@@ -899,6 +907,7 @@ impl SimpleComponent for App {
             process_handle: None,
             tun_lifecycle,
             connection_generation: 0,
+            grant_generation: None,
             process_state: ProcessState::Stopped,
             reconnect_pending: false,
             connected: false,
@@ -939,7 +948,7 @@ impl SimpleComponent for App {
         {
             let s = sender.input_sender().clone();
             prefs_action.connect_activate(move |_, _| {
-                s.emit(AppMsg::OpenPreferences);
+                s.emit(AppMsg::OpenPreferences(None));
             });
         }
         root.add_action(&prefs_action);
@@ -1218,7 +1227,23 @@ impl SimpleComponent for App {
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
                     self.connection_status = None;
                 }
+                let grant_action = error_toast_action(generation, self.grant_generation);
                 self.apply_state(&state);
+                if let (Some(ToastAction::GrantTun), ProcessState::Error(msg)) =
+                    (grant_action, &state)
+                {
+                    let toast = adw::Toast::builder()
+                        .title(format!("Error: {msg}"))
+                        .button_label("Grant TUN privileges")
+                        .build();
+                    let s = sender.input_sender().clone();
+                    toast.connect_button_clicked(move |_| {
+                        s.emit(AppMsg::OpenPreferences(Some(
+                            crate::preferences::TUN_PAGE_NAME,
+                        )));
+                    });
+                    self.toast_overlay.add_toast(toast);
+                }
                 if stopped && self.pending_exit {
                     if matches!(state, ProcessState::Error(_)) && self.tun_marker_present() {
                         self.release_tun_session(&sender);
@@ -1289,7 +1314,12 @@ impl SimpleComponent for App {
                     self.window.destroy();
                 }
             }
-            AppMsg::TunGrantRequired(_) => {}
+            AppMsg::TunGrantRequired(generation) => {
+                // A superseded connection's grant report arms nothing.
+                if is_current_generation(generation, self.connection_generation) {
+                    self.grant_generation = Some(generation);
+                }
+            }
             AppMsg::ProcessLogLine(generation, line) => {
                 // A superseded connection keeps streaming until its teardown
                 // finishes; drop what it logged meanwhile.
@@ -1312,9 +1342,12 @@ impl SimpleComponent for App {
             AppMsg::TrayQuit => {
                 self.quit(&sender);
             }
-            AppMsg::OpenPreferences => {
+            AppMsg::OpenPreferences(page) => {
                 if let Some(dialog) = &self.preferences_dialog {
                     dialog.present(Some(&self.window));
+                    if let Some(name) = page {
+                        dialog.set_visible_page_name(name);
+                    }
                     return;
                 }
 
@@ -1337,6 +1370,9 @@ impl SimpleComponent for App {
                         toast_overlay.add_toast(adw::Toast::new(msg));
                     },
                 );
+                if let Some(name) = page {
+                    dialog.set_visible_page_name(name);
+                }
                 {
                     let s = sender.input_sender().clone();
                     dialog.connect_closed(move |_| {
@@ -1516,6 +1552,18 @@ fn auto_reconnect_fires(message: u32, current: u32, has_handle: bool) -> bool {
 /// produced them; only the app's current one is live.
 fn is_current_generation(message: u64, current: u64) -> bool {
     message == current
+}
+
+/// The extra affordance an Error toast can carry.
+#[derive(Debug, PartialEq, Eq)]
+enum ToastAction {
+    GrantTun,
+}
+
+/// The Error toast grows a "Grant TUN privileges" button only when the
+/// failed connection is the one whose TUN capability grant was armed.
+fn error_toast_action(generation: u64, grant_generation: Option<u64>) -> Option<ToastAction> {
+    (grant_generation == Some(generation)).then_some(ToastAction::GrantTun)
 }
 
 /// TUN follows the session that is running: the launched snapshot decides,
@@ -2054,6 +2102,17 @@ mod tests {
             .map(|(_, line)| line)
             .collect();
         assert_eq!(kept, ["new"]);
+    }
+
+    #[test]
+    fn error_toast_action_arms_only_for_matching_generation() {
+        let generation = 7_u64;
+        assert_eq!(
+            error_toast_action(generation, Some(generation)),
+            Some(ToastAction::GrantTun)
+        );
+        assert_eq!(error_toast_action(generation, Some(generation + 1)), None);
+        assert_eq!(error_toast_action(generation, None), None);
     }
 
     #[test]

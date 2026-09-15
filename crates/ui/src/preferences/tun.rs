@@ -14,6 +14,8 @@ use super::{SettingsCallback, SettingsObservers, ToastCallback, subscribe_settin
 
 type RenderFn = Rc<dyn Fn()>;
 
+pub(crate) const TUN_PAGE_NAME: &str = "tun";
+
 /// Why the route helper still needs a privileged grant, or `None` when it is
 /// ready. The backend holding CAP_NET_ADMIN says nothing about the helper, which
 /// is granted separately and can be missing, stale, or simply never have taken
@@ -54,6 +56,7 @@ pub(super) fn build_tun_page(
         .title("TUN")
         .icon_name("network-vpn-symbolic")
         .build();
+    page.set_name(Some(TUN_PAGE_NAME));
 
     let backend = state.borrow().backend.backend_type;
     let is_v2ray = backend == BackendType::V2ray;

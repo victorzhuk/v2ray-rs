@@ -18,6 +18,7 @@ use dns::build_dns_page;
 use network::build_network_page;
 use routing::{build_routing_error_page, build_routing_page};
 use system::build_system_page;
+pub(crate) use tun::TUN_PAGE_NAME;
 use tun::build_tun_page;
 
 pub(crate) type SettingsCallback = Rc<dyn Fn(AppSettings)>;
