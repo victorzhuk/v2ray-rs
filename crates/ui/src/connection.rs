@@ -689,9 +689,11 @@ mod tests {
         let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
         // A getcap that prints nothing is the "no capabilities" verdict, and a
         // present helper gets the start past the helper gates to that verdict.
+        // `/bin/true` rather than a freshly written script: exec'ing a file a
+        // parallel test may still hold open for writing fails with ETXTBSY.
         let host = tempfile::tempdir().unwrap();
         let probe = v2ray_rs_process::HostProbe {
-            getcap: executable(host.path(), "getcap"),
+            getcap: PathBuf::from("/bin/true"),
             helper: executable(host.path(), "v2ray-rs-netctl"),
         };
         let mut settings = tun_settings();
