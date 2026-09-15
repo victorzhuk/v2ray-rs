@@ -12,7 +12,7 @@ use v2ray_rs_core::models::BackendType;
 /// How long to wait for an xray TUN device to appear after spawn before giving up.
 pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a route helper invocation may run before it is killed.
-pub(crate) const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
+pub const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 const HELPER_BIN: &str = "v2ray-rs-netctl";
@@ -209,9 +209,10 @@ fn device_path(iface: &str) -> String {
 }
 
 /// Captured output and outcome of one route helper invocation.
-pub(crate) struct HelperRun {
+pub struct HelperRun {
     pub output: Vec<String>,
     pub result: Result<(), String>,
+    pub timed_out: bool,
 }
 
 /// Runs `netctl xray-up` to assign the address and split routes.
@@ -255,7 +256,7 @@ pub(crate) async fn xray_down(rt: &TunRuntime) -> HelperRun {
 /// Runs the route helper with its output captured and its lifetime bounded.
 /// `kill_on_drop` covers a caller that abandons the future mid-run; the
 /// timeout covers a helper wedged in a netlink call.
-pub(crate) async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> HelperRun {
+pub async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> HelperRun {
     let verb = args.first().map_or("helper", String::as_str);
     let spawned = crate::spawn::spawn_with_etxtbsy_retry(|| {
         let mut cmd = Command::new(helper);
@@ -273,6 +274,7 @@ pub(crate) async fn run_helper(helper: &Path, args: &[String], timeout: Duration
             return HelperRun {
                 output: Vec::new(),
                 result: Err(format!("{verb}: {e}")),
+                timed_out: false,
             };
         }
     };
@@ -294,13 +296,13 @@ pub(crate) async fn run_helper(helper: &Path, args: &[String], timeout: Duration
     .flatten()
     .collect();
 
-    let result = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => Ok(()),
-        Ok(Ok(status)) => Err(format!("{verb} exited with {status}")),
-        Ok(Err(e)) => Err(format!("{verb}: {e}")),
+    let (result, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) if status.success() => (Ok(()), false),
+        Ok(Ok(status)) => (Err(format!("{verb} exited with {status}")), false),
+        Ok(Err(e)) => (Err(format!("{verb}: {e}")), false),
         Err(_) => {
             let _ = child.kill().await;
-            Err(format!("{verb} timed out after {timeout:?}"))
+            (Err(format!("{verb} timed out after {timeout:?}")), true)
         }
     };
 
@@ -314,7 +316,11 @@ pub(crate) async fn run_helper(helper: &Path, args: &[String], timeout: Duration
         }
     }
     let output = std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner()));
-    HelperRun { output, result }
+    HelperRun {
+        output,
+        result,
+        timed_out,
+    }
 }
 
 fn spawn_reader<R>(stream: R, sink: Arc<Mutex<Vec<String>>>) -> tokio::task::JoinHandle<()>
@@ -504,6 +510,7 @@ mod tests {
         .await;
         let err = run.result.expect_err("a hung helper must fail");
         assert!(err.contains("timed out"), "{err}");
+        assert!(run.timed_out);
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let pid: i32 = std::fs::read_to_string(&pid_file)
@@ -531,5 +538,6 @@ mod tests {
         );
         let err = run.result.expect_err("a non-zero exit must fail");
         assert!(err.contains("exit status"), "{err}");
+        assert!(!run.timed_out);
     }
 }
