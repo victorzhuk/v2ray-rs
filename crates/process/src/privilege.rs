@@ -75,9 +75,9 @@ pub(crate) fn probe_error_text(failure: &ProbeFailure) -> String {
     match failure {
         ProbeFailure::Timeout => "could not verify TUN capabilities: getcap timed out".into(),
         ProbeFailure::NotFound => "getcap not found; install libcap to use TUN".into(),
-        ProbeFailure::Exit(detail) => format!(
-            "could not verify TUN capabilities: getcap exited with {detail}"
-        ),
+        ProbeFailure::Exit(detail) => {
+            format!("could not verify TUN capabilities: getcap exited with {detail}")
+        }
     }
 }
 
@@ -87,7 +87,6 @@ pub(crate) fn probe_error_text(failure: &ProbeFailure) -> String {
 pub(crate) fn caps_check_needed(euid: u32) -> bool {
     euid != 0
 }
-
 
 /// Reports whether the binary at `path` already holds `cap_net_admin` in its
 /// file capabilities. Bounded by `GETCAP_TIMEOUT`; a wedged probe is killed
@@ -118,13 +117,17 @@ pub fn has_net_admin(path: &Path) -> Result<bool, PrivilegeError> {
                 }
                 std::thread::sleep(Duration::from_millis(25));
             }
-            Err(e) => return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))),
+            Err(e) => {
+                return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(
+                    e.to_string(),
+                )));
+            }
         }
     };
 
-    let output = status.and_then(|_| child.wait_with_output()).map_err(|e| {
-        PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string()))
-    })?;
+    let output = status
+        .and_then(|_| child.wait_with_output())
+        .map_err(|e| PrivilegeError::ProbeFailure(ProbeFailure::Exit(e.to_string())))?;
 
     if !output.status.success() {
         return Err(PrivilegeError::ProbeFailure(ProbeFailure::Exit(
