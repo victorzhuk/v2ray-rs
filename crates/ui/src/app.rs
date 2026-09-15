@@ -10,6 +10,7 @@ use tokio::sync::broadcast;
 use crate::cli::CliArgs;
 use v2ray_rs_core::cli::PathOverrides;
 use v2ray_rs_core::config::ConfigWriter;
+use v2ray_rs_core::geodata::GeodataManager;
 use v2ray_rs_core::instance::{
     CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
 };
@@ -132,6 +133,7 @@ pub enum AppMsg {
     AutoReconnect(u32),
     TunReleased,
     TunGrantRequired(u64),
+    DownloadGeodata,
 }
 
 impl App {
@@ -499,6 +501,38 @@ impl App {
             }
         };
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
+
+        let candidate_subscriptions: Vec<Subscription> = subscriptions
+            .iter()
+            .filter(|s| {
+                candidates.iter().any(|c| match c.node_ref {
+                    ConnectionNodeRef::Subscription {
+                        subscription_id, ..
+                    } => subscription_id == s.id,
+                    ConnectionNodeRef::Manual { .. } => false,
+                })
+            })
+            .cloned()
+            .collect();
+        let geodata = GeodataManager::new(&self.paths);
+        if missing_geodata(
+            self.settings.backend.backend_type,
+            &enabled_rules,
+            &candidate_subscriptions,
+            &self.settings.dns,
+            geodata.geoip_path().exists(),
+            geodata.geosite_path().exists(),
+        ) {
+            let toast = adw::Toast::builder()
+                .title("GeoIP/GeoSite rules need geodata that has not been downloaded")
+                .button_label("Download geodata")
+                .build();
+            let s = sender.input_sender().clone();
+            toast.connect_button_clicked(move |_| s.emit(AppMsg::DownloadGeodata));
+            self.toast_overlay.add_toast(toast);
+            return Err("geodata not downloaded".into());
+        }
+
         let connection_subscriptions = subscriptions.clone();
         let connection_manual_nodes = manual_nodes.clone();
         self.connection_generation = self.connection_generation.wrapping_add(1);
@@ -1046,6 +1080,23 @@ impl SimpleComponent for App {
             }
             AppMsg::ShowToast(message) => {
                 self.show_toast(&message);
+            }
+            AppMsg::DownloadGeodata => {
+                let paths = self.paths.clone();
+                let backend = self.settings.backend.backend_type;
+                let s = sender.input_sender().clone();
+                tokio::spawn(async move {
+                    let message = match tokio::task::spawn_blocking(move || {
+                        crate::geodata_service::update_geodata(&paths, backend)
+                    })
+                    .await
+                    {
+                        Ok(Ok(())) => "Geodata updated successfully".to_string(),
+                        Ok(Err(err)) => err,
+                        Err(err) => format!("Geodata download task failed: {err}"),
+                    };
+                    s.emit(AppMsg::ShowToast(message));
+                });
             }
             AppMsg::ToggleConnection => {
                 if self.connected {
