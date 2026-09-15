@@ -14,8 +14,9 @@ use v2ray_rs_core::instance::{
     CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
 };
 use v2ray_rs_core::models::{
-    AppSettings, ConnectionMetadata, ConnectionNodeRef, LastSuccessMetadata, ManualNode,
-    RoutingRuleSet, Subscription, SubscriptionSource, resolve_effective_config,
+    AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsConfig, DnsRuleMatch,
+    LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
+    SubscriptionSource, resolve_effective_config,
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -1566,6 +1567,42 @@ fn error_toast_action(generation: u64, grant_generation: Option<u64>) -> Option<
     (grant_generation == Some(generation)).then_some(ToastAction::GrantTun)
 }
 
+/// v2ray and xray read `geoip:`/`geosite:` references from local .dat files and
+/// refuse to start without them; sing-box rule-sets are fetched per tag elsewhere.
+fn missing_geodata(
+    backend: BackendType,
+    rules: &[RoutingRule],
+    subscriptions: &[Subscription],
+    dns: &DnsConfig,
+    geoip_exists: bool,
+    geosite_exists: bool,
+) -> bool {
+    if backend == BackendType::SingBox || (geoip_exists && geosite_exists) {
+        return false;
+    }
+    let geo_rule = |r: &RoutingRule| {
+        r.enabled
+            && matches!(
+                r.match_condition,
+                RuleMatch::GeoIp { .. } | RuleMatch::GeoSite { .. }
+            )
+    };
+    let geo_dns = |d: &DnsConfig| {
+        d.enabled
+            && d.use_custom_rules
+            && d.rules
+                .iter()
+                .any(|r| matches!(r.match_condition, DnsRuleMatch::GeoSite { .. }))
+    };
+    rules.iter().any(geo_rule)
+        || geo_dns(dns)
+        || subscriptions
+            .iter()
+            .filter(|s| s.use_imported_profile)
+            .filter_map(|s| s.imported_profile.as_ref())
+            .any(|p| p.rules.iter().any(geo_rule) || p.dns.as_ref().is_some_and(geo_dns))
+}
+
 /// TUN follows the session that is running: the launched snapshot decides,
 /// not the current settings, which may already have been edited mid-session.
 fn tun_active_for(state: &ProcessState, snapshot: Option<&RuntimeConfigSnapshot>) -> bool {
@@ -2113,6 +2150,242 @@ mod tests {
         );
         assert_eq!(error_toast_action(generation, Some(generation + 1)), None);
         assert_eq!(error_toast_action(generation, None), None);
+    }
+
+    fn routing_rule(match_condition: RuleMatch, enabled: bool) -> RoutingRule {
+        RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition,
+            action: v2ray_rs_core::models::RuleAction::Proxy,
+            enabled,
+            group: None,
+            via_node: None,
+        }
+    }
+
+    fn geosite_rule(enabled: bool) -> RoutingRule {
+        routing_rule(
+            RuleMatch::GeoSite {
+                category: "google".into(),
+            },
+            enabled,
+        )
+    }
+
+    fn geosite_dns(enabled: bool, use_custom_rules: bool) -> DnsConfig {
+        DnsConfig {
+            enabled,
+            use_custom_rules,
+            rules: vec![v2ray_rs_core::models::DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "netflix".into(),
+                },
+                server_tag: "remote".into(),
+            }],
+            ..DnsConfig::default()
+        }
+    }
+
+    fn profile_sub(active: bool, rules: Vec<RoutingRule>, dns: Option<DnsConfig>) -> Subscription {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.use_imported_profile = active;
+        sub.imported_profile = Some(v2ray_rs_core::models::ImportedProfile {
+            rules,
+            dns,
+            skipped: Vec::new(),
+            imported_at: chrono::Utc::now(),
+        });
+        sub
+    }
+
+    #[test]
+    fn missing_geodata_xray_geosite_rule_without_file() {
+        let rules = [geosite_rule(true)];
+        let dns = DnsConfig::default();
+        assert!(missing_geodata(
+            BackendType::Xray,
+            &rules,
+            &[],
+            &dns,
+            false,
+            false
+        ));
+        let geoip = [routing_rule(
+            RuleMatch::GeoIp {
+                country_code: "ru".into(),
+            },
+            true,
+        )];
+        assert!(missing_geodata(
+            BackendType::V2ray,
+            &geoip,
+            &[],
+            &dns,
+            false,
+            true
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_singbox_is_never_gated() {
+        let rules = [geosite_rule(true)];
+        let subs = [profile_sub(true, vec![geosite_rule(true)], None)];
+        let dns = geosite_dns(true, true);
+        assert!(!missing_geodata(
+            BackendType::SingBox,
+            &rules,
+            &subs,
+            &dns,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_without_geo_rules() {
+        let rules = [
+            routing_rule(
+                RuleMatch::Domain {
+                    pattern: "example.com".into(),
+                },
+                true,
+            ),
+            routing_rule(
+                RuleMatch::IpCidr {
+                    cidr: "10.0.0.0/8".parse().unwrap(),
+                },
+                true,
+            ),
+        ];
+        let dns = DnsConfig::default();
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &rules,
+            &[],
+            &dns,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_imported_profile_geo_rule() {
+        let subs = [profile_sub(true, vec![geosite_rule(true)], None)];
+        let dns = DnsConfig::default();
+        assert!(missing_geodata(
+            BackendType::Xray,
+            &[],
+            &subs,
+            &dns,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_ignores_disabled_and_inactive_rules() {
+        let dns = DnsConfig::default();
+        let disabled = [geosite_rule(false)];
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &disabled,
+            &[],
+            &dns,
+            false,
+            false
+        ));
+        let inactive = [profile_sub(false, vec![geosite_rule(true)], None)];
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &[],
+            &inactive,
+            &dns,
+            false,
+            false
+        ));
+        let disabled_profile = [profile_sub(true, vec![geosite_rule(false)], None)];
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &[],
+            &disabled_profile,
+            &dns,
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_custom_dns_geosite_rule() {
+        let xray = BackendType::Xray;
+        assert!(missing_geodata(
+            xray,
+            &[],
+            &[],
+            &geosite_dns(true, true),
+            false,
+            false
+        ));
+        assert!(!missing_geodata(
+            xray,
+            &[],
+            &[],
+            &geosite_dns(true, false),
+            false,
+            false
+        ));
+        assert!(!missing_geodata(
+            xray,
+            &[],
+            &[],
+            &geosite_dns(false, true),
+            false,
+            false
+        ));
+        let subs = [profile_sub(true, Vec::new(), Some(geosite_dns(true, true)))];
+        assert!(missing_geodata(
+            xray,
+            &[],
+            &subs,
+            &DnsConfig::default(),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_both_files_present() {
+        let rules = [geosite_rule(true)];
+        let dns = geosite_dns(true, true);
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &rules,
+            &[],
+            &dns,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn missing_geodata_one_file_missing() {
+        let rules = [geosite_rule(true)];
+        let dns = DnsConfig::default();
+        assert!(missing_geodata(
+            BackendType::Xray,
+            &rules,
+            &[],
+            &dns,
+            true,
+            false
+        ));
+        assert!(missing_geodata(
+            BackendType::Xray,
+            &rules,
+            &[],
+            &dns,
+            false,
+            true
+        ));
     }
 
     #[test]
