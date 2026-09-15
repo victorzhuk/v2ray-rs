@@ -6,7 +6,6 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use v2ray_rs_core::backend::{DetectedBackend, detect_all, validate_custom_path};
-use v2ray_rs_core::geodata::GeodataManager;
 use v2ray_rs_core::geodata_index::GeodataIndexManager;
 use v2ray_rs_core::models::{AppSettings, AutoResolveStrategy, BackendConfig, BackendType};
 use v2ray_rs_core::persistence::AppPaths;
@@ -241,64 +240,16 @@ pub(super) fn build_network_page(
             spinner.start();
 
             let backend_type = st.borrow().backend.backend_type;
-            let geodata_manager = GeodataManager::new(&paths);
             let paths_for_status = paths.clone();
             let paths_for_task = paths.clone();
-            let index_manager = GeodataIndexManager::new(&paths);
 
             let btn_clone = btn.clone();
             let spinner_clone = spinner.clone();
             let status_row_clone = status_row.clone();
 
             glib::MainContext::default().spawn_local(async move {
-                let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                    #[cfg(feature = "geodata-fetch")]
-                    {
-                        use v2ray_rs_core::geodata::{
-                            download_geodata, download_singbox_rule_sets,
-                        };
-                        use v2ray_rs_core::persistence::{load_routing_rules, load_subscriptions};
-
-                        if backend_type == BackendType::SingBox {
-                            let rules = load_routing_rules(&paths_for_task).unwrap_or_default();
-                            let subscriptions =
-                                load_subscriptions(&paths_for_task).unwrap_or_default();
-                            let tags = crate::geodata_service::singbox_rule_set_tags(
-                                &rules,
-                                &subscriptions,
-                            );
-                            let missing: Vec<String> = tags
-                                .into_iter()
-                                .filter(|tag| !geodata_manager.has_rule_set(tag))
-                                .collect();
-
-                            if !missing.is_empty() {
-                                download_singbox_rule_sets(&geodata_manager, &missing)
-                                    .map_err(|e| format!("Download failed: {}", e))?;
-                            }
-
-                            index_manager
-                                .build_singbox_index(&geodata_manager.rule_sets_dir())
-                                .map_err(|e| format!("Index build failed: {}", e))?;
-                        } else {
-                            download_geodata(&geodata_manager)
-                                .map_err(|e| format!("Download failed: {}", e))?;
-
-                            let geoip_path = geodata_manager.geoip_path();
-                            let geosite_path = geodata_manager.geosite_path();
-
-                            index_manager
-                                .build_index(backend_type, &geoip_path, &geosite_path)
-                                .map_err(|e| format!("Index build failed: {}", e))?;
-                        }
-
-                        Ok("Geodata updated successfully".to_string())
-                    }
-
-                    #[cfg(not(feature = "geodata-fetch"))]
-                    {
-                        Err("Geodata download feature not enabled".to_string())
-                    }
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::geodata_service::update_geodata(&paths_for_task, backend_type)
                 })
                 .await;
 

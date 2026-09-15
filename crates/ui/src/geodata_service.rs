@@ -339,3 +339,53 @@ fn refresh_once(config: GeodataRefreshConfig) -> Result<(), String> {
         Ok(())
     }
 }
+
+pub(crate) fn update_geodata(paths: &AppPaths, backend: BackendType) -> Result<(), String> {
+    #[cfg(feature = "geodata-fetch")]
+    {
+        use v2ray_rs_core::geodata::{
+            GeodataManager, download_geodata, download_singbox_rule_sets,
+        };
+        use v2ray_rs_core::geodata_index::GeodataIndexManager;
+        use v2ray_rs_core::persistence::{load_routing_rules, load_subscriptions};
+
+        let geodata_manager = GeodataManager::new(paths);
+        let index_manager = GeodataIndexManager::new(paths);
+
+        if backend == BackendType::SingBox {
+            let rules = load_routing_rules(paths).unwrap_or_default();
+            let subscriptions = load_subscriptions(paths).unwrap_or_default();
+            let tags = singbox_rule_set_tags(&rules, &subscriptions);
+            let missing: Vec<String> = tags
+                .into_iter()
+                .filter(|tag| !geodata_manager.has_rule_set(tag))
+                .collect();
+
+            if !missing.is_empty() {
+                download_singbox_rule_sets(&geodata_manager, &missing)
+                    .map_err(|e| format!("Download failed: {}", e))?;
+            }
+
+            index_manager
+                .build_singbox_index(&geodata_manager.rule_sets_dir())
+                .map_err(|e| format!("Index build failed: {}", e))?;
+        } else {
+            download_geodata(&geodata_manager).map_err(|e| format!("Download failed: {}", e))?;
+
+            let geoip_path = geodata_manager.geoip_path();
+            let geosite_path = geodata_manager.geosite_path();
+
+            index_manager
+                .build_index(backend, &geoip_path, &geosite_path)
+                .map_err(|e| format!("Index build failed: {}", e))?;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(not(feature = "geodata-fetch"))]
+    {
+        let _ = (paths, backend);
+        Err("Geodata download feature not enabled".to_string())
+    }
+}
