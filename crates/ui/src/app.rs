@@ -504,6 +504,10 @@ impl App {
             return Err(TUN_IPV6_DISABLED.into());
         }
 
+        if let Some(warning) = crate::connection::v2ray_tun_warning(&self.settings) {
+            self.show_toast(&warning);
+        }
+
         let rules = match self.store.load_routing_rules() {
             Ok(rules) => rules,
             Err(err) => {

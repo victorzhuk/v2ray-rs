@@ -468,6 +468,27 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
     })
 }
 
+/// The warning to surface when TUN is on but the backend is v2ray, which has no
+/// native TUN inbound: nothing is tunnelled, only the proxy endpoints work.
+pub(super) fn v2ray_tun_warning(settings: &AppSettings) -> Option<String> {
+    if !settings.tun.enabled || settings.backend.backend_type != BackendType::V2ray {
+        return None;
+    }
+    Some(format!(
+        "TUN is not supported by v2ray; only apps using the SOCKS proxy at {} or the HTTP proxy at {} are proxied",
+        listen_endpoint(&settings.listen_address, settings.socks_port),
+        listen_endpoint(&settings.listen_address, settings.http_port),
+    ))
+}
+
+fn listen_endpoint(addr: &str, port: u16) -> String {
+    if addr.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{addr}]:{port}")
+    } else {
+        format!("{addr}:{port}")
+    }
+}
+
 /// sing-box cannot program its strict IPv6 rules on a host whose kernel has
 /// IPv6 disabled and fails to start; xray's strict routing is done by netctl,
 /// which already skips the IPv6 rules there.
@@ -1494,6 +1515,56 @@ exit 1"#,
             },
             ..AppSettings::default()
         }
+    }
+
+    fn v2ray_settings(socks: u16, http: u16, listen: &str, tun: bool) -> AppSettings {
+        let mut settings = AppSettings {
+            tun: TunConfig {
+                enabled: tun,
+                ..TunConfig::default()
+            },
+            ..AppSettings::default()
+        };
+        settings.backend.backend_type = BackendType::V2ray;
+        settings.listen_address = listen.to_string();
+        settings.socks_port = socks;
+        settings.http_port = http;
+        settings
+    }
+
+    #[test]
+    fn v2ray_with_tun_warns_with_both_endpoints() {
+        let warning = v2ray_tun_warning(&v2ray_settings(2080, 2081, "127.0.0.1", true))
+            .expect("v2ray with TUN enabled must warn");
+
+        assert!(warning.contains("127.0.0.1:2080"), "{warning}");
+        assert!(warning.contains("127.0.0.1:2081"), "{warning}");
+        assert!(warning.contains("v2ray"), "{warning}");
+    }
+
+    #[test]
+    fn v2ray_without_tun_does_not_warn() {
+        assert!(v2ray_tun_warning(&v2ray_settings(2080, 2081, "127.0.0.1", false)).is_none());
+    }
+
+    #[test]
+    fn singbox_and_xray_with_tun_do_not_warn() {
+        for backend in [BackendType::SingBox, BackendType::Xray] {
+            let mut settings = v2ray_settings(2080, 2081, "127.0.0.1", true);
+            settings.backend.backend_type = backend;
+
+            assert!(v2ray_tun_warning(&settings).is_none(), "{backend:?}");
+        }
+    }
+
+    #[test]
+    fn ipv6_listen_address_is_bracketed() {
+        let warning = v2ray_tun_warning(&v2ray_settings(2080, 2081, "::1", true))
+            .expect("v2ray with TUN enabled must warn");
+
+        assert!(warning.contains("[::1]:2080"), "{warning}");
+        assert!(warning.contains("[::1]:2081"), "{warning}");
+        assert!(!warning.contains("::1:2080"), "{warning}");
     }
 
     #[test]
