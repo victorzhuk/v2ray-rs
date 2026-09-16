@@ -245,6 +245,26 @@ fn ws_node() -> ProxyNode {
     })
 }
 
+fn ws_node_with_headers() -> ProxyNode {
+    ProxyNode::Vless(VlessConfig {
+        address: "ws-headers.example.com".into(),
+        port: 443,
+        uuid: "550e8400-e29b-41d4-a716-446655440001".into(),
+        encryption: Some("none".into()),
+        flow: None,
+        transport: TransportSettings::Ws(WsSettings {
+            path: "/ws".into(),
+            host: Some("cdn.example.com".into()),
+            headers: [("User-Agent".to_string(), "x".to_string())].into(),
+        }),
+        tls: Some(TlsSettings {
+            server_name: Some("ws-headers.example.com".into()),
+            ..Default::default()
+        }),
+        remark: Some("WS with headers".into()),
+    })
+}
+
 #[test]
 fn pinned_node_and_ws_transport_options_pass_xray_test() {
     if !xray_available() {
@@ -287,7 +307,7 @@ fn pinned_node_and_ws_transport_options_pass_xray_test() {
         "pinned-node-with-ws-heartbeat",
         &settings,
         &rules,
-        &[ss_node(), ws_node()],
+        &[ss_node(), ws_node(), ws_node_with_headers()],
     );
 }
 
