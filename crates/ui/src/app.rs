@@ -92,9 +92,7 @@ pub struct App {
     session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
     auto_reconnect_attempts: u32,
-    health_failovers: u32,
-    excluded_node: Option<ConnectionNodeRef>,
-    health_reconnect_pending: bool,
+    health_failover: HealthFailover,
     reconnect_generation: u32,
     tun_release_in_flight: bool,
 }
@@ -213,6 +211,34 @@ impl App {
 
     fn restart_banner_visible(&self) -> bool {
         restart_banner_visible_for_state(self.restart_required, &self.process_state)
+    }
+
+    /// Stops the running session without touching the health failover, which
+    /// relies on its exclusion and budget surviving into the reconnect.
+    fn stop_session(&mut self, sender: &ComponentSender<Self>) {
+        let reconnect_pending = self.reconnect_pending;
+        self.session_target = session_target_after_stop(self.session_target, reconnect_pending);
+        self.clear_restart_flow();
+        self.cancel_auto_reconnect();
+        match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
+            DisconnectPlan::Stop => {
+                if let Some(handle) = self.process_handle.take() {
+                    self.apply_state(&ProcessState::Stopping);
+                    handle.stop();
+                }
+            }
+            DisconnectPlan::Release => {
+                self.reconnect_pending = false;
+                self.health_failover.reconnect_pending = false;
+                self.apply_state(&ProcessState::Stopped);
+                self.release_tun_session(sender);
+            }
+            DisconnectPlan::Nothing => {
+                self.reconnect_pending = false;
+                self.health_failover.reconnect_pending = false;
+                self.show_toast("Not connected");
+            }
+        }
     }
 
     // Deliberately leaves `reconnect_pending` alone: restart flows set it right
@@ -960,9 +986,7 @@ impl SimpleComponent for App {
             process_state: ProcessState::Stopped,
             health: None,
             dns_failing: false,
-            health_failovers: 0,
-            excluded_node: None,
-            health_reconnect_pending: false,
+            health_failover: HealthFailover::default(),
             reconnect_pending: false,
             connected: false,
             button_sensitive: true,
@@ -1164,13 +1188,11 @@ impl SimpleComponent for App {
                     self.settings.real_delay.use_for_lowest_latency,
                 );
                 if cancels_auto_reconnect(origin) {
-                    self.health_failovers = 0;
-                    self.excluded_node = None;
+                    self.health_failover.cancel();
                 }
-                let candidates = exclude_candidate(
-                    planner.plan(&subscriptions, &manual_nodes),
-                    self.excluded_node.take(),
-                );
+                let planned = planner.plan(&subscriptions, &manual_nodes);
+                self.health_failover.candidates = planned.len();
+                let candidates = exclude_candidate(planned, self.health_failover.excluded.take());
 
                 if candidates.is_empty() {
                     self.show_toast(
@@ -1231,8 +1253,7 @@ impl SimpleComponent for App {
                 };
 
                 if cancels_auto_reconnect(origin) {
-                    self.health_failovers = 0;
-                    self.excluded_node = None;
+                    self.health_failover.cancel();
                 }
                 if self.process_handle.is_some() {
                     if cancels_auto_reconnect(origin) {
@@ -1255,36 +1276,8 @@ impl SimpleComponent for App {
                     .map(|_| direct_session(target, origin));
             }
             AppMsg::Disconnect => {
-                let reconnect_pending = self.reconnect_pending;
-                self.session_target =
-                    session_target_after_stop(self.session_target, reconnect_pending);
-                self.clear_restart_flow();
-                self.cancel_auto_reconnect();
-                // The health failover issues this Disconnect itself and must
-                // keep its exclusion and budget for the reconnect that follows.
-                if !self.health_reconnect_pending {
-                    self.health_failovers = 0;
-                    self.excluded_node = None;
-                }
-                match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
-                    DisconnectPlan::Stop => {
-                        if let Some(handle) = self.process_handle.take() {
-                            self.apply_state(&ProcessState::Stopping);
-                            handle.stop();
-                        }
-                    }
-                    DisconnectPlan::Release => {
-                        self.reconnect_pending = false;
-                        self.health_reconnect_pending = false;
-                        self.apply_state(&ProcessState::Stopped);
-                        self.release_tun_session(&sender);
-                    }
-                    DisconnectPlan::Nothing => {
-                        self.reconnect_pending = false;
-                        self.health_reconnect_pending = false;
-                        self.show_toast("Not connected");
-                    }
-                }
+                self.health_failover.cancel();
+                self.stop_session(&sender);
             }
             AppMsg::ProcessStateConnection(generation, state, connection) => {
                 // A superseded connection keeps reporting until its teardown
@@ -1356,8 +1349,8 @@ impl SimpleComponent for App {
                 if stopped && !self.reconnect_pending {
                     self.regenerate_config_disconnected();
                 }
-                if stopped && self.health_reconnect_pending {
-                    self.health_reconnect_pending = false;
+                if stopped && self.health_failover.reconnect_pending {
+                    self.health_failover.reconnect_pending = false;
                     sender.input(AppMsg::Connect(ConnectOrigin::AutoReconnect));
                     return;
                 }
@@ -1433,7 +1426,7 @@ impl SimpleComponent for App {
                 let node = self.connection_status.as_ref().map(|meta| meta.node_ref);
                 let unhealthy = matches!(health, Health::Unhealthy(_));
                 if !unhealthy {
-                    self.health_failovers = 0;
+                    self.health_failover.count = 0;
                 }
                 if let Health::Unhealthy(reason) = &health
                     && should_announce(self.health.as_ref(), &health)
@@ -1450,13 +1443,11 @@ impl SimpleComponent for App {
                     && health_failover_allowed(
                         self.settings.health_check.failover,
                         self.session_target,
-                        self.health_failovers,
+                        &self.health_failover,
                     )
                 {
-                    self.excluded_node = node;
-                    self.health_failovers += 1;
-                    self.health_reconnect_pending = true;
-                    sender.input(AppMsg::Disconnect);
+                    self.health_failover.begin(node);
+                    self.stop_session(&sender);
                 }
             }
             AppMsg::DnsHealth(generation, failing) => {
@@ -1839,14 +1830,42 @@ struct SessionTarget {
     established: bool,
 }
 
-/// Only sessions picked by the configured strategy fail over for health, and
-/// only within a budget that a successful probe or a user action refills.
+/// Health failover progress for the strategy-picked session. `candidates` is
+/// the size of the last plan, before the failed node was excluded.
+#[derive(Debug, Default)]
+struct HealthFailover {
+    count: u32,
+    excluded: Option<ConnectionNodeRef>,
+    reconnect_pending: bool,
+    candidates: usize,
+}
+
+impl HealthFailover {
+    fn begin(&mut self, node: Option<ConnectionNodeRef>) {
+        self.excluded = node;
+        self.count += 1;
+        self.reconnect_pending = true;
+    }
+
+    fn cancel(&mut self) {
+        self.count = 0;
+        self.excluded = None;
+        self.reconnect_pending = false;
+    }
+}
+
+/// Only sessions picked by the configured strategy fail over for health, only
+/// when another node is left to try, and only within a budget that a
+/// successful probe or a user action refills.
 fn health_failover_allowed(
     enabled: bool,
     session_target: Option<SessionTarget>,
-    count: u32,
+    failover: &HealthFailover,
 ) -> bool {
-    enabled && session_target.is_none() && count < MAX_AUTO_RECONNECTS
+    enabled
+        && session_target.is_none()
+        && failover.candidates > 1
+        && failover.count < MAX_AUTO_RECONNECTS
 }
 
 fn exclude_candidate(
@@ -2888,23 +2907,69 @@ mod tests {
         );
     }
 
+    fn failover(count: u32, candidates: usize) -> HealthFailover {
+        HealthFailover {
+            count,
+            candidates,
+            ..HealthFailover::default()
+        }
+    }
+
     #[test]
     fn health_failover_allowed_rejects_direct_target() {
         let target = direct_session(session_target_node(), ConnectOrigin::User);
 
-        assert!(health_failover_allowed(true, None, 0));
-        assert!(!health_failover_allowed(true, Some(target), 0));
+        assert!(health_failover_allowed(true, None, &failover(0, 2)));
+        assert!(!health_failover_allowed(
+            true,
+            Some(target),
+            &failover(0, 2)
+        ));
     }
 
     #[test]
     fn health_failover_allowed_rejects_exhausted_budget() {
-        assert!(health_failover_allowed(true, None, MAX_AUTO_RECONNECTS - 1));
-        assert!(!health_failover_allowed(true, None, MAX_AUTO_RECONNECTS));
+        assert!(health_failover_allowed(
+            true,
+            None,
+            &failover(MAX_AUTO_RECONNECTS - 1, 2)
+        ));
+        assert!(!health_failover_allowed(
+            true,
+            None,
+            &failover(MAX_AUTO_RECONNECTS, 2)
+        ));
     }
 
     #[test]
     fn health_failover_allowed_rejects_disabled_preference() {
-        assert!(!health_failover_allowed(false, None, 0));
+        assert!(!health_failover_allowed(false, None, &failover(0, 2)));
+    }
+
+    #[test]
+    fn health_failover_allowed_rejects_single_candidate() {
+        assert!(!health_failover_allowed(true, None, &failover(0, 1)));
+        assert!(!health_failover_allowed(true, None, &failover(0, 0)));
+    }
+
+    #[test]
+    fn user_action_cancels_pending_health_failover() {
+        let node = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::from_u128(1),
+        };
+        let mut state = failover(0, 2);
+        state.begin(Some(node));
+        assert!(state.reconnect_pending);
+        assert_eq!(state.count, 1);
+        assert!(cancels_auto_reconnect(ConnectOrigin::User));
+        assert!(!cancels_auto_reconnect(ConnectOrigin::AutoReconnect));
+
+        state.cancel();
+
+        assert!(!state.reconnect_pending);
+        assert_eq!(state.count, 0);
+        assert_eq!(state.excluded, None);
+        assert_eq!(state.candidates, 2);
     }
 
     fn manual_candidate(node_id: uuid::Uuid) -> ConnectionCandidate {
