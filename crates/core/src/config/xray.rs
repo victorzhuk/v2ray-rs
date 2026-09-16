@@ -568,7 +568,7 @@ mod tests {
             .iter()
             .find(|i| i["protocol"] == "tun")
             .expect("xray tun inbound missing");
-        assert_eq!(tun["settings"]["autoOutboundsInterface"], "auto");
+        assert!(tun["settings"].get("autoOutboundsInterface").is_none());
         assert_eq!(tun["sniffing"]["enabled"], true);
     }
 

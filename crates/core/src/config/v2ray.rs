@@ -186,7 +186,6 @@ fn build_xray_tun_inbound(tun: &TunConfig) -> Value {
             "name": tun.interface_name,
             "mtu": tun.mtu,
             "gateway": tun.addresses(),
-            "autoOutboundsInterface": "auto",
         },
         "sniffing": {
             "enabled": true,
@@ -1239,7 +1238,7 @@ mod tests {
         assert_eq!(tun["settings"]["name"], "tun0");
         assert_eq!(tun["settings"]["mtu"], 1500);
         assert_eq!(tun["settings"]["gateway"], json!(["198.18.0.1/30"]));
-        assert_eq!(tun["settings"]["autoOutboundsInterface"], "auto");
+        assert!(tun["settings"].get("autoOutboundsInterface").is_none());
         assert_eq!(tun["sniffing"]["enabled"], true);
     }
 
