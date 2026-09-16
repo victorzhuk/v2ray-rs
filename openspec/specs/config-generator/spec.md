@@ -199,11 +199,11 @@ When TUN is enabled and the backend is sing-box, the system SHALL add a native `
 - **THEN** the generated sing-box config SHALL NOT contain any inbound of type `tun`
 
 ### Requirement: Generate xray TUN inbound
-When TUN is enabled and the backend is xray, the system SHALL add a native `tun` protocol inbound to the generated config alongside the existing socks/http inbounds, with the configured name, MTU, gateway address(es), DNS, `autoOutboundsInterface: "auto"`, and sniffing enabled. When `dns_hijack` is `Hijack`, the config SHALL additionally contain a `{"protocol": "dns", "tag": "dns-out"}` outbound and a routing rule `{"network": "udp", "port": 53, "outboundTag": "dns-out"}` placed after the `dns-internal` inboundTag rule and before exclusion and user rules; `Native` and `Disabled` SHALL omit both.
+When TUN is enabled and the backend is xray, the system SHALL add a native `tun` protocol inbound to the generated config alongside the existing socks/http inbounds, with the configured name, MTU, gateway address(es), DNS, and sniffing enabled; the inbound SHALL NOT set `autoOutboundsInterface`. When `dns_hijack` is `Hijack`, the config SHALL additionally contain a `{"protocol": "dns", "tag": "dns-out"}` outbound and a routing rule `{"network": "udp", "port": 53, "outboundTag": "dns-out"}` placed after the `dns-internal` inboundTag rule and before exclusion and user rules; `Native` and `Disabled` SHALL omit both.
 
 #### Scenario: xray TUN inbound emitted when enabled
 - **WHEN** TUN is enabled with xray, address `198.18.0.1/30`, and MTU 1500
-- **THEN** the generated config inbounds SHALL include a `{ "protocol": "tun", "settings": { "name": "...", "mtu": 1500, "gateway": ["198.18.0.1/30"], "autoOutboundsInterface": "auto" } }` entry with sniffing enabled
+- **THEN** the generated config inbounds SHALL include a `{ "protocol": "tun", "settings": { "name": "...", "mtu": 1500, "gateway": ["198.18.0.1/30"] } }` entry with sniffing enabled and no `autoOutboundsInterface` key
 
 #### Scenario: No xray TUN inbound when disabled
 - **WHEN** TUN is disabled
