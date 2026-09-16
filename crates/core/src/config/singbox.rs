@@ -38,7 +38,7 @@ fn assemble(
     let first_proxy_tag = super::common::outbound_tag(&nodes[0], 0);
     let via_tags = super::v2ray::via_outbound_tags(nodes, rules);
     let mut config = json!({
-        "log": { "level": "warn" },
+        "log": { "level": settings.logging.backend_level.singbox_level() },
         "inbounds": build_inbounds(settings),
         "outbounds": build_outbounds(nodes, settings)?,
         "route": build_route(rules, &first_proxy_tag, &via_tags, settings),
@@ -873,6 +873,31 @@ mod tests {
         assert!(config["inbounds"].is_array());
         assert!(config["outbounds"].is_array());
         assert!(config["route"].is_object());
+    }
+
+    #[test]
+    fn singbox_log_maps_levels_and_ignores_connection_log() {
+        let expected = [
+            (BackendLogLevel::Error, "error"),
+            (BackendLogLevel::Warning, "warn"),
+            (BackendLogLevel::Info, "info"),
+            (BackendLogLevel::Debug, "debug"),
+        ];
+        for (backend_level, level) in expected {
+            for connection_log in [false, true] {
+                let settings = AppSettings {
+                    logging: LoggingSettings {
+                        backend_level,
+                        connection_log,
+                    },
+                    ..default_settings()
+                };
+                let config = SingboxGenerator
+                    .generate(&[ss_node()], &[], &settings)
+                    .unwrap();
+                assert_eq!(config["log"], json!({ "level": level }));
+            }
+        }
     }
 
     #[test]

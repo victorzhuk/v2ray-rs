@@ -3,9 +3,9 @@ use serde_json::{Value, json};
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
     AppSettings, BackendType, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch,
-    DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction,
-    RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig,
-    VmessConfig, WsSettings, XhttpSettings,
+    DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings, LoggingSettings, ProxyNode,
+    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
+    TunConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -66,6 +66,14 @@ pub(crate) fn v2ray_supports(node: &ProxyNode) -> bool {
     v2ray_refusal(node).is_none()
 }
 
+fn log_object(logging: &LoggingSettings) -> Value {
+    let mut log = json!({ "loglevel": logging.backend_level.as_str() });
+    if !logging.connection_log {
+        log["access"] = json!("none");
+    }
+    log
+}
+
 pub(crate) fn generate_v2ray_family_config(
     nodes: &[ProxyNode],
     rules: &[RoutingRule],
@@ -83,7 +91,7 @@ pub(crate) fn generate_v2ray_family_config(
     let has_direct_dns = dns.as_ref().is_some_and(has_direct_dns_server);
 
     let mut config = json!({
-        "log": { "loglevel": "warning" },
+        "log": log_object(&settings.logging),
         // Partial policy is valid; omitted timers keep backend defaults.
         // Without it xray's stock connIdle (300s) kills long-idle streams.
         "policy": {
@@ -1042,6 +1050,43 @@ mod tests {
         for backend in [V2rayFamilyBackend::V2ray, V2rayFamilyBackend::Xray] {
             let config = generate_v2ray_family_config(&[vless_node()], &[], &settings, backend);
             assert_eq!(config["policy"]["levels"]["0"]["connIdle"], 900);
+        }
+    }
+
+    #[test]
+    fn v2ray_log_info_with_connection_log_omits_access() {
+        let settings = AppSettings {
+            logging: LoggingSettings {
+                backend_level: BackendLogLevel::Info,
+                connection_log: true,
+            },
+            ..default_settings()
+        };
+
+        for backend in [V2rayFamilyBackend::V2ray, V2rayFamilyBackend::Xray] {
+            let config = generate_v2ray_family_config(&[vless_node()], &[], &settings, backend);
+            assert_eq!(config["log"], json!({ "loglevel": "info" }));
+        }
+    }
+
+    #[test]
+    fn v2ray_log_off_sets_access_none_at_every_level() {
+        for level in BackendLogLevel::ALL {
+            let settings = AppSettings {
+                logging: LoggingSettings {
+                    backend_level: level,
+                    connection_log: false,
+                },
+                ..default_settings()
+            };
+
+            for backend in [V2rayFamilyBackend::V2ray, V2rayFamilyBackend::Xray] {
+                let config = generate_v2ray_family_config(&[vless_node()], &[], &settings, backend);
+                assert_eq!(
+                    config["log"],
+                    json!({ "loglevel": level.as_str(), "access": "none" })
+                );
+            }
         }
     }
 

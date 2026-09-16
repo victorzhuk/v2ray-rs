@@ -238,6 +238,19 @@ mod tests {
     }
 
     #[test]
+    fn xray_log_defaults_silence_access() {
+        let node = ws_vless_with_host_header(&[]);
+        let config = XrayGenerator
+            .generate(&[node], &[], &AppSettings::default())
+            .unwrap();
+
+        assert_eq!(
+            config["log"],
+            serde_json::json!({ "loglevel": "warning", "access": "none" })
+        );
+    }
+
+    #[test]
     fn test_ws_host_header_moves_to_dedicated_field() {
         let node = ws_vless_with_host_header(&[]);
         let config = XrayGenerator

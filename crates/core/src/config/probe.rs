@@ -256,6 +256,26 @@ mod tests {
     }
 
     #[test]
+    fn probe_configs_keep_fixed_log_objects() {
+        let nodes = mixed_nodes();
+        let refs: Vec<&SubscriptionNode> = nodes.iter().collect();
+        let expected = [
+            (BackendType::SingBox, json!({ "level": "warn" })),
+            (BackendType::Xray, json!({ "loglevel": "warning" })),
+            (BackendType::V2ray, json!({ "loglevel": "warning" })),
+        ];
+        for (backend, log) in expected {
+            let config = probe_generator_for(backend).unwrap().generate(
+                &refs,
+                19_080,
+                "https://www.gstatic.com/generate_204",
+                5000,
+            );
+            assert_eq!(config["log"], log, "{backend:?}");
+        }
+    }
+
+    #[test]
     fn singbox_probe_config_shape() {
         let nodes = mixed_nodes();
         let refs: Vec<&SubscriptionNode> = nodes.iter().collect();
