@@ -1490,7 +1490,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_record_marks_start_failed_on_tun_device_timeout() {
+    async fn exit_record_marks_start_failed_on_xray_up_failure() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
             .with_log_file(Some(backend_log(dir.path())));
