@@ -1,5 +1,5 @@
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::str::FromStr;
 
@@ -189,6 +189,19 @@ impl AppSettings {
             .map_err(|_| ValidationError::InvalidListenAddress(addr.to_string()))
     }
 
+    /// Address a local client connects to for a port bound on `listen_address`.
+    /// An unspecified bind address maps to the loopback of its family; an
+    /// unparsable one falls back to IPv4 loopback.
+    pub fn local_endpoint(&self, port: u16) -> SocketAddr {
+        let ip = match IpAddr::from_str(&self.listen_address) {
+            Ok(IpAddr::V4(v4)) if v4.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+            Ok(IpAddr::V6(v6)) if v6.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+            Ok(ip) => ip,
+            Err(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+        SocketAddr::new(ip, port)
+    }
+
     /// Validates a Real Delay test URL: must be a syntactically valid
     /// `http://` or `https://` URL. Other schemes are rejected.
     pub fn validate_real_delay_url(url: &str) -> Result<(), ValidationError> {
@@ -329,6 +342,28 @@ mod tests {
                 result,
                 Err(ValidationError::InvalidListenAddress(_))
             ));
+        }
+    }
+
+    #[test]
+    fn local_endpoint_maps_unspecified_to_loopback() {
+        let cases = [
+            ("127.0.0.1", "127.0.0.1:1080"),
+            ("0.0.0.0", "127.0.0.1:1080"),
+            ("::", "[::1]:1080"),
+            ("192.168.1.10", "192.168.1.10:1080"),
+            ("localhost", "127.0.0.1:1080"),
+        ];
+        for (listen, want) in cases {
+            let settings = AppSettings {
+                listen_address: listen.to_string(),
+                ..AppSettings::default()
+            };
+            assert_eq!(
+                settings.local_endpoint(1080),
+                want.parse::<SocketAddr>().unwrap(),
+                "listen_address {listen}"
+            );
         }
     }
 
