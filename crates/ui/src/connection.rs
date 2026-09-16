@@ -1,10 +1,11 @@
-use std::net::SocketAddr;
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, broadcast, mpsc};
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
+use tokio::task::{JoinHandle, JoinSet};
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
@@ -479,6 +480,92 @@ fn spawn_with(
 const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box strict_route turned off for this session (IPv4 routing unchanged)";
 
 const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[cfg_attr(not(test), allow(dead_code))]
+const PIN_LOOKUP_CONCURRENCY: usize = 16;
+
+#[allow(dead_code)]
+async fn os_lookup(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
+    let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+    Ok(addrs.map(|addr| addr.ip()).collect())
+}
+
+/// Looks up every host concurrently within one overall `deadline`. A host
+/// whose lookup fails, comes back empty, or is still running at the deadline
+/// takes its `last_good` addresses, or is left out when there are none.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn resolve_pins<F, Fut>(
+    hosts: Vec<(String, u16)>,
+    last_good: &[HostOverride],
+    deadline: Duration,
+    lookup: F,
+) -> HashMap<String, Vec<IpAddr>>
+where
+    F: Fn(String, u16) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = std::io::Result<Vec<IpAddr>>> + Send + 'static,
+{
+    let mut resolved = HashMap::new();
+    if hosts.is_empty() {
+        return resolved;
+    }
+
+    let until = tokio::time::Instant::now() + deadline;
+    let permits = Arc::new(Semaphore::new(PIN_LOOKUP_CONCURRENCY));
+    let mut lookups = JoinSet::new();
+    for (host, port) in hosts.iter().cloned() {
+        let permits = Arc::clone(&permits);
+        let lookup = lookup.clone();
+        lookups.spawn(async move {
+            let _permit = permits.acquire_owned().await;
+            let result = lookup(host.clone(), port).await;
+            (host, result)
+        });
+    }
+
+    let mut answers = HashMap::new();
+    while let Ok(Some(joined)) = tokio::time::timeout_at(until, lookups.join_next()).await {
+        if let Ok((host, result)) = joined {
+            answers.insert(host, result);
+        }
+    }
+    // Aborts whatever is still looking up past the deadline.
+    drop(lookups);
+
+    for (host, _) in hosts {
+        let failure = match answers.remove(&host) {
+            Some(Ok(addrs)) if !addrs.is_empty() => {
+                resolved.insert(host, unique(addrs));
+                continue;
+            }
+            Some(Ok(_)) => "no addresses".to_string(),
+            Some(Err(err)) => err.to_string(),
+            None => "lookup timed out".to_string(),
+        };
+        log::warn!("cannot pin {host}: {failure}");
+        let fallback = unique(
+            last_good
+                .iter()
+                .filter(|h| h.domain == host)
+                .filter_map(|h| h.ip.parse::<IpAddr>().ok()),
+        );
+        if !fallback.is_empty() {
+            log::warn!("pin {host}: using last good addresses");
+            resolved.insert(host, fallback);
+        }
+    }
+    resolved
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn unique(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    for ip in ips {
+        if !out.contains(&ip) {
+            out.push(ip);
+        }
+    }
+    out
+}
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn pins_enabled(settings: &AppSettings) -> bool {
@@ -2431,6 +2518,104 @@ exit 1"#,
             &xray_tun_settings(),
         );
         assert!(hosts.is_empty(), "{hosts:?}");
+    }
+
+    #[tokio::test]
+    async fn resolve_pins_uses_last_good_when_lookup_fails() {
+        let last_good = [
+            HostOverride {
+                domain: "broken-h2.invalid".into(),
+                ip: "203.0.113.7".into(),
+            },
+            HostOverride {
+                domain: "broken-h2.invalid".into(),
+                ip: "not-an-ip".into(),
+            },
+            HostOverride {
+                domain: "fresh-h2.invalid".into(),
+                ip: "203.0.113.99".into(),
+            },
+        ];
+        let resolved = resolve_pins(
+            vec![
+                ("broken-h2.invalid".into(), 443),
+                ("fresh-h2.invalid".into(), 443),
+            ],
+            &last_good,
+            Duration::from_secs(5),
+            |host: String, _port| async move {
+                if host == "fresh-h2.invalid" {
+                    Ok(vec!["198.51.100.5".parse().unwrap()])
+                } else {
+                    Err(std::io::Error::other("no such host"))
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(
+            resolved.get("broken-h2.invalid"),
+            Some(&vec!["203.0.113.7".parse::<IpAddr>().unwrap()])
+        );
+        assert_eq!(
+            resolved.get("fresh-h2.invalid"),
+            Some(&vec!["198.51.100.5".parse::<IpAddr>().unwrap()])
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_pins_drops_timed_out_host_without_last_good() {
+        let capture = crate::logging::install_test_capture();
+        let started = tokio::time::Instant::now();
+        let resolved = resolve_pins(
+            vec![("slow.invalid".into(), 443)],
+            &[],
+            Duration::from_millis(100),
+            |_host, _port| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(vec!["198.51.100.5".parse().unwrap()])
+            },
+        )
+        .await;
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(!resolved.contains_key("slow.invalid"), "{resolved:?}");
+        assert!(
+            !capture
+                .lines_containing("cannot pin slow.invalid: lookup timed out")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resolve_pins_caps_lookups_at_16() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let hosts = (0..40)
+            .map(|i| (format!("host{i}-h2.invalid"), 443))
+            .collect();
+        let lookup = {
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            move |_host: String, _port: u16| {
+                let in_flight = Arc::clone(&in_flight);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    Ok(vec!["198.51.100.5".parse().unwrap()])
+                }
+            }
+        };
+
+        let resolved = resolve_pins(hosts, &[], Duration::from_secs(5), lookup).await;
+
+        assert_eq!(resolved.len(), 40);
+        assert_eq!(peak.load(Ordering::SeqCst), PIN_LOOKUP_CONCURRENCY);
     }
 
     #[test]
