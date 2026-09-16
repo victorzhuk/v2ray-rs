@@ -3,6 +3,7 @@ use std::sync::Mutex;
 use adw::prelude::*;
 use clap::Parser;
 use gtk::glib;
+use nix::sys::signal::Signal;
 use relm4::adw;
 use relm4::prelude::*;
 use tokio::sync::broadcast;
@@ -96,6 +97,7 @@ pub struct App {
     health_failover: HealthFailover,
     reconnect_generation: u32,
     tun_release_in_flight: bool,
+    _signal_sources: Vec<glib::SourceId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,6 +311,10 @@ impl App {
     }
 
     fn quit(&mut self, sender: &ComponentSender<Self>) {
+        if force_exit_on_second_signal(self.pending_exit) {
+            log::warn!("quit requested again while exit is pending, exiting now");
+            std::process::exit(1);
+        }
         self.cancel_auto_reconnect();
         if self.tun_release_in_flight {
             self.pending_exit = true;
@@ -924,6 +930,18 @@ impl SimpleComponent for App {
             });
         }
 
+        let signal_sources = [Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP]
+            .into_iter()
+            .map(|signal| {
+                let s = sender.input_sender().clone();
+                glib::unix_signal_add_local(signal as i32, move || {
+                    log::info!("received {}, quitting", signal.as_str());
+                    s.emit(AppMsg::TrayQuit);
+                    glib::ControlFlow::Continue
+                })
+            })
+            .collect();
+
         let show_wizard = settings_load_error.is_none() && !settings.onboarding_complete;
 
         let subscriptions_page = SubscriptionsPage::builder()
@@ -1035,6 +1053,7 @@ impl SimpleComponent for App {
             auto_reconnect_attempts: 0,
             reconnect_generation: 0,
             tun_release_in_flight: false,
+            _signal_sources: signal_sources,
         };
 
         let toast_overlay = &model.toast_overlay;
@@ -1682,6 +1701,12 @@ fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> Qu
     } else {
         QuitPlan::Exit
     }
+}
+
+/// A repeated quit while a stop is still pending exits at once, so a wedged
+/// stop cannot make the app unkillable.
+fn force_exit_on_second_signal(pending_exit: bool) -> bool {
+    pending_exit
 }
 
 fn origin_field(origin: ConnectOrigin, direct: bool) -> &'static str {
@@ -2431,6 +2456,17 @@ mod tests {
             quit_plan(false, &ProcessState::Stopped, true),
             QuitPlan::Release
         );
+    }
+
+    #[test]
+    fn second_quit_signal_forces_exit() {
+        for (pending_exit, expected) in [(false, false), (true, true)] {
+            assert_eq!(
+                force_exit_on_second_signal(pending_exit),
+                expected,
+                "pending_exit={pending_exit}"
+            );
+        }
     }
 
     #[test]
