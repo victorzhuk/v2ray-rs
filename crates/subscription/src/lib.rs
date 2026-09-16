@@ -1,4 +1,5 @@
 pub(crate) mod fetch;
+pub(crate) mod health;
 pub(crate) mod json_import;
 pub(crate) mod manager;
 pub(crate) mod observatory;
@@ -8,6 +9,7 @@ pub(crate) mod real_delay;
 pub(crate) mod update;
 
 pub use fetch::{FetchError, decode_subscription_content, fetch_from_file};
+pub use health::probe_via_http_proxy;
 pub use json_import::{JsonImport, parse_json_subscription};
 pub use manager::{SubscriptionError, SubscriptionImportOutcome, SubscriptionService};
 pub use observatory::{
