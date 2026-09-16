@@ -241,6 +241,7 @@ fn spawn_with(
                 &subscriptions,
                 &manual_nodes,
             ));
+            let mut applied = Vec::new();
             if pins_enabled(&effective_settings) {
                 // A parked candidate's tunnel is still up, so a probe would
                 // measure its kill switch rather than the node.
@@ -251,7 +252,7 @@ fn spawn_with(
                 } else {
                     &resolved
                 };
-                apply_pins(&mut effective_settings, &nodes, pins);
+                applied = apply_pins(&mut effective_settings, &nodes, pins);
             }
             if drop_strict_route {
                 effective_settings.tun.strict_route = false;
@@ -371,6 +372,9 @@ fn spawn_with(
                         return;
                     }
                     report(ProcessState::Running, Some(meta.clone()));
+                    if !applied.is_empty() {
+                        sender.emit(AppMsg::NodePins(generation, applied));
+                    }
                 }
                 Err(e) => {
                     if e.is_host_level() {
@@ -654,18 +658,20 @@ fn pin_hosts(
 
 /// Pins each hostname-addressed node to its resolved addresses in `dns.hosts`.
 /// Every family is carried; the generator keeps what its backend can use. A
-/// hostname the user already overrides keeps that override.
+/// hostname the user already overrides keeps that override. Returns the pins
+/// added, never the user's overrides.
 fn apply_pins(
     settings: &mut AppSettings,
     nodes: &[ProxyNode],
     resolved: &HashMap<String, Vec<IpAddr>>,
-) {
+) -> Vec<HostOverride> {
     let overridden: Vec<String> = settings
         .dns
         .hosts
         .iter()
         .map(|h| h.domain.clone())
         .collect();
+    let first_pin = settings.dns.hosts.len();
     let mut seen: Vec<&str> = Vec::new();
     for node in nodes {
         let host = node.address();
@@ -687,6 +693,7 @@ fn apply_pins(
                 ip: ip.to_string(),
             }));
     }
+    settings.dns.hosts[first_pin..].to_vec()
 }
 
 fn probe_allowed(parked: Option<&ProcessManager>) -> bool {

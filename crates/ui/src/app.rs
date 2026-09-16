@@ -17,9 +17,9 @@ use v2ray_rs_core::instance::{
 };
 use v2ray_rs_core::models::{
     AppSettings, AutoResolveStrategy, BackendType, ConnectionMetadata, ConnectionNodeRef,
-    DnsConfig, DnsRuleMatch, LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet,
-    RuleMatch, Subscription, SubscriptionSource, TunConfig, resolve_effective_config,
-    uses_imported_profile,
+    DnsConfig, DnsRuleMatch, HostOverride, LastSuccessMetadata, ManualNode, RoutingRule,
+    RoutingRuleSet, RuleMatch, Subscription, SubscriptionSource, TunConfig,
+    resolve_effective_config, uses_imported_profile,
 };
 use v2ray_rs_core::persistence::{AppPaths, TunSession};
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -72,6 +72,7 @@ pub struct App {
     tun_lifecycle: crate::connection::TunLifecycle,
     connection_generation: u64,
     grant_generation: Option<u64>,
+    last_good_pins: Vec<HostOverride>,
     process_state: ProcessState,
     health: Option<Health>,
     dns_failing: bool,
@@ -145,6 +146,7 @@ pub enum AppMsg {
     AutoReconnect(u32),
     TunReleased,
     TunGrantRequired(u64),
+    NodePins(u64, Vec<HostOverride>),
     DownloadGeodata,
 }
 
@@ -660,7 +662,7 @@ impl App {
                 generation,
                 host_has_ipv6,
                 health_timing: HealthTiming::default(),
-                last_good_pins: Vec::new(),
+                last_good_pins: self.last_good_pins.clone(),
             },
             sender.input_sender().clone(),
         );
@@ -1042,6 +1044,7 @@ impl SimpleComponent for App {
             tun_lifecycle,
             connection_generation: 0,
             grant_generation: None,
+            last_good_pins: Vec::new(),
             process_state: ProcessState::Stopped,
             health: None,
             dns_failing: false,
@@ -1486,6 +1489,14 @@ impl SimpleComponent for App {
                     self.grant_generation = Some(generation);
                 }
             }
+            AppMsg::NodePins(generation, pins) => {
+                apply_node_pins(
+                    &mut self.last_good_pins,
+                    generation,
+                    self.connection_generation,
+                    pins,
+                );
+            }
             AppMsg::ProcessLogLine(generation, line) => {
                 // A superseded connection keeps streaming until its teardown
                 // finishes; drop what it logged meanwhile.
@@ -1831,6 +1842,21 @@ fn auto_reconnect_fires(message: u32, current: u32, has_handle: bool) -> bool {
 /// produced them; only the app's current one is live.
 fn is_current_generation(message: u64, current: u64) -> bool {
     message == current
+}
+
+/// Keeps the addresses the current connection pinned, replacing whatever an
+/// earlier session pinned for the same hostnames.
+fn apply_node_pins(
+    store: &mut Vec<HostOverride>,
+    message_generation: u64,
+    current_generation: u64,
+    pins: Vec<HostOverride>,
+) {
+    if !is_current_generation(message_generation, current_generation) {
+        return;
+    }
+    store.retain(|kept| !pins.iter().any(|pin| pin.domain == kept.domain));
+    store.extend(pins);
 }
 
 /// The extra affordance an Error toast can carry.
@@ -2694,6 +2720,37 @@ mod tests {
         );
         assert_eq!(error_toast_action(generation, Some(generation + 1)), None);
         assert_eq!(error_toast_action(generation, None), None);
+    }
+
+    fn pin(domain: &str, ip: &str) -> HostOverride {
+        HostOverride {
+            domain: domain.to_string(),
+            ip: ip.to_string(),
+        }
+    }
+
+    #[test]
+    fn node_pins_from_stale_generation_are_ignored() {
+        let mut store = vec![pin("a.example", "192.0.2.1")];
+        apply_node_pins(&mut store, 3, 4, vec![pin("a.example", "192.0.2.9")]);
+        assert_eq!(store, [pin("a.example", "192.0.2.1")]);
+
+        apply_node_pins(&mut store, 4, 4, vec![pin("a.example", "192.0.2.9")]);
+        assert_eq!(store, [pin("a.example", "192.0.2.9")]);
+    }
+
+    #[test]
+    fn node_pins_replace_only_their_hostnames() {
+        let mut store = vec![
+            pin("a.example", "192.0.2.1"),
+            pin("a.example", "2001:db8::1"),
+            pin("b.example", "192.0.2.2"),
+        ];
+        apply_node_pins(&mut store, 1, 1, vec![pin("a.example", "192.0.2.7")]);
+        assert_eq!(
+            store,
+            [pin("b.example", "192.0.2.2"), pin("a.example", "192.0.2.7")]
+        );
     }
 
     fn routing_rule(match_condition: RuleMatch, enabled: bool) -> RoutingRule {
