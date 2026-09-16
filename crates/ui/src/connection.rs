@@ -802,13 +802,11 @@ fn unpinned_host<'a>(settings: &AppSettings, nodes: &'a [ProxyNode]) -> Option<&
 }
 
 fn dns_capture_off_notice(host: &str) -> String {
-    format!(
-        "notice: DNS capture off for this session: {host} could not be resolved before connecting"
-    )
+    format!("notice: DNS capture off for this session: {host} has no usable pinned address")
 }
 
 fn dns_capture_off_toast(host: &str) -> String {
-    format!("DNS capture is off for this session: {host} could not be resolved")
+    format!("DNS capture is off for this session: {host} has no usable pinned address")
 }
 
 fn hijack_field(mode: DnsHijackMode) -> &'static str {
