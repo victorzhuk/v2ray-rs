@@ -200,6 +200,7 @@ impl TransportRows {
                 .build(),
             grpc_multi_mode: adw::SwitchRow::builder()
                 .title("gRPC Multi Mode")
+                .subtitle("Not used by sing-box")
                 .active(grpc_multi_mode)
                 .build(),
             h2_host: adw::EntryRow::builder()
@@ -340,7 +341,7 @@ impl TlsRows {
                 .text(tls.short_id.as_deref().unwrap_or_default())
                 .build(),
             spider_x: adw::EntryRow::builder()
-                .title("Reality Spider X")
+                .title("Reality Spider X (not used by sing-box)")
                 .text(tls.spider_x.as_deref().unwrap_or_default())
                 .build(),
         };
@@ -1221,4 +1222,53 @@ fn comma_separated_values(row: &adw::EntryRow) -> Vec<String> {
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn grpc_multi_mode_row_notes_sing_box_and_keeps_value() {
+        crate::gtk_test::run(|| {
+            let rows = TransportRows::new(&TransportSettings::Grpc(GrpcSettings {
+                service_name: "svc".into(),
+                multi_mode: true,
+            }));
+
+            assert_eq!(rows.grpc_multi_mode.title(), "gRPC Multi Mode");
+            assert_eq!(
+                rows.grpc_multi_mode.subtitle(),
+                Some("Not used by sing-box".into())
+            );
+            assert!(rows.grpc_multi_mode.is_sensitive());
+            match rows.value() {
+                TransportSettings::Grpc(grpc) => {
+                    assert_eq!(grpc.service_name, "svc");
+                    assert!(grpc.multi_mode);
+                }
+                other => panic!("expected gRPC transport, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn spider_x_row_notes_sing_box_and_keeps_value() {
+        crate::gtk_test::run(|| {
+            let rows = TlsRows::new(Some(&TlsSettings {
+                reality: true,
+                public_key: Some("pk".into()),
+                spider_x: Some("/spx".into()),
+                ..Default::default()
+            }));
+
+            assert_eq!(
+                rows.spider_x.title(),
+                "Reality Spider X (not used by sing-box)"
+            );
+            assert!(rows.spider_x.is_sensitive());
+            let tls = rows.value().expect("TLS stays enabled");
+            assert_eq!(tls.spider_x.as_deref(), Some("/spx"));
+        });
+    }
 }
