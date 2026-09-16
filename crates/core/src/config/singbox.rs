@@ -338,10 +338,10 @@ fn build_ws_transport(ws: &WsSettings) -> Value {
         "path": ws.path,
     });
     let mut headers = ws.headers.clone();
-    if let Some(host) = &ws.host {
-        headers
-            .entry("Host".to_string())
-            .or_insert_with(|| host.clone());
+    if let Some(host) = &ws.host
+        && !headers.keys().any(|k| k.eq_ignore_ascii_case("host"))
+    {
+        headers.insert("Host".to_string(), host.clone());
     }
     if !headers.is_empty() {
         transport["headers"] = json!(headers);
@@ -1149,6 +1149,34 @@ mod tests {
         assert_eq!(out["transport"]["path"], "/ws");
         assert_eq!(out["tls"]["enabled"], true);
         assert_eq!(out["tls"]["server_name"], "example.com");
+    }
+
+    #[test]
+    fn test_singbox_ws_lowercase_host_header_wins_over_node_host() {
+        let node = ProxyNode::Vless(VlessConfig {
+            transport: TransportSettings::Ws(WsSettings {
+                path: "/ws".into(),
+                host: Some("cdn.example.com".into()),
+                headers: [("host".to_string(), "front.example.com".to_string())].into(),
+            }),
+            ..match vless_node() {
+                ProxyNode::Vless(v) => v,
+                _ => unreachable!(),
+            }
+        });
+        let config = SingboxGenerator
+            .generate(&[node], &[], &default_settings())
+            .unwrap();
+
+        let headers = config["outbounds"][0]["transport"]["headers"]
+            .as_object()
+            .unwrap();
+        let hosts: Vec<_> = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .collect();
+        assert_eq!(hosts.len(), 1, "{headers:?}");
+        assert_eq!(headers["host"], "front.example.com");
     }
 
     #[test]
