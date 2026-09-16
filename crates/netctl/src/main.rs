@@ -37,10 +37,10 @@ enum Command {
         /// closed instead of leaking out the real interface once the device is gone.
         #[arg(long)]
         strict: bool,
-        /// Route this prefix via the main table instead of the tunnel.
-        /// Repeatable. Any caller can exclude any prefix, even 0.0.0.0/1 plus
-        /// 128.0.0.0/1, which takes the whole tunnel down no further than
-        /// xray-down already allows.
+        // Any caller can exclude any prefix, even 0.0.0.0/1 plus 128.0.0.0/1,
+        // which takes the whole tunnel down no further than xray-down already
+        // allows.
+        /// Route this prefix via the main table instead of the tunnel. Repeatable.
         #[arg(long = "exclude", value_name = "CIDR", value_parser = validate::parse_exclusion)]
         exclude: Vec<(IpAddr, u8)>,
     },
