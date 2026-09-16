@@ -10,7 +10,7 @@ mod tun;
 pub use log_buffer::{LogBuffer, LogLine, LogSource};
 #[cfg(any(test, feature = "test-utils"))]
 pub use manager::HostProbe;
-pub use manager::{ProcessError, ProcessManager};
+pub use manager::{ProcessError, ProcessManager, StopReason};
 pub use pid::PidFile;
 pub use privilege::{
     BACKEND_CAPS, HELPER_CAPS, PrivilegeError, ProbeFailure, grant, has_net_admin, manual_command,

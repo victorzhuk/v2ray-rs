@@ -44,6 +44,35 @@ const CRASH_WINDOW: Duration = Duration::from_secs(60);
 const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
 const LOG_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 const REASON_MAX_CHARS: usize = 200;
+const CRASH_REASON: &str = "crash";
+
+/// Why a requested stop happened, recorded in the backend log's exit record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    UserStop,
+    NodeSwitch,
+    ApplyRestart,
+    AppQuit,
+    StartFailed,
+}
+
+impl StopReason {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            StopReason::UserStop => "user-stop",
+            StopReason::NodeSwitch => "node-switch",
+            StopReason::ApplyRestart => "apply-restart",
+            StopReason::AppQuit => "app-quit",
+            StopReason::StartFailed => "start-failed",
+        }
+    }
+}
+
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ProcessError {
@@ -137,6 +166,7 @@ pub struct ProcessManager {
     backend: Option<BackendType>,
     log_writer: Option<Arc<RotatingFileWriter>>,
     cached_version: Option<Option<String>>,
+    stop_reason: StopReason,
     #[cfg(any(test, feature = "test-utils"))]
     host_probe: Option<HostProbe>,
 }
@@ -177,6 +207,7 @@ impl ProcessManager {
             backend: None,
             log_writer: None,
             cached_version: None,
+            stop_reason: StopReason::UserStop,
             #[cfg(any(test, feature = "test-utils"))]
             host_probe: None,
         }
@@ -492,6 +523,11 @@ impl ProcessManager {
         self.start().await
     }
     pub async fn shutdown(&mut self) {
+        self.shutdown_with(StopReason::UserStop).await;
+    }
+
+    pub async fn shutdown_with(&mut self, reason: StopReason) {
+        self.stop_reason = reason;
         self.auto_restart = false;
         let _ = self.stop().await;
     }
@@ -508,7 +544,7 @@ impl ProcessManager {
             Ok(status) => status,
             Err(err) => {
                 self.cleanup_after_exit().await;
-                self.write_exit_record(false, None);
+                self.write_exit_record(false, CRASH_REASON, None);
                 let error = ProcessError::Wait(err);
                 let _ = self
                     .state
@@ -553,7 +589,8 @@ impl ProcessManager {
             let exited = match self.child.as_mut().map(Child::try_wait) {
                 Some(Ok(status)) => status,
                 Some(Err(err)) => {
-                    self.stop_child(false).await;
+                    self.stop_child(false, StopReason::StartFailed.as_str())
+                        .await;
                     return Err(ProcessError::Wait(err));
                 }
                 None => None,
@@ -561,7 +598,7 @@ impl ProcessManager {
             if let Some(status) = exited {
                 self.cleanup_after_exit().await;
                 let reason = self.exit_reason(&status);
-                self.write_exit_record(false, Some(&status));
+                self.write_exit_record(false, StopReason::StartFailed.as_str(), Some(&status));
                 return Err(ProcessError::ExitedBeforeReady(reason));
             }
             // Bounded: a connect to a non-loopback address behind a drop rule
@@ -573,7 +610,8 @@ impl ProcessManager {
                 return Ok(());
             }
             if probe_start.elapsed() >= self.ready_timeout {
-                self.stop_child(false).await;
+                self.stop_child(false, StopReason::StartFailed.as_str())
+                    .await;
                 return Err(ProcessError::ReadyTimeout {
                     addr,
                     timeout: self.ready_timeout,
@@ -607,13 +645,15 @@ impl ProcessManager {
             && rt.needs_helper()
         {
             if !tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await {
-                self.graceful_stop().await;
+                self.stop_child(false, StopReason::StartFailed.as_str())
+                    .await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
             }
             let run = tun::xray_up(&rt).await;
             self.log_helper("xray-up", &run);
             if let Err(e) = run.result {
-                self.graceful_stop().await;
+                self.stop_child(false, StopReason::StartFailed.as_str())
+                    .await;
                 return Err(ProcessError::TunHelper(e));
             }
         }
@@ -679,7 +719,7 @@ impl ProcessManager {
 
     // Only after cleanup_after_exit has drained the readers, so last_output is
     // the child's final line rather than a stale snapshot.
-    fn write_exit_record(&self, requested: bool, status: Option<&ExitStatus>) {
+    fn write_exit_record(&self, requested: bool, reason: &str, status: Option<&ExitStatus>) {
         if self.log_writer.is_none() {
             return;
         }
@@ -688,7 +728,7 @@ impl ProcessManager {
             &self.log_writer,
             "exit",
             &format!(
-                "requested={requested} {} crashes_in_window={} last_output={last}",
+                "requested={requested} reason={reason} {} crashes_in_window={} last_output={last}",
                 exit_status_field(status),
                 self.crash_times.len()
             ),
@@ -845,10 +885,10 @@ impl ProcessManager {
     }
 
     async fn graceful_stop(&mut self) {
-        self.stop_child(true).await;
+        self.stop_child(true, self.stop_reason.as_str()).await;
     }
 
-    async fn stop_child(&mut self, requested: bool) {
+    async fn stop_child(&mut self, requested: bool, reason: &str) {
         let Some(child) = &mut self.child else {
             return;
         };
@@ -867,7 +907,7 @@ impl ProcessManager {
         }
 
         self.cleanup_after_exit().await;
-        self.write_exit_record(requested, status.as_ref());
+        self.write_exit_record(requested, reason, status.as_ref());
     }
 
     async fn handle_unexpected_exit(&mut self, status: ExitStatus) {
@@ -884,7 +924,7 @@ impl ProcessManager {
         // teardown here would drop the tunnel's fail-closed routes and leak
         // traffic; only stop() releases them.
         self.record_crash();
-        self.write_exit_record(false, Some(&status));
+        self.write_exit_record(false, CRASH_REASON, Some(&status));
 
         if !self.auto_restart {
             let _ = self.state.transition(ProcessState::Error(msg), None);
@@ -1175,7 +1215,7 @@ mod tests {
             .find(|l| l.contains(" exit "))
             .unwrap_or_else(|| panic!("no exit record: {lines:#?}"));
         for field in [
-            "exit requested=false",
+            "exit requested=false reason=start-failed",
             "code=1",
             "crashes_in_window=0",
             "last_output=FATAL",
@@ -1323,9 +1363,61 @@ mod tests {
             .iter()
             .find(|l| l.contains("exit requested="))
             .expect("exit record");
-        assert!(exit.contains("exit requested=true"), "{exit}");
+        assert!(
+            exit.contains("exit requested=true reason=user-stop"),
+            "{exit}"
+        );
         assert!(exit.contains("signal=15"), "{exit}");
         assert!(exit.contains("crashes_in_window=0"), "{exit}");
+    }
+
+    #[tokio::test]
+    async fn exit_record_reason_per_stop_reason() {
+        for reason in [
+            StopReason::NodeSwitch,
+            StopReason::ApplyRestart,
+            StopReason::AppQuit,
+        ] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+                .with_log_file(Some(backend_log(dir.path())));
+
+            mgr.start().await.unwrap();
+            mgr.shutdown_with(reason).await;
+            let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+            let exits: Vec<_> = lines.iter().filter(|l| l.contains(" exit ")).collect();
+            assert_eq!(exits.len(), 1, "{lines:#?}");
+            let expected = format!("exit requested=true reason={reason}");
+            assert!(exits[0].contains(&expected), "{}", exits[0]);
+        }
+    }
+
+    #[tokio::test]
+    async fn exit_record_marks_start_failed_on_tun_device_timeout() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
+        let (helper, _) = stub_helper(dir.path(), "[ \"$1\" = xray-up ] && exit 1\nexit 0\n");
+        mgr.tun = Some(xray_on_lo(helper));
+
+        let result = mgr.launch().await;
+        assert!(
+            matches!(result, Err(ProcessError::TunHelper(_))),
+            "{result:?}"
+        );
+        assert!(mgr.child.is_none());
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let exits: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains(" exit requested="))
+            .collect();
+        assert_eq!(exits.len(), 1, "{lines:#?}");
+        assert!(
+            exits[0].contains("exit requested=false reason=start-failed"),
+            "{}",
+            exits[0]
+        );
     }
 
     #[tokio::test]
@@ -1346,7 +1438,7 @@ mod tests {
             .iter()
             .find(|l| l.contains("exit requested="))
             .expect("exit record");
-        assert!(exit.contains("exit requested=false"), "{exit}");
+        assert!(exit.contains("exit requested=false reason=crash"), "{exit}");
         assert!(exit.contains("code=3"), "{exit}");
         assert!(exit.contains("crashes_in_window=1"), "{exit}");
         assert!(
@@ -2171,7 +2263,11 @@ mod tests {
         let lines = read_lines(&dir.path().join("backend.log"));
         let exits: Vec<_> = lines.iter().filter(|l| l.contains(" exit ")).collect();
         assert_eq!(exits.len(), 1, "{lines:#?}");
-        assert!(exits[0].contains("exit requested=false"), "{}", exits[0]);
+        assert!(
+            exits[0].contains("exit requested=false reason=start-failed"),
+            "{}",
+            exits[0]
+        );
     }
 
     #[test]
