@@ -917,8 +917,8 @@ impl SimpleComponent for App {
                 let _lifecycle = lifecycle.lock().await;
                 let orphan_paths = bg_paths.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    if !skip_orphans && let Err(err) = cleanup_orphaned_backend(&orphan_paths) {
-                        log::warn!("failed to clean orphaned backend process: {err}");
+                    if !skip_orphans {
+                        record_unclean_previous_run(&orphan_paths);
                     }
                 })
                 .await;
@@ -2470,6 +2470,41 @@ mod tests {
     }
 
     #[test]
+    fn stale_pid_file_records_unclean_previous_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        paths.ensure_dirs().unwrap();
+        let config = tmp.path().join("config.json");
+        let pid = std::process::id();
+        PidFile::new(paths.pid_file_path())
+            .write(pid, std::path::Path::new("/bin/sh"), &config)
+            .unwrap();
+
+        assert!(!record_unclean_previous_run(&paths));
+
+        let log = std::fs::read_to_string(paths.logs_dir().join("backend.log")).unwrap();
+        assert!(
+            log.contains(&format!(
+                "unclean previous run left backend pid={pid} killed=false"
+            )),
+            "{log}"
+        );
+        assert_eq!(log.matches("unclean previous run").count(), 1);
+        assert!(!paths.pid_file_path().exists());
+    }
+
+    #[test]
+    fn no_pid_file_records_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        paths.ensure_dirs().unwrap();
+
+        assert!(!record_unclean_previous_run(&paths));
+
+        assert!(!paths.logs_dir().join("backend.log").exists());
+    }
+
+    #[test]
     fn quit_idle_exits() {
         assert_eq!(
             quit_plan(false, &ProcessState::Stopped, false),
@@ -3407,6 +3442,31 @@ fn notify_tray(summary: &str, body: &str) {
 fn cleanup_orphaned_backend(paths: &AppPaths) -> std::io::Result<bool> {
     let pid_file = PidFile::new(paths.pid_file_path());
     pid_file.check_and_kill_orphaned()
+}
+
+/// The PID file is removed on every clean stop and crash exit, so finding one
+/// at startup means the previous run ended without cleaning up.
+fn record_unclean_previous_run(paths: &AppPaths) -> bool {
+    let pid_file = PidFile::new(paths.pid_file_path());
+    if !paths.pid_file_path().exists() {
+        return false;
+    }
+    let pid = match pid_file.read() {
+        Ok(Some(record)) => record.pid.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let killed = cleanup_orphaned_backend(paths).unwrap_or_else(|err| {
+        log::warn!("failed to clean orphaned backend process: {err}");
+        false
+    });
+    match RotatingFileWriter::open(paths.logs_dir().join("backend.log"), DEFAULT_MAX_BYTES) {
+        Ok(log) => log.append_line(
+            "notice",
+            &format!("unclean previous run left backend pid={pid} killed={killed}"),
+        ),
+        Err(err) => log::warn!("open backend log: {err}"),
+    }
+    killed
 }
 
 struct RecoveryFailure {
