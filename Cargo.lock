@@ -3693,6 +3693,7 @@ dependencies = [
  "percent-encoding",
  "relm4",
  "rustls",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

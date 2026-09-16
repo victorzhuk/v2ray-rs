@@ -22,6 +22,7 @@ base64.workspace = true
 percent-encoding.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile.workspace = true
 v2ray-rs-process = { workspace = true, features = ["test-utils"] }
 

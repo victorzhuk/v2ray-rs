@@ -660,6 +660,7 @@ impl App {
                 generation,
                 host_has_ipv6,
                 health_timing: HealthTiming::default(),
+                last_good_pins: Vec::new(),
             },
             sender.input_sender().clone(),
         );

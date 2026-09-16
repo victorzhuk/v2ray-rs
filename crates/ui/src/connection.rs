@@ -57,6 +57,9 @@ pub(super) struct ConnectionRequest {
     pub generation: u64,
     pub host_has_ipv6: bool,
     pub health_timing: HealthTiming,
+    /// Addresses a node hostname last connected through, used when its lookup
+    /// fails at connect time.
+    pub last_good_pins: Vec<HostOverride>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -114,6 +117,7 @@ fn spawn_with(
         generation,
         host_has_ipv6,
         health_timing,
+        last_good_pins,
     } = request;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
 
@@ -185,6 +189,23 @@ fn spawn_with(
             sender.emit(AppMsg::ProcessLogLine(generation, warning));
         }
 
+        // Every hostname is looked up here, before any candidate's tunnel
+        // exists: once its rules are up, a lookup would be captured by the
+        // tunnel it is preparing.
+        let resolved = resolve_pins(
+            pin_hosts(
+                &candidates,
+                &subscriptions,
+                &manual_nodes,
+                &enabled_rules,
+                &settings,
+            ),
+            &last_good_pins,
+            PIN_LOOKUP_TIMEOUT,
+            os_lookup,
+        )
+        .await;
+
         let total = candidates.len();
         'candidates: for (index, candidate) in candidates.into_iter().enumerate() {
             let position = index + 1;
@@ -217,9 +238,9 @@ fn spawn_with(
                 &subscriptions,
                 &manual_nodes,
             ));
-            // Must happen before the tunnel exists: once its rules are up, this
-            // very lookup would be captured by the tunnel it is preparing.
-            pin_node_addresses(&mut effective_settings, &nodes).await;
+            if pins_enabled(&effective_settings) {
+                apply_pins(&mut effective_settings, &nodes, &resolved);
+            }
             if drop_strict_route {
                 effective_settings.tun.strict_route = false;
             }
@@ -481,10 +502,8 @@ const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box str
 
 const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[cfg_attr(not(test), allow(dead_code))]
 const PIN_LOOKUP_CONCURRENCY: usize = 16;
 
-#[allow(dead_code)]
 async fn os_lookup(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
     let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
     Ok(addrs.map(|addr| addr.ip()).collect())
@@ -493,7 +512,6 @@ async fn os_lookup(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
 /// Looks up every host concurrently within one overall `deadline`. A host
 /// whose lookup fails, comes back empty, or is still running at the deadline
 /// takes its `last_good` addresses, or is left out when there are none.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn resolve_pins<F, Fut>(
     hosts: Vec<(String, u16)>,
     last_good: &[HostOverride],
@@ -556,7 +574,6 @@ where
     resolved
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn unique(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
     let mut out = Vec::new();
     for ip in ips {
@@ -567,7 +584,6 @@ fn unique(ips: impl IntoIterator<Item = IpAddr>) -> Vec<IpAddr> {
     out
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
 fn pins_enabled(settings: &AppSettings) -> bool {
     settings.tun.enabled && settings.backend.backend_type != BackendType::V2ray
 }
@@ -575,7 +591,6 @@ fn pins_enabled(settings: &AppSettings) -> bool {
 /// Hostnames to pin before any candidate starts: each candidate node and its
 /// via nodes, under that candidate's effective settings. The first port seen
 /// for a hostname wins.
-#[cfg_attr(not(test), allow(dead_code))]
 fn pin_hosts(
     candidates: &[ConnectionCandidate],
     subscriptions: &[Subscription],
@@ -605,39 +620,40 @@ fn pin_hosts(
     hosts
 }
 
-/// Pins every hostname-addressed node to concrete IPs in `dns.hosts`. Every
-/// family is carried; the generator keeps what its backend can use.
-async fn pin_node_addresses(settings: &mut AppSettings, nodes: &[ProxyNode]) {
+/// Pins each hostname-addressed node to its resolved addresses in `dns.hosts`.
+/// Every family is carried; the generator keeps what its backend can use. A
+/// hostname the user already overrides keeps that override.
+fn apply_pins(
+    settings: &mut AppSettings,
+    nodes: &[ProxyNode],
+    resolved: &HashMap<String, Vec<IpAddr>>,
+) {
+    let overridden: Vec<String> = settings
+        .dns
+        .hosts
+        .iter()
+        .map(|h| h.domain.clone())
+        .collect();
+    let mut seen: Vec<&str> = Vec::new();
     for node in nodes {
         let host = node.address();
-        if host.parse::<std::net::IpAddr>().is_ok() {
+        if host.parse::<IpAddr>().is_ok()
+            || overridden.iter().any(|d| d == host)
+            || seen.contains(&host)
+        {
             continue;
         }
-        if settings.dns.hosts.iter().any(|h| h.domain == host) {
+        seen.push(host);
+        let Some(addrs) = resolved.get(host) else {
             continue;
-        }
-
-        // A reconnect can start while the previous tunnel's rules are still up,
-        // which is exactly when this lookup gets captured and stalls. Bounded so
-        // that costs a few seconds and a disabled capture, not the connect.
-        let lookup = tokio::time::timeout(
-            PIN_LOOKUP_TIMEOUT,
-            tokio::net::lookup_host((host, node.port())),
-        )
-        .await;
-
-        match lookup {
-            Err(_) => log::warn!("cannot pin {host}: lookup timed out"),
-            Ok(Err(err)) => log::warn!("cannot pin {host}: {err}"),
-            Ok(Ok(addrs)) => {
-                for addr in addrs {
-                    settings.dns.hosts.push(HostOverride {
-                        domain: host.to_string(),
-                        ip: addr.ip().to_string(),
-                    });
-                }
-            }
-        }
+        };
+        settings
+            .dns
+            .hosts
+            .extend(addrs.iter().map(|ip| HostOverride {
+                domain: host.to_string(),
+                ip: ip.to_string(),
+            }));
     }
 }
 
@@ -1117,6 +1133,7 @@ mod tests {
             generation: GENERATION,
             host_has_ipv6: true,
             health_timing: HealthTiming::default(),
+            last_good_pins: Vec::new(),
         }
     }
 
@@ -2019,6 +2036,90 @@ exit 1"#,
         assert!(lines[failed].contains("trace refused"), "{}", lines[failed]);
         assert!(
             !lines.iter().any(|line| line.contains("198.51.100.13")),
+            "{lines:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tun_off_connection_pins_no_hostname() {
+        use std::net::ToSocketAddrs;
+        assert!(
+            ("localhost", 0).to_socket_addrs().unwrap().next().is_some(),
+            "localhost must resolve for this test to mean anything"
+        );
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exit 1"#,
+        );
+        let (_handle, rx) = connect(
+            &stub,
+            singbox_settings(),
+            vec![candidate("localhost"), candidate("localhost")],
+        );
+
+        let (terminal, _) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        let sessions: Vec<&str> = log.lines().filter(|l| l.contains(" session ")).collect();
+        assert_eq!(sessions.len(), 2, "{log}");
+        for session in sessions {
+            assert!(session.contains("nodes_pinned=false"), "{session}");
+        }
+
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("sing-box.json"))
+            .expect("generated config readable");
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        let servers = config["dns"]["servers"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            !servers.iter().any(|s| s["type"] == "hosts"),
+            "{}",
+            config["dns"]
+        );
+        assert!(
+            !config["dns"].to_string().contains("localhost"),
+            "{}",
+            config["dns"]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_resolves_every_candidate_host_before_first_start() {
+        let capture = crate::logging::install_test_capture();
+        let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        let mut settings = xray_tun_settings();
+        settings.tun.interface_name = "v2rstest4".into();
+        let req = request(
+            &stub,
+            settings,
+            vec![
+                candidate("failover-a.invalid"),
+                candidate("failover-b.invalid"),
+            ],
+        );
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe);
+
+        let (terminal, _) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let lines = capture.lines_containing("failover-");
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} line: {lines:#?}"))
+        };
+        let first_start = at("candidate start 1/2");
+        assert!(
+            at("cannot pin failover-a.invalid") < first_start,
+            "{lines:#?}"
+        );
+        assert!(
+            at("cannot pin failover-b.invalid") < first_start,
             "{lines:#?}"
         );
     }
