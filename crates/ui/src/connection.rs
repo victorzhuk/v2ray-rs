@@ -206,6 +206,9 @@ fn spawn_with(
         )
         .await;
 
+        // Once per connection, like the strict-route notice, so a failover
+        // cannot repeat it.
+        let mut capture_notice_sent = false;
         let total = candidates.len();
         'candidates: for (index, candidate) in candidates.into_iter().enumerate() {
             let position = index + 1;
@@ -253,7 +256,8 @@ fn spawn_with(
             if drop_strict_route {
                 effective_settings.tun.strict_route = false;
             }
-            let pinned = hosts_cover_nodes(&effective_settings, &nodes);
+            let unpinned = unpinned_host(&effective_settings, &nodes);
+            let pinned = unpinned.is_none();
             let config_path =
                 match writer.write_config(&nodes, &effective_rules, &effective_settings) {
                     Ok(path) => path,
@@ -307,6 +311,21 @@ fn spawn_with(
                     "app"
                 },
             );
+            if !capture_notice_sent
+                && tun
+                    .as_ref()
+                    .is_some_and(|rt| rt.backend == BackendType::Xray)
+                && effective_settings.tun.dns_hijack == DnsHijackMode::Hijack
+                && let Some(host) = unpinned
+            {
+                capture_notice_sent = true;
+                let notice = dns_capture_off_notice(host);
+                if let Some(log) = &backend_log {
+                    log.append_line("notice", &notice);
+                }
+                sender.emit(AppMsg::ProcessLogLine(generation, notice));
+                sender.emit(AppMsg::ShowToast(dns_capture_off_toast(host)));
+            }
             // Written before the backend or the route helper touches the kernel,
             // so a crash mid-start still leaves the next launch a recovery pass.
             if let Some(rt) = &tun
@@ -759,21 +778,30 @@ async fn filter_reachable(
     }
 }
 
-/// Whether the settings the config is generated from resolve every node
-/// hostname on their own. Capturing port 53 while the backend still needs the
+/// The first node hostname the settings the config is generated from cannot
+/// resolve on their own. Capturing port 53 while the backend still needs the
 /// OS resolver to find its own server would send that lookup into the tunnel it
 /// is trying to build. An override xray answers with an empty set — the wrong
 /// family for its query strategy — does not count.
-fn hosts_cover_nodes(settings: &AppSettings, nodes: &[ProxyNode]) -> bool {
-    nodes.iter().all(|node| {
-        let host = node.address();
-        host.parse::<std::net::IpAddr>().is_ok()
-            || settings
+fn unpinned_host<'a>(settings: &AppSettings, nodes: &'a [ProxyNode]) -> Option<&'a str> {
+    nodes.iter().map(ProxyNode::address).find(|host| {
+        host.parse::<std::net::IpAddr>().is_err()
+            && !settings
                 .dns
                 .hosts
                 .iter()
-                .any(|h| h.domain == host && h.matches_strategy(settings.dns.strategy))
+                .any(|h| h.domain == *host && h.matches_strategy(settings.dns.strategy))
     })
+}
+
+fn dns_capture_off_notice(host: &str) -> String {
+    format!(
+        "notice: DNS capture off for this session: {host} could not be resolved before connecting"
+    )
+}
+
+fn dns_capture_off_toast(host: &str) -> String {
+    format!("DNS capture is off for this session: {host} could not be resolved")
 }
 
 fn hijack_field(mode: DnsHijackMode) -> &'static str {
@@ -2340,6 +2368,46 @@ exit 1"#,
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unpinned_candidates_notify_capture_off_once() {
+        let (stub, settings, _host, probe) = xray_tun_stub_with_probe("v2rsnotice0");
+        let (_handle, rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("notice-a.invalid"), candidate("notice-b.invalid")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        let (terminal, lines, toasts) = drain_within(&rx, Duration::from_secs(60)).await;
+        assert_error_terminal(terminal);
+
+        let notices: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.starts_with("notice: DNS capture off for this session:"))
+            .collect();
+        assert_eq!(notices.len(), 1, "{lines:#?}");
+        assert!(
+            notices[0].starts_with("notice: DNS capture off for this session: notice-a.invalid"),
+            "{}",
+            notices[0]
+        );
+        assert_eq!(toasts, vec![dns_capture_off_toast("notice-a.invalid")]);
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(
+            log.matches("DNS capture off for this session").count(),
+            1,
+            "{log}"
+        );
+        let sessions: Vec<&str> = log.lines().filter(|l| l.contains(" session ")).collect();
+        assert_eq!(sessions.len(), 2, "{log}");
+        for session in sessions {
+            assert!(session.contains("capture_dns=false"), "{session}");
+            assert!(session.contains("nodes_pinned=false"), "{session}");
+        }
+    }
+
     #[tokio::test]
     async fn filter_reachable_keeps_only_listening_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2714,6 +2782,10 @@ exit 1"#,
             password: "secret".into(),
             remark: None,
         })
+    }
+
+    fn hosts_cover_nodes(settings: &AppSettings, nodes: &[ProxyNode]) -> bool {
+        unpinned_host(settings, nodes).is_none()
     }
 
     fn tun_settings() -> AppSettings {
