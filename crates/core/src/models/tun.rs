@@ -361,6 +361,20 @@ mod tests {
     }
 
     #[test]
+    fn tun_config_refuses_exclude_route_covering_all() {
+        let tun = TunConfig {
+            exclude_routes: vec!["0.0.0.0/0".to_string()],
+            ..TunConfig::default()
+        };
+        assert_eq!(
+            tun.validate(),
+            Err(ValidationError::ExcludeRouteCoversAll(
+                "0.0.0.0/0".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_legacy_section_without_new_fields_loads_empty() {
         let tun: TunConfig = toml::from_str("enabled = true\ninterface_name = \"utun\"\n").unwrap();
         assert!(tun.enabled);

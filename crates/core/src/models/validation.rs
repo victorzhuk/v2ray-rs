@@ -33,6 +33,8 @@ pub enum ValidationError {
     InvalidTunMtu(u16),
     #[error("too many excluded routes: {0} (at most {max})", max = MAX_EXCLUDE_ROUTES)]
     TooManyExcludedRoutes(usize),
+    #[error("excluded route covers every address: {0}")]
+    ExcludeRouteCoversAll(String),
     #[error("invalid process name: {0}")]
     InvalidProcessName(String),
 }
@@ -71,7 +73,8 @@ pub fn validate_ip_cidr(cidr: &str) -> Result<(), ValidationError> {
 pub fn validate_exclude_route(cidr: &str) -> Result<(), ValidationError> {
     match cidr.parse::<IpNet>() {
         Ok(net) if net.prefix_len() > 0 => Ok(()),
-        _ => Err(ValidationError::InvalidIpCidr(cidr.to_string())),
+        Ok(_) => Err(ValidationError::ExcludeRouteCoversAll(cidr.to_string())),
+        Err(_) => Err(ValidationError::InvalidIpCidr(cidr.to_string())),
     }
 }
 
@@ -222,7 +225,7 @@ mod tests {
         for cidr in ["0.0.0.0/0", "::/0"] {
             assert_eq!(
                 validate_exclude_route(cidr),
-                Err(ValidationError::InvalidIpCidr(cidr.to_string()))
+                Err(ValidationError::ExcludeRouteCoversAll(cidr.to_string()))
             );
         }
         assert_eq!(
