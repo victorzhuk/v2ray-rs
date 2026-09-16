@@ -2336,7 +2336,7 @@ exit 1"#,
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn probe_runs_before_write_config_when_allowed() {
+    async fn probe_narrows_pins_to_listening_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (stub, settings, _host, probe) = xray_tun_stub_with_probe("v2rsprobe1");
@@ -2634,6 +2634,56 @@ exit 1"#,
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn running_candidate_reports_applied_pins() {
+        let localhost = tokio::net::lookup_host(("localhost", 0)).await;
+        assert!(
+            localhost.is_ok_and(|mut addrs| addrs.next().is_some()),
+            "localhost must resolve"
+        );
+        let stub = sleeping_stub();
+        let host = tempfile::tempdir().unwrap();
+        let getcap = host.path().join("getcap");
+        std::fs::write(&getcap, "#!/bin/sh\necho \"$1 cap_net_admin=ep\"\n").unwrap();
+        std::fs::set_permissions(&getcap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = v2ray_rs_process::HostProbe {
+            getcap,
+            helper: executable(host.path(), "v2ray-rs-netctl"),
+        };
+        let (_listener, mut settings) = ready_singbox_settings();
+        settings.tun.enabled = true;
+        settings.tun.interface_name = "v2rspins0".into();
+        let (handle, rx) =
+            connect_with(&stub, settings, vec![candidate("localhost")], move |mgr| {
+                mgr.with_host_probe(probe.clone())
+            });
+        wait_running(&rx).await;
+
+        handle.stop(StopReason::UserStop);
+        let mut reports = Vec::new();
+        let mut stopped = false;
+        while let Some(msg) = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("connection task outlived its terminal state")
+        {
+            match msg {
+                AppMsg::NodePins(generation, pins) => reports.push((generation, pins)),
+                AppMsg::ProcessStateConnection(_, ProcessState::Stopped, _) => stopped = true,
+                _ => {}
+            }
+        }
+        assert!(stopped);
+
+        assert_eq!(reports.len(), 1, "{reports:?}");
+        let (generation, pins) = &reports[0];
+        assert_eq!(*generation, GENERATION);
+        assert!(!pins.is_empty());
+        for pin in pins {
+            assert_eq!(pin.domain, "localhost", "{pins:?}");
+            assert!(pin.ip.parse::<IpAddr>().is_ok(), "{pins:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn health_monitor_reports_unhealthy_then_healthy() {
         let stub = sleeping_stub();
         let proxy = fake_proxy(false).await;
@@ -2787,10 +2837,6 @@ exit 1"#,
             password: "secret".into(),
             remark: None,
         })
-    }
-
-    fn hosts_cover_nodes(settings: &AppSettings, nodes: &[ProxyNode]) -> bool {
-        unpinned_host(settings, nodes).is_none()
     }
 
     fn tun_settings() -> AppSettings {
@@ -2995,7 +3041,7 @@ exit 1"#,
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resolve_pins_drops_timed_out_host_without_last_good() {
         let capture = crate::logging::install_test_capture();
         let started = tokio::time::Instant::now();
@@ -3025,26 +3071,43 @@ exit 1"#,
 
         let in_flight = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let gate = Arc::new(Semaphore::new(0));
         let hosts = (0..40)
             .map(|i| (format!("host{i}-h2.invalid"), 443))
             .collect();
         let lookup = {
             let in_flight = Arc::clone(&in_flight);
             let peak = Arc::clone(&peak);
+            let entered = Arc::clone(&entered);
+            let gate = Arc::clone(&gate);
             move |_host: String, _port: u16| {
                 let in_flight = Arc::clone(&in_flight);
                 let peak = Arc::clone(&peak);
+                let entered = Arc::clone(&entered);
+                let gate = Arc::clone(&gate);
                 async move {
                     let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
                     peak.fetch_max(now, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    entered.notify_one();
+                    let _ = gate.acquire().await;
                     in_flight.fetch_sub(1, Ordering::SeqCst);
                     Ok(vec!["198.51.100.5".parse().unwrap()])
                 }
             }
         };
 
-        let resolved = resolve_pins(hosts, &[], Duration::from_secs(5), lookup).await;
+        let resolving =
+            tokio::spawn(
+                async move { resolve_pins(hosts, &[], Duration::from_secs(60), lookup).await },
+            );
+        while in_flight.load(Ordering::SeqCst) < PIN_LOOKUP_CONCURRENCY {
+            tokio::time::timeout(RECV_TIMEOUT, entered.notified())
+                .await
+                .expect("lookups never reached the cap");
+        }
+        gate.close();
+        let resolved = resolving.await.unwrap();
 
         assert_eq!(resolved.len(), 40);
         assert_eq!(peak.load(Ordering::SeqCst), PIN_LOOKUP_CONCURRENCY);
@@ -3053,7 +3116,7 @@ exit 1"#,
     #[test]
     fn ip_addressed_nodes_need_no_pin() {
         let settings = tun_settings();
-        assert!(hosts_cover_nodes(&settings, &[node("203.0.113.9")]));
+        assert_eq!(unpinned_host(&settings, &[node("203.0.113.9")]), None);
     }
 
     #[test]
@@ -3061,12 +3124,10 @@ exit 1"#,
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
 
-        assert!(!hosts_cover_nodes(&settings, &[node("proxy.example.com")]));
-        let runtime = build_tun_runtime(
-            &settings,
-            hosts_cover_nodes(&settings, &[node("proxy.example.com")]),
-        )
-        .unwrap();
+        let nodes = [node("proxy.example.com")];
+        let unpinned = unpinned_host(&settings, &nodes);
+        assert_eq!(unpinned, Some("proxy.example.com"));
+        let runtime = build_tun_runtime(&settings, unpinned.is_none()).unwrap();
         assert!(!runtime.capture_dns);
     }
 
@@ -3080,8 +3141,9 @@ exit 1"#,
         });
 
         let nodes = [node("proxy.example.com")];
-        assert!(hosts_cover_nodes(&settings, &nodes));
-        let runtime = build_tun_runtime(&settings, hosts_cover_nodes(&settings, &nodes)).unwrap();
+        let unpinned = unpinned_host(&settings, &nodes);
+        assert_eq!(unpinned, None);
+        let runtime = build_tun_runtime(&settings, unpinned.is_none()).unwrap();
         assert!(runtime.capture_dns);
     }
 
@@ -3096,8 +3158,9 @@ exit 1"#,
         });
 
         let nodes = [node("proxy.example.com")];
-        assert!(
-            !hosts_cover_nodes(&settings, &nodes),
+        assert_eq!(
+            unpinned_host(&settings, &nodes),
+            Some("proxy.example.com"),
             "an override of the wrong family is an empty answer, not a pin"
         );
     }

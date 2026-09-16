@@ -24,6 +24,7 @@ percent-encoding.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 v2ray-rs-process = { workspace = true, features = ["test-utils"] }
 
 [features]
