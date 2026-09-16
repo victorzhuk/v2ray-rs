@@ -584,7 +584,7 @@ make fmt && make clippy && make test TEST_TIMEOUT=10m   (fmt = cargo fmt -- --ch
           "task": "1.1",
           "file": "crates/process/src/manager.rs",
           "symbol": "graceful_stop",
-          "anchor": "        self.write_exit_record(true, status.as_ref());",
+          "anchor": "        self.write_exit_record(requested, status.as_ref());",
           "change": "pass the stored reason through (or read it inside write_exit_record)"
         },
         {
@@ -633,7 +633,7 @@ make fmt && make clippy && make test TEST_TIMEOUT=10m   (fmt = cargo fmt -- --ch
           "task": "1.1",
           "file": "crates/process/src/manager.rs",
           "symbol": "readiness-failure exit path (added by confirm-backend-ready-before-running)",
-          "anchor": "        self.write_exit_record(true, status.as_ref());",
+          "anchor": "        self.write_exit_record(requested, status.as_ref());",
           "change": "After the rebase onto confirm-backend-ready-before-running there are THREE callers, not two: graceful_stop (requested=true, self.stop_reason.as_str()), handle_unexpected_exit and wait_and_handle_exit (requested=false, CRASH_REASON), and the readiness path (requested=false, StopReason::StartFailed.as_str(), crashes_in_window=0). The readiness path writes its own record and must not route through graceful_stop, which would emit requested=true reason=user-stop."
         }
       ],
@@ -1725,7 +1725,7 @@ make fmt && make clippy && make test TEST_TIMEOUT=10m   (fmt = cargo fmt -- --ch
           "task": "4.1",
           "file": "crates/ui/src/app.rs",
           "symbol": "status_primary (new pure fn) + update_status_labels",
-          "anchor": "            (ProcessState::Starting, _) => (\"Connecting…\".to_string(), \"Resolving nodes\".into()),",
+          "anchor": "        (ProcessState::Starting, _) => (\"Connecting…\".to_string(), \"Resolving nodes\".into()),",
           "change": "replace the Starting arm with status_primary(state, prev_state, origin, attempt) → \"Restarting after crash\" / \"Reconnecting (n/3)\" / \"Connecting…\""
         },
         {
