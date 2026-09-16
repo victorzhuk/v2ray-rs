@@ -100,6 +100,29 @@ pub fn init_logging(paths: &AppPaths) {
     }
 }
 
+fn panic_record(info: &std::panic::PanicHookInfo) -> String {
+    let payload = info.payload();
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string payload");
+    match info.location() {
+        Some(location) => format!("panic at {location}: {message}"),
+        None => format!("panic at unknown location: {message}"),
+    }
+}
+
+/// Records every panic in the app log, then hands it to the previously
+/// installed hook so the default stderr report and backtrace still happen.
+pub fn install_panic_hook() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        log::error!("{}", panic_record(info));
+        previous(info);
+    }));
+}
+
 #[cfg(test)]
 pub(crate) struct TestLogCapture {
     lines: std::sync::Mutex<Vec<String>>,
@@ -230,6 +253,51 @@ mod tests {
 
         let lines = capture.wait_for("capture-probe", 2);
         assert_eq!(lines, ["capture-probe first", "capture-probe second"]);
+    }
+
+    static PANIC_HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn panic_record_names_message_and_location() {
+        let _guard = PANIC_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        static RECORD: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|info| {
+            *RECORD.lock().unwrap() = Some(panic_record(info));
+        }));
+
+        let line = line!() + 1;
+        let result = std::panic::catch_unwind(|| panic!("record-probe {}", 7));
+
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(original);
+        assert!(result.is_err());
+        let record = RECORD.lock().unwrap().take().unwrap();
+        assert!(record.starts_with(&format!("panic at {}:{line}:", file!())));
+        assert!(record.ends_with(": record-probe 7"));
+    }
+
+    #[test]
+    fn install_panic_hook_chains_previous() {
+        let _guard = PANIC_HOOK.lock().unwrap_or_else(|e| e.into_inner());
+        static PREVIOUS_RAN: std::sync::atomic::AtomicBool =
+            std::sync::atomic::AtomicBool::new(false);
+        let capture = install_test_capture();
+        let original = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {
+            PREVIOUS_RAN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        install_panic_hook();
+
+        let result = std::panic::catch_unwind(|| panic!("chain-probe"));
+
+        let _ = std::panic::take_hook();
+        std::panic::set_hook(original);
+        assert!(result.is_err());
+        assert!(PREVIOUS_RAN.load(std::sync::atomic::Ordering::SeqCst));
+        let lines = capture.wait_for("chain-probe", 1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(&format!("panic at {}:", file!())));
     }
 
     #[test]

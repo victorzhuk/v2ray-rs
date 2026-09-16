@@ -3545,6 +3545,7 @@ fn try_run() -> Result<(), String> {
         .map_err(|err| format!("failed to create directories: {err}"))?;
 
     crate::logging::init_logging(&paths);
+    crate::logging::install_panic_hook();
     log::info!(
         "v2ray-rs {} starting, profile '{}'",
         env!("CARGO_PKG_VERSION"),
