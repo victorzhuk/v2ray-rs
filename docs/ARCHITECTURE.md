@@ -160,7 +160,9 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   link up, assigns the address, and installs the tunnel default route into table
   2023 plus the policy rules that steer traffic into it:
   - 9000 — `fwmark 0xff` → `main`, so xray's own sockets reach the real default
-    instead of looping back through the tunnel;
+    instead of looping back through the tunnel. This fwmark rule is the only
+    loop guard: xray outbounds are not bound to an interface, so they follow
+    the whole `main` table, VPN routes included;
   - 9001 — `main` with `suppress_prefixlength 0`, keeping LAN and link routes;
   - 9002 — everything else → table 2023.
 
