@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// Validates a TUN interface name: non-empty, at most 15 chars, restricted to
 /// lowercase letters, digits, `_` and `-`. Mirrors the core model's rule so the
@@ -43,10 +43,36 @@ pub fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8), String> {
     Ok((ip, prefix))
 }
 
+/// Same cap the app enforces on `exclude_routes` (`MAX_EXCLUDE_ROUTES` in
+/// `crates/core/src/models/tun.rs`); the helper re-checks it because any local
+/// process can invoke it directly.
+pub const MAX_EXCLUSIONS: usize = 256;
+
+/// Parses a route exclusion CIDR, refusing prefix 0 and clearing host bits.
+pub fn parse_exclusion(cidr: &str) -> Result<(IpAddr, u8), String> {
+    let (ip, prefix) = parse_cidr(cidr)?;
+    if prefix == 0 {
+        return Err(format!("exclusion prefix length 0 refused: {cidr:?}"));
+    }
+    let network = match ip {
+        IpAddr::V4(v4) => Ipv4Addr::from(u32::from(v4) & (u32::MAX << (32 - prefix))).into(),
+        IpAddr::V6(v6) => Ipv6Addr::from(u128::from(v6) & (u128::MAX << (128 - prefix))).into(),
+    };
+    Ok((network, prefix))
+}
+
+pub fn check_exclusion_count(count: usize) -> Result<(), String> {
+    if count > MAX_EXCLUSIONS {
+        return Err(format!(
+            "too many exclusions: {count} (max {MAX_EXCLUSIONS})"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn iface_rules() {
@@ -86,5 +112,48 @@ mod tests {
         for bad in ["1.2.3.4", "1.2.3.4/33", "::1/129", "garbage", "1.2.3.4/x"] {
             assert!(parse_cidr(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn exclusion_accepts_host_route() {
+        assert_eq!(
+            parse_exclusion("10.15.12.100/32").unwrap(),
+            (IpAddr::V4(Ipv4Addr::new(10, 15, 12, 100)), 32)
+        );
+    }
+
+    #[test]
+    fn exclusion_clears_host_bits() {
+        assert_eq!(
+            parse_exclusion("10.1.2.3/8").unwrap(),
+            (IpAddr::V4(Ipv4Addr::new(10, 0, 0, 0)), 8)
+        );
+        assert_eq!(
+            parse_exclusion("fd00::1/64").unwrap(),
+            (IpAddr::V6("fd00::".parse::<Ipv6Addr>().unwrap()), 64)
+        );
+    }
+
+    #[test]
+    fn exclusion_refuses_default_prefix() {
+        for bad in ["0.0.0.0/0", "::/0", "10.0.0.1/0"] {
+            let err = parse_exclusion(bad).unwrap_err();
+            assert!(err.contains(&format!("{bad:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn exclusion_refuses_out_of_range_prefix() {
+        for bad in ["1.2.3.4/33", "::1/129", "garbage", "1.2.3.4", "1.2.3.4/x"] {
+            let err = parse_exclusion(bad).unwrap_err();
+            assert!(err.contains(&format!("{bad:?}")), "{err}");
+        }
+    }
+
+    #[test]
+    fn exclusion_count_capped_at_256() {
+        assert!(check_exclusion_count(0).is_ok());
+        assert!(check_exclusion_count(256).is_ok());
+        assert!(check_exclusion_count(257).unwrap_err().contains("257"));
     }
 }
