@@ -6,7 +6,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use chrono::Utc;
+use chrono::{Local, Utc};
 
 use crate::persistence::{PersistenceError, create_dir_with_permissions};
 
@@ -206,6 +206,18 @@ impl RotatingFileWriter {
     }
 }
 
+/// Formats seconds east of UTC as `±HH:MM`, dropping any seconds component.
+pub fn format_utc_offset(seconds_east: i32) -> String {
+    let sign = if seconds_east < 0 { '-' } else { '+' };
+    let minutes = seconds_east.unsigned_abs() / 60;
+    format!("{sign}{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// The host's current UTC offset as `±HH:MM`.
+pub fn local_utc_offset() -> String {
+    format_utc_offset(Local::now().offset().local_minus_utc())
+}
+
 #[cfg(test)]
 impl RotatingFileWriter {
     /// Test-only constructor that places the writer in the post-retirement,
@@ -235,6 +247,15 @@ mod tests {
         // RFC 3339 timestamp (<= 35 chars) + separator + stream tag +
         // separator + 48-char marker + newline.
         35 + 1 + 1 + 1 + 48 + 1
+    }
+
+    #[test]
+    fn format_utc_offset_signs_hours_minutes() {
+        assert_eq!(format_utc_offset(10800), "+03:00");
+        assert_eq!(format_utc_offset(0), "+00:00");
+        assert_eq!(format_utc_offset(-19800), "-05:30");
+        assert_eq!(format_utc_offset(20700), "+05:45");
+        assert_eq!(format_utc_offset(-59), "-00:00");
     }
 
     #[test]

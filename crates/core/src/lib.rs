@@ -1,3 +1,4 @@
+pub mod ansi;
 pub mod backend;
 pub mod cli;
 pub mod config;

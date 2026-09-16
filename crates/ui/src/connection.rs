@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
+use v2ray_rs_core::ansi::strip_ansi;
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
@@ -992,7 +993,7 @@ struct CandidateFailure {
 
 impl CandidateFailure {
     fn new(label: &str, reason: &str, address: &str, port: u16) -> Self {
-        let reason = strip_ansi(reason);
+        let reason = strip_ansi(reason).into_owned();
         Self {
             key: failure_key(&reason, label, address, port),
             label: label.to_string(),
@@ -1021,31 +1022,6 @@ fn repeats_previous(failures: &[CandidateFailure]) -> bool {
         [.., previous, last] => previous.key == last.key,
         _ => false,
     }
-}
-
-/// Drops CSI sequences so nothing the backend colored reaches the user.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c != '\u{1b}' {
-            out.push(c);
-            continue;
-        }
-        if chars.next_if_eq(&'[').is_none() {
-            continue;
-        }
-        while chars
-            .next_if(|c| ('\u{30}'..='\u{3f}').contains(c))
-            .is_some()
-        {}
-        while chars
-            .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
-            .is_some()
-        {}
-        chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
-    }
-    out
 }
 
 /// The comparable form of a failure: everything that varies between candidates
