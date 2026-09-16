@@ -98,6 +98,7 @@ impl StateManager {
         connection: Option<ConnectionMetadata>,
     ) -> Result<ProcessState, TransitionError> {
         let old = self.state.transition(target.clone())?;
+        log::info!("backend state {old:?} → {target:?}");
         let _ = self.tx.send(ProcessEvent::StateChanged {
             from: old.clone(),
             to: target,
@@ -263,6 +264,15 @@ mod tests {
     fn state_manager_starts_stopped() {
         let mgr = StateManager::new();
         assert_eq!(mgr.state(), ProcessState::Stopped);
+    }
+
+    #[test]
+    fn rejected_transition_changes_nothing() {
+        let mut mgr = StateManager::new();
+        let mut rx = mgr.subscribe();
+        assert!(mgr.transition(ProcessState::Running, None).is_err());
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

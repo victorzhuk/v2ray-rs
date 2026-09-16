@@ -954,6 +954,13 @@ impl ProcessManager {
                 return;
             }
 
+            log::info!(
+                "backend exited unexpectedly ({}); respawn crash={}/{}",
+                exit_status_field(Some(&status)),
+                self.crash_times.len(),
+                MAX_CRASHES
+            );
+
             if self.state.state() == ProcessState::Running {
                 let _ = self
                     .state
@@ -1673,6 +1680,39 @@ mod tests {
         assert_eq!(mgr.state(), ProcessState::Running);
         assert_eq!(read_lines(&checks).len(), 1);
         assert_eq!(wait_for_lines(&dir.path().join("runs"), 2).await.len(), 2);
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn crash_respawn_records_crash_count() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = format!("{VERSION_STUB}{}", crashing_backend(dir.path(), 1));
+        let mut mgr = manager_for(&dir, &script).with_log_file(Some(backend_log(dir.path())));
+        mgr.restart_delay = Duration::from_millis(50);
+        mgr.start().await.unwrap();
+
+        let mut rx = mgr.subscribe();
+        mgr.wait_and_handle_exit().await.unwrap();
+
+        assert_eq!(
+            drain_states(&mut rx),
+            [ProcessState::Starting, ProcessState::Running]
+        );
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 3).await;
+        let records: Vec<_> = lines
+            .iter()
+            .filter(|l| l.contains("session backend=") || l.contains(" exit requested="))
+            .collect();
+        assert_eq!(records.len(), 3, "{lines:#?}");
+        assert!(records[0].contains("session backend="), "{}", records[0]);
+        assert!(
+            records[1].contains("exit requested=false reason=crash"),
+            "{}",
+            records[1]
+        );
+        assert!(records[1].contains("code=1"), "{}", records[1]);
+        assert!(records[1].contains("crashes_in_window=1"), "{}", records[1]);
+        assert!(records[2].contains("session backend="), "{}", records[2]);
         mgr.shutdown().await;
     }
 
