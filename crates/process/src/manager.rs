@@ -1148,6 +1148,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn startup_failure_writes_one_session_and_no_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut mgr = manager_for(&dir, "echo FATAL >&2\nexit 1\n")
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_ready_probe(listener.local_addr().unwrap());
+        mgr.restart_delay = Duration::from_millis(50);
+
+        let result = mgr.start().await;
+        assert!(
+            matches!(result, Err(ProcessError::ExitedBeforeReady(_))),
+            "{result:?}"
+        );
+
+        let log = dir.path().join("backend.log");
+        let sessions = |lines: &[String]| lines.iter().filter(|l| l.contains(" session ")).count();
+        let lines = read_lines(&log);
+        assert_eq!(sessions(&lines), 1, "{lines:#?}");
+        let exit = lines
+            .iter()
+            .find(|l| l.contains(" exit "))
+            .unwrap_or_else(|| panic!("no exit record: {lines:#?}"));
+        for field in [
+            "exit requested=false",
+            "code=1",
+            "crashes_in_window=0",
+            "last_output=FATAL",
+        ] {
+            assert!(exit.contains(field), "{field} missing in {exit}");
+        }
+
+        sleep(Duration::from_secs(3)).await;
+        assert_eq!(sessions(&read_lines(&log)), 1);
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+    }
+
+    #[tokio::test]
+    async fn respawn_readiness_failure_counts_as_crash() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let runs = dir.path().join("runs");
+        let script = format!(
+            "echo run >> {runs}\n[ $(wc -l < {runs}) -le 1 ] && {{ sleep 2; exit 1; }}\nexit 1\n",
+            runs = runs.display()
+        );
+        let mut mgr = manager_for(&dir, &script).with_ready_probe(listener.local_addr().unwrap());
+        mgr.restart_delay = Duration::from_millis(50);
+
+        mgr.start().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        while mgr.state() == ProcessState::Running {
+            mgr.wait_and_handle_exit().await.unwrap();
+        }
+
+        match mgr.state() {
+            ProcessState::Error(msg) => {
+                assert!(msg.contains("3 crashes within 60s"), "{msg}");
+                assert!(msg.contains("restart failed"), "{msg}");
+            }
+            other => panic!("expected Error state, got {other:?}"),
+        }
+        assert_eq!(mgr.crash_times.len(), MAX_CRASHES);
+        assert_eq!(read_lines(&runs).len(), MAX_CRASHES);
+    }
+
+    #[tokio::test]
     async fn backend_log_captures_all_lines_under_load() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}seq 1 20000; exec sleep 30\n"))
