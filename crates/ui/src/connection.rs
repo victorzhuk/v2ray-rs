@@ -149,7 +149,7 @@ fn spawn_with(
             ));
         }
 
-        for candidate in candidates {
+        'candidates: for candidate in candidates {
             if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
                 if let Some(mut failed) = parked.take() {
                     failed.shutdown().await;
@@ -195,6 +195,9 @@ fn spawn_with(
                             &candidate_address,
                             candidate_port,
                         ));
+                        if repeats_previous(&failures) {
+                            break 'candidates;
+                        }
                         continue;
                     }
                 };
@@ -284,6 +287,9 @@ fn spawn_with(
                         candidate_port,
                     ));
                     parked = Some(mgr);
+                    if repeats_previous(&failures) {
+                        break 'candidates;
+                    }
                     continue;
                 }
             }
@@ -361,9 +367,12 @@ fn spawn_with(
             halt(state_forwarder).await;
             halt(log_forwarder).await;
             parked = Some(mgr);
+            if repeats_previous(&failures) {
+                break 'candidates;
+            }
         }
 
-        report(ProcessState::Error(summarize_failures(&failures)), None);
+        report(ProcessState::Error(terminal_failure(&failures)), None);
     });
 
     ConnectionHandle { cmd_tx }
@@ -654,6 +663,19 @@ fn mask_port(text: &str, port: u16) -> String {
         i += c.len_utf8();
     }
     out
+}
+
+/// The message for the single terminal state. Two candidates that failed the
+/// same way say nothing about any node, so a per-node list would only invite
+/// another pointless retry.
+fn terminal_failure(failures: &[CandidateFailure]) -> String {
+    match failures.last() {
+        Some(last) if repeats_previous(failures) => format!(
+            "Connection failed on consecutive nodes with the same error (not node-specific): {}",
+            last.reason
+        ),
+        _ => summarize_failures(failures),
+    }
 }
 
 fn summarize_failures(failures: &[CandidateFailure]) -> String {
@@ -982,6 +1004,96 @@ mod tests {
         assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
         assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
         assert_nothing_after_terminal(&rx).await;
+    }
+
+    /// Lines the stub appended, one per candidate it was asked to check.
+    fn attempts(marker: &std::path::Path) -> usize {
+        std::fs::read_to_string(marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn same_failure_on_consecutive_candidates_stops_failover() {
+        let launches = tempfile::tempdir().unwrap();
+        let marker = launches.path().join("launched");
+        let stub = stub(&format!(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0
+[ "$1" = check ] || exec sleep 30
+echo attempt >> {}
+printf '\033[31mFATAL\033[0m[0000] configure tun interface: operation not permitted\n' >&2
+exit 1"#,
+            marker.display()
+        ));
+        let (_handle, rx) = connect(
+            &stub,
+            singbox_settings(),
+            vec![
+                candidate("203.0.113.1"),
+                candidate("203.0.113.2"),
+                candidate("203.0.113.3"),
+            ],
+        );
+
+        let (terminal, _) = drain(&rx).await;
+        let Some(ProcessState::Error(msg)) = terminal else {
+            panic!("expected a single error terminal, got {terminal:?}");
+        };
+        assert!(
+            msg.starts_with("Connection failed on consecutive nodes with the same error"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("configure tun interface: operation not permitted"),
+            "{msg}"
+        );
+        assert!(!msg.contains('\u{1b}'), "{msg}");
+        assert_eq!(attempts(&marker), 2);
+
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("sing-box.json"))
+            .expect("generated config readable");
+        assert!(config.contains("203.0.113.2"), "{config}");
+        assert!(
+            !config.contains("203.0.113.3"),
+            "third candidate must not be attempted: {config}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn differing_failures_keep_failing_over() {
+        let launches = tempfile::tempdir().unwrap();
+        let marker = launches.path().join("launched");
+        let stub = stub(&format!(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0
+[ "$1" = check ] || exec sleep 30
+echo attempt >> {}
+grep -q 203.0.113.1 "$3" && echo "alpha refused" >&2 && exit 1
+grep -q 203.0.113.2 "$3" && echo "bravo refused" >&2 && exit 1
+echo "charlie refused" >&2
+exit 1"#,
+            marker.display()
+        ));
+        let (_handle, rx) = connect(
+            &stub,
+            singbox_settings(),
+            vec![
+                candidate("203.0.113.1"),
+                candidate("203.0.113.2"),
+                candidate("203.0.113.3"),
+            ],
+        );
+
+        let (terminal, _) = drain(&rx).await;
+        let Some(ProcessState::Error(msg)) = terminal else {
+            panic!("expected a single error terminal, got {terminal:?}");
+        };
+        assert!(msg.starts_with("All candidates failed"), "{msg}");
+        for reason in ["alpha refused", "bravo refused", "charlie refused"] {
+            assert!(msg.contains(reason), "{msg}");
+        }
+        assert!(!msg.contains('\u{1b}'), "{msg}");
+        assert_eq!(attempts(&marker), 3);
     }
 
     /// Drains the connection until its channel closes, returning the terminal
