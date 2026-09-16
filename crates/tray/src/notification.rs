@@ -41,6 +41,12 @@ impl Notifier {
         }
     }
 
+    pub fn notify(&self, summary: &str, body: &str) {
+        if self.enabled.load(Ordering::Relaxed) {
+            self.send(summary, body);
+        }
+    }
+
     fn send(&self, summary: &str, body: &str) {
         if let Err(e) = Notification::new()
             .appname("V2Ray Manager")

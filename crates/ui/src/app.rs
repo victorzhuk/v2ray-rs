@@ -1435,6 +1435,14 @@ impl SimpleComponent for App {
                 if !unhealthy {
                     self.health_failovers = 0;
                 }
+                if let Health::Unhealthy(reason) = &health
+                    && should_announce(self.health.as_ref(), &health)
+                {
+                    self.show_toast(&format!("Proxy not responding: {reason}"));
+                    if self.settings.notifications_enabled {
+                        notify_tray("Proxy not responding", reason);
+                    }
+                }
                 self.health = Some(health);
                 self.update_status_labels();
                 if unhealthy
@@ -1930,6 +1938,10 @@ fn last_success_settings(current: &AppSettings, meta: &ConnectionMetadata) -> Ap
         connected_at: meta.connected_since,
     });
     settings
+}
+
+fn should_announce(prev: Option<&Health>, next: &Health) -> bool {
+    matches!(next, Health::Unhealthy(_)) && !matches!(prev, Some(Health::Unhealthy(_)))
 }
 
 fn active_nodes_available(subscriptions: &[Subscription], manual_nodes: &[ManualNode]) -> bool {
@@ -3030,6 +3042,20 @@ mod tests {
     }
 
     #[test]
+    fn should_announce_fires_once_per_unhealthy_streak() {
+        let unhealthy = Health::Unhealthy("timeout".into());
+
+        assert!(should_announce(None, &unhealthy));
+        assert!(should_announce(Some(&Health::Healthy), &unhealthy));
+        assert!(!should_announce(
+            Some(&Health::Unhealthy("refused".into())),
+            &unhealthy
+        ));
+        assert!(!should_announce(None, &Health::Healthy));
+        assert!(!should_announce(Some(&unhealthy), &Health::Healthy));
+    }
+
+    #[test]
     fn records_last_success_only_on_running() {
         let connection = ConnectionMetadata {
             node_ref: session_target_node(),
@@ -3073,6 +3099,14 @@ fn update_tray_notification_setting(enabled: bool) {
         && let Some(handle) = guard.as_mut()
     {
         handle.set_notifications_enabled(enabled);
+    }
+}
+
+fn notify_tray(summary: &str, body: &str) {
+    if let Ok(guard) = TRAY_HANDLE.lock()
+        && let Some(handle) = guard.as_ref()
+    {
+        handle.notify(summary, body);
     }
 }
 

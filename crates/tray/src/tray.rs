@@ -32,6 +32,12 @@ impl TrayHandle {
     pub fn set_notifications_enabled(&mut self, enabled: bool) {
         self.notifier.set_enabled(enabled);
     }
+
+    pub fn notify(&self, summary: &str, body: &str) {
+        let notifier = self.notifier.clone();
+        let (summary, body) = (summary.to_owned(), body.to_owned());
+        tokio::task::spawn_blocking(move || notifier.notify(&summary, &body));
+    }
 }
 
 struct AppTray {
