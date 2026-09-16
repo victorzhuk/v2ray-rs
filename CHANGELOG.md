@@ -7,14 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Preferences → System → Diagnostics sets the backend log level (`error`,
+  `warning`, `info`, `debug`; default `warning`) and a Connection log switch
+  for xray/v2ray.
+- Known backend deprecation and security warnings, such as xray's REALITY
+  `potential MITM or redirection`, raise a toast once per warning per
+  connection.
+
 ### Changed
 - Excluded routes with prefix length 0 (such as `0.0.0.0/0`), or more than 256
   of them, are refused. A list over 256 entries must be trimmed in
   `settings.toml`.
+- The xray/v2ray access log is off by default. Turn on the Connection log
+  switch to restore it.
+- The sing-box log level follows the backend log level setting.
+- The `session` record in `backend.log` states the host's UTC offset as
+  `utc_offset=±HH:MM`.
 
 ### Fixed
 - On xray TUN, excluded routes now bypass the TUN device, including DNS
   capture on port 53.
+- Terminal color escapes are no longer written to `backend.log` or shown on
+  the logs page.
+- Backend lines printed during startup now reach the logs page.
 
 ## [0.18.0] - 2026-09-12
 

@@ -47,7 +47,7 @@ AppSettings + Vec<ProxyNode> + Vec<RoutingRule>
 ProcessManager::start()
   → [TUN mode] check CAP_NET_ADMIN on binary
   → tokio::process::Command::new(backend_binary).arg("run").arg("-c").arg(config)
-  → stdout/stderr → LogBuffer (ring, 10K lines) + broadcast channel
+  → stdout/stderr → strip_ansi → backend.log + LogBuffer (ring, 10K lines) + broadcast channel
   → [xray TUN] wait_for_device() + netctl xray-up → routes programmed
   → ProcessState transitions broadcast to UI + tray
 ```
@@ -222,6 +222,13 @@ and settings live in an `adw::PreferencesDialog` off the hamburger menu.
 `geodata_service.rs` drives async geodata downloads off the GTK main thread via
 `glib::MainContext::spawn_local` + `tokio::task::spawn_blocking`. `wizard.rs`
 handles first-run onboarding.
+
+The connection task subscribes to backend log lines before `start()` returns,
+so lines printed during startup reach the logs page. `backend_warning.rs`
+matches each line against known per-backend patterns (xray/v2ray `is
+deprecated`, xray REALITY `potential MITM or redirection`, sing-box `WARN` +
+`deprecated`) and raises a toast quoting the line (leading timestamp dropped,
+160 chars max), once per pattern per connection.
 
 ### `run` (`v2ray-rs-run`)
 
@@ -415,7 +422,7 @@ between the Rust-side source validation and the root-side `cp`.
 
 ```
 $XDG_CONFIG_HOME/v2ray-rs/
-  settings.toml              — AppSettings (backend, ports, TUN, DNS, ...)
+  settings.toml              — AppSettings (backend, ports, TUN, DNS, logging, ...)
 
 $XDG_DATA_HOME/v2ray-rs/
   subscriptions.json
@@ -467,10 +474,21 @@ directory and appended to across runs.
   tagged by its stream (`stdout`/`stderr`) or the route-helper tag. The
   connection task opens one shared writer, so failover between candidates
   appends to the same file. Interspersed diagnostics records: one `session`
-  line per launch (`backend=… version=… node=… tun=…`; the version probe runs
-  at most once per manager) and one `exit` line per exit (exit code or
-  signal, whether the stop was requested, crashes in the restart window, and
-  the backend's last output line).
+  line per launch (`backend=… version=… node=… tun=… utc_offset=±HH:MM`; the
+  version probe runs at most once per manager) and one `exit` line per exit
+  (exit code or signal, whether the stop was requested, crashes in the restart
+  window, and the backend's last output line). `core::ansi::strip_ansi`
+  removes CSI and OSC escape sequences from backend, helper, and version
+  output before it reaches the file, the `LogBuffer`, or the log channel.
+
+- **Backend verbosity** — `AppSettings.logging` (`LoggingSettings`), edited in
+  Preferences → System → Diagnostics, drives the generated config's `log`
+  object. `backend_level` (`error`, `warning`, `info`, `debug`; default
+  `warning`) sets xray/v2ray `loglevel` and sing-box `level` (`warn` for
+  warning). `connection_log` (default off) applies to xray/v2ray only: off
+  emits `access: "none"`. The switch is insensitive for sing-box, which writes
+  connection lines at `info` and `debug`.
+  Probe configs keep a fixed `warning` level.
 
 ## Cross-cutting patterns
 
