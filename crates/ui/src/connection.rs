@@ -246,7 +246,8 @@ fn spawn_with(
                 )
                 .with_tun(tun)
                 .with_backend(settings.backend.backend_type)
-                .with_log_file(backend_log.clone()),
+                .with_log_file(backend_log.clone())
+                .with_ready_probe(effective_settings.local_endpoint(effective_settings.socks_port)),
             );
 
             let started = tokio::select! {
@@ -339,12 +340,13 @@ fn spawn_with(
                     }
                 }
             });
+            let forwarders = vec![state_forwarder, log_forwarder];
 
             loop {
                 tokio::select! {
                     Some(ConnectionCmd::Stop) = cmd_rx.recv() => {
                         mgr.shutdown().await;
-                        halt(state_forwarder).await;
+                        halt(forwarders).await;
                         report(ProcessState::Stopped, None);
                         return;
                     }
@@ -365,7 +367,7 @@ fn spawn_with(
                                 break;
                             }
                             _ => {
-                                halt(state_forwarder).await;
+                                halt(forwarders).await;
                                 report(ProcessState::Stopped, None);
                                 return;
                             }
@@ -373,8 +375,7 @@ fn spawn_with(
                     }
                 }
             }
-            halt(state_forwarder).await;
-            halt(log_forwarder).await;
+            halt(forwarders).await;
             parked = Some(mgr);
             if repeats_previous(&failures) {
                 break 'candidates;
@@ -519,11 +520,15 @@ fn tun_session_for(rt: &TunRuntime) -> TunSession {
     }
 }
 
-/// Stops a forwarder and waits until it can no longer emit, so nothing it
-/// relays can land after the terminal state that follows.
-async fn halt(task: JoinHandle<()>) {
-    task.abort();
-    let _ = task.await;
+/// Stops every task spawned for a candidate and waits until none can emit, so
+/// nothing they relay can land after the terminal state that follows.
+async fn halt(tasks: Vec<JoinHandle<()>>) {
+    for task in &tasks {
+        task.abort();
+    }
+    for task in tasks {
+        let _ = task.await;
+    }
 }
 
 /// Whether a host-level TUN failure is fixed by granting capabilities to the
@@ -829,6 +834,15 @@ mod tests {
         settings
     }
 
+    /// Settings whose SOCKS port is a live listener, so a stub backend passes
+    /// the readiness probe. The listener must outlive the connection under test.
+    fn ready_singbox_settings() -> (std::net::TcpListener, AppSettings) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut settings = singbox_settings();
+        settings.socks_port = listener.local_addr().unwrap().port();
+        (listener, settings)
+    }
+
     async fn next_state(
         rx: &relm4::Receiver<AppMsg>,
     ) -> (ProcessState, Option<ConnectionMetadata>) {
@@ -1044,9 +1058,10 @@ mod tests {
         let stub = stub(
             r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
         );
+        let (_listener, settings) = ready_singbox_settings();
         let (handle, rx) = connect(
             &stub,
-            singbox_settings(),
+            settings,
             vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
         );
 
@@ -1089,7 +1104,10 @@ mod tests {
             }
         };
         assert!(msg.starts_with("All candidates failed"), "{msg}");
-        assert!(msg.contains("203.0.113.1: 3 crashes"), "{msg}");
+        assert!(
+            msg.contains("203.0.113.1: process exited with code 1"),
+            "{msg}"
+        );
         assert!(msg.contains("203.0.113.3: config rejected"), "{msg}");
         assert_nothing_after_terminal(&rx).await;
     }
@@ -1455,7 +1473,8 @@ exit 1"#,
         let stub = stub(
             r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.2; done"#,
         );
-        let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
 
         loop {
             let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
@@ -1520,7 +1539,8 @@ exit 1"#,
         let stub = stub(
             r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
         );
-        let (handle, rx) = connect(&stub, singbox_settings(), vec![candidate("203.0.113.1")]);
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
 
         loop {
             let (state, _) = next_state(&rx).await;
@@ -1554,6 +1574,47 @@ exit 1"#,
         assert_eq!(contents.matches(" exit ").count(), 1, "{contents}");
         assert!(contents[exit_at..].contains("requested=true"), "{contents}");
         assert!(session_at < exit_at, "{contents}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_halts_every_forwarder() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.05; done"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+            assert!(relays(&state), "reported {state:?}");
+        }
+
+        handle.stop();
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => break,
+                Some(AppMsg::ProcessLogLine(_, line)) => {
+                    panic!("log line {line:?} relayed after the terminal state")
+                }
+                Some(AppMsg::ProcessStateConnection(_, state, _)) => {
+                    panic!("{state:?} reported after the terminal state")
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     fn node(address: &str) -> ProxyNode {
