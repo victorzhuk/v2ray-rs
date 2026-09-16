@@ -875,7 +875,7 @@ TEST_TIMEOUT=10m make test && make lint   — `make test` expands to `timeout 10
           "task": "3.1",
           "file": "crates/ui/src/connection.rs",
           "symbol": "exit paths (halt)",
-          "anchor": "            halt(log_forwarder).await;",
+          "anchor": "            halt(forwarders).await;",
           "change": "halt the monitor task alongside the forwarders here AND on every early `return` in the supervise loop / Stop branches, so no probe traffic survives handle.stop()"
         },
         {
