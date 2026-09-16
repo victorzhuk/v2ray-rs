@@ -156,7 +156,7 @@ pub(super) fn build_tun_page(
     // --- Excluded routes ----------------------------------------------------
     let routes_group = adw::PreferencesGroup::builder()
         .title("Excluded routes")
-        .description("CIDRs that bypass the tunnel")
+        .description(EXCLUDED_ROUTES_DESCRIPTION)
         .build();
     let add_row = adw::ActionRow::builder()
         .title("Add excluded route")
@@ -254,7 +254,7 @@ pub(super) fn build_tun_page(
     // --- Excluded domains ---------------------------------------------------
     let domains_group = adw::PreferencesGroup::builder()
         .title("Excluded domains")
-        .description("Domain suffixes that bypass the tunnel")
+        .description(excluded_domains_description(backend))
         .build();
     let add_domain_row = adw::ActionRow::builder()
         .title("Add excluded domain")
@@ -733,6 +733,7 @@ pub(super) fn build_tun_page(
             hijack_row.set_sensitive(backend != BackendType::V2ray);
             routes_group.set_sensitive(backend != BackendType::V2ray);
             domains_group.set_sensitive(backend != BackendType::V2ray);
+            domains_group.set_description(Some(excluded_domains_description(backend)));
             apps_group.set_sensitive(singbox_only);
             refresh_caps();
         });
@@ -751,6 +752,22 @@ pub(super) fn build_tun_page(
 
 fn strict_route_applies(backend: BackendType) -> bool {
     matches!(backend, BackendType::SingBox | BackendType::Xray)
+}
+
+const EXCLUDED_ROUTES_DESCRIPTION: &str =
+    "CIDRs routed outside the tunnel; applies on next connect";
+
+// xray has no TUN-level domain bypass: matching flows enter the device and are
+// only sent out directly by its routing.
+fn excluded_domains_description(backend: BackendType) -> &'static str {
+    match backend {
+        BackendType::Xray => {
+            "Matching traffic still passes through the tunnel and is sent directly by xray; applies on next connect"
+        }
+        BackendType::SingBox | BackendType::V2ray => {
+            "Domain suffixes that bypass the tunnel; applies on next connect"
+        }
+    }
 }
 
 fn apply_tun_mutation<F>(
@@ -810,5 +827,24 @@ mod tests {
         assert!(strict_route_applies(BackendType::Xray));
         assert!(strict_route_applies(BackendType::SingBox));
         assert!(!strict_route_applies(BackendType::V2ray));
+    }
+
+    #[test]
+    fn excluded_routes_description_names_next_connect() {
+        assert_eq!(
+            EXCLUDED_ROUTES_DESCRIPTION,
+            "CIDRs routed outside the tunnel; applies on next connect"
+        );
+    }
+
+    #[test]
+    fn excluded_domains_description_per_backend() {
+        let xray = excluded_domains_description(BackendType::Xray);
+        assert!(xray.contains("still passes through the tunnel"));
+        assert!(!xray.contains("bypass"));
+        assert!(xray.ends_with("applies on next connect"));
+        let bypass = "Domain suffixes that bypass the tunnel; applies on next connect";
+        assert_eq!(excluded_domains_description(BackendType::SingBox), bypass);
+        assert_eq!(excluded_domains_description(BackendType::V2ray), bypass);
     }
 }
