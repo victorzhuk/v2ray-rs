@@ -1292,7 +1292,9 @@ impl SimpleComponent for App {
                 }
                 if connection.is_some() {
                     self.connection_status = connection;
-                    if let Some(meta) = &self.connection_status {
+                    if records_last_success(&state, self.connection_status.as_ref())
+                        && let Some(meta) = &self.connection_status
+                    {
                         let settings = last_success_settings(&self.settings, meta);
                         if let Err(err) = self.persist_settings(settings) {
                             log::error!("save settings: {err}");
@@ -1787,6 +1789,12 @@ fn consume_terminal_direct_state(
 fn keep_last_success(mut incoming: AppSettings, current: &AppSettings) -> AppSettings {
     incoming.last_success = current.last_success.clone();
     incoming
+}
+
+/// Only a backend that became ready counts as a success; `Starting` and
+/// `Stopping` relays carry metadata for display alone.
+fn records_last_success(state: &ProcessState, connection: Option<&ConnectionMetadata>) -> bool {
+    matches!(state, ProcessState::Running) && connection.is_some()
 }
 
 /// A session that reached `Running` records which node last served traffic,
@@ -2742,6 +2750,36 @@ mod tests {
                 connected_at: now,
             })
         );
+    }
+
+    #[test]
+    fn records_last_success_only_on_running() {
+        let connection = ConnectionMetadata {
+            node_ref: session_target_node(),
+            source: "manual".into(),
+            source_id: String::new(),
+            node_name: "node".into(),
+            node_address: "127.0.0.1".into(),
+            node_port: 1080,
+            backend: BackendType::Xray,
+            strategy: AutoResolveStrategy::default(),
+            latency_ms: None,
+            connected_since: chrono::Utc::now(),
+        };
+
+        assert!(!records_last_success(
+            &ProcessState::Starting,
+            Some(&connection)
+        ));
+        assert!(records_last_success(
+            &ProcessState::Running,
+            Some(&connection)
+        ));
+        assert!(!records_last_success(&ProcessState::Running, None));
+        assert!(!records_last_success(
+            &ProcessState::Stopping,
+            Some(&connection)
+        ));
     }
 }
 
