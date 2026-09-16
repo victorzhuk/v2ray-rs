@@ -1577,6 +1577,53 @@ exit 1"#,
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn two_candidates_first_exits_before_ready() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && { echo "FATAL start service: listen failed" >&2; exit 1; }; exec sleep 30"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+
+        loop {
+            let (state, connection) = next_state(&rx).await;
+            assert!(relays(&state), "failover reported {state:?}");
+            if matches!(state, ProcessState::Running) {
+                let address = connection.map(|c| c.node_address);
+                assert_eq!(address.as_deref(), Some("203.0.113.2"));
+                break;
+            }
+        }
+
+        let contents = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(contents.matches(" session ").count(), 2, "{contents}");
+        let exit_at = contents.find(" exit ").expect("exit record");
+        assert_eq!(
+            contents[..exit_at].matches(" session ").count(),
+            1,
+            "{contents}"
+        );
+        assert!(
+            contents[..exit_at].contains("node=203.0.113.1"),
+            "{contents}"
+        );
+
+        handle.stop();
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+        assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn stop_halts_every_forwarder() {
         let stub = stub(
             r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; while :; do echo v2rs-log-line; sleep 0.05; done"#,
