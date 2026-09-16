@@ -1629,6 +1629,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         }
     }
 
@@ -1850,6 +1851,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         }));
 
         let result = mgr.start_with_connection(None).await;
@@ -1886,6 +1888,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         }))
         .with_backend(BackendType::Xray)
         .with_log_file(Some(backend_log(dir.path())));
@@ -1963,6 +1966,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         }))
         .with_backend(BackendType::SingBox);
 
@@ -2110,6 +2114,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         });
 
         let mut rx = mgr.subscribe();
@@ -2144,6 +2149,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: true,
+            exclude_routes: Vec::new(),
         });
 
         mgr.stop().await.unwrap();
@@ -2351,6 +2357,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))
@@ -2391,6 +2398,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))

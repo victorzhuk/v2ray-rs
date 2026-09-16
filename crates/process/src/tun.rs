@@ -42,6 +42,9 @@ pub struct TunRuntime {
     /// Install the fail-closed fallback routes, so traffic has nowhere to go
     /// while the tunnel device is missing. xray only.
     pub strict: bool,
+    /// Destinations routed through the main table instead of the tunnel. xray
+    /// only; sing-box excludes them in its own config.
+    pub exclude_routes: Vec<String>,
 }
 
 impl TunRuntime {
@@ -246,6 +249,9 @@ pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
     if rt.strict {
         args.push("--strict".to_string());
     }
+    for cidr in &rt.exclude_routes {
+        args.extend(["--exclude".to_string(), cidr.clone()]);
+    }
     args
 }
 
@@ -438,6 +444,7 @@ mod tests {
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());
@@ -453,6 +460,7 @@ mod tests {
             bypass_uid: Some(967),
             capture_dns: true,
             strict,
+            exclude_routes: vec!["10.15.12.100/32".into()],
         }
     }
 
@@ -472,6 +480,8 @@ mod tests {
                 "967",
                 "--capture-dns",
                 "--strict",
+                "--exclude",
+                "10.15.12.100/32",
             ]
         );
     }
@@ -482,11 +492,37 @@ mod tests {
             addr_v6: None,
             bypass_uid: None,
             capture_dns: false,
+            exclude_routes: Vec::new(),
             ..xray_rt(false)
         };
         assert_eq!(
             xray_up_args(&rt),
             ["xray-up", "--iface", "tun0", "--addr", "172.19.0.1/30"]
+        );
+    }
+
+    #[test]
+    fn xray_up_args_pass_exclusions_in_order() {
+        let rt = TunRuntime {
+            addr_v6: None,
+            bypass_uid: None,
+            capture_dns: false,
+            exclude_routes: vec!["10.15.12.100/32".into(), "91.230.107.224/32".into()],
+            ..xray_rt(false)
+        };
+        assert_eq!(
+            xray_up_args(&rt),
+            [
+                "xray-up",
+                "--iface",
+                "tun0",
+                "--addr",
+                "172.19.0.1/30",
+                "--exclude",
+                "10.15.12.100/32",
+                "--exclude",
+                "91.230.107.224/32",
+            ]
         );
     }
 

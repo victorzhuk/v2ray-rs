@@ -847,6 +847,7 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
             && settings.tun.dns_hijack == DnsHijackMode::Hijack
             && nodes_pinned,
         strict: settings.tun.strict_route,
+        exclude_routes: Vec::new(),
     })
 }
 
@@ -2278,6 +2279,7 @@ exit 1"#,
             bypass_uid: None,
             capture_dns: false,
             strict: false,
+            exclude_routes: Vec::new(),
         }));
 
         assert!(probe_allowed(None));
