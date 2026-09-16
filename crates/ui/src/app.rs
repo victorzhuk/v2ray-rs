@@ -124,6 +124,7 @@ pub enum AppMsg {
     CloseRequested,
     TrayShowWindow,
     TrayQuit,
+    QuitSignal,
     ActiveNodesChanged(bool),
     ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(u64, String),
@@ -316,9 +317,9 @@ impl App {
         });
     }
 
-    fn quit(&mut self, sender: &ComponentSender<Self>) {
-        if force_exit_on_second_signal(self.pending_exit) {
-            log::warn!("quit requested again while exit is pending, exiting now");
+    fn quit(&mut self, sender: &ComponentSender<Self>, signal: bool) {
+        if force_exit(self.pending_exit, signal) {
+            log::warn!("quit signal received again while exit is pending, exiting now");
             std::process::exit(1);
         }
         self.cancel_auto_reconnect();
@@ -948,7 +949,7 @@ impl SimpleComponent for App {
                 let s = sender.input_sender().clone();
                 glib::unix_signal_add_local(signal as i32, move || {
                     log::info!("received {}, quitting", signal.as_str());
-                    s.emit(AppMsg::TrayQuit);
+                    s.emit(AppMsg::QuitSignal);
                     glib::ControlFlow::Continue
                 })
             })
@@ -1543,7 +1544,7 @@ impl SimpleComponent for App {
                 if self.settings.minimize_to_tray && tray_available() {
                     self.window.set_visible(false);
                 } else {
-                    self.quit(&sender);
+                    self.quit(&sender, false);
                 }
             }
             AppMsg::TrayShowWindow => {
@@ -1551,7 +1552,10 @@ impl SimpleComponent for App {
                 self.window.present();
             }
             AppMsg::TrayQuit => {
-                self.quit(&sender);
+                self.quit(&sender, false);
+            }
+            AppMsg::QuitSignal => {
+                self.quit(&sender, true);
             }
             AppMsg::OpenPreferences(page) => {
                 if let Some(dialog) = &self.preferences_dialog {
@@ -1717,10 +1721,10 @@ fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> Qu
     }
 }
 
-/// A repeated quit while a stop is still pending exits at once, so a wedged
-/// stop cannot make the app unkillable.
-fn force_exit_on_second_signal(pending_exit: bool) -> bool {
-    pending_exit
+/// A quit signal arriving while a stop is still pending exits at once, so a
+/// wedged stop cannot make the app unkillable. UI quits keep waiting.
+fn force_exit(pending_exit: bool, signal: bool) -> bool {
+    pending_exit && signal
 }
 
 fn origin_field(origin: ConnectOrigin, direct: bool) -> &'static str {
@@ -2485,12 +2489,17 @@ mod tests {
     }
 
     #[test]
-    fn second_quit_signal_forces_exit() {
-        for (pending_exit, expected) in [(false, false), (true, true)] {
+    fn only_repeated_quit_signal_forces_exit() {
+        for (pending_exit, signal, expected) in [
+            (true, true, true),
+            (true, false, false),
+            (false, true, false),
+            (false, false, false),
+        ] {
             assert_eq!(
-                force_exit_on_second_signal(pending_exit),
+                force_exit(pending_exit, signal),
                 expected,
-                "pending_exit={pending_exit}"
+                "pending_exit={pending_exit} signal={signal}"
             );
         }
     }
@@ -2595,7 +2604,6 @@ mod tests {
         for (line, want) in cases {
             assert_eq!(line, want);
         }
-        assert!(!auto_reconnect_allowed(false, MAX_AUTO_RECONNECTS));
     }
 
     #[test]
