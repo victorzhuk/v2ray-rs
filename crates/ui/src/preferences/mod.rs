@@ -60,7 +60,7 @@ pub fn show_preferences(
     let routing_cb: RoutingCallback = Rc::new(on_routing_changed);
     let toast_cb: ToastCallback = Rc::new(on_toast);
 
-    let system_page = build_system_page(&settings_state, &settings_cb);
+    let system_page = build_system_page(&settings_state, &settings_cb, &settings_observers);
     dialog.add(&system_page);
 
     let network_page = build_network_page(
