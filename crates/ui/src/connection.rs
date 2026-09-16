@@ -352,6 +352,9 @@ fn spawn_with(
                 .with_session_fields(session_fields)
                 .with_ready_probe(effective_settings.local_endpoint(effective_settings.socks_port)),
             );
+            // xray prints deprecation warnings milliseconds after spawn, before
+            // start returns, so a later subscription would miss them.
+            let mut log_rx = mgr.subscribe_logs();
 
             let started = tokio::select! {
                 biased;
@@ -439,7 +442,6 @@ fn spawn_with(
 
             let log_sender = sender.clone();
             let backend = settings.backend.backend_type;
-            let mut log_rx = mgr.subscribe_logs();
             let warnings = Arc::clone(&warnings);
             let log_forwarder = tokio::spawn(async move {
                 // Only xray's log lines are known to mark DNS failures.
@@ -2309,11 +2311,53 @@ exit 1"#,
         }
     }
 
+    /// Collects log lines containing `marker` and toasts from every message,
+    /// including those before Running, until Running is reported and `want`
+    /// matching lines arrived.
+    async fn collect_until_running(
+        rx: &relm4::Receiver<AppMsg>,
+        marker: &str,
+        want: usize,
+    ) -> (usize, Vec<String>) {
+        let mut running = false;
+        let mut relayed = 0;
+        let mut toasts = Vec::new();
+        while !running || relayed < want {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("warning lines not relayed in time")
+                .expect("connection task ended before relaying the warnings");
+            match msg {
+                AppMsg::ProcessStateConnection(_, state, _) => {
+                    assert!(relays(&state), "reported {state:?}");
+                    running |= matches!(state, ProcessState::Running);
+                }
+                AppMsg::ProcessLogLine(_, line) if line.contains(marker) => relayed += 1,
+                AppMsg::ShowToast(toast) => toasts.push(toast),
+                _ => {}
+            }
+        }
+        (relayed, toasts)
+    }
+
+    async fn stop_and_count(
+        handle: &ConnectionHandle,
+        rx: &relm4::Receiver<AppMsg>,
+        marker: &str,
+        relayed: &mut usize,
+        toasts: &mut Vec<String>,
+    ) {
+        handle.stop(StopReason::UserStop);
+        let (_, lines, rest) = drain_within(rx, RECV_TIMEOUT).await;
+        toasts.extend(rest);
+        *relayed += lines.iter().filter(|line| line.contains(marker)).count();
+    }
+
     #[tokio::test]
     async fn reality_warning_toasts_once_per_connection() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let stub = stub(
-            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; while [ ! -e "$0.go" ]; do sleep 0.05; done; for i in 1 2 3; do echo "2026/09/14 09:57:30.532567 [Error] [1944052120] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"; done; exec sleep 30"#,
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; for i in 1 2 3; do echo "2026/09/14 09:57:30.532567 [Error] [1944052120] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"; done; exec sleep 30"#,
         );
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut settings = AppSettings::default();
@@ -2321,37 +2365,9 @@ exit 1"#,
         settings.socks_port = listener.local_addr().unwrap().port();
         let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
 
-        loop {
-            let (state, _) = next_state(&rx).await;
-            if matches!(state, ProcessState::Running) {
-                break;
-            }
-            assert!(relays(&state), "reported {state:?}");
-        }
-        // The forwarder subscribes once the backend is running; earlier output
-        // would never reach it.
-        std::fs::write(stub.binary.with_extension("go"), "").unwrap();
-
-        let mut relayed = 0;
-        let mut toasts = Vec::new();
-        while relayed < 3 {
-            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
-                .await
-                .expect("warning lines not relayed in time")
-                .expect("connection task ended before relaying the warnings");
-            match msg {
-                AppMsg::ProcessLogLine(_, line) if line.contains("potential MITM") => relayed += 1,
-                AppMsg::ShowToast(toast) => toasts.push(toast),
-                _ => {}
-            }
-        }
-        handle.stop(StopReason::UserStop);
-        let (_, lines, rest) = drain_within(&rx, RECV_TIMEOUT).await;
-        toasts.extend(rest);
-        relayed += lines
-            .iter()
-            .filter(|line| line.contains("potential MITM"))
-            .count();
+        let marker = "potential MITM";
+        let (mut relayed, mut toasts) = collect_until_running(&rx, marker, 3).await;
+        stop_and_count(&handle, &rx, marker, &mut relayed, &mut toasts).await;
 
         assert_eq!(relayed, 3);
         assert_eq!(
@@ -2359,6 +2375,33 @@ exit 1"#,
             [
                 "Backend warning: [Error] [1944052120] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"
             ]
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn startup_deprecation_warning_toasts_once() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; echo "2026/09/15 08:51:54.138024 [Warning] common/errors: The feature WebSocket transport (with ALPN http/1.1, etc.) is deprecated, not recommended for using and might be removed. Please migrate to XHTTP H2 & H3 as soon as possible."; echo "2026/09/15 08:51:54.138100 [Warning] common/errors: The feature WebSocket transport (with ALPN http/1.1, etc.) is deprecated, not recommended for using and might be removed. Please migrate to XHTTP H2 & H3 as soon as possible."; exec sleep 30"#,
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.socks_port = listener.local_addr().unwrap().port();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        let marker = "WebSocket transport";
+        let (mut relayed, mut toasts) = collect_until_running(&rx, marker, 2).await;
+        stop_and_count(&handle, &rx, marker, &mut relayed, &mut toasts).await;
+
+        assert_eq!(relayed, 2);
+        assert_eq!(toasts.len(), 1, "toasts: {toasts:?}");
+        assert!(
+            toasts[0]
+                .starts_with("Backend warning: [Warning] common/errors: The feature WebSocket"),
+            "toast: {}",
+            toasts[0]
         );
         drop(listener);
     }
