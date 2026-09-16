@@ -29,6 +29,11 @@ const RT_TABLE_MAIN: u32 = 254;
 /// capture rules, so it egresses the real interface instead of the tunnel.
 const RULE_PREF_BYPASS_UID: u32 = 8998;
 
+/// Route exclusions: destination prefixes that look up `main` ahead of every
+/// other xray rule, so they leave through the real interface even when DNS
+/// capture would otherwise pull a `:53` flow into the tunnel.
+const RULE_PREF_EXCLUDE: u32 = 8997;
+
 /// DNS capture: port-53 traffic reaches the tunnel table ahead of the rule that
 /// keeps LAN routes working, so a resolver on the local subnet stops being the
 /// one exception the tunnel never sees. Matched on an unmarked fwmark so the
@@ -42,6 +47,16 @@ const DNS_PORT: u16 = 53;
 const RULE_PREF_BYPASS: u32 = 9000;
 const RULE_PREF_MAIN: u32 = 9001;
 const RULE_PREF_TUN: u32 = 9002;
+
+/// Every priority `xray_up` and `replace_exclusions` install, torn down together.
+const XRAY_RULE_PREFS: [u32; 6] = [
+    RULE_PREF_EXCLUDE,
+    RULE_PREF_BYPASS_UID,
+    RULE_PREF_DNS,
+    RULE_PREF_BYPASS,
+    RULE_PREF_MAIN,
+    RULE_PREF_TUN,
+];
 
 /// Metric of the strict-mode `unreachable` default in [`XRAY_ROUTE_TABLE`]. The
 /// highest possible value sorts it behind the TUN device route, so it only
@@ -123,6 +138,25 @@ pub async fn xray_up(
     }
 
     Ok(())
+}
+
+/// Replaces the route exclusions: every [`RULE_PREF_EXCLUDE`] rule is removed
+/// for both families, then one rule per entry sends that destination to `main`,
+/// in order. IPv6 entries are skipped when the host has IPv6 disabled. Already
+/// present rules (two entries equal after normalization) are not an error.
+pub async fn replace_exclusions(handle: &Handle, exclude: &[(IpAddr, u8)]) -> Result<(), String> {
+    del_rules_with_priority(handle, RULE_PREF_EXCLUDE).await;
+    let has_ipv6 = host_has_ipv6();
+    for &(ip, prefix) in exclude {
+        if exclusion_installable(ip, has_ipv6) {
+            add_exclusion_rule(handle, ip, prefix).await?;
+        }
+    }
+    Ok(())
+}
+
+fn exclusion_installable(ip: IpAddr, host_has_ipv6: bool) -> bool {
+    ip.is_ipv4() || host_has_ipv6
 }
 
 /// Whether `xray_up` installs the IPv6 policy rules (and, with `strict`, the
@@ -351,6 +385,30 @@ async fn add_rule(
     }
 }
 
+async fn add_exclusion_rule(handle: &Handle, ip: IpAddr, prefix: u8) -> Result<(), String> {
+    let mut req = handle.rule().add();
+    {
+        let msg = req.message_mut();
+        msg.header.family = match ip {
+            IpAddr::V4(_) => AddressFamily::Inet,
+            IpAddr::V6(_) => AddressFamily::Inet6,
+        };
+        msg.header.action = RuleAction::ToTable;
+        msg.header.table = RT_TABLE_MAIN as u8;
+        msg.header.dst_len = prefix;
+        msg.attributes
+            .push(RuleAttribute::Priority(RULE_PREF_EXCLUDE));
+        msg.attributes.push(RuleAttribute::Destination(ip));
+    }
+    match req.execute().await {
+        Ok(()) => Ok(()),
+        Err(e) if is_exists(&e) => Ok(()),
+        Err(e) => Err(format!(
+            "add exclusion rule {ip}/{prefix} (pref {RULE_PREF_EXCLUDE}): {e}"
+        )),
+    }
+}
+
 /// Diverts traffic owned by `uid` to `main` at [`RULE_PREF_BYPASS_UID`], ahead of
 /// the capture rules, so the bypass user's sockets reach the real default
 /// instead of the tunnel. Installed per family when `--bypass-uid` is set.
@@ -394,20 +452,25 @@ async fn del_xray_rules(handle: &Handle) {
     }
 }
 
+async fn del_rules_with_priority(handle: &Handle, priority: u32) {
+    for version in [IpVersion::V4, IpVersion::V6] {
+        let mut rules = handle.rule().get(version).execute();
+        while let Ok(Some(rule)) = rules.try_next().await {
+            if rule_priority(&rule) == Some(priority) {
+                let _ = handle.rule().del(rule).execute().await;
+            }
+        }
+    }
+}
+
 fn is_xray_rule(rule: &RuleMessage) -> bool {
-    rule.attributes.iter().any(|attr| {
-        matches!(
-            attr,
-            RuleAttribute::Priority(p)
-                if [
-                    RULE_PREF_BYPASS_UID,
-                    RULE_PREF_DNS,
-                    RULE_PREF_BYPASS,
-                    RULE_PREF_MAIN,
-                    RULE_PREF_TUN,
-                ]
-                .contains(p)
-        )
+    rule_priority(rule).is_some_and(|p| XRAY_RULE_PREFS.contains(&p))
+}
+
+fn rule_priority(rule: &RuleMessage) -> Option<u32> {
+    rule.attributes.iter().find_map(|attr| match attr {
+        RuleAttribute::Priority(p) => Some(*p),
+        _ => None,
     })
 }
 
@@ -463,7 +526,11 @@ fn is_no_such_device(err: &rtnetlink::Error) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{XRAY_FWMARK, v6_rules_needed};
+    use std::net::IpAddr;
+
+    use super::{
+        RULE_PREF_EXCLUDE, XRAY_FWMARK, XRAY_RULE_PREFS, exclusion_installable, v6_rules_needed,
+    };
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
 
     /// Guards against the two fwmark constants drifting: xray stamps its own
@@ -495,5 +562,30 @@ mod tests {
                 "v6_requested={v6_requested} strict={strict} host_has_ipv6={host_has_ipv6}"
             );
         }
+    }
+
+    #[test]
+    fn exclusion_installable_skips_v6_without_host_ipv6() {
+        let v4: IpAddr = "10.0.0.0".parse().unwrap();
+        let v6: IpAddr = "2001:db8::".parse().unwrap();
+        let cases = [
+            (v4, true, true),
+            (v4, false, true),
+            (v6, true, true),
+            (v6, false, false),
+        ];
+        for (ip, host_has_ipv6, want) in cases {
+            assert_eq!(
+                exclusion_installable(ip, host_has_ipv6),
+                want,
+                "ip={ip} host_has_ipv6={host_has_ipv6}"
+            );
+        }
+    }
+
+    #[test]
+    fn xray_rule_prefs_cover_exclusions() {
+        assert_eq!(RULE_PREF_EXCLUDE, 8997);
+        assert!(XRAY_RULE_PREFS.contains(&RULE_PREF_EXCLUDE));
     }
 }
