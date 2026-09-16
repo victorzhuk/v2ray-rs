@@ -14,7 +14,9 @@ use v2ray_rs_core::models::{
 use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
-use v2ray_rs_process::{ProcessError, ProcessEvent, ProcessManager, ProcessState, TunRuntime};
+use v2ray_rs_process::{
+    ProcessError, ProcessEvent, ProcessManager, ProcessState, StopReason, TunRuntime,
+};
 
 use crate::app::AppMsg;
 use crate::health::{DnsFailureWindow, HealthTracker};
@@ -76,12 +78,12 @@ impl Default for HealthTiming {
 }
 
 enum ConnectionCmd {
-    Stop,
+    Stop(StopReason),
 }
 
 impl ConnectionHandle {
-    pub(super) fn stop(&self) {
-        let _ = self.cmd_tx.try_send(ConnectionCmd::Stop);
+    pub(super) fn stop(&self, reason: StopReason) {
+        let _ = self.cmd_tx.try_send(ConnectionCmd::Stop(reason));
     }
 }
 
@@ -127,7 +129,7 @@ fn spawn_with(
 
         // A Stop that arrived while we were queued behind the previous
         // connection's teardown must not be answered by starting anyway.
-        if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
+        if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop(_))) {
             report(ProcessState::Stopped, None);
             return;
         }
@@ -183,9 +185,9 @@ fn spawn_with(
         }
 
         'candidates: for candidate in candidates {
-            if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
+            if let Ok(ConnectionCmd::Stop(reason)) = cmd_rx.try_recv() {
                 if let Some(mut failed) = parked.take() {
-                    failed.shutdown().await;
+                    failed.shutdown_with(reason).await;
                 }
                 report(ProcessState::Stopped, None);
                 return;
@@ -289,10 +291,10 @@ fn spawn_with(
 
             let started = tokio::select! {
                 biased;
-                Some(ConnectionCmd::Stop) = cmd_rx.recv() => {
-                    mgr.shutdown().await;
+                Some(ConnectionCmd::Stop(reason)) = cmd_rx.recv() => {
+                    mgr.shutdown_with(reason).await;
                     if let Some(mut failed) = parked.take() {
-                        failed.shutdown().await;
+                        failed.shutdown_with(reason).await;
                     }
                     report(ProcessState::Stopped, None);
                     return;
@@ -305,8 +307,8 @@ fn spawn_with(
                     // A Disconnect clicked while the start was in flight sits
                     // queued until here; honor it instead of flashing the UI
                     // back to Connected with a dead handle.
-                    if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
-                        mgr.shutdown().await;
+                    if let Ok(ConnectionCmd::Stop(reason)) = cmd_rx.try_recv() {
+                        mgr.shutdown_with(reason).await;
                         report(ProcessState::Stopped, None);
                         return;
                     }
@@ -317,9 +319,9 @@ fn spawn_with(
                         // A host-level failure blocks every candidate, so
                         // failover is over: tear down what is parked and
                         // report the host error itself, not a summary.
-                        mgr.shutdown().await;
+                        mgr.shutdown_with(StopReason::StartFailed).await;
                         if let Some(mut failed) = parked.take() {
-                            failed.shutdown().await;
+                            failed.shutdown_with(StopReason::StartFailed).await;
                         }
                         if grant_fixable(&e) {
                             sender.emit(AppMsg::TunGrantRequired(generation));
@@ -412,8 +414,8 @@ fn spawn_with(
 
             loop {
                 tokio::select! {
-                    Some(ConnectionCmd::Stop) = cmd_rx.recv() => {
-                        mgr.shutdown().await;
+                    Some(ConnectionCmd::Stop(reason)) = cmd_rx.recv() => {
+                        mgr.shutdown_with(reason).await;
                         halt(forwarders).await;
                         report(ProcessState::Stopped, None);
                         return;
@@ -1218,6 +1220,39 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn stop_reason_reaches_the_exit_record() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+            assert!(relays(&state), "start reported {state:?}");
+        }
+
+        handle.stop(StopReason::NodeSwitch);
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log")).unwrap();
+        let exit = log
+            .lines()
+            .find(|l| l.contains(" exit requested="))
+            .unwrap_or_else(|| panic!("no exit record in {log}"));
+        assert!(exit.contains("reason=node-switch"), "{exit}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn failover_reports_no_stopped_and_stop_reports_one() {
         let stub = stub(
             r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
@@ -1239,7 +1274,7 @@ mod tests {
             }
         }
 
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let (state, _) = next_state(&rx).await;
             if matches!(state, ProcessState::Stopped) {
@@ -1652,7 +1687,7 @@ exit 1"#,
             }
         }
 
-        handle.stop();
+        handle.stop(StopReason::UserStop);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1730,7 +1765,7 @@ exit 1"#,
             "{session_line}"
         );
 
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let (state, _) = next_state(&rx).await;
             if matches!(state, ProcessState::Stopped) {
@@ -1821,7 +1856,7 @@ exit 1"#,
             "{contents}"
         );
 
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let (state, _) = next_state(&rx).await;
             if matches!(state, ProcessState::Stopped) {
@@ -1848,7 +1883,7 @@ exit 1"#,
             assert!(relays(&state), "reported {state:?}");
         }
 
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let (state, _) = next_state(&rx).await;
             if matches!(state, ProcessState::Stopped) {
@@ -1957,7 +1992,7 @@ exit 1"#,
     }
 
     async fn stop_and_wait(handle: &ConnectionHandle, rx: &relm4::Receiver<AppMsg>) {
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let (state, _) = next_state(rx).await;
             if matches!(state, ProcessState::Stopped) {
@@ -1992,7 +2027,7 @@ exit 1"#,
         })
         .await
         .expect("health probes stopped after recovery");
-        handle.stop();
+        handle.stop(StopReason::UserStop);
         loop {
             let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
                 .await
@@ -2063,7 +2098,9 @@ exit 1"#,
                     assert_eq!(generation, GENERATION);
                     reports.push(failing);
                 }
-                Some(AppMsg::ProcessLogLine(_, line)) if line == "dns-burst-done" => handle.stop(),
+                Some(AppMsg::ProcessLogLine(_, line)) if line == "dns-burst-done" => {
+                    handle.stop(StopReason::UserStop)
+                }
                 Some(_) => {}
             }
         }

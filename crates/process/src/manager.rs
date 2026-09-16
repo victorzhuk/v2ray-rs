@@ -53,6 +53,7 @@ pub enum StopReason {
     NodeSwitch,
     ApplyRestart,
     AppQuit,
+    HealthFailover,
     StartFailed,
 }
 
@@ -63,6 +64,7 @@ impl StopReason {
             StopReason::NodeSwitch => "node-switch",
             StopReason::ApplyRestart => "apply-restart",
             StopReason::AppQuit => "app-quit",
+            StopReason::HealthFailover => "health-failover",
             StopReason::StartFailed => "start-failed",
         }
     }
@@ -1464,6 +1466,7 @@ mod tests {
             StopReason::NodeSwitch,
             StopReason::ApplyRestart,
             StopReason::AppQuit,
+            StopReason::HealthFailover,
         ] {
             let dir = tempfile::TempDir::new().unwrap();
             let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))

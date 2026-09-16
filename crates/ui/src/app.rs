@@ -26,7 +26,7 @@ use v2ray_rs_core::resolve::{
 };
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
-use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState};
+use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState, StopReason};
 use v2ray_rs_tray::{TrayAction, TrayHandle};
 
 static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
@@ -224,7 +224,12 @@ impl App {
             DisconnectPlan::Stop => {
                 if let Some(handle) = self.process_handle.take() {
                     self.apply_state(&ProcessState::Stopping);
-                    handle.stop();
+                    handle.stop(stop_reason_for(
+                        self.pending_exit,
+                        self.health_failover.reconnect_pending,
+                        reconnect_pending,
+                        self.pending_direct_target.is_some(),
+                    ));
                 }
             }
             DisconnectPlan::Release => {
@@ -312,7 +317,7 @@ impl App {
             QuitPlan::Stop => {
                 self.pending_exit = true;
                 if let Some(handle) = self.process_handle.take() {
-                    handle.stop();
+                    handle.stop(StopReason::AppQuit);
                 }
             }
             QuitPlan::AwaitStopped => self.pending_exit = true,
@@ -1766,6 +1771,25 @@ fn disconnect_plan(has_handle: bool, marker_present: bool) -> DisconnectPlan {
     }
 }
 
+fn stop_reason_for(
+    pending_exit: bool,
+    health_failover: bool,
+    reconnect_pending: bool,
+    direct_target: bool,
+) -> StopReason {
+    if pending_exit {
+        StopReason::AppQuit
+    } else if health_failover {
+        StopReason::HealthFailover
+    } else if reconnect_pending {
+        StopReason::ApplyRestart
+    } else if direct_target {
+        StopReason::NodeSwitch
+    } else {
+        StopReason::UserStop
+    }
+}
+
 /// An Error that arrives while the user is disconnecting, or after the
 /// automatic reconnect budget is spent, gets no retry, so the kill-switch
 /// routes must be released.
@@ -2083,6 +2107,28 @@ mod tests {
         assert!(!reconnect_after_stop(&ProcessState::Stopped, false));
         assert!(!reconnect_after_stop(&ProcessState::Running, true));
         assert!(!reconnect_after_stop(&ProcessState::Stopping, true));
+    }
+
+    #[test]
+    fn stop_reason_for_maps_every_input() {
+        use StopReason::*;
+        let cases = [
+            ((false, false, false, false), UserStop),
+            ((false, false, false, true), NodeSwitch),
+            ((false, false, true, false), ApplyRestart),
+            ((false, false, true, true), ApplyRestart),
+            ((false, true, true, false), HealthFailover),
+            ((false, true, true, true), HealthFailover),
+            ((true, false, false, false), AppQuit),
+            ((true, true, true, true), AppQuit),
+        ];
+        for ((exit, failover, reconnect, direct), expected) in cases {
+            assert_eq!(
+                stop_reason_for(exit, failover, reconnect, direct),
+                expected,
+                "exit={exit} failover={failover} reconnect={reconnect} direct={direct}"
+            );
+        }
     }
 
     fn session_target_node() -> ConnectionNodeRef {
