@@ -239,7 +239,16 @@ fn spawn_with(
                 &manual_nodes,
             ));
             if pins_enabled(&effective_settings) {
-                apply_pins(&mut effective_settings, &nodes, &resolved);
+                // A parked candidate's tunnel is still up, so a probe would
+                // measure its kill switch rather than the node.
+                let probed;
+                let pins = if probe_allowed(parked.as_ref()) {
+                    probed = probe_pins(&nodes, &resolved).await;
+                    &probed
+                } else {
+                    &resolved
+                };
+                apply_pins(&mut effective_settings, &nodes, pins);
             }
             if drop_strict_route {
                 effective_settings.tun.strict_route = false;
@@ -504,10 +513,8 @@ const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 
 const PIN_LOOKUP_CONCURRENCY: usize = 16;
 
-#[cfg_attr(not(test), allow(dead_code))]
 const PIN_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
 
-#[cfg_attr(not(test), allow(dead_code))]
 const PIN_PROBE_TOTAL: Duration = Duration::from_secs(2);
 
 async fn os_lookup(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
@@ -663,11 +670,57 @@ fn apply_pins(
     }
 }
 
+fn probe_allowed(parked: Option<&ProcessManager>) -> bool {
+    parked.is_none_or(|mgr| !mgr.has_tun_runtime())
+}
+
+/// Narrows the resolved addresses of every multi-address node hostname to the
+/// ones accepting a connect on that node's port. Hosts are probed concurrently
+/// so one candidate spends at most `PIN_PROBE_TOTAL` here.
+async fn probe_pins(
+    nodes: &[ProxyNode],
+    resolved: &HashMap<String, Vec<IpAddr>>,
+) -> HashMap<String, Vec<IpAddr>> {
+    let mut probes = JoinSet::new();
+    let mut probed = HashMap::new();
+    for node in nodes {
+        let host = node.address();
+        let Some(addrs) = resolved.get(host) else {
+            continue;
+        };
+        if probed.contains_key(host) {
+            continue;
+        }
+        probed.insert(host.to_string(), addrs.clone());
+        if addrs.len() < 2 {
+            continue;
+        }
+        let (host, addrs, port) = (host.to_string(), addrs.clone(), node.port());
+        probes.spawn(async move {
+            let kept = filter_reachable(
+                &host,
+                &addrs,
+                port,
+                PIN_PROBE_CONNECT_TIMEOUT,
+                PIN_PROBE_TOTAL,
+            )
+            .await;
+            (host, kept)
+        });
+    }
+    while let Some(joined) = probes.join_next().await {
+        if let Ok((host, kept)) = joined {
+            probed.insert(host, kept);
+        }
+    }
+    probed
+}
+
 /// Keeps the addresses that accept a TCP connect on `port`, in input order.
 /// When none does within the budgets, every address is kept: an unreachable
 /// probe is no reason to leave a node unpinned.
-#[cfg_attr(not(test), allow(dead_code))]
 async fn filter_reachable(
+    host: &str,
     addrs: &[IpAddr],
     port: u16,
     per_connect: Duration,
@@ -699,6 +752,7 @@ async fn filter_reachable(
         .filter(|ip| reachable.contains(ip))
         .collect();
     if kept.is_empty() {
+        log::warn!("pin probe: no address of {host} accepted on port {port}; keeping all");
         addrs.to_vec()
     } else {
         kept
@@ -2172,6 +2226,120 @@ exit 1"#,
         );
     }
 
+    #[test]
+    fn probe_skipped_when_parked_manager_holds_tun() {
+        let manager = || {
+            ProcessManager::new(
+                PathBuf::from("/bin/true"),
+                PathBuf::from("/nonexistent/config.json"),
+                PathBuf::from("/nonexistent/pid"),
+                None,
+            )
+        };
+        let tunneled = manager().with_tun(Some(TunRuntime {
+            backend: BackendType::Xray,
+            iface: "v2rsprobe0".into(),
+            addr_v4: "172.19.0.1/30".into(),
+            addr_v6: None,
+            helper_path: PathBuf::from("/bin/true"),
+            bypass_uid: None,
+            capture_dns: false,
+            strict: false,
+        }));
+
+        assert!(probe_allowed(None));
+        assert!(probe_allowed(Some(&manager())));
+        assert!(!probe_allowed(Some(&tunneled)));
+    }
+
+    /// Drains the connection until its channel closes, allowing `bound` between
+    /// messages, and returns the terminal state, log lines and toasts.
+    async fn drain_within(
+        rx: &relm4::Receiver<AppMsg>,
+        bound: Duration,
+    ) -> (Option<ProcessState>, Vec<String>, Vec<String>) {
+        let mut terminal = None;
+        let mut lines = Vec::new();
+        let mut toasts = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(bound, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => return (terminal, lines, toasts),
+                Some(AppMsg::ProcessLogLine(_, line)) => lines.push(line),
+                Some(AppMsg::ShowToast(toast)) => toasts.push(toast),
+                Some(AppMsg::ProcessStateConnection(_, state, _)) if !relays(&state) => {
+                    terminal = Some(state);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    fn xray_tun_stub_with_probe(
+        iface: &str,
+    ) -> (
+        Stub,
+        AppSettings,
+        tempfile::TempDir,
+        v2ray_rs_process::HostProbe,
+    ) {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; exit 1"#,
+        );
+        let host = tempfile::tempdir().unwrap();
+        let getcap = host.path().join("getcap");
+        std::fs::write(&getcap, "#!/bin/sh\necho \"$1 cap_net_admin=ep\"\n").unwrap();
+        std::fs::set_permissions(&getcap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = v2ray_rs_process::HostProbe {
+            getcap,
+            helper: executable(host.path(), "v2ray-rs-netctl"),
+        };
+        let mut settings = xray_tun_settings();
+        settings.tun.interface_name = iface.into();
+        settings.tun.strict_route = false;
+        (stub, settings, host, probe)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn probe_runs_before_write_config_when_allowed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (stub, settings, _host, probe) = xray_tun_stub_with_probe("v2rsprobe1");
+        let candidate = ConnectionCandidate {
+            node: ProxyNode::Shadowsocks(ShadowsocksConfig {
+                address: "probe-a.invalid".into(),
+                port,
+                method: "aes-256-gcm".into(),
+                password: "secret".into(),
+                remark: None,
+            }),
+            ..candidate("probe-a.invalid")
+        };
+        let mut req = request(&stub, settings, vec![candidate]);
+        req.last_good_pins = ["127.0.0.1", "127.0.0.2"]
+            .map(|ip| HostOverride {
+                domain: "probe-a.invalid".into(),
+                ip: ip.into(),
+            })
+            .to_vec();
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, move |mgr| mgr.with_host_probe(probe.clone()));
+
+        let (terminal, _, _) = drain_within(&rx, Duration::from_secs(60)).await;
+        assert_error_terminal(terminal);
+
+        let config = std::fs::read_to_string(stub.paths.generated_dir().join("xray.json"))
+            .expect("generated config readable");
+        let config: serde_json::Value = serde_json::from_str(&config).unwrap();
+        assert_eq!(
+            config["dns"]["hosts"]["probe-a.invalid"], "127.0.0.1",
+            "{}",
+            config["dns"]
+        );
+    }
+
     #[tokio::test]
     async fn filter_reachable_keeps_only_listening_address() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2180,6 +2348,7 @@ exit 1"#,
         let closed: IpAddr = "127.0.0.2".parse().unwrap();
 
         let kept = filter_reachable(
+            "probe-open.invalid",
             &[closed, open],
             port,
             PIN_PROBE_CONNECT_TIMEOUT,
@@ -2197,7 +2366,14 @@ exit 1"#,
         drop(listener);
         let addrs: Vec<IpAddr> = vec!["127.0.0.2".parse().unwrap(), "127.0.0.1".parse().unwrap()];
 
-        let kept = filter_reachable(&addrs, port, PIN_PROBE_CONNECT_TIMEOUT, PIN_PROBE_TOTAL).await;
+        let kept = filter_reachable(
+            "probe-closed.invalid",
+            &addrs,
+            port,
+            PIN_PROBE_CONNECT_TIMEOUT,
+            PIN_PROBE_TOTAL,
+        )
+        .await;
 
         assert_eq!(kept, addrs);
     }
