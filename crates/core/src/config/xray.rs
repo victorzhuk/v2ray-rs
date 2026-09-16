@@ -266,6 +266,32 @@ mod tests {
     }
 
     #[test]
+    fn test_ws_host_with_custom_headers_moves_to_dedicated_field() {
+        let node = ws_vless_with_host_header(&[("User-Agent", "x")]);
+        let config = XrayGenerator
+            .generate(&[node], &[], &AppSettings::default())
+            .unwrap();
+
+        let ws = &config["outbounds"][0]["streamSettings"]["wsSettings"];
+        assert_eq!(ws["host"], "cdn.example.com");
+        let headers = ws["headers"].as_object().unwrap();
+        assert_eq!(headers.len(), 1, "{ws}");
+        assert_eq!(headers["User-Agent"], "x");
+    }
+
+    #[test]
+    fn test_ws_lowercase_host_header_wins_over_node_host() {
+        let node = ws_vless_with_host_header(&[("host", "front.example.com")]);
+        let config = XrayGenerator
+            .generate(&[node], &[], &AppSettings::default())
+            .unwrap();
+
+        let ws = &config["outbounds"][0]["streamSettings"]["wsSettings"];
+        assert_eq!(ws["host"], "front.example.com");
+        assert!(ws.get("headers").is_none(), "{ws}");
+    }
+
+    #[test]
     fn test_tun_sets_domain_strategy_so_the_dialer_uses_the_builtin_resolver() {
         let settings = AppSettings {
             tun: TunConfig {
