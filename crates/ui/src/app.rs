@@ -94,6 +94,8 @@ pub struct App {
     session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
     auto_reconnect_attempts: u32,
+    status_prev: ProcessState,
+    connection_origin: ConnectOrigin,
     health_failover: HealthFailover,
     reconnect_generation: u32,
     tun_release_in_flight: bool,
@@ -152,6 +154,7 @@ impl App {
 
     fn apply_state(&mut self, state: &ProcessState) {
         let from = self.process_state.clone();
+        self.status_prev = from.clone();
         (self.connected, self.button_sensitive) = connect_toggle(state);
         if let ProcessState::Error(msg) = state {
             // An armed TUN grant is consumed here; the caller replaces the
@@ -204,9 +207,12 @@ impl App {
     fn update_status_labels(&self) {
         let (primary, details) = status_texts(&StatusView {
             state: &self.process_state,
+            prev_state: &self.status_prev,
             meta: self.connection_status.as_ref(),
             health: self.health.as_ref(),
             dns_failing: self.dns_failing,
+            origin: self.connection_origin,
+            attempt: self.auto_reconnect_attempts,
         });
         self.status_label.set_text(&primary);
         self.status_details.set_text(&details);
@@ -626,7 +632,13 @@ impl App {
         let pid_path = self.paths.pid_file_path();
         let geodata_dir = self.paths.geodata_dir();
 
+        self.connection_origin = origin;
         self.apply_state(&ProcessState::Starting);
+        // A fresh connect replacing a live session is not a crash respawn.
+        if matches!(self.status_prev, ProcessState::Running) {
+            self.status_prev = ProcessState::Stopped;
+            self.update_status_labels();
+        }
         self.logs_page.emit(LogsMsg::SetRunning(true));
         self.logs_page.emit(LogsMsg::Clear);
 
@@ -1051,6 +1063,8 @@ impl SimpleComponent for App {
             session_target: None,
             settings_debounce: None,
             auto_reconnect_attempts: 0,
+            status_prev: ProcessState::Stopped,
+            connection_origin: ConnectOrigin::User,
             reconnect_generation: 0,
             tun_release_in_flight: false,
             _signal_sources: signal_sources,
@@ -1925,9 +1939,12 @@ fn release_on_error(app_state_stopping: bool, reconnects_left: u32) -> bool {
 
 struct StatusView<'a> {
     state: &'a ProcessState,
+    prev_state: &'a ProcessState,
     meta: Option<&'a ConnectionMetadata>,
     health: Option<&'a Health>,
     dns_failing: bool,
+    origin: ConnectOrigin,
+    attempt: u32,
 }
 
 /// Health only colours a `Running` session; any other state reads as before
@@ -1960,7 +1977,16 @@ fn status_texts(view: &StatusView) -> (String, String) {
                 _ => ("Connected".to_string(), details),
             }
         }
-        (ProcessState::Starting, _) => ("Connecting…".to_string(), "Resolving nodes".into()),
+        (ProcessState::Starting, _) => {
+            let primary = match (view.prev_state, view.origin, view.attempt) {
+                (ProcessState::Running, _, _) => "Restarting after crash".to_string(),
+                (_, ConnectOrigin::AutoReconnect, n) if n > 0 => {
+                    format!("Reconnecting ({n}/{MAX_AUTO_RECONNECTS})")
+                }
+                _ => "Connecting…".to_string(),
+            };
+            (primary, "Resolving nodes".into())
+        }
         (ProcessState::Stopping, _) => ("Disconnecting…".to_string(), "Stopping backend".into()),
         (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
         _ => (
@@ -3302,9 +3328,12 @@ mod tests {
     ) -> StatusView<'a> {
         StatusView {
             state: &ProcessState::Running,
+            prev_state: &ProcessState::Starting,
             meta: Some(meta),
             health,
             dns_failing,
+            origin: ConnectOrigin::User,
+            attempt: 0,
         }
     }
 
@@ -3359,14 +3388,91 @@ mod tests {
 
         let texts = status_texts(&StatusView {
             state: &ProcessState::Starting,
+            prev_state: &ProcessState::Stopped,
             meta: Some(&meta),
             health: Some(&health),
             dns_failing: true,
+            origin: ConnectOrigin::User,
+            attempt: 0,
         });
 
         assert_eq!(
             texts,
             ("Connecting…".to_string(), "Resolving nodes".to_string())
+        );
+    }
+
+    #[test]
+    fn status_texts_covers_every_starting_case() {
+        let meta = status_meta();
+        let starting = |prev: &ProcessState, origin, attempt| {
+            status_texts(&StatusView {
+                state: &ProcessState::Starting,
+                prev_state: prev,
+                meta: None,
+                health: None,
+                dns_failing: false,
+                origin,
+                attempt,
+            })
+            .0
+        };
+        let stopped = ProcessState::Stopped;
+        let running = ProcessState::Running;
+        let error = ProcessState::Error("boom".into());
+
+        assert_eq!(
+            starting(&running, ConnectOrigin::AutoReconnect, 2),
+            "Restarting after crash"
+        );
+        assert_eq!(
+            starting(&running, ConnectOrigin::User, 0),
+            "Restarting after crash"
+        );
+        assert_eq!(
+            starting(&error, ConnectOrigin::AutoReconnect, 1),
+            "Reconnecting (1/3)"
+        );
+        assert_eq!(
+            starting(&error, ConnectOrigin::AutoReconnect, 3),
+            "Reconnecting (3/3)"
+        );
+        assert_eq!(
+            starting(&stopped, ConnectOrigin::AutoReconnect, 0),
+            "Connecting…"
+        );
+        assert_eq!(starting(&stopped, ConnectOrigin::User, 2), "Connecting…");
+        assert_eq!(starting(&error, ConnectOrigin::Restart, 1), "Connecting…");
+
+        let other = |state: &ProcessState| {
+            status_texts(&StatusView {
+                state,
+                prev_state: &running,
+                meta: Some(&meta),
+                health: Some(&Health::Unhealthy("stale".into())),
+                dns_failing: true,
+                origin: ConnectOrigin::AutoReconnect,
+                attempt: 2,
+            })
+        };
+        let pair = |a: &str, b: &str| (a.to_string(), b.to_string());
+        assert_eq!(
+            other(&ProcessState::Stopping),
+            pair("Disconnecting…", "Stopping backend")
+        );
+        assert_eq!(
+            other(&stopped),
+            pair("Disconnected", "No active connection")
+        );
+        assert_eq!(other(&error), pair("Error", "boom"));
+        assert_eq!(
+            status_texts(&running_view(&meta, None, false)),
+            status_texts(&StatusView {
+                prev_state: &running,
+                origin: ConnectOrigin::AutoReconnect,
+                attempt: 2,
+                ..running_view(&meta, None, false)
+            })
         );
     }
 
