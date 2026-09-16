@@ -504,6 +504,12 @@ const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5
 
 const PIN_LOOKUP_CONCURRENCY: usize = 16;
 
+#[cfg_attr(not(test), allow(dead_code))]
+const PIN_PROBE_CONNECT_TIMEOUT: Duration = Duration::from_millis(1500);
+
+#[cfg_attr(not(test), allow(dead_code))]
+const PIN_PROBE_TOTAL: Duration = Duration::from_secs(2);
+
 async fn os_lookup(host: String, port: u16) -> std::io::Result<Vec<IpAddr>> {
     let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
     Ok(addrs.map(|addr| addr.ip()).collect())
@@ -654,6 +660,48 @@ fn apply_pins(
                 domain: host.to_string(),
                 ip: ip.to_string(),
             }));
+    }
+}
+
+/// Keeps the addresses that accept a TCP connect on `port`, in input order.
+/// When none does within the budgets, every address is kept: an unreachable
+/// probe is no reason to leave a node unpinned.
+#[cfg_attr(not(test), allow(dead_code))]
+async fn filter_reachable(
+    addrs: &[IpAddr],
+    port: u16,
+    per_connect: Duration,
+    total: Duration,
+) -> Vec<IpAddr> {
+    if addrs.is_empty() {
+        return Vec::new();
+    }
+    let until = tokio::time::Instant::now() + total;
+    let mut probes = JoinSet::new();
+    for &ip in addrs {
+        probes.spawn(async move {
+            let connect = tokio::net::TcpStream::connect(SocketAddr::new(ip, port));
+            (
+                ip,
+                matches!(tokio::time::timeout(per_connect, connect).await, Ok(Ok(_))),
+            )
+        });
+    }
+    let mut reachable = Vec::new();
+    while let Ok(Some(joined)) = tokio::time::timeout_at(until, probes.join_next()).await {
+        if let Ok((ip, true)) = joined {
+            reachable.push(ip);
+        }
+    }
+    let kept: Vec<IpAddr> = addrs
+        .iter()
+        .copied()
+        .filter(|ip| reachable.contains(ip))
+        .collect();
+    if kept.is_empty() {
+        addrs.to_vec()
+    } else {
+        kept
     }
 }
 
@@ -2122,6 +2170,36 @@ exit 1"#,
             at("cannot pin failover-b.invalid") < first_start,
             "{lines:#?}"
         );
+    }
+
+    #[tokio::test]
+    async fn filter_reachable_keeps_only_listening_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let open: IpAddr = "127.0.0.1".parse().unwrap();
+        let closed: IpAddr = "127.0.0.2".parse().unwrap();
+
+        let kept = filter_reachable(
+            &[closed, open],
+            port,
+            PIN_PROBE_CONNECT_TIMEOUT,
+            PIN_PROBE_TOTAL,
+        )
+        .await;
+
+        assert_eq!(kept, vec![open]);
+    }
+
+    #[tokio::test]
+    async fn filter_reachable_keeps_all_when_none_accept() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let addrs: Vec<IpAddr> = vec!["127.0.0.2".parse().unwrap(), "127.0.0.1".parse().unwrap()];
+
+        let kept = filter_reachable(&addrs, port, PIN_PROBE_CONNECT_TIMEOUT, PIN_PROBE_TOTAL).await;
+
+        assert_eq!(kept, addrs);
     }
 
     #[tokio::test(flavor = "multi_thread")]
