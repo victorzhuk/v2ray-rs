@@ -641,8 +641,10 @@ fn mask_counters(text: &str) -> String {
     out
 }
 
-/// Replaces the candidate's own port where it stands alone. The boundary check
-/// keeps `443` from being clipped out of `14430` or `10.4.43.1`.
+/// Replaces the candidate's own port where the text reads it as a port: right
+/// after a `:` and not running into another number. Requiring the colon keeps a
+/// short port such as `80` out of prose like `80% packet loss`, and the trailing
+/// check keeps `443` from being clipped out of `14430` or `10.4.43.1`.
 fn mask_port(text: &str, port: u16) -> String {
     let needle = port.to_string();
     let bytes = text.as_bytes();
@@ -651,7 +653,7 @@ fn mask_port(text: &str, port: u16) -> String {
     let mut i = 0;
     while i < text.len() {
         if text[i..].starts_with(&needle)
-            && free(i.checked_sub(1).map(|j| bytes[j]))
+            && i.checked_sub(1).map(|j| bytes[j]) == Some(b':')
             && free(bytes.get(i + needle.len()).copied())
         {
             out.push_str("<port>");
@@ -913,6 +915,62 @@ mod tests {
     fn failure_key_keeps_a_port_inside_a_longer_number() {
         let key = failure_key("dial tcp 10.4.43.1:14430: refused", "node", "node", 443);
         assert_eq!(key, "dial tcp 10.4.43.1:14430: refused");
+    }
+
+    #[test]
+    fn failure_key_keeps_a_bare_port_number_in_prose() {
+        let first = failure_key(
+            "upstream updates.example.com reports 80% packet loss",
+            "203.0.113.1",
+            "203.0.113.1",
+            80,
+        );
+        let second = failure_key(
+            "upstream mirror.example.net reports 80% packet loss",
+            "203.0.113.2",
+            "203.0.113.2",
+            80,
+        );
+        assert!(first.contains("80% packet loss"), "{first}");
+        assert_ne!(first, second);
+
+        let addressed = failure_key(
+            "dial tcp 203.0.113.1:80: refused",
+            "node",
+            "203.0.113.1",
+            80,
+        );
+        assert_eq!(addressed, "dial tcp <node>:<port>: refused");
+    }
+
+    #[test]
+    fn failure_key_keeps_a_midstring_timestamp() {
+        let first = failure_key(
+            "[Warning] handshake started at 2026/09/14 10:37:35 failed",
+            "203.0.113.1",
+            "203.0.113.1",
+            443,
+        );
+        let second = failure_key(
+            "[Warning] handshake started at 2026/09/14 10:41:02 failed",
+            "203.0.113.2",
+            "203.0.113.2",
+            443,
+        );
+        assert!(first.contains("2026/09/14 10:37:35"), "{first}");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn summarize_failures_strips_ansi() {
+        let summary = summarize_failures(&[CandidateFailure::new(
+            "203.0.113.1",
+            "\u{1b}[31mFATAL\u{1b}[0m[0000] configure tun interface: operation not permitted",
+            "203.0.113.1",
+            443,
+        )]);
+        assert!(!summary.contains('\u{1b}'), "{summary}");
+        assert!(summary.contains("FATAL[0000]"), "{summary}");
     }
 
     #[test]
