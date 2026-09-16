@@ -553,7 +553,7 @@ impl ProcessManager {
             let exited = match self.child.as_mut().map(Child::try_wait) {
                 Some(Ok(status)) => status,
                 Some(Err(err)) => {
-                    self.graceful_stop().await;
+                    self.stop_child(false).await;
                     return Err(ProcessError::Wait(err));
                 }
                 None => None,
@@ -573,7 +573,7 @@ impl ProcessManager {
                 return Ok(());
             }
             if probe_start.elapsed() >= self.ready_timeout {
-                self.graceful_stop().await;
+                self.stop_child(false).await;
                 return Err(ProcessError::ReadyTimeout {
                     addr,
                     timeout: self.ready_timeout,
@@ -845,6 +845,10 @@ impl ProcessManager {
     }
 
     async fn graceful_stop(&mut self) {
+        self.stop_child(true).await;
+    }
+
+    async fn stop_child(&mut self, requested: bool) {
         let Some(child) = &mut self.child else {
             return;
         };
@@ -863,7 +867,7 @@ impl ProcessManager {
         }
 
         self.cleanup_after_exit().await;
-        self.write_exit_record(true, status.as_ref());
+        self.write_exit_record(requested, status.as_ref());
     }
 
     async fn handle_unexpected_exit(&mut self, status: ExitStatus) {
@@ -2148,18 +2152,26 @@ mod tests {
             .unwrap()
             .local_addr()
             .unwrap();
-        let mut mgr = manager_for(&dir, "exec sleep 30\n").with_ready_probe(addr);
-        mgr.ready_timeout = Duration::from_millis(300);
+        let mut mgr = manager_for(&dir, "exec sleep 30\n")
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_ready_probe(addr);
+        mgr.ready_timeout = Duration::from_millis(1500);
+        assert!(mgr.ready_timeout > STABILITY_WINDOW);
 
         match mgr.start().await {
             Err(e @ ProcessError::ReadyTimeout { .. }) => {
                 let text = e.to_string();
                 assert!(text.contains(&addr.to_string()), "{text}");
-                assert!(text.contains("300ms"), "{text}");
+                assert!(text.contains("1.5s"), "{text}");
             }
             other => panic!("expected ReadyTimeout, got {other:?}"),
         }
         assert!(mgr.child.is_none(), "the backend should have been reaped");
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let exits: Vec<_> = lines.iter().filter(|l| l.contains(" exit ")).collect();
+        assert_eq!(exits.len(), 1, "{lines:#?}");
+        assert!(exits[0].contains("exit requested=false"), "{}", exits[0]);
     }
 
     #[test]
