@@ -1,4 +1,5 @@
 pub(crate) mod app;
+mod backend_warning;
 mod cli;
 mod config_preview;
 mod connection;

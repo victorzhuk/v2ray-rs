@@ -1042,7 +1042,7 @@ fn failure_key(reason: &str, label: &str, address: &str, port: u16) -> String {
 
 /// Removes one leading `YYYY/MM/DD HH:MM:SS(.frac)` stamp. Only the leading one
 /// is an artifact of when the attempt ran; a date inside the text is content.
-fn strip_leading_timestamp(text: &str) -> &str {
+pub(crate) fn strip_leading_timestamp(text: &str) -> &str {
     let b = text.as_bytes();
     let digits = |range: std::ops::Range<usize>| {
         range
