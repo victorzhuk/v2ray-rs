@@ -17,8 +17,9 @@ use crate::log_buffer::{LogBuffer, LogLine, LogSource};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, HelperRun, TunRuntime};
+use v2ray_rs_core::ansi::strip_ansi;
 use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
-use v2ray_rs_core::rotating_log::RotatingFileWriter;
+use v2ray_rs_core::rotating_log::{RotatingFileWriter, local_utc_offset};
 
 fn format_triple((major, minor, patch): (u32, u32, u32)) -> String {
     format!("{major}.{minor}.{patch}")
@@ -683,6 +684,7 @@ impl ProcessManager {
             return;
         }
         let version = self.backend_version().await;
+        let version = strip_ansi(&version);
         let backend = self
             .backend
             .map(|b| b.to_string())
@@ -693,7 +695,10 @@ impl ProcessManager {
             .map(|c| truncate_reason(&c.node_name))
             .unwrap_or_else(|| "none".into());
         let tun = if self.tun.is_some() { "on" } else { "off" };
-        let mut record = format!("backend={backend} version={version} node={node} tun={tun}");
+        let offset = local_utc_offset();
+        let mut record = format!(
+            "backend={backend} version={version} node={node} tun={tun} utc_offset={offset}"
+        );
         if let Some(fields) = &self.session_fields {
             record.push(' ');
             record.push_str(&truncate_reason(fields));
@@ -870,8 +875,9 @@ impl ProcessManager {
                 let reader = BufReader::new(stdout);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let line = strip_ansi(&line);
                     write_stream_line(&writer, "stdout", &line);
-                    let log_line = LogLine::stdout(&line);
+                    let log_line = LogLine::stdout(line);
                     let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
                     buffer
                         .lock()
@@ -889,8 +895,9 @@ impl ProcessManager {
                 let reader = BufReader::new(stderr);
                 let mut lines = reader.lines();
                 while let Ok(Some(line)) = lines.next_line().await {
+                    let line = strip_ansi(&line);
                     write_stream_line(&writer, "stderr", &line);
-                    let log_line = LogLine::stderr(&line);
+                    let log_line = LogLine::stderr(line);
                     let _ = tx.send(ProcessEvent::LogLine(log_line.clone()));
                     buffer
                         .lock()
@@ -1016,7 +1023,13 @@ impl ProcessManager {
             .as_ref()
             .err()
             .map(|e| format!("{verb} failed: {e}"));
-        for content in run.output.iter().cloned().chain(failure) {
+        for raw in run
+            .output
+            .iter()
+            .map(String::as_str)
+            .chain(failure.as_deref())
+        {
+            let content = strip_ansi(raw);
             write_stream_line(&self.log_writer, "helper", &content);
             let line = LogLine::stderr(content);
             self.log_buffer
@@ -1063,7 +1076,7 @@ impl ProcessManager {
         const MARKERS: [&str; 6] = ["[Warning]", "[Error]", "WARN", "ERROR", "FATAL", "panic"];
         let buffer = self.log_buffer.lock().unwrap_or_else(|e| e.into_inner());
         buffer.last_n(50).iter().rev().find_map(|l| {
-            let plain = without_ansi(&l.content);
+            let plain = strip_ansi(&l.content);
             MARKERS
                 .iter()
                 .any(|m| plain.contains(m))
@@ -1105,27 +1118,6 @@ fn truncate_reason(line: &str) -> String {
     } else {
         sanitized
     }
-}
-
-// sing-box colours its level tags; strip CSI sequences before matching them.
-fn without_ansi(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        if c != '\x1b' {
-            out.push(c);
-            continue;
-        }
-        if chars.clone().next() == Some('[') {
-            chars.next();
-            for c in chars.by_ref() {
-                if ('\x40'..='\x7e').contains(&c) {
-                    break;
-                }
-            }
-        }
-    }
-    out
 }
 
 fn exit_status_field(status: Option<&ExitStatus>) -> String {
@@ -1368,6 +1360,153 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_record_states_utc_offset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let session = lines
+            .iter()
+            .find(|l| l.contains(" session "))
+            .unwrap_or_else(|| panic!("no session record: {lines:?}"));
+        let expected = format!("utc_offset={}", local_utc_offset());
+        assert!(session.contains(&expected), "{session}");
+        let value = session
+            .split(' ')
+            .find_map(|f| f.strip_prefix("utc_offset="))
+            .unwrap();
+        let b = value.as_bytes();
+        assert!(
+            b.len() == 6
+                && matches!(b[0], b'+' | b'-')
+                && b[1..3].iter().all(u8::is_ascii_digit)
+                && b[3] == b':'
+                && b[4..].iter().all(u8::is_ascii_digit),
+            "{session}"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_record_version_stripped_of_escapes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            "if [ \"$1\" = version ]; then printf '\\033[1mcustom-build\\033[0m\\n'; exit 0; fi\nexec sleep 30\n",
+        )
+        .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let log = std::fs::read_to_string(dir.path().join("backend.log")).unwrap();
+        assert!(!log.contains('\u{1b}'), "{log:?}");
+        assert!(log.contains("version=custom-build node="), "{log}");
+    }
+
+    #[tokio::test]
+    async fn backend_escapes_stripped_before_file_buffer_and_stream() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(
+            &dir,
+            &format!("{VERSION_STUB}printf '\\033[31mFATAL\\033[0m[0000] start service: boom\\n' >&2\nprintf '\\033]0;t\\007plain out\\n'\nexit 0\n"),
+        )
+        .with_log_file(Some(backend_log(dir.path())));
+        let mut rx = mgr.subscribe_logs();
+        mgr.set_auto_restart(false);
+
+        mgr.start_with_connection(None).await.unwrap();
+        mgr.wait_and_handle_exit().await.unwrap();
+
+        let log = std::fs::read_to_string(dir.path().join("backend.log")).unwrap();
+        assert!(!log.contains('\u{1b}'), "{log:?}");
+        assert!(
+            log.contains("stderr FATAL[0000] start service: boom"),
+            "{log}"
+        );
+        assert!(log.contains("stdout plain out"), "{log}");
+
+        let buffered: Vec<String> = mgr
+            .log_buffer()
+            .lock()
+            .unwrap()
+            .last_n(50)
+            .iter()
+            .map(|l| l.content.clone())
+            .collect();
+        assert!(
+            buffered
+                .iter()
+                .any(|c| c == "FATAL[0000] start service: boom"),
+            "{buffered:?}"
+        );
+        assert!(buffered.iter().any(|c| c == "plain out"), "{buffered:?}");
+        assert!(
+            buffered.iter().all(|c| !c.contains('\u{1b}')),
+            "{buffered:?}"
+        );
+
+        let mut streamed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProcessEvent::LogLine(line) = event {
+                streamed.push(line.content);
+            }
+        }
+        assert!(
+            streamed
+                .iter()
+                .any(|c| c == "FATAL[0000] start service: boom"),
+            "{streamed:?}"
+        );
+        assert!(
+            streamed.iter().all(|c| !c.contains('\u{1b}')),
+            "{streamed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_lines_stripped_of_escapes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mgr = manager_for(&dir, "exit 0\n").with_log_file(Some(backend_log(dir.path())));
+        let mut rx = mgr.subscribe_logs();
+
+        mgr.log_helper(
+            "xray-up",
+            &HelperRun {
+                output: vec!["\u{1b}[1mlink up\u{1b}[0m".into()],
+                result: Err("\u{1b}[31mno\u{1b}[0m".into()),
+                timed_out: false,
+            },
+        );
+
+        let log = std::fs::read_to_string(dir.path().join("backend.log")).unwrap();
+        assert!(!log.contains('\u{1b}'), "{log:?}");
+        assert!(log.contains("helper link up"), "{log}");
+        assert!(log.contains("helper xray-up failed: no"), "{log}");
+
+        let buffered: Vec<String> = mgr
+            .log_buffer()
+            .lock()
+            .unwrap()
+            .last_n(10)
+            .iter()
+            .map(|l| l.content.clone())
+            .collect();
+        assert_eq!(buffered, ["link up", "xray-up failed: no"]);
+
+        let mut streamed = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            if let ProcessEvent::LogLine(line) = event {
+                streamed.push(line.content);
+            }
+        }
+        assert_eq!(streamed, ["link up", "xray-up failed: no"]);
+    }
+
+    #[tokio::test]
     async fn session_record_appends_caller_fields() {
         let dir = tempfile::TempDir::new().unwrap();
         let fields = "hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app";
@@ -1382,7 +1521,7 @@ mod tests {
         let sessions: Vec<&String> = lines.iter().filter(|l| l.contains(" session ")).collect();
         assert_eq!(sessions.len(), 1, "{lines:?}");
         assert!(
-            sessions[0].contains("tun=off hijack=hijack"),
+            sessions[0].contains("tun=off utc_offset="),
             "{}",
             sessions[0]
         );

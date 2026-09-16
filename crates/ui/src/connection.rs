@@ -2050,8 +2050,12 @@ exit 1"#,
         );
         let session_line = contents[session_at..].lines().next().unwrap_or_default();
         assert!(
+            session_line.contains("tun=off utc_offset="),
+            "{session_line}"
+        );
+        assert!(
             session_line.ends_with(
-                "tun=off hijack=off capture_dns=false strict=false nodes_pinned=true profile=app"
+                "hijack=off capture_dns=false strict=false nodes_pinned=true profile=app"
             ),
             "{session_line}"
         );
@@ -2103,9 +2107,10 @@ exit 1"#,
         let contents = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
             .expect("backend.log readable");
         assert_eq!(contents.matches(" session ").count(), 1, "{contents}");
+        assert!(contents.contains("tun=on utc_offset="), "{contents}");
         assert!(
             contents.contains(
-                "tun=on hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
+                "hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
             ),
             "{contents}"
         );
