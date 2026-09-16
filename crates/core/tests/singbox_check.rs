@@ -3,8 +3,8 @@ use std::process::Command;
 
 use v2ray_rs_core::config::{ConfigGenerator, ConfigWriter, SingboxGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, DnsHijackMode, DnsProtocol, DnsServerConfig, FakeIpConfig,
-    HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    AppSettings, BackendLogLevel, BackendType, DnsHijackMode, DnsProtocol, DnsServerConfig,
+    FakeIpConfig, HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::AppProfile;
@@ -315,6 +315,11 @@ fn generated_singbox_configs_pass_sing_box_check() {
         detour: None,
     }];
     cases.push(("single-doh-server", single_doh_server));
+
+    let mut log_debug = AppSettings::default();
+    log_debug.logging.backend_level = BackendLogLevel::Debug;
+    log_debug.logging.connection_log = true;
+    cases.push(("log-debug", log_debug));
 
     for (name, settings) in &cases {
         check(name, settings);

@@ -3,8 +3,8 @@ use std::process::Command;
 
 use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig, HostOverride,
-    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings,
+    AppSettings, BackendLogLevel, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig,
+    HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings,
     TransportSettings, VlessConfig, WsSettings,
 };
 
@@ -163,6 +163,11 @@ fn generated_xray_configs_pass_xray_test() {
         },
     ];
     cases.push(("tun-user-dns-direct-detour", tun_direct_detour));
+
+    let mut log_debug = AppSettings::default();
+    log_debug.logging.backend_level = BackendLogLevel::Debug;
+    log_debug.logging.connection_log = true;
+    cases.push(("log-debug-connection-log", log_debug));
 
     for (name, settings) in &cases {
         check(name, settings);
