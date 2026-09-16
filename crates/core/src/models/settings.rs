@@ -150,6 +150,50 @@ impl Default for HealthCheckSettings {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BackendLogLevel {
+    Error,
+    #[default]
+    Warning,
+    Info,
+    Debug,
+}
+
+impl BackendLogLevel {
+    pub const ALL: [BackendLogLevel; 4] = [
+        BackendLogLevel::Error,
+        BackendLogLevel::Warning,
+        BackendLogLevel::Info,
+        BackendLogLevel::Debug,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            BackendLogLevel::Error => "error",
+            BackendLogLevel::Warning => "warning",
+            BackendLogLevel::Info => "info",
+            BackendLogLevel::Debug => "debug",
+        }
+    }
+
+    /// sing-box spells the warning level `warn`.
+    pub const fn singbox_level(self) -> &'static str {
+        match self {
+            BackendLogLevel::Warning => "warn",
+            other => other.as_str(),
+        }
+    }
+}
+
+/// Backend log verbosity and per-connection access logging.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoggingSettings {
+    pub backend_level: BackendLogLevel,
+    pub connection_log: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub version: u32,
@@ -185,6 +229,8 @@ pub struct AppSettings {
     pub real_delay: RealDelaySettings,
     #[serde(default)]
     pub health_check: HealthCheckSettings,
+    #[serde(default)]
+    pub logging: LoggingSettings,
 }
 
 pub fn default_listen_address() -> String {
@@ -270,6 +316,7 @@ impl Default for AppSettings {
             tun: TunConfig::default(),
             real_delay: RealDelaySettings::default(),
             health_check: HealthCheckSettings::default(),
+            logging: LoggingSettings::default(),
         }
     }
 }
@@ -447,6 +494,49 @@ mod tests {
         };
         let toml_str = toml::to_string(&settings).unwrap();
         let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_default_logging_settings() {
+        let logging = AppSettings::default().logging;
+        assert_eq!(logging.backend_level, BackendLogLevel::Warning);
+        assert!(!logging.connection_log);
+        assert_eq!(logging, LoggingSettings::default());
+    }
+
+    #[test]
+    fn test_legacy_settings_toml_missing_logging_defaults() {
+        let toml_str = "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n";
+        let settings: AppSettings = toml::from_str(toml_str).unwrap();
+        assert_eq!(settings.logging.backend_level, BackendLogLevel::Warning);
+        assert!(!settings.logging.connection_log);
+    }
+
+    #[test]
+    fn test_logging_section_missing_key_defaults() {
+        let toml_str = format!(
+            "{}[logging]\nconnection_log = true\n",
+            "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n"
+        );
+        let settings: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(settings.logging.backend_level, BackendLogLevel::Warning);
+        assert!(settings.logging.connection_log);
+    }
+
+    #[test]
+    fn test_logging_settings_toml_roundtrip_debug_connection_log() {
+        let settings = AppSettings {
+            logging: LoggingSettings {
+                backend_level: BackendLogLevel::Debug,
+                connection_log: true,
+            },
+            ..AppSettings::default()
+        };
+        let toml_str = toml::to_string(&settings).unwrap();
+        assert!(toml_str.contains("backend_level = \"debug\""));
+        let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(deserialized.logging, settings.logging);
         assert_eq!(settings, deserialized);
     }
 
