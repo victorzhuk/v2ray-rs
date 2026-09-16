@@ -9,6 +9,7 @@ use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
     ManualNode, ProxyNode, RoutingRule, Subscription, resolve_effective_config,
+    uses_imported_profile,
 };
 use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
@@ -253,6 +254,18 @@ fn spawn_with(
             };
 
             let tun = build_tun_runtime(&effective_settings, pinned);
+            let session_fields = format!(
+                "hijack={} capture_dns={} strict={} nodes_pinned={pinned} profile={}",
+                tun.as_ref()
+                    .map_or("off", |_| hijack_field(effective_settings.tun.dns_hijack)),
+                tun.as_ref().is_some_and(|rt| rt.capture_dns),
+                tun.as_ref().is_some_and(|rt| rt.strict),
+                if uses_imported_profile(&candidate.node_ref, &subscriptions) {
+                    "imported"
+                } else {
+                    "app"
+                },
+            );
             // Written before the backend or the route helper touches the kernel,
             // so a crash mid-start still leaves the next launch a recovery pass.
             if let Some(rt) = &tun
@@ -270,6 +283,7 @@ fn spawn_with(
                 .with_tun(tun)
                 .with_backend(settings.backend.backend_type)
                 .with_log_file(backend_log.clone())
+                .with_session_fields(session_fields)
                 .with_ready_probe(effective_settings.local_endpoint(effective_settings.socks_port)),
             );
 
@@ -497,6 +511,14 @@ fn hosts_cover_nodes(settings: &AppSettings, nodes: &[ProxyNode]) -> bool {
                 .iter()
                 .any(|h| h.domain == host && h.matches_strategy(settings.dns.strategy))
     })
+}
+
+fn hijack_field(mode: DnsHijackMode) -> &'static str {
+    match mode {
+        DnsHijackMode::Hijack => "hijack",
+        DnsHijackMode::Native => "native",
+        DnsHijackMode::Disabled => "disabled",
+    }
 }
 
 /// Builds the TUN runtime from settings, or `None` when TUN is off or the
@@ -1700,6 +1722,13 @@ exit 1"#,
             contents.contains("backend=sing-box version=1.13.0 node=203.0.113.1 tun=off"),
             "{contents}"
         );
+        let session_line = contents[session_at..].lines().next().unwrap_or_default();
+        assert!(
+            session_line.ends_with(
+                "tun=off hijack=off capture_dns=false strict=false nodes_pinned=true profile=app"
+            ),
+            "{session_line}"
+        );
 
         handle.stop();
         loop {
@@ -1716,6 +1745,44 @@ exit 1"#,
         assert_eq!(contents.matches(" exit ").count(), 1, "{contents}");
         assert!(contents[exit_at..].contains("requested=true"), "{contents}");
         assert!(session_at < exit_at, "{contents}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xray_tun_session_record_carries_dns_decisions() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; exec sleep 30"#,
+        );
+        let host = tempfile::tempdir().unwrap();
+        let getcap = host.path().join("getcap");
+        std::fs::write(&getcap, "#!/bin/sh\necho \"$1 cap_net_admin=ep\"\n").unwrap();
+        std::fs::set_permissions(&getcap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = v2ray_rs_process::HostProbe {
+            getcap,
+            helper: executable(host.path(), "v2ray-rs-netctl"),
+        };
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "v2rstest3".into();
+        settings.tun.strict_route = false;
+        let (_handle, rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        let (terminal, _) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let contents = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(contents.matches(" session ").count(), 1, "{contents}");
+        assert!(
+            contents.contains(
+                "tun=on hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
+            ),
+            "{contents}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

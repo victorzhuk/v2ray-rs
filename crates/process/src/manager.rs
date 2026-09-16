@@ -167,6 +167,7 @@ pub struct ProcessManager {
     log_writer: Option<Arc<RotatingFileWriter>>,
     cached_version: Option<Option<String>>,
     stop_reason: StopReason,
+    session_fields: Option<String>,
     #[cfg(any(test, feature = "test-utils"))]
     host_probe: Option<HostProbe>,
 }
@@ -208,6 +209,7 @@ impl ProcessManager {
             log_writer: None,
             cached_version: None,
             stop_reason: StopReason::UserStop,
+            session_fields: None,
             #[cfg(any(test, feature = "test-utils"))]
             host_probe: None,
         }
@@ -263,6 +265,12 @@ impl ProcessManager {
     /// land in the backend log file.
     pub fn with_log_file(mut self, writer: Option<Arc<RotatingFileWriter>>) -> Self {
         self.log_writer = writer;
+        self
+    }
+
+    /// Appends caller-decided `key=value` fields to every session record.
+    pub fn with_session_fields(mut self, fields: String) -> Self {
+        self.session_fields = Some(fields);
         self
     }
 
@@ -678,11 +686,12 @@ impl ProcessManager {
             .map(|c| truncate_reason(&c.node_name))
             .unwrap_or_else(|| "none".into());
         let tun = if self.tun.is_some() { "on" } else { "off" };
-        write_stream_line(
-            &self.log_writer,
-            "session",
-            &format!("backend={backend} version={version} node={node} tun={tun}"),
-        );
+        let mut record = format!("backend={backend} version={version} node={node} tun={tun}");
+        if let Some(fields) = &self.session_fields {
+            record.push(' ');
+            record.push_str(&truncate_reason(fields));
+        }
+        write_stream_line(&self.log_writer, "session", &record);
     }
 
     // Diagnostics-only probe for the session record: runs at most once per
@@ -1342,6 +1351,48 @@ mod tests {
             "{lines:?}"
         );
         mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_record_appends_caller_fields() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let fields = "hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app";
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_session_fields(fields.into());
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let sessions: Vec<&String> = lines.iter().filter(|l| l.contains(" session ")).collect();
+        assert_eq!(sessions.len(), 1, "{lines:?}");
+        assert!(
+            sessions[0].contains("tun=off hijack=hijack"),
+            "{}",
+            sessions[0]
+        );
+        assert!(sessions[0].ends_with(fields), "{}", sessions[0]);
+    }
+
+    #[tokio::test]
+    async fn session_fields_cannot_forge_a_second_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_session_fields("hijack=hijack\n2026-01-01 session forged=true\rx=y".into());
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let sessions: Vec<&String> = lines.iter().filter(|l| l.contains(" session ")).collect();
+        assert_eq!(sessions.len(), 1, "{lines:?}");
+        assert!(
+            sessions[0].contains("hijack=hijack 2026-01-01 session forged=true x=y"),
+            "{}",
+            sessions[0]
+        );
     }
 
     #[tokio::test]

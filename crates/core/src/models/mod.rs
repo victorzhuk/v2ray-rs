@@ -14,7 +14,7 @@ pub use dns::{
     DnsConfig, DnsProtocol, DnsProviderPreset, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
     DnsValidationError, FakeIpConfig, HostOverride, builtin_dns_presets,
 };
-pub use imported_profile::{ImportedProfile, resolve_effective_config};
+pub use imported_profile::{ImportedProfile, resolve_effective_config, uses_imported_profile};
 pub use manual_node::ManualNode;
 pub use presets::{Preset, builtin_presets};
 pub use proxy::{

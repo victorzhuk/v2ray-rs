@@ -21,13 +21,7 @@ pub fn resolve_effective_config(
     global_rules: &[RoutingRule],
     settings: &AppSettings,
 ) -> (Vec<RoutingRule>, AppSettings) {
-    if let ConnectionNodeRef::Subscription {
-        subscription_id, ..
-    } = node_ref
-        && let Some(sub) = subscriptions.iter().find(|s| s.id == *subscription_id)
-        && sub.use_imported_profile
-        && let Some(profile) = &sub.imported_profile
-    {
+    if let Some(profile) = active_profile(node_ref, subscriptions) {
         let rules: Vec<RoutingRule> = profile
             .rules
             .iter()
@@ -42,6 +36,29 @@ pub fn resolve_effective_config(
     }
 
     (global_rules.to_vec(), settings.clone())
+}
+
+/// Whether `resolve_effective_config` takes the imported profile for this
+/// candidate instead of the app's global rules and DNS.
+pub fn uses_imported_profile(node_ref: &ConnectionNodeRef, subscriptions: &[Subscription]) -> bool {
+    active_profile(node_ref, subscriptions).is_some()
+}
+
+fn active_profile<'a>(
+    node_ref: &ConnectionNodeRef,
+    subscriptions: &'a [Subscription],
+) -> Option<&'a ImportedProfile> {
+    let ConnectionNodeRef::Subscription {
+        subscription_id, ..
+    } = node_ref
+    else {
+        return None;
+    };
+    subscriptions
+        .iter()
+        .find(|s| s.id == *subscription_id)
+        .filter(|s| s.use_imported_profile)
+        .and_then(|s| s.imported_profile.as_ref())
 }
 
 #[cfg(test)]
@@ -144,6 +161,28 @@ mod tests {
 
         assert_eq!(rules.len(), 1);
         assert_eq!(effective.dns, settings.dns);
+    }
+
+    #[test]
+    fn uses_imported_profile_matches_resolve_effective_config() {
+        let sub = subscription_with_profile(true);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        assert!(uses_imported_profile(&node_ref, &[sub]));
+
+        let manual = ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        };
+        assert!(!uses_imported_profile(&manual, &[]));
+
+        let off = subscription_with_profile(false);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: off.id,
+            node_id: off.nodes[0].id,
+        };
+        assert!(!uses_imported_profile(&node_ref, &[off]));
     }
 
     #[test]
