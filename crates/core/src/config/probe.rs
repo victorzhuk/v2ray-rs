@@ -151,6 +151,7 @@ impl ProbeConfigGenerator for V2rayProbeGenerator {
         let outbounds: Vec<Value> = nodes
             .iter()
             .enumerate()
+            .filter(|(_, node)| crate::config::v2ray::v2ray_supports(&node.node))
             .map(|(i, node)| {
                 crate::config::v2ray::build_family_outbound(
                     &node.node,
@@ -377,5 +378,36 @@ mod tests {
         // Valid JSON.
         let s = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn v2ray_probe_skips_refused_nodes() {
+        let reality = SubscriptionNode::new(ProxyNode::Vless(VlessConfig {
+            address: "reality.example.com".into(),
+            port: 443,
+            uuid: "uuid-r".into(),
+            encryption: None,
+            flow: None,
+            transport: TransportSettings::Tcp,
+            tls: Some(TlsSettings {
+                reality: true,
+                public_key: Some("pbk".into()),
+                ..Default::default()
+            }),
+            remark: Some("REALITY".into()),
+        }));
+        let tls = mixed_nodes().swap_remove(0);
+        let refs = vec![&reality, &tls];
+        let config = V2rayProbeGenerator.generate(
+            &refs,
+            19_093,
+            "https://www.gstatic.com/generate_204",
+            5000,
+        );
+
+        let outbounds = config["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds.len(), 1);
+        assert_eq!(outbounds[0]["tag"], probe_tag(1));
+        assert_eq!(outbounds[0]["protocol"], "vless");
     }
 }

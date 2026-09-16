@@ -62,6 +62,10 @@ pub(crate) fn v2ray_refusal(node: &ProxyNode) -> Option<ConfigError> {
     None
 }
 
+pub(crate) fn v2ray_supports(node: &ProxyNode) -> bool {
+    v2ray_refusal(node).is_none()
+}
+
 pub(crate) fn generate_v2ray_family_config(
     nodes: &[ProxyNode],
     rules: &[RoutingRule],
