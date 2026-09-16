@@ -2,10 +2,10 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig,
-    DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
-    ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig,
-    WsSettings, XhttpSettings,
+    AppSettings, BackendType, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch,
+    DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction,
+    RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig,
+    VmessConfig, WsSettings, XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -26,6 +26,9 @@ impl ConfigGenerator for V2rayGenerator {
         if nodes.is_empty() {
             return Err(ConfigError::NoNodes);
         }
+        if let Some(err) = nodes.iter().find_map(v2ray_refusal) {
+            return Err(err);
+        }
         Ok(generate_v2ray_family_config(
             nodes,
             rules,
@@ -33,6 +36,30 @@ impl ConfigGenerator for V2rayGenerator {
             V2rayFamilyBackend::V2ray,
         ))
     }
+}
+
+pub(crate) fn v2ray_refusal(node: &ProxyNode) -> Option<ConfigError> {
+    let (transport, tls) = match node {
+        ProxyNode::Vless(c) => (&c.transport, &c.tls),
+        ProxyNode::Vmess(c) => (&c.transport, &c.tls),
+        ProxyNode::Trojan(c) => (&c.transport, &c.tls),
+        ProxyNode::Shadowsocks(_) => return None,
+    };
+    let name = || node.remark().unwrap_or(node.address()).to_string();
+    if matches!(transport, TransportSettings::Xhttp(_)) {
+        return Some(ConfigError::UnsupportedTransport {
+            backend: BackendType::V2ray,
+            node: name(),
+        });
+    }
+    if tls.as_ref().is_some_and(|t| t.reality) {
+        return Some(ConfigError::UnsupportedSecurity {
+            backend: BackendType::V2ray,
+            node: name(),
+            feature: "REALITY",
+        });
+    }
+    None
 }
 
 pub(crate) fn generate_v2ray_family_config(
@@ -1717,18 +1744,75 @@ mod tests {
     }
 
     #[test]
-    fn test_xhttp_transport() {
+    fn test_v2ray_xhttp_unsupported_transport() {
         let generator = V2rayGenerator;
-        let config = generator
-            .generate(&[xhttp_node()], &[], &default_settings())
-            .unwrap();
+        let result = generator.generate(&[xhttp_node()], &[], &default_settings());
 
-        let stream = &config["outbounds"][0]["streamSettings"];
-        assert_eq!(stream["network"], "xhttp");
-        assert_eq!(stream["xhttpSettings"]["path"], "/xhttp");
-        assert_eq!(stream["xhttpSettings"]["host"], "xhttp.example.com");
-        assert_eq!(stream["xhttpSettings"]["mode"], "auto");
-        assert_eq!(stream["security"], "reality");
+        match result {
+            Err(ConfigError::UnsupportedTransport { backend, node }) => {
+                assert_eq!(backend, BackendType::V2ray);
+                assert_eq!(node, "Test XHTTP");
+            }
+            other => panic!("expected UnsupportedTransport, got {other:?}"),
+        }
+    }
+
+    fn reality_node() -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "reality.example.com".into(),
+            port: 443,
+            uuid: "test-uuid-reality".into(),
+            encryption: None,
+            flow: None,
+            transport: TransportSettings::Tcp,
+            tls: Some(TlsSettings {
+                reality: true,
+                public_key: Some("pbk".into()),
+                ..Default::default()
+            }),
+            remark: Some("Test REALITY".into()),
+        })
+    }
+
+    #[test]
+    fn test_v2ray_reality_unsupported_security() {
+        let generator = V2rayGenerator;
+        let err = generator
+            .generate(&[reality_node()], &[], &default_settings())
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "security REALITY not supported by backend v2ray for node 'Test REALITY'; use xray"
+        );
+        match err {
+            ConfigError::UnsupportedSecurity {
+                backend,
+                node,
+                feature,
+            } => {
+                assert_eq!(backend, BackendType::V2ray);
+                assert_eq!(node, "Test REALITY");
+                assert_eq!(feature, "REALITY");
+            }
+            other => panic!("expected UnsupportedSecurity, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_write_config_rejects_reality_for_v2ray() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = crate::config::ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::V2ray;
+
+        let result = writer.write_config(&[reality_node()], &[], &settings);
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::UnsupportedSecurity { .. })
+        ));
+        assert!(!writer.output_path(BackendType::V2ray).exists());
     }
 
     fn ws_node(host: Option<&str>, headers: &[(&str, &str)]) -> ProxyNode {
