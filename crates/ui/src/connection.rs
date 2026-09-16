@@ -480,6 +480,44 @@ const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box str
 
 const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn pins_enabled(settings: &AppSettings) -> bool {
+    settings.tun.enabled && settings.backend.backend_type != BackendType::V2ray
+}
+
+/// Hostnames to pin before any candidate starts: each candidate node and its
+/// via nodes, under that candidate's effective settings. The first port seen
+/// for a hostname wins.
+#[cfg_attr(not(test), allow(dead_code))]
+fn pin_hosts(
+    candidates: &[ConnectionCandidate],
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+    enabled_rules: &[RoutingRule],
+    settings: &AppSettings,
+) -> Vec<(String, u16)> {
+    let mut hosts: Vec<(String, u16)> = Vec::new();
+    for candidate in candidates {
+        let (mut rules, effective) =
+            resolve_effective_config(&candidate.node_ref, subscriptions, enabled_rules, settings);
+        if !pins_enabled(&effective) {
+            continue;
+        }
+        let via = resolve_via_nodes(&mut rules, subscriptions, manual_nodes);
+        for node in std::iter::once(&candidate.node).chain(&via) {
+            let host = node.address();
+            if host.parse::<std::net::IpAddr>().is_ok()
+                || effective.dns.hosts.iter().any(|h| h.domain == host)
+                || hosts.iter().any(|(known, _)| known == host)
+            {
+                continue;
+            }
+            hosts.push((host.to_string(), node.port()));
+        }
+    }
+    hosts
+}
+
 /// Pins every hostname-addressed node to concrete IPs in `dns.hosts`. Every
 /// family is carried; the generator keeps what its backend can use.
 async fn pin_node_addresses(settings: &mut AppSettings, nodes: &[ProxyNode]) {
@@ -914,7 +952,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use v2ray_rs_core::models::{
-        DnsStrategy, ShadowsocksConfig, TransportSettings, TunConfig, VlessConfig, XhttpSettings,
+        DnsStrategy, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TunConfig,
+        VlessConfig, XhttpSettings,
     };
     use v2ray_rs_core::persistence::load_tun_session;
     use v2ray_rs_core::profile::AppProfile;
@@ -2293,6 +2332,105 @@ exit 1"#,
         assert!(warning.contains("[::1]:2080"), "{warning}");
         assert!(warning.contains("[::1]:2081"), "{warning}");
         assert!(!warning.contains("::1:2080"), "{warning}");
+    }
+
+    fn xray_tun_settings() -> AppSettings {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings
+    }
+
+    #[test]
+    fn pin_hosts_empty_without_tun() {
+        let settings = AppSettings::default();
+        let hosts = pin_hosts(&[candidate("proxy.example.com")], &[], &[], &[], &settings);
+        assert!(hosts.is_empty(), "{hosts:?}");
+    }
+
+    #[test]
+    fn pin_hosts_empty_for_v2ray() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::V2ray;
+        let hosts = pin_hosts(&[candidate("proxy.example.com")], &[], &[], &[], &settings);
+        assert!(hosts.is_empty(), "{hosts:?}");
+    }
+
+    #[test]
+    fn pin_hosts_dedupes_shared_hostname() {
+        let hosts = pin_hosts(
+            &[
+                candidate("proxy.example.com"),
+                candidate("other.example.com"),
+                candidate("proxy.example.com"),
+            ],
+            &[],
+            &[],
+            &[],
+            &xray_tun_settings(),
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                ("proxy.example.com".to_string(), 8388),
+                ("other.example.com".to_string(), 8388),
+            ]
+        );
+    }
+
+    #[test]
+    fn pin_hosts_includes_via_node() {
+        let via = ManualNode {
+            id: uuid::Uuid::new_v4(),
+            node: node("via.example.com"),
+            enabled: true,
+        };
+        let rule = RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "example.org".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: Some(ConnectionNodeRef::Manual { node_id: via.id }),
+        };
+        let hosts = pin_hosts(
+            &[candidate("proxy.example.com")],
+            &[],
+            &[via],
+            &[rule],
+            &xray_tun_settings(),
+        );
+        assert_eq!(
+            hosts,
+            vec![
+                ("proxy.example.com".to_string(), 8388),
+                ("via.example.com".to_string(), 8388),
+            ]
+        );
+    }
+
+    #[test]
+    fn pin_hosts_skips_user_override() {
+        let mut settings = xray_tun_settings();
+        settings.dns.hosts.push(HostOverride {
+            domain: "proxy.example.com".into(),
+            ip: "203.0.113.9".into(),
+        });
+        let hosts = pin_hosts(&[candidate("proxy.example.com")], &[], &[], &[], &settings);
+        assert!(hosts.is_empty(), "{hosts:?}");
+    }
+
+    #[test]
+    fn pin_hosts_skips_ip_literals() {
+        let hosts = pin_hosts(
+            &[candidate("203.0.113.9"), candidate("2001:db8::1")],
+            &[],
+            &[],
+            &[],
+            &xray_tun_settings(),
+        );
+        assert!(hosts.is_empty(), "{hosts:?}");
     }
 
     #[test]
