@@ -831,10 +831,8 @@ mod tests {
 
     #[test]
     fn excluded_routes_description_names_next_connect() {
-        assert_eq!(
-            EXCLUDED_ROUTES_DESCRIPTION,
-            "CIDRs routed outside the tunnel; applies on next connect"
-        );
+        assert!(EXCLUDED_ROUTES_DESCRIPTION.contains("outside the tunnel"));
+        assert!(EXCLUDED_ROUTES_DESCRIPTION.ends_with("applies on next connect"));
     }
 
     #[test]

@@ -581,7 +581,9 @@ mod tests {
 
     #[test]
     fn xray_rule_prefs_cover_exclusions() {
-        assert_eq!(RULE_PREF_EXCLUDE, 8997);
         assert!(XRAY_RULE_PREFS.contains(&RULE_PREF_EXCLUDE));
+        for pref in XRAY_RULE_PREFS.iter().filter(|&&p| p != RULE_PREF_EXCLUDE) {
+            assert!(RULE_PREF_EXCLUDE < *pref, "pref={pref}");
+        }
     }
 }

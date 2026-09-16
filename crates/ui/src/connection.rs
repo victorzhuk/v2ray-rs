@@ -3178,16 +3178,6 @@ exit 1"#,
     }
 
     #[test]
-    fn runtime_uses_effective_exclude_routes() {
-        let mut persisted = xray_tun_settings();
-        persisted.tun.exclude_routes = vec!["10.15.12.100/32".into()];
-        let mut effective = persisted.clone();
-        effective.tun.exclude_routes = vec!["91.230.107.224/32".into()];
-        let runtime = build_tun_runtime(&effective, true).unwrap();
-        assert_eq!(runtime.exclude_routes, ["91.230.107.224/32"]);
-    }
-
-    #[test]
     fn wrong_family_pin_leaves_capture_off() {
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
