@@ -134,6 +134,22 @@ impl Default for RealDelaySettings {
     }
 }
 
+/// User preferences for the active-connection health check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCheckSettings {
+    pub enabled: bool,
+    pub failover: bool,
+}
+
+impl Default for HealthCheckSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            failover: false,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppSettings {
     pub version: u32,
@@ -167,6 +183,8 @@ pub struct AppSettings {
     pub tun: TunConfig,
     #[serde(default)]
     pub real_delay: RealDelaySettings,
+    #[serde(default)]
+    pub health_check: HealthCheckSettings,
 }
 
 pub fn default_listen_address() -> String {
@@ -251,6 +269,7 @@ impl Default for AppSettings {
             dns: DnsConfig::default(),
             tun: TunConfig::default(),
             real_delay: RealDelaySettings::default(),
+            health_check: HealthCheckSettings::default(),
         }
     }
 }
@@ -406,6 +425,28 @@ mod tests {
         let toml_str = toml::to_string(&settings).unwrap();
         let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(deserialized.real_delay, settings.real_delay);
+        assert_eq!(settings, deserialized);
+    }
+
+    #[test]
+    fn test_legacy_settings_toml_missing_health_check_defaults() {
+        let toml_str = "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n";
+        let settings: AppSettings = toml::from_str(toml_str).unwrap();
+        assert!(settings.health_check.enabled);
+        assert!(!settings.health_check.failover);
+    }
+
+    #[test]
+    fn test_health_check_settings_round_trip() {
+        let settings = AppSettings {
+            health_check: HealthCheckSettings {
+                enabled: false,
+                failover: true,
+            },
+            ..AppSettings::default()
+        };
+        let toml_str = toml::to_string(&settings).unwrap();
+        let deserialized: AppSettings = toml::from_str(&toml_str).unwrap();
         assert_eq!(settings, deserialized);
     }
 

@@ -26,7 +26,8 @@ pub use resolve::{
 };
 pub use routing::{RoutingRule, RoutingRuleSet, RuleAction, RuleMatch};
 pub use settings::{
-    AppSettings, BackendConfig, BackendType, Language, RealDelayCapability, RealDelaySettings,
+    AppSettings, BackendConfig, BackendType, HealthCheckSettings, Language, RealDelayCapability,
+    RealDelaySettings,
 };
 pub use subscription::{Subscription, SubscriptionNode, SubscriptionSource};
 pub use tun::{DnsHijackMode, TunConfig, TunStack};
