@@ -16,6 +16,8 @@ const NS_STRICT: &str = "nctl-strict-ns";
 const NS_CLEAR: &str = "nctl-clear-ns";
 const NS_REUP: &str = "nctl-reup-ns";
 const NS_GONE: &str = "nctl-gone-ns";
+const NS_EXCL: &str = "nctl-excl-ns";
+const NS_EXCL_REUP: &str = "nctl-exclreup-ns";
 const IFACE: &str = "nctltest0";
 /// Stand-in for the physical uplink that owns the `main` default route.
 const MAIN_IFACE: &str = "nctlmain0";
@@ -389,7 +391,7 @@ fn assert_xray_state_cleared(ns: &str, after: &str) {
             "table 2023 not empty after {after} ({family}): {table}"
         );
         let rules = ip_in_output(ns, &[family, "rule", "show"]);
-        for pref in ["8998:", "8999:", "9000:", "9001:", "9002:"] {
+        for pref in ["8997:", "8998:", "8999:", "9000:", "9001:", "9002:"] {
             assert!(
                 !rules.contains(pref),
                 "rule {pref} leaked after {after} ({family}): {rules}"
@@ -578,5 +580,192 @@ fn strict_state_refuses_unmarked_traffic_without_device() {
     assert!(
         !ok || out.contains("unreachable"),
         "unmarked IPv6 lookup must fail closed: {out}"
+    );
+}
+
+/// IPv4 policy rules at the exclusion priority.
+fn exclusion_lines(ns: &str) -> Vec<String> {
+    ip_in_output(ns, &["-4", "rule", "show"])
+        .lines()
+        .filter(|l| l.starts_with("8997:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+#[test]
+fn exclusions_route_outside_tunnel_ahead_of_dns_capture() {
+    let _ = run("ip", &["netns", "del", NS_EXCL]);
+    if !run("ip", &["netns", "add", NS_EXCL]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_EXCL);
+
+    if !ip_in(NS_EXCL, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+    assert!(ip_in(
+        NS_EXCL,
+        &["tuntap", "add", "dev", MAIN_IFACE, "mode", "tun"]
+    ));
+    assert!(ip_in(
+        NS_EXCL,
+        &["addr", "add", "10.99.0.1/24", "dev", MAIN_IFACE]
+    ));
+    assert!(ip_in(NS_EXCL, &["link", "set", MAIN_IFACE, "up"]));
+    assert!(ip_in(
+        NS_EXCL,
+        &["route", "add", "default", "dev", MAIN_IFACE]
+    ));
+
+    assert!(netctl_in(
+        NS_EXCL,
+        &[
+            "xray-up",
+            "--iface",
+            IFACE,
+            "--addr",
+            ADDR,
+            "--capture-dns",
+            "--exclude",
+            "198.51.100.7/32",
+            "--exclude",
+            "192.0.2.53/32",
+        ]
+    ));
+
+    let excl = exclusion_lines(NS_EXCL);
+    assert_eq!(excl.len(), 2, "expected two exclusion rules: {excl:?}");
+    assert!(
+        excl.iter().all(|l| l.contains("lookup main")),
+        "exclusion rules must look up main: {excl:?}"
+    );
+
+    let rules = ip_in_output(NS_EXCL, &["-4", "rule", "show"]);
+    assert!(
+        rules.find("8997:").unwrap() < rules.find("8999:").unwrap(),
+        "exclusions must be evaluated before dns capture: {rules}"
+    );
+
+    let (ok, out) = ip_in_full(NS_EXCL, &["-4", "route", "get", "198.51.100.7"]);
+    assert!(
+        ok && out.contains(&format!("dev {MAIN_IFACE}")),
+        "excluded address must route via main: {out}"
+    );
+
+    // Without the exclusion this lookup would match the dns capture rule and
+    // land in the tunnel table.
+    let (ok, out) = ip_in_full(
+        NS_EXCL,
+        &[
+            "-4",
+            "route",
+            "get",
+            "192.0.2.53",
+            "ipproto",
+            "udp",
+            "dport",
+            "53",
+        ],
+    );
+    assert!(
+        ok && out.contains(&format!("dev {MAIN_IFACE}")),
+        "excluded resolver must skip dns capture: {out}"
+    );
+}
+
+#[test]
+fn exclusions_replaced_on_reup_and_cleared_on_teardown() {
+    let _ = run("ip", &["netns", "del", NS_EXCL_REUP]);
+    if !run("ip", &["netns", "add", NS_EXCL_REUP]) {
+        eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        return;
+    }
+    let _guard = NsGuard(NS_EXCL_REUP);
+
+    if !ip_in(
+        NS_EXCL_REUP,
+        &["tuntap", "add", "dev", IFACE, "mode", "tun"],
+    ) {
+        eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        return;
+    }
+
+    let up_two = [
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--exclude",
+        "198.51.100.7/32",
+        "--exclude",
+        "192.0.2.53/32",
+    ];
+    let up_one = [
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--exclude",
+        "198.51.100.7/32",
+    ];
+    let up_none = ["xray-up", "--iface", IFACE, "--addr", ADDR];
+    let recreate = || {
+        assert!(ip_in(
+            NS_EXCL_REUP,
+            &["tuntap", "add", "dev", IFACE, "mode", "tun"]
+        ));
+    };
+
+    assert!(netctl_in(NS_EXCL_REUP, &up_two));
+    assert_eq!(exclusion_lines(NS_EXCL_REUP).len(), 2);
+
+    assert!(netctl_in(NS_EXCL_REUP, &up_one));
+    let excl = exclusion_lines(NS_EXCL_REUP);
+    assert!(
+        excl.len() == 1 && excl[0].contains("198.51.100.7"),
+        "re-up must keep only the listed exclusion: {excl:?}"
+    );
+
+    assert!(netctl_in(NS_EXCL_REUP, &up_none));
+    let excl = exclusion_lines(NS_EXCL_REUP);
+    assert!(
+        excl.is_empty(),
+        "re-up without --exclude must clear: {excl:?}"
+    );
+
+    assert!(netctl_in(NS_EXCL_REUP, &up_two));
+    assert!(netctl_in(NS_EXCL_REUP, &["xray-down", "--iface", IFACE]));
+    let excl = exclusion_lines(NS_EXCL_REUP);
+    assert!(
+        excl.is_empty(),
+        "exclusions leaked after xray-down: {excl:?}"
+    );
+
+    recreate();
+    assert!(netctl_in(NS_EXCL_REUP, &up_two));
+    assert!(netctl_in(
+        NS_EXCL_REUP,
+        &["recover", "--xray", "--iface", IFACE]
+    ));
+    let excl = exclusion_lines(NS_EXCL_REUP);
+    assert!(
+        excl.is_empty(),
+        "exclusions leaked after recover --xray: {excl:?}"
+    );
+
+    recreate();
+    assert!(netctl_in(NS_EXCL_REUP, &up_two));
+    assert!(netctl_in(
+        NS_EXCL_REUP,
+        &["recover", "--singbox", "--iface", IFACE]
+    ));
+    let excl = exclusion_lines(NS_EXCL_REUP);
+    assert!(
+        excl.is_empty(),
+        "exclusions leaked after recover --singbox: {excl:?}"
     );
 }
