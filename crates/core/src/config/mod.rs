@@ -43,6 +43,12 @@ pub enum ConfigError {
     },
     #[error("transport not supported by backend {backend} for node '{node}'")]
     UnsupportedTransport { backend: BackendType, node: String },
+    #[error("security {feature} not supported by backend {backend} for node '{node}'; use xray")]
+    UnsupportedSecurity {
+        backend: BackendType,
+        node: String,
+        feature: &'static str,
+    },
     #[error(
         "node '{node}' disables certificate verification, which backend {backend} does not support; enable verification or use sing-box"
     )]
