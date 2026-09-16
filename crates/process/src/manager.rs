@@ -280,6 +280,11 @@ impl ProcessManager {
         self.state.state()
     }
 
+    /// Reports whether a TUN runtime is attached, not whether routes are up.
+    pub fn has_tun_runtime(&self) -> bool {
+        self.tun.is_some()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ProcessEvent> {
         self.state.subscribe()
     }
@@ -1625,6 +1630,23 @@ mod tests {
             capture_dns: false,
             strict: false,
         }
+    }
+
+    #[test]
+    fn has_tun_runtime_reflects_attached_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!manager_for(&dir, "exec sleep 30\n").has_tun_runtime());
+        assert!(
+            !manager_for(&dir, "exec sleep 30\n")
+                .with_tun(None)
+                .has_tun_runtime()
+        );
+        let (helper, _) = stub_helper(dir.path(), "exit 0\n");
+        assert!(
+            manager_for(&dir, "exec sleep 30\n")
+                .with_tun(Some(xray_on_lo(helper)))
+                .has_tun_runtime()
+        );
     }
 
     fn crashing_backend(dir: &std::path::Path, crashes: usize) -> String {
