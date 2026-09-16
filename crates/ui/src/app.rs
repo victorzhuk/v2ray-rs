@@ -44,8 +44,9 @@ pub struct AppInit {
 }
 
 use crate::config_preview::{ConfigPreviewDialog, ConfigPreviewInput};
-use crate::connection::{ConnectionHandle, ConnectionRequest};
+use crate::connection::{ConnectionHandle, ConnectionRequest, HealthTiming};
 use crate::geodata_service::{GeodataRefreshConfig, GeodataRefreshService};
+use crate::health::Health;
 use crate::logs::{LogsMsg, LogsPage};
 use crate::nodes::{NodesMsg, NodesOutput, NodesPage};
 use crate::subscriptions::{
@@ -70,6 +71,8 @@ pub struct App {
     connection_generation: u64,
     grant_generation: Option<u64>,
     process_state: ProcessState,
+    health: Option<Health>,
+    dns_failing: bool,
     reconnect_pending: bool,
     connected: bool,
     button_sensitive: bool,
@@ -118,6 +121,8 @@ pub enum AppMsg {
     ActiveNodesChanged(bool),
     ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
     ProcessLogLine(u64, String),
+    ConnectionHealth(u64, Health),
+    DnsHealth(u64, bool),
     OpenPreferences(Option<&'static str>),
     ViewGeneratedConfig,
     PreferencesClosed,
@@ -596,6 +601,7 @@ impl App {
                 lifecycle: self.tun_lifecycle.clone(),
                 generation,
                 host_has_ipv6,
+                health_timing: HealthTiming::default(),
             },
             sender.input_sender().clone(),
         );
@@ -966,6 +972,8 @@ impl SimpleComponent for App {
             connection_generation: 0,
             grant_generation: None,
             process_state: ProcessState::Stopped,
+            health: None,
+            dns_failing: false,
             reconnect_pending: false,
             connected: false,
             button_sensitive: true,
@@ -1403,6 +1411,16 @@ impl SimpleComponent for App {
                     return;
                 }
                 self.logs_page.emit(LogsMsg::AppendLine(line));
+            }
+            AppMsg::ConnectionHealth(generation, health) => {
+                if is_current_generation(generation, self.connection_generation) {
+                    self.health = Some(health);
+                }
+            }
+            AppMsg::DnsHealth(generation, failing) => {
+                if is_current_generation(generation, self.connection_generation) {
+                    self.dns_failing = failing;
+                }
             }
             AppMsg::CloseRequested => {
                 if self.settings.minimize_to_tray && tray_available() {

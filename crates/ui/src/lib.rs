@@ -4,7 +4,6 @@ mod config_preview;
 mod connection;
 pub(crate) mod failure_streak;
 mod geodata_service;
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) mod health;
 pub mod i18n;
 pub(crate) mod logging;

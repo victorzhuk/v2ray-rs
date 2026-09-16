@@ -1,6 +1,7 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
-
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{Mutex, broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -15,6 +16,7 @@ use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_process::{ProcessError, ProcessEvent, ProcessManager, ProcessState, TunRuntime};
 
 use crate::app::AppMsg;
+use crate::health::{DnsFailureWindow, HealthTracker};
 
 /// Serializes everything that mutates backend-process and kernel TUN state.
 ///
@@ -50,6 +52,26 @@ pub(super) struct ConnectionRequest {
     /// clear the live connection's handle.
     pub generation: u64,
     pub host_has_ipv6: bool,
+    pub health_timing: HealthTiming,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct HealthTiming {
+    pub initial_delay: Duration,
+    pub interval: Duration,
+    /// Re-evaluates the DNS failure window without a new log line, so the
+    /// failing mark clears once a burst has stopped.
+    pub dns_recheck: Duration,
+}
+
+impl Default for HealthTiming {
+    fn default() -> Self {
+        Self {
+            initial_delay: Duration::from_secs(10),
+            interval: Duration::from_secs(30),
+            dns_recheck: Duration::from_secs(10),
+        }
+    }
 }
 
 enum ConnectionCmd {
@@ -87,6 +109,7 @@ fn spawn_with(
         lifecycle,
         generation,
         host_has_ipv6,
+        health_timing,
     } = request;
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<ConnectionCmd>(4);
 
@@ -327,20 +350,51 @@ fn spawn_with(
             });
 
             let log_sender = sender.clone();
+            let backend = settings.backend.backend_type;
             let mut log_rx = mgr.subscribe_logs();
             let log_forwarder = tokio::spawn(async move {
+                // Only xray's log lines are known to mark DNS failures.
+                let mut dns = (backend == BackendType::Xray).then(DnsFailureWindow::default);
+                let mut dns_failing = false;
+                let mut recheck = tokio::time::interval(health_timing.dns_recheck);
                 loop {
-                    match log_rx.recv().await {
-                        Ok(ProcessEvent::LogLine(line)) => {
-                            log_sender.emit(AppMsg::ProcessLogLine(generation, line.content));
-                        }
-                        Ok(_) => {}
-                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                        Err(broadcast::error::RecvError::Closed) => break,
+                    tokio::select! {
+                        event = log_rx.recv() => match event {
+                            Ok(ProcessEvent::LogLine(line)) => {
+                                if let Some(window) = &mut dns {
+                                    window.observe(&line.content, Instant::now());
+                                }
+                                log_sender.emit(AppMsg::ProcessLogLine(generation, line.content));
+                            }
+                            Ok(_) => continue,
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        },
+                        _ = recheck.tick(), if dns.is_some() => {}
+                    }
+                    if let Some(window) = &dns
+                        && let Some(failing) = dns_flip(window, &mut dns_failing, Instant::now())
+                    {
+                        log_sender.emit(AppMsg::DnsHealth(generation, failing));
                     }
                 }
             });
-            let forwarders = vec![state_forwarder, log_forwarder];
+            let mut forwarders = vec![state_forwarder, log_forwarder];
+            if effective_settings.health_check.enabled {
+                forwarders.push(spawn_health_monitor(
+                    HealthProbe {
+                        proxy: effective_settings.local_endpoint(effective_settings.http_port),
+                        url: effective_settings.real_delay.test_url.clone(),
+                        timeout: Duration::from_millis(u64::from(
+                            effective_settings.real_delay.timeout_ms,
+                        )),
+                    },
+                    health_timing,
+                    mgr.subscribe(),
+                    sender.clone(),
+                    generation,
+                ));
+            }
 
             loop {
                 tokio::select! {
@@ -518,6 +572,70 @@ fn tun_session_for(rt: &TunRuntime) -> TunSession {
         backend: rt.backend,
         iface: rt.iface.clone(),
     }
+}
+
+struct HealthProbe {
+    proxy: SocketAddr,
+    url: String,
+    timeout: Duration,
+}
+
+/// Probes through the local HTTP proxy and reports health transitions. Its own
+/// state receiver pauses probing while the manager respawns the backend and
+/// restarts from a clean streak once it is running again.
+fn spawn_health_monitor(
+    probe: HealthProbe,
+    timing: HealthTiming,
+    mut state_rx: broadcast::Receiver<ProcessEvent>,
+    sender: relm4::Sender<AppMsg>,
+    generation: u64,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        tokio::time::sleep(timing.initial_delay).await;
+        let mut tracker = HealthTracker::new();
+        let mut tick = tokio::time::interval(timing.interval);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut paused = false;
+        loop {
+            tokio::select! {
+                event = state_rx.recv() => match event {
+                    Ok(ProcessEvent::StateChanged { to: ProcessState::Starting, .. }) => {
+                        paused = true;
+                        tracker.reset();
+                    }
+                    Ok(ProcessEvent::StateChanged { to: ProcessState::Running, .. }) => {
+                        paused = false;
+                        tracker.reset();
+                        tick.reset();
+                    }
+                    Ok(_) => {}
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = tick.tick(), if !paused => {
+                    let outcome = v2ray_rs_subscription::probe_via_http_proxy(
+                        probe.proxy,
+                        &probe.url,
+                        probe.timeout,
+                    )
+                    .await;
+                    if let Some(health) = tracker.record(outcome) {
+                        sender.emit(AppMsg::ConnectionHealth(generation, health));
+                    }
+                }
+            }
+        }
+    })
+}
+
+/// The new DNS failing mark when it differs from the last one reported.
+fn dns_flip(window: &DnsFailureWindow, reported: &mut bool, now: Instant) -> Option<bool> {
+    let failing = window.is_failing(now);
+    if failing == *reported {
+        return None;
+    }
+    *reported = failing;
+    Some(failing)
 }
 
 /// Stops every task spawned for a candidate and waits until none can emit, so
@@ -745,6 +863,8 @@ mod tests {
     use v2ray_rs_core::persistence::load_tun_session;
     use v2ray_rs_core::profile::AppProfile;
 
+    use crate::health::Health;
+
     const GENERATION: u64 = 7;
     const RECV_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -814,7 +934,29 @@ mod tests {
             lifecycle: TunLifecycle::default(),
             generation: GENERATION,
             host_has_ipv6: true,
+            health_timing: HealthTiming::default(),
         }
+    }
+
+    const FAST_HEALTH: HealthTiming = HealthTiming {
+        initial_delay: Duration::from_millis(50),
+        interval: Duration::from_millis(100),
+        dns_recheck: Duration::from_millis(100),
+    };
+
+    fn connect_with_health(
+        stub: &Stub,
+        settings: AppSettings,
+        candidates: Vec<ConnectionCandidate>,
+        health_timing: HealthTiming,
+    ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let req = ConnectionRequest {
+            health_timing,
+            ..request(stub, settings, candidates)
+        };
+        let handle = spawn_with(req, tx, |mgr| mgr);
+        (handle, rx)
     }
 
     fn connect_with(
@@ -1662,6 +1804,240 @@ exit 1"#,
                 Some(_) => {}
             }
         }
+    }
+
+    struct FakeProxy {
+        port: u16,
+        accepts: Arc<std::sync::atomic::AtomicUsize>,
+        healthy: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FakeProxy {
+        fn accepts(&self) -> usize {
+            self.accepts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_healthy(&self, healthy: bool) {
+            self.healthy
+                .store(healthy, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    async fn fake_proxy(healthy: bool) -> FakeProxy {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = FakeProxy {
+            port: listener.local_addr().unwrap().port(),
+            accepts: Arc::default(),
+            healthy: Arc::new(std::sync::atomic::AtomicBool::new(healthy)),
+        };
+        let accepts = proxy.accepts.clone();
+        let healthy = proxy.healthy.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let reply = if healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                    "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n"
+                } else {
+                    "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = socket.read(&mut buf).await;
+                    let _ = socket.write_all(reply.as_bytes()).await;
+                });
+            }
+        });
+        proxy
+    }
+
+    fn health_settings(proxy: &FakeProxy) -> (std::net::TcpListener, AppSettings) {
+        let (listener, mut settings) = ready_singbox_settings();
+        settings.http_port = proxy.port;
+        settings.real_delay.test_url = "http://probe.test/generate_204".into();
+        (listener, settings)
+    }
+
+    fn sleeping_stub() -> Stub {
+        stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+        )
+    }
+
+    async fn wait_running(rx: &relm4::Receiver<AppMsg>) {
+        loop {
+            let (state, _) = next_state(rx).await;
+            if matches!(state, ProcessState::Running) {
+                return;
+            }
+            assert!(relays(&state), "reported {state:?}");
+        }
+    }
+
+    async fn next_health(rx: &relm4::Receiver<AppMsg>) -> Health {
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("no health reported in time")
+                .expect("connection task ended before a health report");
+            if let AppMsg::ConnectionHealth(generation, health) = msg {
+                assert_eq!(generation, GENERATION);
+                return health;
+            }
+        }
+    }
+
+    async fn stop_and_wait(handle: &ConnectionHandle, rx: &relm4::Receiver<AppMsg>) {
+        handle.stop();
+        loop {
+            let (state, _) = next_state(rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                return;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_monitor_reports_unhealthy_then_healthy() {
+        let stub = sleeping_stub();
+        let proxy = fake_proxy(false).await;
+        let (_listener, settings) = health_settings(&proxy);
+        let (handle, rx) =
+            connect_with_health(&stub, settings, vec![candidate("203.0.113.1")], FAST_HEALTH);
+        wait_running(&rx).await;
+
+        let health = next_health(&rx).await;
+        assert!(
+            matches!(health, Health::Unhealthy(ref r) if r.contains("502")),
+            "{health:?}"
+        );
+        proxy.set_healthy(true);
+        assert_eq!(next_health(&rx).await, Health::Healthy);
+
+        let seen = proxy.accepts();
+        while proxy.accepts() < seen + 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle.stop();
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => break,
+                Some(AppMsg::ConnectionHealth(_, health)) => {
+                    panic!("repeated health report {health:?}")
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_monitor_is_not_spawned_when_disabled() {
+        let stub = sleeping_stub();
+        let proxy = fake_proxy(true).await;
+        let (_listener, mut settings) = health_settings(&proxy);
+        settings.health_check.enabled = false;
+        let (handle, rx) =
+            connect_with_health(&stub, settings, vec![candidate("203.0.113.1")], FAST_HEALTH);
+        wait_running(&rx).await;
+
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(proxy.accepts(), 0);
+
+        stop_and_wait(&handle, &rx).await;
+        assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn health_monitor_stops_with_the_connection() {
+        let stub = sleeping_stub();
+        let proxy = fake_proxy(true).await;
+        let (_listener, settings) = health_settings(&proxy);
+        let (handle, rx) =
+            connect_with_health(&stub, settings, vec![candidate("203.0.113.1")], FAST_HEALTH);
+        wait_running(&rx).await;
+        assert_eq!(next_health(&rx).await, Health::Healthy);
+
+        stop_and_wait(&handle, &rx).await;
+        assert_nothing_after_terminal(&rx).await;
+        let after_stop = proxy.accepts();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(proxy.accepts(), after_stop, "probe sent after stop");
+    }
+
+    const DNS_BURST: &str = r#"sleep 2; i=0; while [ $i -lt 25 ]; do echo "2026/09/16 12:00:00 [Info] app/dns: failed to retrieve response for example.com"; i=$((i+1)); done; echo dns-burst-done; exec sleep 30"#;
+
+    fn dns_burst_stub(version: &str) -> Stub {
+        stub(&format!(
+            r#"[ "$1" = version ] && echo "{version}" && exit 0; [ "$1" = check ] && exit 0; [ "$2" = -test ] && exit 0; {DNS_BURST}"#
+        ))
+    }
+
+    /// Stops the connection once the burst is relayed and returns every DNS
+    /// health report it emitted.
+    async fn dns_reports(handle: &ConnectionHandle, rx: &relm4::Receiver<AppMsg>) -> Vec<bool> {
+        let mut reports = Vec::new();
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => return reports,
+                Some(AppMsg::DnsHealth(generation, failing)) => {
+                    assert_eq!(generation, GENERATION);
+                    reports.push(failing);
+                }
+                Some(AppMsg::ProcessLogLine(_, line)) if line == "dns-burst-done" => handle.stop(),
+                Some(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn xray_dns_burst_reports_dns_health() {
+        let stub = dns_burst_stub("Xray 26.6.27");
+        let (_listener, mut settings) = ready_singbox_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.health_check.enabled = false;
+        let (handle, rx) =
+            connect_with_health(&stub, settings, vec![candidate("203.0.113.1")], FAST_HEALTH);
+
+        assert_eq!(dns_reports(&handle, &rx).await, vec![true]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn singbox_dns_burst_reports_nothing() {
+        let stub = dns_burst_stub("sing-box version 1.13.0");
+        let (_listener, mut settings) = ready_singbox_settings();
+        settings.health_check.enabled = false;
+        let (handle, rx) =
+            connect_with_health(&stub, settings, vec![candidate("203.0.113.1")], FAST_HEALTH);
+
+        assert_eq!(dns_reports(&handle, &rx).await, Vec::<bool>::new());
+    }
+
+    #[test]
+    fn dns_window_clears_after_the_recheck_tick() {
+        let base = Instant::now();
+        let mut window = DnsFailureWindow::default();
+        let mut reported = false;
+        for k in 0..20 {
+            window.observe(
+                "[Info] app/dns: failed to retrieve response for example.com",
+                base + Duration::from_secs(k),
+            );
+        }
+        let last = base + Duration::from_secs(19);
+        assert_eq!(dns_flip(&window, &mut reported, last), Some(true));
+        assert_eq!(dns_flip(&window, &mut reported, last), None);
+        let tick = last + Duration::from_secs(61);
+        assert_eq!(dns_flip(&window, &mut reported, tick), Some(false));
+        assert_eq!(dns_flip(&window, &mut reported, tick), None);
     }
 
     fn node(address: &str) -> ProxyNode {
