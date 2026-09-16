@@ -195,6 +195,7 @@ fn is_xtls_flow(flow: &str) -> bool {
 mod tests {
     use super::*;
     use crate::models::*;
+    use uuid::Uuid;
 
     fn xray_vless_with_xtls() -> ProxyNode {
         ProxyNode::Vless(VlessConfig {
@@ -586,6 +587,55 @@ mod tests {
                 assert!(outbound["streamSettings"]["sockopt"]["mark"].is_null());
             } else {
                 assert_eq!(outbound["streamSettings"]["sockopt"]["mark"], 255);
+            }
+        }
+    }
+
+    #[test]
+    fn test_xray_tun_marks_every_dialing_outbound() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        let nodes = [xray_vless_with_xtls(), ws_vless_with_host_header(&[])];
+        let rules = vec![RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "api.example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: Some(ConnectionNodeRef::Manual {
+                node_id: Uuid::new_v4(),
+            }),
+        }];
+
+        let config = XrayGenerator.generate(&nodes, &rules, &settings).unwrap();
+
+        let via_rule = config["routing"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| {
+                r["domain"]
+                    .as_array()
+                    .is_some_and(|d| d.iter().any(|v| v == "domain:api.example.com"))
+            })
+            .expect("via-node rule missing");
+        assert_eq!(
+            via_rule["outboundTag"],
+            crate::config::common::outbound_tag(&nodes[1], 1),
+            "{via_rule}"
+        );
+
+        for outbound in config["outbounds"].as_array().unwrap() {
+            let mark = &outbound["streamSettings"]["sockopt"]["mark"];
+            if outbound["protocol"] == "blackhole" || outbound["protocol"] == "dns" {
+                assert!(mark.is_null(), "{outbound}");
+            } else {
+                assert_eq!(
+                    mark, 255,
+                    "dialing outbound must carry the fwmark: {outbound}"
+                );
             }
         }
     }
