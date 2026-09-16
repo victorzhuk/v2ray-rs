@@ -21,6 +21,7 @@ use v2ray_rs_process::{
 };
 
 use crate::app::AppMsg;
+use crate::backend_warning::BackendWarnings;
 use crate::health::{DnsFailureWindow, HealthTracker};
 
 /// Serializes everything that mutates backend-process and kernel TUN state.
@@ -210,6 +211,9 @@ fn spawn_with(
         // Once per connection, like the strict-route notice, so a failover
         // cannot repeat it.
         let mut capture_notice_sent = false;
+        let warnings = Arc::new(std::sync::Mutex::new(BackendWarnings::new(
+            settings.backend.backend_type,
+        )));
         let total = candidates.len();
         'candidates: for (index, candidate) in candidates.into_iter().enumerate() {
             let position = index + 1;
@@ -436,6 +440,7 @@ fn spawn_with(
             let log_sender = sender.clone();
             let backend = settings.backend.backend_type;
             let mut log_rx = mgr.subscribe_logs();
+            let warnings = Arc::clone(&warnings);
             let log_forwarder = tokio::spawn(async move {
                 // Only xray's log lines are known to mark DNS failures.
                 let mut dns = (backend == BackendType::Xray).then(DnsFailureWindow::default);
@@ -448,7 +453,14 @@ fn spawn_with(
                                 if let Some(window) = &mut dns {
                                     window.observe(&line.content, Instant::now());
                                 }
+                                let toast = warnings
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .toast_for(&line.content);
                                 log_sender.emit(AppMsg::ProcessLogLine(generation, line.content));
+                                if let Some(toast) = toast {
+                                    log_sender.emit(AppMsg::ShowToast(toast));
+                                }
                             }
                             Ok(_) => continue,
                             Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2295,6 +2307,60 @@ exit 1"#,
                 Some(_) => {}
             }
         }
+    }
+
+    #[tokio::test]
+    async fn reality_warning_toasts_once_per_connection() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; while [ ! -e "$0.go" ]; do sleep 0.05; done; for i in 1 2 3; do echo "2026/09/14 09:57:30.532567 [Error] [1944052120] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"; done; exec sleep 30"#,
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.socks_port = listener.local_addr().unwrap().port();
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+            assert!(relays(&state), "reported {state:?}");
+        }
+        // The forwarder subscribes once the backend is running; earlier output
+        // would never reach it.
+        std::fs::write(stub.binary.with_extension("go"), "").unwrap();
+
+        let mut relayed = 0;
+        let mut toasts = Vec::new();
+        while relayed < 3 {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("warning lines not relayed in time")
+                .expect("connection task ended before relaying the warnings");
+            match msg {
+                AppMsg::ProcessLogLine(_, line) if line.contains("potential MITM") => relayed += 1,
+                AppMsg::ShowToast(toast) => toasts.push(toast),
+                _ => {}
+            }
+        }
+        handle.stop(StopReason::UserStop);
+        let (_, lines, rest) = drain_within(&rx, RECV_TIMEOUT).await;
+        toasts.extend(rest);
+        relayed += lines
+            .iter()
+            .filter(|line| line.contains("potential MITM"))
+            .count();
+
+        assert_eq!(relayed, 3);
+        assert_eq!(
+            toasts,
+            [
+                "Backend warning: [Error] [1944052120] transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)"
+            ]
+        );
+        drop(listener);
     }
 
     fn xray_tun_stub_with_probe(
