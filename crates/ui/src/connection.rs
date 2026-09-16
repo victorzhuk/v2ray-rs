@@ -149,6 +149,15 @@ fn spawn_with(
             ));
         }
 
+        // Same reasoning as the strict-route notice: outside the candidate loop
+        // so a failover cannot repeat it.
+        if let Some(warning) = v2ray_tun_warning(&settings) {
+            if let Some(log) = &backend_log {
+                log.append_line("warning", &warning);
+            }
+            sender.emit(AppMsg::ProcessLogLine(generation, warning));
+        }
+
         'candidates: for candidate in candidates {
             if matches!(cmd_rx.try_recv(), Ok(ConnectionCmd::Stop)) {
                 if let Some(mut failed) = parked.take() {
@@ -1297,6 +1306,56 @@ exit 1"#,
         let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
             .expect("backend.log readable");
         assert!(!log.contains(STRICT_ROUTE_NOTICE), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2ray_tun_warning_logged_once_per_connection() {
+        let stub = stub(r#"exit 1"#);
+        let settings = v2ray_settings(2080, 2081, "127.0.0.1", true);
+        let expected = v2ray_tun_warning(&settings).expect("warning");
+        assert!(expected.contains("127.0.0.1:2080"), "{expected}");
+        assert!(expected.contains("127.0.0.1:2081"), "{expected}");
+        let req = request(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe);
+
+        let (terminal, lines) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        assert_eq!(
+            lines.iter().filter(|l| *l == &expected).count(),
+            1,
+            "{lines:?}"
+        );
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(log.matches(&expected).count(), 1, "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v2ray_without_tun_logs_no_warning() {
+        let stub = stub(r#"exit 1"#);
+        let expected =
+            v2ray_tun_warning(&v2ray_settings(2080, 2081, "127.0.0.1", true)).expect("warning");
+        let req = request(
+            &stub,
+            v2ray_settings(2080, 2081, "127.0.0.1", false),
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+        );
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe);
+
+        let (terminal, lines) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        assert!(!lines.iter().any(|l| l.contains(&expected)), "{lines:?}");
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert!(!log.contains(&expected), "{log}");
     }
 
     #[test]
