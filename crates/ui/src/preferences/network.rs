@@ -357,6 +357,24 @@ pub(super) fn build_network_page(
 
     page.add(&real_delay_group);
 
+    let health_check_group = adw::PreferencesGroup::builder()
+        .title("Connection health")
+        .build();
+
+    let health_check_enabled_row = adw::SwitchRow::builder()
+        .title("Check connection health")
+        .active(s.health_check.enabled)
+        .build();
+    health_check_group.add(&health_check_enabled_row);
+
+    let health_check_failover_row = adw::SwitchRow::builder()
+        .title("Reconnect when the proxy stops responding")
+        .active(s.health_check.failover)
+        .build();
+    health_check_group.add(&health_check_failover_row);
+
+    page.add(&health_check_group);
+
     drop(s);
 
     {
@@ -600,6 +618,22 @@ pub(super) fn build_network_page(
         let cb = cb.clone();
         real_delay_use_for_lowest_row.connect_active_notify(move |row| {
             st.borrow_mut().real_delay.use_for_lowest_latency = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        health_check_enabled_row.connect_active_notify(move |row| {
+            st.borrow_mut().health_check.enabled = row.is_active();
+            emit(&st, &cb);
+        });
+    }
+    {
+        let st = state.clone();
+        let cb = cb.clone();
+        health_check_failover_row.connect_active_notify(move |row| {
+            st.borrow_mut().health_check.failover = row.is_active();
             emit(&st, &cb);
         });
     }
