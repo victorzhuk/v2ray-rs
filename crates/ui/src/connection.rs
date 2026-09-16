@@ -532,7 +532,7 @@ fn spawn_with(
 
 const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box strict_route turned off for this session (IPv4 routing unchanged)";
 
-const PIN_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 const PIN_LOOKUP_CONCURRENCY: usize = 16;
 
