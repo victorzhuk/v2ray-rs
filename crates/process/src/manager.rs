@@ -724,11 +724,12 @@ impl ProcessManager {
             return;
         }
         let last = self.last_output_line().unwrap_or_else(|| "none".into());
+        let err = self.last_error_line().unwrap_or_else(|| "none".into());
         write_stream_line(
             &self.log_writer,
             "exit",
             &format!(
-                "requested={requested} reason={reason} {} crashes_in_window={} last_output={last}",
+                "requested={requested} reason={reason} {} crashes_in_window={} last_output={last} last_error={err}",
                 exit_status_field(status),
                 self.crash_times.len()
             ),
@@ -1032,6 +1033,20 @@ impl ProcessManager {
         };
         pick(LogSource::Stderr).or_else(|| pick(LogSource::Stdout))
     }
+
+    /// Last warning or error among recent output, so an access log that keeps
+    /// running after a failure does not bury it.
+    fn last_error_line(&self) -> Option<String> {
+        const MARKERS: [&str; 6] = ["[Warning]", "[Error]", "WARN", "ERROR", "FATAL", "panic"];
+        let buffer = self.log_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        buffer.last_n(50).iter().rev().find_map(|l| {
+            let plain = without_ansi(&l.content);
+            MARKERS
+                .iter()
+                .any(|m| plain.contains(m))
+                .then(|| truncate_reason(plain.trim()))
+        })
+    }
 }
 
 fn too_old(
@@ -1067,6 +1082,27 @@ fn truncate_reason(line: &str) -> String {
     } else {
         sanitized
     }
+}
+
+// sing-box colours its level tags; strip CSI sequences before matching them.
+fn without_ansi(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        if chars.clone().next() == Some('[') {
+            chars.next();
+            for c in chars.by_ref() {
+                if ('\x40'..='\x7e').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 fn exit_status_field(status: Option<&ExitStatus>) -> String {
@@ -1445,6 +1481,63 @@ mod tests {
             exit.contains("last_output=fatal: tls handshake exploded"),
             "{exit}"
         );
+    }
+
+    async fn crash_exit_record(dir: &tempfile::TempDir, body: &str) -> (String, String) {
+        let mut mgr = manager_for(dir, &format!("{VERSION_STUB}{body}"))
+            .with_log_file(Some(backend_log(dir.path())));
+        mgr.set_auto_restart(false);
+
+        mgr.start().await.unwrap();
+        mgr.wait_and_handle_exit().await.unwrap();
+        let ProcessState::Error(msg) = mgr.state() else {
+            panic!("expected Error state, got {:?}", mgr.state());
+        };
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        let exit = lines
+            .iter()
+            .find(|l| l.contains(" exit requested="))
+            .unwrap_or_else(|| panic!("no exit record: {lines:#?}"))
+            .clone();
+        (exit, msg)
+    }
+
+    #[tokio::test]
+    async fn last_error_survives_access_noise() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let access = "2026/09/16 10:00:01 from 127.0.0.1:50002 accepted tcp:example.com:443 [socks -> proxy]";
+        let body = format!(
+            "echo '[Warning] cert about to expire'\necho '2026/09/16 10:00:00 from 127.0.0.1:50001 accepted tcp:example.org:443 [socks -> proxy]'\necho '{access}'\nexit 3\n"
+        );
+        let (exit, msg) = crash_exit_record(&dir, &body).await;
+        assert!(
+            exit.contains(&format!(
+                "last_output={access} last_error=[Warning] cert about to expire"
+            )),
+            "{exit}"
+        );
+        assert_eq!(msg, format!("process exited with code 3: {access}"));
+    }
+
+    #[tokio::test]
+    async fn last_error_is_none_without_warnings() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (exit, _) = crash_exit_record(&dir, "echo 'started'\nexit 3\n").await;
+        assert!(
+            exit.ends_with("last_output=started last_error=none"),
+            "{exit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_error_matches_through_ansi() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (exit, _) = crash_exit_record(
+            &dir,
+            "printf '\\033[33m[Warning]\\033[0m tls retry\\n'\necho 'done'\nexit 3\n",
+        )
+        .await;
+        assert!(exit.ends_with("last_error=[Warning] tls retry"), "{exit}");
     }
 
     fn stub_helper(dir: &std::path::Path, body: &str) -> (PathBuf, PathBuf) {
