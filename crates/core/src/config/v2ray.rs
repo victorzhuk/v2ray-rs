@@ -390,10 +390,14 @@ fn apply_stream_settings(
 
 fn build_ws_settings(ws: &WsSettings) -> Value {
     let mut settings = json!({ "path": ws.path });
-    if !ws.headers.is_empty() {
-        settings["headers"] = json!(ws.headers);
-    } else if let Some(host) = &ws.host {
-        settings["headers"] = json!({ "Host": host });
+    let mut headers = ws.headers.clone();
+    if let Some(host) = &ws.host
+        && !headers.keys().any(|k| k.eq_ignore_ascii_case("host"))
+    {
+        headers.insert("Host".into(), host.clone());
+    }
+    if !headers.is_empty() {
+        settings["headers"] = json!(headers);
     }
     settings
 }
@@ -1725,6 +1729,55 @@ mod tests {
         assert_eq!(stream["xhttpSettings"]["host"], "xhttp.example.com");
         assert_eq!(stream["xhttpSettings"]["mode"], "auto");
         assert_eq!(stream["security"], "reality");
+    }
+
+    fn ws_node(host: Option<&str>, headers: &[(&str, &str)]) -> ProxyNode {
+        ProxyNode::Vless(VlessConfig {
+            address: "ws.example.com".into(),
+            port: 443,
+            uuid: "test-uuid-ws".into(),
+            encryption: Some("none".into()),
+            flow: None,
+            transport: TransportSettings::Ws(WsSettings {
+                path: "/ws".into(),
+                host: host.map(Into::into),
+                headers: headers
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            }),
+            tls: None,
+            remark: Some("WS Node".into()),
+        })
+    }
+
+    #[test]
+    fn test_ws_host_merges_into_custom_headers() {
+        let node = ws_node(Some("cdn.example.com"), &[("User-Agent", "x")]);
+        let config = V2rayGenerator
+            .generate(&[node], &[], &default_settings())
+            .unwrap();
+
+        let ws = &config["outbounds"][0]["streamSettings"]["wsSettings"];
+        let headers = ws["headers"].as_object().unwrap();
+        assert_eq!(headers.len(), 2, "{ws}");
+        assert_eq!(headers["User-Agent"], "x");
+        assert_eq!(headers["Host"], "cdn.example.com");
+        assert!(ws.get("host").is_none());
+    }
+
+    #[test]
+    fn test_ws_lowercase_host_header_wins_over_node_host() {
+        let node = ws_node(Some("cdn.example.com"), &[("host", "front.example.com")]);
+        let config = V2rayGenerator
+            .generate(&[node], &[], &default_settings())
+            .unwrap();
+
+        let headers = config["outbounds"][0]["streamSettings"]["wsSettings"]["headers"]
+            .as_object()
+            .unwrap();
+        assert_eq!(headers.len(), 1, "{headers:?}");
+        assert_eq!(headers["host"], "front.example.com");
     }
 
     #[test]
