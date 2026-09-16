@@ -1,4 +1,5 @@
 use super::RuleMatch;
+use super::tun::MAX_EXCLUDE_ROUTES;
 use ipnet::IpNet;
 use thiserror::Error;
 
@@ -30,6 +31,8 @@ pub enum ValidationError {
     InvalidTunInterface(String),
     #[error("invalid tun mtu: {0} (must be 576-9000)")]
     InvalidTunMtu(u16),
+    #[error("too many excluded routes: {0} (at most {max})", max = MAX_EXCLUDE_ROUTES)]
+    TooManyExcludedRoutes(usize),
     #[error("invalid process name: {0}")]
     InvalidProcessName(String),
 }
@@ -61,6 +64,15 @@ pub fn validate_ip_cidr(cidr: &str) -> Result<(), ValidationError> {
     cidr.parse::<IpNet>()
         .map(|_| ())
         .map_err(|_| ValidationError::InvalidIpCidr(cidr.to_string()))
+}
+
+/// Validates a TUN route exclusion: a CIDR with a non-zero prefix, since a
+/// whole-address-space exclusion would route everything around the tunnel.
+pub fn validate_exclude_route(cidr: &str) -> Result<(), ValidationError> {
+    match cidr.parse::<IpNet>() {
+        Ok(net) if net.prefix_len() > 0 => Ok(()),
+        _ => Err(ValidationError::InvalidIpCidr(cidr.to_string())),
+    }
 }
 
 /// Validates a TUN interface name: non-empty, at most 15 characters (IFNAMSIZ
@@ -204,6 +216,27 @@ pub fn validate_rule_match(m: &RuleMatch) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exclude_route_refuses_whole_address_space() {
+        for cidr in ["0.0.0.0/0", "::/0"] {
+            assert_eq!(
+                validate_exclude_route(cidr),
+                Err(ValidationError::InvalidIpCidr(cidr.to_string()))
+            );
+        }
+        assert_eq!(
+            validate_exclude_route("bogus"),
+            Err(ValidationError::InvalidIpCidr("bogus".to_string()))
+        );
+    }
+
+    #[test]
+    fn exclude_route_accepts_prefix() {
+        for cidr in ["10.0.0.0/8", "fd00::/64"] {
+            assert_eq!(validate_exclude_route(cidr), Ok(()), "cidr={cidr}");
+        }
+    }
 
     #[test]
     fn test_validate_country_code() {

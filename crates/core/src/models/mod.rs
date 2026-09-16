@@ -33,6 +33,7 @@ pub use subscription::{Subscription, SubscriptionNode, SubscriptionSource};
 pub use tun::{DnsHijackMode, TunConfig, TunStack};
 pub use validation::{
     ValidationError, validate_country_code, validate_domain_keyword, validate_domain_pattern,
-    validate_geosite_category, validate_ip_cidr, validate_network_spec, validate_port_spec,
-    validate_protocol_name, validate_rule_match, validate_test_url, validate_tun_interface_name,
+    validate_exclude_route, validate_geosite_category, validate_ip_cidr, validate_network_spec,
+    validate_port_spec, validate_protocol_name, validate_rule_match, validate_test_url,
+    validate_tun_interface_name,
 };

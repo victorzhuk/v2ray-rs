@@ -1,8 +1,13 @@
 use serde::{Deserialize, Serialize};
 
 use super::validation::{
-    ValidationError, validate_domain_pattern, validate_ip_cidr, validate_tun_interface_name,
+    ValidationError, validate_domain_pattern, validate_exclude_route, validate_ip_cidr,
+    validate_tun_interface_name,
 };
+
+/// Upper bound on `exclude_routes`. The route helper enforces the same cap
+/// (`MAX_EXCLUSIONS` in `crates/netctl/src/validate.rs`).
+pub const MAX_EXCLUDE_ROUTES: usize = 256;
 
 /// Network stack used by the TUN inbound. Serializes to the backend literals
 /// (`system`, `gvisor`, `mixed`).
@@ -99,8 +104,13 @@ impl TunConfig {
         if let Some(v6) = &self.address_v6 {
             validate_ip_cidr(v6)?;
         }
+        if self.exclude_routes.len() > MAX_EXCLUDE_ROUTES {
+            return Err(ValidationError::TooManyExcludedRoutes(
+                self.exclude_routes.len(),
+            ));
+        }
         for route in &self.exclude_routes {
-            validate_ip_cidr(route)?;
+            validate_exclude_route(route)?;
         }
         for domain in &self.exclude_domains {
             validate_domain_pattern(domain)?;
@@ -325,6 +335,29 @@ mod tests {
             bad_exclude.validate(),
             Err(ValidationError::InvalidIpCidr(_))
         ));
+    }
+
+    #[test]
+    fn tun_config_refuses_more_than_256_exclude_routes() {
+        let routes = |n: usize| {
+            (0..n)
+                .map(|i| format!("10.{}.{}.0/24", i / 256, i % 256))
+                .collect::<Vec<_>>()
+        };
+        let at_cap = TunConfig {
+            exclude_routes: routes(256),
+            ..TunConfig::default()
+        };
+        assert_eq!(at_cap.validate(), Ok(()));
+
+        let over_cap = TunConfig {
+            exclude_routes: routes(257),
+            ..TunConfig::default()
+        };
+        assert_eq!(
+            over_cap.validate(),
+            Err(ValidationError::TooManyExcludedRoutes(257))
+        );
     }
 
     #[test]

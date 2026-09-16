@@ -6,8 +6,8 @@ use relm4::gtk::glib;
 use relm4::{adw, gtk};
 
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, DnsHijackMode, TunStack, validate_domain_pattern, validate_ip_cidr,
-    validate_tun_interface_name,
+    AppSettings, BackendType, DnsHijackMode, TunStack, validate_domain_pattern,
+    validate_exclude_route, validate_ip_cidr, validate_tun_interface_name,
 };
 
 use super::{SettingsCallback, SettingsObservers, ToastCallback, subscribe_settings};
@@ -239,7 +239,7 @@ pub(super) fn build_tun_page(
             let entry = entry.clone();
             dialog.connect_response(Some("add"), move |_, _| {
                 let value = entry.text().trim().to_string();
-                if validate_ip_cidr(&value).is_ok() {
+                if validate_exclude_route(&value).is_ok() {
                     let _ = apply_tun_mutation(&state, &cb, |s| {
                         s.tun.exclude_routes.push(value.clone());
                         Ok(())
