@@ -1805,48 +1805,45 @@ mod tests {
     /// is no display to initialize against.
     #[test]
     fn programmatic_selection_does_not_re_enter_the_handler() {
-        if gtk::init().is_err() {
-            eprintln!("no display, skipping");
-            return;
-        }
+        crate::gtk_test::run(|| {
+            let state = Rc::new(RefCell::new(AppSettings::default()));
+            let suppress = Rc::new(Cell::new(false));
+            let writes = Rc::new(Cell::new(0u32));
 
-        let state = Rc::new(RefCell::new(AppSettings::default()));
-        let suppress = Rc::new(Cell::new(false));
-        let writes = Rc::new(Cell::new(0u32));
+            let row = adw::ComboRow::builder()
+                .model(&gtk::StringList::new(&[
+                    "Prefer IPv4",
+                    "Prefer IPv6",
+                    "IPv4 Only",
+                    "IPv6 Only",
+                ]))
+                .selected(strategy_to_index(DnsStrategy::Ipv4Only))
+                .build();
 
-        let row = adw::ComboRow::builder()
-            .model(&gtk::StringList::new(&[
-                "Prefer IPv4",
-                "Prefer IPv6",
-                "IPv4 Only",
-                "IPv6 Only",
-            ]))
-            .selected(strategy_to_index(DnsStrategy::Ipv4Only))
-            .build();
+            {
+                let state = state.clone();
+                let suppress = suppress.clone();
+                let writes = writes.clone();
+                row.connect_selected_notify(move |row| {
+                    if suppress.get() {
+                        return;
+                    }
+                    // Would panic if a borrow were still alive from the caller.
+                    state.borrow_mut().dns.strategy = index_to_strategy(row.selected());
+                    writes.set(writes.get() + 1);
+                });
+            }
 
-        {
-            let state = state.clone();
-            let suppress = suppress.clone();
-            let writes = writes.clone();
-            row.connect_selected_notify(move |row| {
-                if suppress.get() {
-                    return;
-                }
-                // Would panic if a borrow were still alive from the caller.
-                state.borrow_mut().dns.strategy = index_to_strategy(row.selected());
-                writes.set(writes.get() + 1);
+            state.borrow_mut().dns.strategy = DnsStrategy::PreferIpv4;
+            // Deliberately the shape that used to abort: a live borrow across the
+            // setter. Safe only because the handler bails out before taking one.
+            without_handlers(&suppress, || {
+                row.set_selected(strategy_to_index(state.borrow().dns.strategy))
             });
-        }
 
-        state.borrow_mut().dns.strategy = DnsStrategy::PreferIpv4;
-        // Deliberately the shape that used to abort: a live borrow across the
-        // setter. Safe only because the handler bails out before taking one.
-        without_handlers(&suppress, || {
-            row.set_selected(strategy_to_index(state.borrow().dns.strategy))
+            assert_eq!(row.selected(), strategy_to_index(DnsStrategy::PreferIpv4));
+            assert_eq!(writes.get(), 0, "the handler must not write the value back");
+            assert!(!suppress.get(), "the guard must be released");
         });
-
-        assert_eq!(row.selected(), strategy_to_index(DnsStrategy::PreferIpv4));
-        assert_eq!(writes.get(), 0, "the handler must not write the value back");
-        assert!(!suppress.get(), "the guard must be released");
     }
 }
