@@ -1,6 +1,7 @@
 mod net;
 mod validate;
 
+use std::net::IpAddr;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
@@ -36,6 +37,12 @@ enum Command {
         /// closed instead of leaking out the real interface once the device is gone.
         #[arg(long)]
         strict: bool,
+        /// Route this prefix via the main table instead of the tunnel.
+        /// Repeatable. Any caller can exclude any prefix, even 0.0.0.0/1 plus
+        /// 128.0.0.0/1, which takes the whole tunnel down no further than
+        /// xray-down already allows.
+        #[arg(long = "exclude", value_name = "CIDR", value_parser = validate::parse_exclusion)]
+        exclude: Vec<(IpAddr, u8)>,
     },
     /// Remove the xray policy rules, flush the tunnel table (IPv4 and IPv6) and
     /// delete the xray TUN device (no-op if absent).
@@ -81,6 +88,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             bypass_uid,
             capture_dns,
             strict,
+            exclude,
         } => {
             validate::validate_iface(&iface)?;
             // The named device must be a TUN device the backend already created;
@@ -91,8 +99,10 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
+            validate::check_exclusion_count(exclude.len())?;
             let handle = net::connect()?;
-            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns, strict).await
+            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns, strict).await?;
+            net::replace_exclusions(&handle, &exclude).await
         }
         Command::XrayDown { iface } => {
             validate::validate_iface(&iface)?;
@@ -113,6 +123,8 @@ async fn run(cli: Cli) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::{Cli, Command};
     use clap::Parser;
 
@@ -139,5 +151,36 @@ mod tests {
             parse(&[]).command,
             Command::XrayUp { strict: false, .. }
         ));
+    }
+
+    #[test]
+    fn xray_up_parses_repeated_exclude() {
+        let Command::XrayUp { exclude, .. } =
+            parse(&["--exclude", "10.1.2.3/8", "--exclude", "2001:db8::1/32"]).command
+        else {
+            panic!("expected xray-up");
+        };
+        let want: Vec<(IpAddr, u8)> = vec![
+            ("10.0.0.0".parse().unwrap(), 8),
+            ("2001:db8::".parse().unwrap(), 32),
+        ];
+        assert_eq!(exclude, want);
+    }
+
+    #[test]
+    fn xray_up_refuses_invalid_exclude_naming_it() {
+        let err = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "xray-up",
+            "--iface",
+            "xtun0",
+            "--addr",
+            "172.19.0.1/30",
+            "--exclude",
+            "10.0.0.0/33",
+        ])
+        .err()
+        .expect("invalid exclusion must be refused");
+        assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
     }
 }
