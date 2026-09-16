@@ -145,7 +145,10 @@ pub async fn xray_up(
 /// in order. IPv6 entries are skipped when the host has IPv6 disabled. Already
 /// present rules (two entries equal after normalization) are not an error.
 pub async fn replace_exclusions(handle: &Handle, exclude: &[(IpAddr, u8)]) -> Result<(), String> {
-    del_rules_with_priority(handle, RULE_PREF_EXCLUDE).await;
+    del_rules_matching(handle, |rule| {
+        rule_priority(rule) == Some(RULE_PREF_EXCLUDE)
+    })
+    .await;
     let has_ipv6 = host_has_ipv6();
     for &(ip, prefix) in exclude {
         if exclusion_installable(ip, has_ipv6) {
@@ -442,21 +445,14 @@ async fn add_bypass_uid_rule(
 /// Deletes the policy rules `xray_up` installs, across both families. Matches on
 /// our reserved priorities so unrelated rules are left untouched.
 async fn del_xray_rules(handle: &Handle) {
-    for version in [IpVersion::V4, IpVersion::V6] {
-        let mut rules = handle.rule().get(version).execute();
-        while let Ok(Some(rule)) = rules.try_next().await {
-            if is_xray_rule(&rule) {
-                let _ = handle.rule().del(rule).execute().await;
-            }
-        }
-    }
+    del_rules_matching(handle, is_xray_rule).await;
 }
 
-async fn del_rules_with_priority(handle: &Handle, priority: u32) {
+async fn del_rules_matching(handle: &Handle, matches: impl Fn(&RuleMessage) -> bool) {
     for version in [IpVersion::V4, IpVersion::V6] {
         let mut rules = handle.rule().get(version).execute();
         while let Ok(Some(rule)) = rules.try_next().await {
-            if rule_priority(&rule) == Some(priority) {
+            if matches(&rule) {
                 let _ = handle.rule().del(rule).execute().await;
             }
         }
