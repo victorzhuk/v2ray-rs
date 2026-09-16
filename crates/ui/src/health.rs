@@ -1,4 +1,10 @@
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 const FAILURE_THRESHOLD: u32 = 3;
+const DNS_FAILURE_THRESHOLD: usize = 20;
+const DNS_WINDOW: Duration = Duration::from_secs(60);
+const DNS_FAILURE_MARKER: &str = "app/dns: failed to retrieve response";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Health {
@@ -54,9 +60,41 @@ impl HealthTracker {
     }
 }
 
+#[derive(Debug, Default)]
+pub(crate) struct DnsFailureWindow {
+    failures: VecDeque<Instant>,
+}
+
+impl DnsFailureWindow {
+    pub(crate) fn observe(&mut self, line: &str, now: Instant) {
+        if !line.contains(DNS_FAILURE_MARKER) {
+            return;
+        }
+        while self
+            .failures
+            .front()
+            .is_some_and(|&at| now.saturating_duration_since(at) >= DNS_WINDOW)
+        {
+            self.failures.pop_front();
+        }
+        self.failures.push_back(now);
+    }
+
+    pub(crate) fn is_failing(&self, now: Instant) -> bool {
+        let recent = self
+            .failures
+            .iter()
+            .filter(|&&at| now.saturating_duration_since(at) < DNS_WINDOW)
+            .count();
+        recent >= DNS_FAILURE_THRESHOLD
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DNS_LINE: &str = "2026/09/16 12:00:00 [Info] app/dns: failed to retrieve response for example.com > context deadline exceeded";
 
     fn fail(tracker: &mut HealthTracker, reason: &str) -> Option<Health> {
         tracker.record(Err(reason.to_string()))
@@ -126,5 +164,52 @@ mod tests {
         assert_eq!(fail(&mut tracker, "timeout"), None);
         tracker.reset();
         assert_eq!(tracker.record(Ok(())), Some(Health::Healthy));
+    }
+
+    #[test]
+    fn dns_window_marks_failing_at_twenty_within_sixty_seconds() {
+        let base = Instant::now();
+        let mut window = DnsFailureWindow::default();
+        for k in 0..19 {
+            window.observe(DNS_LINE, base + Duration::from_secs(k * 3));
+        }
+        let at = base + Duration::from_secs(57);
+        assert!(!window.is_failing(at));
+        window.observe(DNS_LINE, at);
+        assert!(window.is_failing(at));
+    }
+
+    #[test]
+    fn dns_window_needs_twenty_inside_one_window() {
+        let base = Instant::now();
+        let mut window = DnsFailureWindow::default();
+        for k in 0..20 {
+            window.observe(DNS_LINE, base + Duration::from_secs(k * 4));
+        }
+        assert!(!window.is_failing(base + Duration::from_secs(76)));
+    }
+
+    #[test]
+    fn dns_window_clears_sixty_seconds_after_the_last_line() {
+        let base = Instant::now();
+        let mut window = DnsFailureWindow::default();
+        for k in 0..20 {
+            window.observe(DNS_LINE, base + Duration::from_secs(k));
+        }
+        let last = base + Duration::from_secs(19);
+        assert!(window.is_failing(last));
+        assert!(!window.is_failing(last + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn dns_window_ignores_tun_noise() {
+        let base = Instant::now();
+        let mut window = DnsFailureWindow::default();
+        let noise = "2026/09/16 12:00:00 [Info] proxy/tun: connection reset by peer";
+        for k in 0..500 {
+            let now = base + Duration::from_millis(k * 10);
+            window.observe(noise, now);
+            assert!(!window.is_failing(now));
+        }
     }
 }
