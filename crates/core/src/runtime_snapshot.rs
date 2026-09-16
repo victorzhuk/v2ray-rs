@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::models::{
-    AppSettings, AutoResolveStrategy, BackendType, DnsConfig, ManualNode, RoutingRuleSet,
-    Subscription, TunConfig,
+    AppSettings, AutoResolveStrategy, BackendType, DnsConfig, LoggingSettings, ManualNode,
+    RoutingRuleSet, Subscription, TunConfig,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -21,6 +21,7 @@ pub struct RuntimeConfigSnapshot {
     pub tun: TunConfig,
     pub idle_timeout_secs: u32,
     pub ws_heartbeat_secs: u32,
+    pub logging: LoggingSettings,
     pub timestamp: i64,
 }
 
@@ -46,6 +47,7 @@ impl RuntimeConfigSnapshot {
             || self.tun != settings.tun
             || self.idle_timeout_secs != settings.idle_timeout_secs
             || self.ws_heartbeat_secs != settings.ws_heartbeat_secs
+            || self.logging != settings.logging
     }
 
     pub fn restore_settings(&self, settings: &mut AppSettings) {
@@ -60,6 +62,7 @@ impl RuntimeConfigSnapshot {
         settings.tun = self.tun.clone();
         settings.idle_timeout_secs = self.idle_timeout_secs;
         settings.ws_heartbeat_secs = self.ws_heartbeat_secs;
+        settings.logging = self.logging;
     }
 
     pub fn restore_manual_nodes(&self) -> Vec<ManualNode> {
@@ -82,7 +85,7 @@ pub fn subscriptions_runtime_state_eq(lhs: &[Subscription], rhs: &[Subscription]
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Language;
+    use crate::models::{BackendLogLevel, Language};
 
     fn make_snapshot(backend_type: BackendType, binary_path: &str) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot {
@@ -100,6 +103,7 @@ mod tests {
             tun: TunConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
+            logging: LoggingSettings::default(),
             timestamp: 1234567890,
         }
     }
@@ -171,6 +175,7 @@ mod tests {
             tun: TunConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
+            logging: LoggingSettings::default(),
             timestamp: 1234567890,
         };
 
@@ -280,6 +285,7 @@ mod tests {
             tun: TunConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
+            logging: LoggingSettings::default(),
             timestamp: 1234567890,
         };
 
@@ -351,6 +357,7 @@ mod tests {
             tun: TunConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
+            logging: LoggingSettings::default(),
             timestamp: 1234567890,
         };
 
@@ -417,6 +424,47 @@ mod tests {
 
         settings.ws_heartbeat_secs = 15;
         assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_logging_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.logging.backend_level = BackendLogLevel::Debug;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.logging = LoggingSettings::default();
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.logging.connection_log = true;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_restores_logging() {
+        let logging = LoggingSettings {
+            backend_level: BackendLogLevel::Debug,
+            connection_log: true,
+        };
+        let snapshot = RuntimeConfigSnapshot {
+            logging,
+            ..make_snapshot(BackendType::Xray, "/usr/bin/xray")
+        };
+
+        let mut settings = AppSettings::default();
+        snapshot.restore_settings(&mut settings);
+
+        assert_eq!(settings.logging, logging);
     }
 
     #[test]

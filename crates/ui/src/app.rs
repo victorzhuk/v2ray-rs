@@ -628,6 +628,7 @@ impl App {
             tun: self.settings.tun.clone(),
             idle_timeout_secs: self.settings.idle_timeout_secs,
             ws_heartbeat_secs: self.settings.ws_heartbeat_secs,
+            logging: self.settings.logging,
             timestamp: chrono::Utc::now().timestamp(),
         });
 
@@ -2246,6 +2247,7 @@ mod tests {
             },
             idle_timeout_secs: 300,
             ws_heartbeat_secs: 30,
+            logging: Default::default(),
             timestamp: 0,
         }
     }
