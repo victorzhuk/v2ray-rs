@@ -847,7 +847,11 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
             && settings.tun.dns_hijack == DnsHijackMode::Hijack
             && nodes_pinned,
         strict: settings.tun.strict_route,
-        exclude_routes: Vec::new(),
+        exclude_routes: if backend == BackendType::Xray {
+            settings.tun.exclude_routes.clone()
+        } else {
+            Vec::new()
+        },
     })
 }
 
@@ -3147,6 +3151,40 @@ exit 1"#,
         assert_eq!(unpinned, None);
         let runtime = build_tun_runtime(&settings, unpinned.is_none()).unwrap();
         assert!(runtime.capture_dns);
+    }
+
+    #[test]
+    fn xray_runtime_carries_exclude_routes() {
+        let mut settings = xray_tun_settings();
+        settings.tun.exclude_routes = vec!["10.15.12.100/32".into(), "91.230.107.224/32".into()];
+        let runtime = build_tun_runtime(&settings, true).unwrap();
+        assert_eq!(
+            runtime.exclude_routes,
+            ["10.15.12.100/32", "91.230.107.224/32"]
+        );
+    }
+
+    #[test]
+    fn singbox_runtime_has_no_exclude_routes() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings.tun.exclude_routes = vec!["10.15.12.100/32".into()];
+        let runtime = build_tun_runtime(&settings, true).unwrap();
+        assert!(
+            runtime.exclude_routes.is_empty(),
+            "{:?}",
+            runtime.exclude_routes
+        );
+    }
+
+    #[test]
+    fn runtime_uses_effective_exclude_routes() {
+        let mut persisted = xray_tun_settings();
+        persisted.tun.exclude_routes = vec!["10.15.12.100/32".into()];
+        let mut effective = persisted.clone();
+        effective.tun.exclude_routes = vec!["91.230.107.224/32".into()];
+        let runtime = build_tun_runtime(&effective, true).unwrap();
+        assert_eq!(runtime.exclude_routes, ["91.230.107.224/32"]);
     }
 
     #[test]
