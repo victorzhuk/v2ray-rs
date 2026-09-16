@@ -15,9 +15,10 @@ use v2ray_rs_core::instance::{
     CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
 };
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsConfig, DnsRuleMatch,
-    LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
-    SubscriptionSource, TunConfig, resolve_effective_config,
+    AppSettings, AutoResolveStrategy, BackendType, ConnectionMetadata, ConnectionNodeRef,
+    DnsConfig, DnsRuleMatch, LastSuccessMetadata, ManualNode, RoutingRule, RoutingRuleSet,
+    RuleMatch, Subscription, SubscriptionSource, TunConfig, resolve_effective_config,
+    uses_imported_profile,
 };
 use v2ray_rs_core::persistence::{AppPaths, TunSession};
 use v2ray_rs_core::profile::{AppProfile, StdEnv};
@@ -265,9 +266,14 @@ impl App {
     /// so a flaky upstream reconnects on its own and can pick a fresh candidate.
     fn schedule_auto_reconnect(&mut self, sender: &ComponentSender<Self>) -> bool {
         if !auto_reconnect_allowed(self.pending_exit, self.auto_reconnect_attempts) {
+            log::info!("{}", auto_reconnect_exhausted_line());
             return false;
         }
         self.auto_reconnect_attempts += 1;
+        log::info!(
+            "{}",
+            auto_reconnect_line(self.auto_reconnect_attempts, MAX_AUTO_RECONNECTS)
+        );
         let generation = self.reconnect_generation;
         let s = sender.clone();
         glib::timeout_add_local_once(AUTO_RECONNECT_DELAY, move || {
@@ -313,6 +319,7 @@ impl App {
             &self.process_state,
             self.tun_marker_present(),
         );
+        log::info!("{}", quit_line(&plan));
         match plan {
             QuitPlan::Stop => {
                 self.pending_exit = true;
@@ -503,6 +510,8 @@ impl App {
 
     fn start_connection(
         &mut self,
+        origin: ConnectOrigin,
+        direct: bool,
         candidates: Vec<ConnectionCandidate>,
         subscriptions: Vec<Subscription>,
         manual_nodes: Vec<ManualNode>,
@@ -569,6 +578,19 @@ impl App {
             self.toast_overlay.add_toast(toast);
             return Err("geodata not downloaded".into());
         }
+
+        log::info!(
+            "{}",
+            connect_line(
+                origin,
+                direct,
+                self.settings.auto_resolve_strategy,
+                candidates.len(),
+                candidates
+                    .iter()
+                    .any(|c| uses_imported_profile(&c.node_ref, &subscriptions)),
+            )
+        );
 
         let connection_subscriptions = subscriptions.clone();
         let connection_manual_nodes = manual_nodes.clone();
@@ -1209,7 +1231,14 @@ impl SimpleComponent for App {
                 if cancels_auto_reconnect(origin) {
                     self.cancel_auto_reconnect();
                 }
-                let _ = self.start_connection(candidates, subscriptions, manual_nodes, &sender);
+                let _ = self.start_connection(
+                    origin,
+                    false,
+                    candidates,
+                    subscriptions,
+                    manual_nodes,
+                    &sender,
+                );
                 self.session_target = None;
             }
             AppMsg::ConnectToNode(target, origin) => {
@@ -1276,7 +1305,14 @@ impl SimpleComponent for App {
                 self.reconnect_pending = false;
 
                 self.session_target = self
-                    .start_connection(vec![candidate], subscriptions, manual_nodes, &sender)
+                    .start_connection(
+                        origin,
+                        true,
+                        vec![candidate],
+                        subscriptions,
+                        manual_nodes,
+                        &sender,
+                    )
                     .ok()
                     .map(|_| direct_session(target, origin));
             }
@@ -1452,6 +1488,14 @@ impl SimpleComponent for App {
                     )
                 {
                     self.health_failover.begin(node);
+                    let name = self
+                        .connection_status
+                        .as_ref()
+                        .map_or("unknown", |meta| meta.node_name.as_str());
+                    log::info!(
+                        "{}",
+                        health_failover_line(name, self.health_failover.count, MAX_AUTO_RECONNECTS)
+                    );
                     self.stop_session(&sender);
                 }
             }
@@ -1638,6 +1682,63 @@ fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> Qu
     } else {
         QuitPlan::Exit
     }
+}
+
+fn origin_field(origin: ConnectOrigin, direct: bool) -> &'static str {
+    match origin {
+        ConnectOrigin::User if direct => "node",
+        ConnectOrigin::User => "user",
+        ConnectOrigin::AutoReconnect => "auto-reconnect",
+        ConnectOrigin::Restart => "restart",
+    }
+}
+
+fn strategy_field(strategy: AutoResolveStrategy) -> &'static str {
+    match strategy {
+        AutoResolveStrategy::ListOrder => "list-order",
+        AutoResolveStrategy::LowestLatency => "lowest-latency",
+        AutoResolveStrategy::Random => "random",
+        AutoResolveStrategy::LastSuccessful => "last-successful",
+    }
+}
+
+fn connect_line(
+    origin: ConnectOrigin,
+    direct: bool,
+    strategy: AutoResolveStrategy,
+    candidates: usize,
+    profile_override: bool,
+) -> String {
+    format!(
+        "connect origin={} strategy={} candidates={candidates} profile_override={profile_override}",
+        origin_field(origin, direct),
+        strategy_field(strategy),
+    )
+}
+
+fn auto_reconnect_line(attempt: u32, max: u32) -> String {
+    format!(
+        "auto-reconnect scheduled attempt={attempt}/{max} delay={}s",
+        AUTO_RECONNECT_DELAY.as_secs()
+    )
+}
+
+fn auto_reconnect_exhausted_line() -> String {
+    format!("auto-reconnect exhausted max={MAX_AUTO_RECONNECTS}")
+}
+
+fn health_failover_line(node: &str, count: u32, max: u32) -> String {
+    format!("health failover node={node} count={count}/{max}")
+}
+
+fn quit_line(plan: &QuitPlan) -> String {
+    let plan = match plan {
+        QuitPlan::Stop => "stop",
+        QuitPlan::AwaitStopped => "await-stopped",
+        QuitPlan::Release => "release",
+        QuitPlan::Exit => "exit",
+    };
+    format!("quit requested plan={plan}")
 }
 
 /// Returns `(shows_disconnect, sensitive)`. `Starting` offers Disconnect so a
@@ -2351,6 +2452,52 @@ mod tests {
             attempts += 1;
         }
         assert_eq!(attempts, 3);
+        assert!(!auto_reconnect_allowed(false, MAX_AUTO_RECONNECTS));
+    }
+
+    #[test]
+    fn decision_lines_carry_key_value_fields() {
+        use ConnectOrigin::*;
+        let cases = [
+            (
+                connect_line(User, false, AutoResolveStrategy::ListOrder, 3, false),
+                "connect origin=user strategy=list-order candidates=3 profile_override=false",
+            ),
+            (
+                connect_line(User, true, AutoResolveStrategy::LowestLatency, 1, true),
+                "connect origin=node strategy=lowest-latency candidates=1 profile_override=true",
+            ),
+            (
+                connect_line(AutoReconnect, false, AutoResolveStrategy::Random, 2, false),
+                "connect origin=auto-reconnect strategy=random candidates=2 profile_override=false",
+            ),
+            (
+                connect_line(Restart, true, AutoResolveStrategy::LastSuccessful, 1, false),
+                "connect origin=restart strategy=last-successful candidates=1 profile_override=false",
+            ),
+            (
+                auto_reconnect_line(1, MAX_AUTO_RECONNECTS),
+                "auto-reconnect scheduled attempt=1/3 delay=5s",
+            ),
+            (
+                auto_reconnect_exhausted_line(),
+                "auto-reconnect exhausted max=3",
+            ),
+            (
+                health_failover_line("Frankfurt", 2, MAX_AUTO_RECONNECTS),
+                "health failover node=Frankfurt count=2/3",
+            ),
+            (quit_line(&QuitPlan::Stop), "quit requested plan=stop"),
+            (
+                quit_line(&QuitPlan::AwaitStopped),
+                "quit requested plan=await-stopped",
+            ),
+            (quit_line(&QuitPlan::Release), "quit requested plan=release"),
+            (quit_line(&QuitPlan::Exit), "quit requested plan=exit"),
+        ];
+        for (line, want) in cases {
+            assert_eq!(line, want);
+        }
         assert!(!auto_reconnect_allowed(false, MAX_AUTO_RECONNECTS));
     }
 

@@ -184,7 +184,9 @@ fn spawn_with(
             sender.emit(AppMsg::ProcessLogLine(generation, warning));
         }
 
-        'candidates: for candidate in candidates {
+        let total = candidates.len();
+        'candidates: for (index, candidate) in candidates.into_iter().enumerate() {
+            let position = index + 1;
             if let Ok(ConnectionCmd::Stop(reason)) = cmd_rx.try_recv() {
                 if let Some(mut failed) = parked.take() {
                     failed.shutdown_with(reason).await;
@@ -198,6 +200,7 @@ fn spawn_with(
                 .unwrap_or(candidate.node.address())
                 .to_string();
             let candidate_address = candidate.node.address().to_string();
+            log::info!("candidate start {position}/{total} label={candidate_label}");
             let candidate_port = candidate.node.port();
             let (mut effective_rules, mut effective_settings) = resolve_effective_config(
                 &candidate.node_ref,
@@ -224,12 +227,17 @@ fn spawn_with(
                 match writer.write_config(&nodes, &effective_rules, &effective_settings) {
                     Ok(path) => path,
                     Err(e) => {
-                        failures.push(CandidateFailure::new(
-                            &candidate_label,
-                            &format!("config generation failed: {e}"),
-                            &candidate_address,
-                            candidate_port,
-                        ));
+                        record_failure(
+                            &mut failures,
+                            CandidateFailure::new(
+                                &candidate_label,
+                                &format!("config generation failed: {e}"),
+                                &candidate_address,
+                                candidate_port,
+                            ),
+                            position,
+                            total,
+                        );
                         if repeats_previous(&failures) {
                             break 'candidates;
                         }
@@ -329,12 +337,17 @@ fn spawn_with(
                         report(ProcessState::Error(e.to_string()), None);
                         return;
                     }
-                    failures.push(CandidateFailure::new(
-                        &candidate_label,
-                        &e.to_string(),
-                        &candidate_address,
-                        candidate_port,
-                    ));
+                    record_failure(
+                        &mut failures,
+                        CandidateFailure::new(
+                            &candidate_label,
+                            &e.to_string(),
+                            &candidate_address,
+                            candidate_port,
+                        ),
+                        position,
+                        total,
+                    );
                     parked = Some(mgr);
                     if repeats_previous(&failures) {
                         break 'candidates;
@@ -428,12 +441,17 @@ fn spawn_with(
                         match mgr.state() {
                             ProcessState::Running => {}
                             ProcessState::Error(msg) => {
-                                failures.push(CandidateFailure::new(
-                                    &candidate_label,
-                                    &msg,
-                                    &candidate_address,
-                                    candidate_port,
-                                ));
+                                record_failure(
+                                    &mut failures,
+                                    CandidateFailure::new(
+                                        &candidate_label,
+                                        &msg,
+                                        &candidate_address,
+                                        candidate_port,
+                                    ),
+                                    position,
+                                    total,
+                                );
                                 break;
                             }
                             _ => {
@@ -700,6 +718,20 @@ impl CandidateFailure {
             reason,
         }
     }
+}
+
+fn record_failure(
+    failures: &mut Vec<CandidateFailure>,
+    failure: CandidateFailure,
+    position: usize,
+    total: usize,
+) {
+    log::info!(
+        "candidate failed {position}/{total} label={} reason={}",
+        failure.label,
+        failure.reason
+    );
+    failures.push(failure);
 }
 
 /// Whether the last two candidates failed the same way.
@@ -1817,6 +1849,51 @@ exit 1"#,
                 "tun=on hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
             ),
             "{contents}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_is_traceable() {
+        let capture = crate::logging::install_test_capture();
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 198.51.100.11 "$3" && { echo "FATAL start service: trace refused" >&2; exit 1; }; exec sleep 30"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let (handle, rx) = connect(
+            &stub,
+            settings,
+            vec![
+                candidate("198.51.100.11"),
+                candidate("198.51.100.12"),
+                candidate("198.51.100.13"),
+            ],
+        );
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            assert!(relays(&state), "failover reported {state:?}");
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+        }
+        handle.stop(StopReason::UserStop);
+
+        let lines = capture.lines_containing("198.51.100.1");
+        let at = |prefix: &str, address: &str| {
+            lines
+                .iter()
+                .position(|line| line.starts_with(prefix) && line.contains(address))
+                .unwrap_or_else(|| panic!("no {prefix:?} line for {address}: {lines:#?}"))
+        };
+        let started = at("candidate start 1/3 ", "198.51.100.11");
+        let failed = at("candidate failed 1/3 ", "198.51.100.11");
+        let next = at("candidate start 2/3 ", "198.51.100.12");
+        assert!(started < failed && failed < next, "{lines:#?}");
+        assert!(lines[failed].contains("reason="), "{}", lines[failed]);
+        assert!(lines[failed].contains("trace refused"), "{}", lines[failed]);
+        assert!(
+            !lines.iter().any(|line| line.contains("198.51.100.13")),
+            "{lines:#?}"
         );
     }
 

@@ -101,6 +101,66 @@ pub fn init_logging(paths: &AppPaths) {
 }
 
 #[cfg(test)]
+pub(crate) struct TestLogCapture {
+    lines: std::sync::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl TestLogCapture {
+    pub(crate) fn lines_containing(&self, needle: &str) -> Vec<String> {
+        self.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(needle))
+            .cloned()
+            .collect()
+    }
+
+    /// Polls until `count` captured lines contain `needle`, or 5 s pass.
+    pub(crate) fn wait_for(&self, needle: &str, count: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let lines = self.lines_containing(needle);
+            if lines.len() >= count || std::time::Instant::now() >= deadline {
+                return lines;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+}
+
+#[cfg(test)]
+impl Log for TestLogCapture {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= LevelFilter::Info
+    }
+
+    fn log(&self, record: &Record) {
+        if self.enabled(record.metadata()) {
+            self.lines.lock().unwrap().push(record.args().to_string());
+        }
+    }
+
+    fn flush(&self) {}
+}
+
+/// Installs one capturing logger for the whole test binary; later calls
+/// return the same instance.
+#[cfg(test)]
+pub(crate) fn install_test_capture() -> &'static TestLogCapture {
+    static CAPTURE: TestLogCapture = TestLogCapture {
+        lines: std::sync::Mutex::new(Vec::new()),
+    };
+    static INSTALL: std::sync::Once = std::sync::Once::new();
+    INSTALL.call_once(|| {
+        log::set_logger(&CAPTURE).expect("no other logger installed in tests");
+        log::set_max_level(LevelFilter::Info);
+    });
+    &CAPTURE
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use log::Level;
@@ -159,6 +219,17 @@ mod tests {
         chrono::DateTime::parse_from_rfc3339(timestamp)
             .expect("record must carry exactly one RFC 3339 timestamp from the writer");
         assert_eq!(rest, "WARN test-target evil forge  more");
+    }
+
+    #[test]
+    fn test_capture_records_info_lines() {
+        let capture = install_test_capture();
+        log::info!("capture-probe first");
+        log::info!("capture-probe second");
+        log::debug!("capture-probe hidden");
+
+        let lines = capture.wait_for("capture-probe", 2);
+        assert_eq!(lines, ["capture-probe first", "capture-probe second"]);
     }
 
     #[test]
