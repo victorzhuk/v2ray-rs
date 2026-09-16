@@ -1,3 +1,4 @@
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
@@ -7,6 +8,7 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use thiserror::Error;
 use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
@@ -34,6 +36,9 @@ fn parse_semver_triple(text: &str) -> Option<(u32, u32, u32)> {
 
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const CRASH_RESTART_DELAY: Duration = Duration::from_secs(2);
+const READY_TIMEOUT: Duration = Duration::from_secs(15);
+const STABILITY_WINDOW: Duration = Duration::from_secs(1);
+const READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const MAX_CRASHES: usize = 3;
 const CRASH_WINDOW: Duration = Duration::from_secs(60);
 const CONFIG_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
@@ -80,6 +85,10 @@ pub enum ProcessError {
     },
     #[error("config rejected by backend: {0}")]
     ConfigCheck(String),
+    #[error("{0}")]
+    ExitedBeforeReady(String),
+    #[error("backend did not accept connections on {addr} within {timeout:?}")]
+    ReadyTimeout { addr: SocketAddr, timeout: Duration },
 }
 
 impl ProcessError {
@@ -120,6 +129,8 @@ pub struct ProcessManager {
     crash_times: Vec<Instant>,
     auto_restart: bool,
     restart_delay: Duration,
+    ready_probe: Option<SocketAddr>,
+    ready_timeout: Duration,
     log_handles: Vec<tokio::task::JoinHandle<()>>,
     current_connection: Option<ConnectionMetadata>,
     tun: Option<TunRuntime>,
@@ -158,6 +169,8 @@ impl ProcessManager {
             crash_times: Vec::new(),
             auto_restart: true,
             restart_delay: CRASH_RESTART_DELAY,
+            ready_probe: None,
+            ready_timeout: READY_TIMEOUT,
             log_handles: Vec::new(),
             current_connection: None,
             tun: None,
@@ -199,6 +212,13 @@ impl ProcessManager {
     /// Attaches TUN runtime details so start/stop become TUN-aware.
     pub fn with_tun(mut self, tun: Option<TunRuntime>) -> Self {
         self.tun = tun;
+        self
+    }
+
+    /// Holds a start in `Starting` until the backend accepts connections on
+    /// `addr` and has stayed up for the stability window.
+    pub fn with_ready_probe(mut self, addr: SocketAddr) -> Self {
+        self.ready_probe = Some(addr);
         self
     }
 
@@ -422,7 +442,11 @@ impl ProcessManager {
             return Err(e);
         }
 
-        match self.launch().await {
+        let started = match self.launch().await {
+            Ok(()) => self.wait_ready().await,
+            err => err,
+        };
+        match started {
             Ok(()) => {
                 self.state.transition(ProcessState::Running, connection)?;
                 Ok(())
@@ -510,9 +534,53 @@ impl ProcessManager {
     /// stall the restart on a slow preflight.
     async fn respawn(&mut self) -> Result<(), ProcessError> {
         self.launch().await?;
+        self.wait_ready().await?;
         self.state
             .transition(ProcessState::Running, self.current_connection.clone())?;
         Ok(())
+    }
+
+    // Runs after launch(), so an xray TUN start has already waited for the
+    // device and run xray-up. Connecting only once the stability window has
+    // passed keeps a backend that binds its inbounds and then dies in
+    // post-start from counting as ready.
+    async fn wait_ready(&mut self) -> Result<(), ProcessError> {
+        let Some(addr) = self.ready_probe else {
+            return Ok(());
+        };
+        let probe_start = Instant::now();
+        loop {
+            let exited = match self.child.as_mut().map(Child::try_wait) {
+                Some(Ok(status)) => status,
+                Some(Err(err)) => {
+                    self.graceful_stop().await;
+                    return Err(ProcessError::Wait(err));
+                }
+                None => None,
+            };
+            if let Some(status) = exited {
+                self.cleanup_after_exit().await;
+                let reason = self.exit_reason(&status);
+                self.write_exit_record(false, Some(&status));
+                return Err(ProcessError::ExitedBeforeReady(reason));
+            }
+            // Bounded: a connect to a non-loopback address behind a drop rule
+            // would otherwise outlive ready_timeout.
+            if probe_start.elapsed() >= STABILITY_WINDOW
+                && let Ok(Ok(_)) =
+                    tokio::time::timeout(READY_POLL_INTERVAL, TcpStream::connect(addr)).await
+            {
+                return Ok(());
+            }
+            if probe_start.elapsed() >= self.ready_timeout {
+                self.graceful_stop().await;
+                return Err(ProcessError::ReadyTimeout {
+                    addr,
+                    timeout: self.ready_timeout,
+                });
+            }
+            sleep(READY_POLL_INTERVAL).await;
+        }
     }
 
     // A launch failure leaves routing state in place: during a respawn the
@@ -799,14 +867,7 @@ impl ProcessManager {
     }
 
     async fn handle_unexpected_exit(&mut self, status: ExitStatus) {
-        let exit_code = status.code();
-        let mut msg = match exit_code {
-            Some(code) => format!("process exited with code {code}"),
-            None => "process killed by signal".into(),
-        };
-        if let Some(reason) = self.last_output_line() {
-            msg = format!("{msg}: {reason}");
-        }
+        let mut msg = self.exit_reason(&status);
 
         // Reaching here means the backend died while we still expected it
         // Running: stop() moves state to Stopping before killing, so a requested
@@ -853,6 +914,17 @@ impl ProcessManager {
                     self.record_crash();
                 }
             }
+        }
+    }
+
+    fn exit_reason(&self, status: &ExitStatus) -> String {
+        let msg = match status.code() {
+            Some(code) => format!("process exited with code {code}"),
+            None => "process killed by signal".into(),
+        };
+        match self.last_output_line() {
+            Some(reason) => format!("{msg}: {reason}"),
+            None => msg,
         }
     }
 
@@ -1967,6 +2039,63 @@ mod tests {
         assert!(warned, "expected a TUN panic advisory log line");
     }
 
+    #[tokio::test]
+    async fn ready_probe_accepts_live_backend() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut mgr =
+            manager_for(&dir, "exec sleep 30\n").with_ready_probe(listener.local_addr().unwrap());
+
+        let started = Instant::now();
+        mgr.start().await.unwrap();
+        assert!(
+            started.elapsed() >= STABILITY_WINDOW,
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(mgr.state(), ProcessState::Running);
+        mgr.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exit_before_ready_carries_last_output() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut mgr = manager_for(&dir, "echo FATAL >&2\nexit 1\n")
+            .with_ready_probe(listener.local_addr().unwrap());
+
+        match mgr.start().await {
+            Err(ProcessError::ExitedBeforeReady(msg)) => {
+                assert!(msg.contains("code 1"), "{msg}");
+                assert!(msg.contains("FATAL"), "{msg}");
+            }
+            other => panic!("expected ExitedBeforeReady, got {other:?}"),
+        }
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(mgr.child.is_none());
+    }
+
+    #[tokio::test]
+    async fn ready_timeout_stops_the_backend() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let mut mgr = manager_for(&dir, "exec sleep 30\n").with_ready_probe(addr);
+        mgr.ready_timeout = Duration::from_millis(300);
+
+        match mgr.start().await {
+            Err(e @ ProcessError::ReadyTimeout { .. }) => {
+                let text = e.to_string();
+                assert!(text.contains(&addr.to_string()), "{text}");
+                assert!(text.contains("300ms"), "{text}");
+            }
+            other => panic!("expected ReadyTimeout, got {other:?}"),
+        }
+        assert!(mgr.child.is_none(), "the backend should have been reaped");
+    }
+
     #[test]
     fn is_host_level_classifies_every_variant() {
         let cases: Vec<(ProcessError, bool)> = vec![
@@ -2026,6 +2155,17 @@ mod tests {
                 true,
             ),
             (ProcessError::ConfigCheck("bad dns config".into()), false),
+            (
+                ProcessError::ExitedBeforeReady("process exited with code 1: FATAL".into()),
+                false,
+            ),
+            (
+                ProcessError::ReadyTimeout {
+                    addr: SocketAddr::from(([127, 0, 0, 1], 1080)),
+                    timeout: READY_TIMEOUT,
+                },
+                false,
+            ),
         ];
         for (error, host_level) in cases {
             assert_eq!(error.is_host_level(), host_level, "{error}");
