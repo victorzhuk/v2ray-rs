@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Excluded routes with prefix length 0 (such as `0.0.0.0/0`), or more than 256
+  of them, are refused. A list over 256 entries must be trimmed in
+  `settings.toml`.
+
+### Fixed
+- On xray TUN, excluded routes now bypass the TUN device, including DNS
+  capture on port 53.
+
 ## [0.18.0] - 2026-09-12
 
 ### Added

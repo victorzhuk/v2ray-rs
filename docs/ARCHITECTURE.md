@@ -156,7 +156,7 @@ dependencies — deliberately minimal (rtnetlink, tokio current-thread, clap).
 
 Three subcommands, all idempotent and input-validated before any netlink call:
 
-- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns] [--strict]`: brings the
+- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns] [--strict] [--exclude CIDR]...`: brings the
   link up, assigns the address, and installs the tunnel default route into table
   2023 plus the policy rules that steer traffic into it:
   - 9000 — `fwmark 0xff` → `main`, so xray's own sockets reach the real default
@@ -175,6 +175,14 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   resolve to table 2023, an unclean exit leaves entries that match nothing
   rather than blackholing DNS.
 
+  `--exclude` (repeatable, from `exclude_routes`) adds one rule per prefix at
+  8997 sending that destination to `main`, ahead of every other xray rule, so
+  excluded traffic leaves the real interface even on port 53 under
+  `--capture-dns`. Prefix length 0 is refused, host bits are cleared, and at
+  most 256 prefixes are accepted. The 8997 rules are replaced on every
+  `xray-up`, after the rest of the setup succeeds; IPv6 prefixes are skipped on
+  a host with IPv6 disabled.
+
   `--strict` (set from `strict_route`) is the kill-switch. It adds an
   `unreachable` default to table 2023 for IPv4 and IPv6 at the highest metric,
   behind the tunnel route, so once the device is gone traffic fails closed
@@ -187,7 +195,7 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   families, then deletes the device (no-op when all are gone). The flush comes
   first so a failing device delete cannot leave the fallback blackholing traffic.
 - `recover --iface --singbox|--xray`: cleans up leftover TUN state after an
-  unclean shutdown; for xray it leaves table 2023 and prefs 8998–9002 empty in
+  unclean shutdown; for xray it leaves table 2023 and prefs 8997–9002 empty in
   both families, for sing-box it flushes the `auto_route` table/rules.
 
 `xray-up` refuses any `--iface` that is not a TUN device (checked via
