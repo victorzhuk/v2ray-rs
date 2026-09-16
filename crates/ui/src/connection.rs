@@ -162,6 +162,8 @@ fn spawn_with(
                 .remark()
                 .unwrap_or(candidate.node.address())
                 .to_string();
+            let candidate_address = candidate.node.address().to_string();
+            let candidate_port = candidate.node.port();
             let (mut effective_rules, mut effective_settings) = resolve_effective_config(
                 &candidate.node_ref,
                 &subscriptions,
@@ -187,7 +189,12 @@ fn spawn_with(
                 match writer.write_config(&nodes, &effective_rules, &effective_settings) {
                     Ok(path) => path,
                     Err(e) => {
-                        failures.push(format!("{candidate_label}: config generation failed: {e}"));
+                        failures.push(CandidateFailure::new(
+                            &candidate_label,
+                            &format!("config generation failed: {e}"),
+                            &candidate_address,
+                            candidate_port,
+                        ));
                         continue;
                     }
                 };
@@ -270,7 +277,12 @@ fn spawn_with(
                         report(ProcessState::Error(e.to_string()), None);
                         return;
                     }
-                    failures.push(format!("{candidate_label}: {e}"));
+                    failures.push(CandidateFailure::new(
+                        &candidate_label,
+                        &e.to_string(),
+                        &candidate_address,
+                        candidate_port,
+                    ));
                     parked = Some(mgr);
                     continue;
                 }
@@ -329,7 +341,12 @@ fn spawn_with(
                         match mgr.state() {
                             ProcessState::Running => {}
                             ProcessState::Error(msg) => {
-                                failures.push(format!("{candidate_label}: {msg}"));
+                                failures.push(CandidateFailure::new(
+                                    &candidate_label,
+                                    &msg,
+                                    &candidate_address,
+                                    candidate_port,
+                                ));
                                 break;
                             }
                             _ => {
@@ -479,7 +496,167 @@ fn grant_fixable(e: &ProcessError) -> bool {
     )
 }
 
-fn summarize_failures(failures: &[String]) -> String {
+/// A candidate's failure kept split: the summary prints `label: reason`, while
+/// `key` is the normalized form the loop compares to spot a failure that every
+/// candidate shares and that failing over cannot fix.
+struct CandidateFailure {
+    label: String,
+    reason: String,
+    key: String,
+}
+
+impl CandidateFailure {
+    fn new(label: &str, reason: &str, address: &str, port: u16) -> Self {
+        let reason = strip_ansi(reason);
+        Self {
+            key: failure_key(&reason, label, address, port),
+            label: label.to_string(),
+            reason,
+        }
+    }
+}
+
+/// Whether the last two candidates failed the same way.
+fn repeats_previous(failures: &[CandidateFailure]) -> bool {
+    match failures {
+        [.., previous, last] => previous.key == last.key,
+        _ => false,
+    }
+}
+
+/// Drops CSI sequences so nothing the backend colored reaches the user.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        if chars.next_if_eq(&'[').is_none() {
+            continue;
+        }
+        while chars
+            .next_if(|c| ('\u{30}'..='\u{3f}').contains(c))
+            .is_some()
+        {}
+        while chars
+            .next_if(|c| ('\u{20}'..='\u{2f}').contains(c))
+            .is_some()
+        {}
+        chars.next_if(|c| ('\u{40}'..='\u{7e}').contains(c));
+    }
+    out
+}
+
+/// The comparable form of a failure: everything that varies between candidates
+/// purely because they are different attempts — colors, log timestamps, message
+/// counters, the node's own name, address and port — collapses to a placeholder,
+/// so two texts compare equal exactly when they describe the same failure.
+fn failure_key(reason: &str, label: &str, address: &str, port: u16) -> String {
+    let stripped = strip_ansi(reason);
+    let mut key = mask_counters(strip_leading_timestamp(stripped.trim()));
+    for token in [label, address] {
+        // A two-letter remark such as "US" would mask unrelated substrings.
+        if token.chars().count() >= 3 {
+            key = key.replace(token, "<node>");
+        }
+    }
+    mask_port(&key, port)
+}
+
+/// Removes one leading `YYYY/MM/DD HH:MM:SS(.frac)` stamp. Only the leading one
+/// is an artifact of when the attempt ran; a date inside the text is content.
+fn strip_leading_timestamp(text: &str) -> &str {
+    let b = text.as_bytes();
+    let digits = |range: std::ops::Range<usize>| {
+        range
+            .clone()
+            .all(|i| b.get(i).is_some_and(u8::is_ascii_digit))
+    };
+    let literal = |i: usize, c: u8| b.get(i) == Some(&c);
+    let shaped = digits(0..4)
+        && literal(4, b'/')
+        && digits(5..7)
+        && literal(7, b'/')
+        && digits(8..10)
+        && literal(10, b' ')
+        && digits(11..13)
+        && literal(13, b':')
+        && digits(14..16)
+        && literal(16, b':')
+        && digits(17..19);
+    if !shaped {
+        return text;
+    }
+
+    let mut end = 19;
+    if literal(19, b'.') {
+        let fraction = b
+            .get(20..)
+            .unwrap_or_default()
+            .iter()
+            .take(9)
+            .take_while(|c| c.is_ascii_digit())
+            .count();
+        if fraction > 0 {
+            end = 20 + fraction;
+        }
+    }
+    while literal(end, b' ') {
+        end += 1;
+    }
+    &text[end..]
+}
+
+/// Collapses bracketed all-digit tokens such as sing-box's `[0000]` message
+/// counter. Named brackets like `[tun-in]` are content and stay.
+fn mask_counters(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        out.push_str(&rest[..open]);
+        let after = &rest[open + 1..];
+        match after.find(']') {
+            Some(close) if close > 0 && after[..close].bytes().all(|c| c.is_ascii_digit()) => {
+                out.push_str("[N]");
+                rest = &after[close + 1..];
+            }
+            _ => {
+                out.push('[');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Replaces the candidate's own port where it stands alone. The boundary check
+/// keeps `443` from being clipped out of `14430` or `10.4.43.1`.
+fn mask_port(text: &str, port: u16) -> String {
+    let needle = port.to_string();
+    let bytes = text.as_bytes();
+    let free = |c: Option<u8>| !c.is_some_and(|c| c.is_ascii_digit() || c == b'.');
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        if text[i..].starts_with(&needle)
+            && free(i.checked_sub(1).map(|j| bytes[j]))
+            && free(bytes.get(i + needle.len()).copied())
+        {
+            out.push_str("<port>");
+            i += needle.len();
+            continue;
+        }
+        let c = text[i..].chars().next().expect("index on a char boundary");
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
+}
+
+fn summarize_failures(failures: &[CandidateFailure]) -> String {
     if failures.is_empty() {
         return "All candidates failed".into();
     }
@@ -487,7 +664,7 @@ fn summarize_failures(failures: &[String]) -> String {
     let preview = failures
         .iter()
         .take(3)
-        .map(String::as_str)
+        .map(|f| format!("{}: {}", f.label, f.reason))
         .collect::<Vec<_>>()
         .join("; ");
 
@@ -637,6 +814,101 @@ mod tests {
         assert!(relays(&ProcessState::Stopping));
         assert!(!relays(&ProcessState::Stopped));
         assert!(!relays(&ProcessState::Error("boom".into())));
+    }
+
+    #[test]
+    fn failure_key_ignores_the_singbox_message_counter() {
+        let first = failure_key(
+            "\u{1b}[31mFATAL\u{1b}[0m[0000] start service: initialize inbound/tun[0]: configure tun interface: operation not permitted",
+            "203.0.113.1",
+            "203.0.113.1",
+            8388,
+        );
+        let second = failure_key(
+            "\u{1b}[31mFATAL\u{1b}[0m[0001] start service: initialize inbound/tun[0]: configure tun interface: operation not permitted",
+            "203.0.113.2",
+            "203.0.113.2",
+            8388,
+        );
+        assert_eq!(first, second);
+        assert!(!first.contains('\u{1b}'), "{first}");
+    }
+
+    #[test]
+    fn failure_key_ignores_xray_timestamps() {
+        let first = failure_key(
+            "2026/09/14 10:37:35.309646 [Warning] failed to handle connection",
+            "203.0.113.1",
+            "203.0.113.1",
+            443,
+        );
+        let second = failure_key(
+            "2026/09/14 10:41:02.884131 [Warning] failed to handle connection",
+            "203.0.113.2",
+            "203.0.113.2",
+            443,
+        );
+        assert_eq!(first, second);
+        assert!(first.starts_with("[Warning]"), "{first}");
+    }
+
+    #[test]
+    fn failure_key_ignores_each_candidates_own_host() {
+        let first = failure_key(
+            "tls: failed to verify certificate for 203.0.113.1:443",
+            "203.0.113.1",
+            "203.0.113.1",
+            443,
+        );
+        let second = failure_key(
+            "tls: failed to verify certificate for 203.0.113.2:443",
+            "203.0.113.2",
+            "203.0.113.2",
+            443,
+        );
+        assert_eq!(first, second);
+        assert_eq!(first, "tls: failed to verify certificate for <node>:<port>");
+    }
+
+    #[test]
+    fn failure_key_keeps_unrelated_hosts_distinct() {
+        let first = failure_key(
+            "tls: handshake with updates.example.com failed",
+            "203.0.113.1",
+            "203.0.113.1",
+            443,
+        );
+        let second = failure_key(
+            "tls: handshake with mirror.example.net failed",
+            "203.0.113.2",
+            "203.0.113.2",
+            443,
+        );
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn failure_key_keeps_a_port_inside_a_longer_number() {
+        let key = failure_key("dial tcp 10.4.43.1:14430: refused", "node", "node", 443);
+        assert_eq!(key, "dial tcp 10.4.43.1:14430: refused");
+    }
+
+    #[test]
+    fn repeats_previous_needs_two_equal_keys() {
+        let failure = |label: &str, reason: &str| CandidateFailure::new(label, reason, label, 443);
+        let shared =
+            "\u{1b}[31mFATAL\u{1b}[0m[0000] configure tun interface: operation not permitted";
+
+        assert!(!repeats_previous(&[]));
+        assert!(!repeats_previous(&[failure("203.0.113.1", shared)]));
+        assert!(repeats_previous(&[
+            failure("203.0.113.1", shared),
+            failure("203.0.113.2", shared),
+        ]));
+        assert!(!repeats_previous(&[
+            failure("203.0.113.1", shared),
+            failure("203.0.113.2", "config rejected"),
+        ]));
     }
 
     #[test]
