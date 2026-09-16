@@ -159,6 +159,10 @@ impl App {
             }
         }
         self.process_state = state.clone();
+        if !matches!(state, ProcessState::Running) {
+            self.health = None;
+            self.dns_failing = false;
+        }
 
         let node_ref = if matches!(state, ProcessState::Running) {
             self.connection_status.as_ref().map(|meta| meta.node_ref)
@@ -194,33 +198,12 @@ impl App {
     }
 
     fn update_status_labels(&self) {
-        let (primary, details) = match (&self.process_state, &self.connection_status) {
-            (ProcessState::Running, Some(meta)) => {
-                let latency = meta
-                    .latency_ms
-                    .map(|ms| format!("{ms} ms"))
-                    .unwrap_or_else(|| "n/a".into());
-                let details = format!(
-                    "{} · {} · {} · {} · {} · since {}",
-                    meta.source,
-                    meta.node_name,
-                    latency,
-                    meta.backend,
-                    meta.strategy,
-                    meta.connected_since.format("%Y-%m-%d %H:%M")
-                );
-                ("Connected".to_string(), details)
-            }
-            (ProcessState::Starting, _) => ("Connecting…".to_string(), "Resolving nodes".into()),
-            (ProcessState::Stopping, _) => {
-                ("Disconnecting…".to_string(), "Stopping backend".into())
-            }
-            (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
-            _ => (
-                "Disconnected".to_string(),
-                "No active connection".to_string(),
-            ),
-        };
+        let (primary, details) = status_texts(&StatusView {
+            state: &self.process_state,
+            meta: self.connection_status.as_ref(),
+            health: self.health.as_ref(),
+            dns_failing: self.dns_failing,
+        });
         self.status_label.set_text(&primary);
         self.status_details.set_text(&details);
     }
@@ -1413,14 +1396,18 @@ impl SimpleComponent for App {
                 self.logs_page.emit(LogsMsg::AppendLine(line));
             }
             AppMsg::ConnectionHealth(generation, health) => {
-                if is_current_generation(generation, self.connection_generation) {
-                    self.health = Some(health);
+                if !is_current_generation(generation, self.connection_generation) {
+                    return;
                 }
+                self.health = Some(health);
+                self.update_status_labels();
             }
             AppMsg::DnsHealth(generation, failing) => {
-                if is_current_generation(generation, self.connection_generation) {
-                    self.dns_failing = failing;
+                if !is_current_generation(generation, self.connection_generation) {
+                    return;
                 }
+                self.dns_failing = failing;
+                self.update_status_labels();
             }
             AppMsg::CloseRequested => {
                 if self.settings.minimize_to_tray && tray_available() {
@@ -1736,6 +1723,53 @@ fn disconnect_plan(has_handle: bool, marker_present: bool) -> DisconnectPlan {
 /// routes must be released.
 fn release_on_error(app_state_stopping: bool, reconnects_left: u32) -> bool {
     app_state_stopping || reconnects_left == 0
+}
+
+struct StatusView<'a> {
+    state: &'a ProcessState,
+    meta: Option<&'a ConnectionMetadata>,
+    health: Option<&'a Health>,
+    dns_failing: bool,
+}
+
+/// Health only colours a `Running` session; any other state reads as before
+/// even if a stale report is still around.
+fn status_texts(view: &StatusView) -> (String, String) {
+    match (view.state, view.meta) {
+        (ProcessState::Running, Some(meta)) => {
+            let latency = meta
+                .latency_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_else(|| "n/a".into());
+            let details = format!(
+                "{} · {} · {} · {} · {} · since {}",
+                meta.source,
+                meta.node_name,
+                latency,
+                meta.backend,
+                meta.strategy,
+                meta.connected_since.format("%Y-%m-%d %H:%M")
+            );
+            match view.health {
+                Some(Health::Unhealthy(reason)) => (
+                    "Proxy not responding".to_string(),
+                    format!("{details} · last probe: {reason}"),
+                ),
+                _ if view.dns_failing => (
+                    "Connected".to_string(),
+                    format!("DNS via proxy failing · {details}"),
+                ),
+                _ => ("Connected".to_string(), details),
+            }
+        }
+        (ProcessState::Starting, _) => ("Connecting…".to_string(), "Resolving nodes".into()),
+        (ProcessState::Stopping, _) => ("Disconnecting…".to_string(), "Stopping backend".into()),
+        (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
+        _ => (
+            "Disconnected".to_string(),
+            "No active connection".to_string(),
+        ),
+    }
 }
 
 /// The node the current session attempt is anchored to, and whether it ever
@@ -2767,6 +2801,96 @@ mod tests {
                 node_ref: node,
                 connected_at: now,
             })
+        );
+    }
+
+    fn status_meta() -> ConnectionMetadata {
+        ConnectionMetadata {
+            node_ref: session_target_node(),
+            source: "manual".into(),
+            source_id: String::new(),
+            node_name: "node".into(),
+            node_address: "127.0.0.1".into(),
+            node_port: 1080,
+            backend: BackendType::Xray,
+            strategy: AutoResolveStrategy::default(),
+            latency_ms: Some(42),
+            connected_since: chrono::Utc::now(),
+        }
+    }
+
+    fn running_view<'a>(
+        meta: &'a ConnectionMetadata,
+        health: Option<&'a Health>,
+        dns_failing: bool,
+    ) -> StatusView<'a> {
+        StatusView {
+            state: &ProcessState::Running,
+            meta: Some(meta),
+            health,
+            dns_failing,
+        }
+    }
+
+    #[test]
+    fn status_texts_unhealthy_says_proxy_not_responding() {
+        let meta = status_meta();
+        let (_, connected) = status_texts(&running_view(&meta, None, false));
+        let health = Health::Unhealthy("connection refused".into());
+
+        let (primary, details) = status_texts(&running_view(&meta, Some(&health), true));
+
+        assert_eq!(primary, "Proxy not responding");
+        assert_eq!(
+            details,
+            format!("{connected} · last probe: connection refused")
+        );
+    }
+
+    #[test]
+    fn status_texts_dns_failing_prefixes_details() {
+        let meta = status_meta();
+        let (_, connected) = status_texts(&running_view(&meta, None, false));
+
+        let (primary, details) = status_texts(&running_view(&meta, Some(&Health::Healthy), true));
+
+        assert_eq!(primary, "Connected");
+        assert_eq!(details, format!("DNS via proxy failing · {connected}"));
+    }
+
+    #[test]
+    fn status_texts_healthy_matches_todays_connected_text() {
+        let meta = status_meta();
+
+        let (primary, details) = status_texts(&running_view(&meta, Some(&Health::Healthy), false));
+
+        assert_eq!(primary, "Connected");
+        assert_eq!(
+            details,
+            format!(
+                "manual · node · 42 ms · {} · {} · since {}",
+                meta.backend,
+                meta.strategy,
+                meta.connected_since.format("%Y-%m-%d %H:%M")
+            )
+        );
+    }
+
+    #[test]
+    fn status_texts_starting_ignores_stale_health() {
+        let meta = status_meta();
+        let health = Health::Unhealthy("timeout".into());
+
+        let texts = status_texts(&StatusView {
+            state: &ProcessState::Starting,
+            meta: Some(&meta),
+            health: Some(&health),
+            dns_failing: true,
+        });
+
+        assert_eq!(
+            texts,
+            ("Connecting…".to_string(), "Resolving nodes".to_string())
         );
     }
 
