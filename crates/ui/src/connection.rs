@@ -1918,9 +1918,13 @@ exit 1"#,
         assert_eq!(next_health(&rx).await, Health::Healthy);
 
         let seen = proxy.accepts();
-        while proxy.accepts() < seen + 2 {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        tokio::time::timeout(RECV_TIMEOUT, async {
+            while proxy.accepts() < seen + 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("health probes stopped after recovery");
         handle.stop();
         loop {
             let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
