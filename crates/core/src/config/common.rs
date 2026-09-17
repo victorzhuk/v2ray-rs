@@ -1,5 +1,11 @@
 use crate::models::{AppSettings, DnsServerConfig, ProxyNode};
 
+pub(crate) fn skipped_derived_warning(tag: &str, skipped: usize) -> Option<String> {
+    (skipped > 0).then(|| {
+        format!("DNS: no server tagged '{tag}' - skipping {skipped} auto-derived domain entries")
+    })
+}
+
 pub(crate) fn outbound_tag(node: &ProxyNode, index: usize) -> String {
     match node.remark() {
         Some(name) if !name.is_empty() => format!("proxy-{index}-{name}"),

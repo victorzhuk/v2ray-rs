@@ -2,10 +2,11 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, BackendType, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch,
-    DnsServerConfig, DnsStrategy, GrpcSettings, H2Settings, LoggingSettings, ProxyNode,
-    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
-    TunConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
+    DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings,
+    H2Settings, LoggingSettings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -923,6 +924,17 @@ fn build_user_dns_servers(
         {
             for d in &settings.tun.exclude_domains {
                 domestic_domains.push(d.clone());
+            }
+        }
+
+        for (tag, derived) in [
+            (AUTO_SPLIT_REMOTE_TAG, &remote_domains),
+            (AUTO_SPLIT_DOMESTIC_TAG, &domestic_domains),
+        ] {
+            if !settings.dns.has_server_tag(tag)
+                && let Some(warning) = super::common::skipped_derived_warning(tag, derived.len())
+            {
+                log::warn!("{warning}");
             }
         }
 
@@ -3098,5 +3110,91 @@ mod tests {
         assert!(!server(Some("proxy")).resolves_via_proxy_private(BackendType::V2ray, false));
         assert!(!server(Some("proxy")).resolves_via_proxy_private(BackendType::V2ray, true));
         assert!(!server(Some("direct")).resolves_via_proxy_private(BackendType::Xray, true));
+    }
+
+    fn udp_server(tag: &str) -> DnsServerConfig {
+        DnsServerConfig {
+            tag: tag.to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "223.5.5.5".to_string(),
+            port: None,
+            detour: None,
+        }
+    }
+
+    fn direct_rule(pattern: &str) -> RoutingRule {
+        RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: pattern.into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }
+    }
+
+    #[test]
+    fn test_skipped_derived_warning_payload_names_tag_and_count() {
+        let warning = crate::config::common::skipped_derived_warning("remote", 3).unwrap();
+        assert_eq!(
+            warning,
+            "DNS: no server tagged 'remote' - skipping 3 auto-derived domain entries"
+        );
+        assert!(crate::config::common::skipped_derived_warning("remote", 0).is_none());
+    }
+
+    #[test]
+    fn test_dns_derived_remote_tag_missing_keeps_domains_off_and_warns() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+        settings.dns.servers = vec![udp_server("lan")];
+        assert!(!settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG));
+
+        let rules = vec![proxy_rule("example.com", None)];
+        let config = build_dns(&rules, &settings);
+
+        let servers = config["servers"].as_array().unwrap();
+        assert!(
+            servers.iter().all(|s| s.get("domains").is_none()),
+            "no server may carry derived domains when the tag is missing: {servers:?}"
+        );
+        assert_eq!(
+            crate::config::common::skipped_derived_warning(AUTO_SPLIT_REMOTE_TAG, 1).as_deref(),
+            Some("DNS: no server tagged 'remote' - skipping 1 auto-derived domain entries")
+        );
+    }
+
+    #[test]
+    fn test_dns_derived_standard_tags_attach_without_warning() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+        assert!(settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG));
+        assert!(settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG));
+
+        let rules = vec![proxy_rule("example.com", None), direct_rule("ru.example")];
+        let config = build_dns(&rules, &settings);
+
+        let servers = config["servers"].as_array().unwrap();
+        let tag_index = |tag: &str| {
+            settings
+                .dns
+                .servers
+                .iter()
+                .position(|s| s.tag == tag)
+                .unwrap()
+        };
+        let domains_of = |tag: &str| servers[tag_index(tag)].get("domains").cloned();
+        assert_eq!(
+            domains_of(AUTO_SPLIT_REMOTE_TAG),
+            Some(json!(["domain:example.com"]))
+        );
+        assert_eq!(
+            domains_of(AUTO_SPLIT_DOMESTIC_TAG),
+            Some(json!(["domain:ru.example"]))
+        );
     }
 }

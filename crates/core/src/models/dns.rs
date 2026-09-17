@@ -5,6 +5,10 @@ use std::net::IpAddr;
 
 use super::settings::BackendType;
 
+/// Server tags the auto-split DNS plane attaches derived domain lists to.
+pub const AUTO_SPLIT_REMOTE_TAG: &str = "remote";
+pub const AUTO_SPLIT_DOMESTIC_TAG: &str = "domestic";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsProtocol {
@@ -432,6 +436,10 @@ impl Default for DnsConfig {
 }
 
 impl DnsConfig {
+    pub fn has_server_tag(&self, tag: &str) -> bool {
+        self.servers.iter().any(|s| s.tag == tag)
+    }
+
     pub fn validate(&self) -> Result<(), DnsValidationError> {
         if self.enabled && self.servers.is_empty() {
             return Err(DnsValidationError::NoServers);

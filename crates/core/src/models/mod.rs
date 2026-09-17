@@ -11,8 +11,9 @@ mod tun;
 mod validation;
 
 pub use dns::{
-    DnsConfig, DnsProtocol, DnsProviderPreset, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
-    DnsValidationError, FakeIpConfig, HostOverride, builtin_dns_presets,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, DnsConfig, DnsProtocol, DnsProviderPreset,
+    DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, DnsValidationError, FakeIpConfig,
+    HostOverride, builtin_dns_presets,
 };
 pub use imported_profile::{ImportedProfile, resolve_effective_config, uses_imported_profile};
 pub use manual_node::ManualNode;
