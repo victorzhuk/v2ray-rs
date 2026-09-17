@@ -997,7 +997,14 @@ fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamily
         );
     }
 
-    effective_protocol.server_address(&server.address, if effective_protocol != server.protocol { None } else { server.port })
+    effective_protocol.server_address(
+        &server.address,
+        if effective_protocol != server.protocol {
+            None
+        } else {
+            server.port
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2106,11 +2113,17 @@ mod tests {
         };
 
         assert_eq!(
-            dns_server_address_for_backend(&server(DnsProtocol::Dot, Some(853)), V2rayFamilyBackend::V2ray),
+            dns_server_address_for_backend(
+                &server(DnsProtocol::Dot, Some(853)),
+                V2rayFamilyBackend::V2ray
+            ),
             "https://dns.google/dns-query"
         );
         assert_eq!(
-            dns_server_address_for_backend(&server(DnsProtocol::H3, Some(8443)), V2rayFamilyBackend::Xray),
+            dns_server_address_for_backend(
+                &server(DnsProtocol::H3, Some(8443)),
+                V2rayFamilyBackend::Xray
+            ),
             "https://dns.google/dns-query"
         );
     }
