@@ -33,9 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `utc_offset=±HH:MM`.
 
 ### Fixed
-- A `settings.toml` whose `[dns]` table omits `enabled`, or whose `servers`
-  list is empty, now loads instead of discarding every setting in the file;
-  defaults apply only to keys that are absent.
+- A `settings.toml` whose `[dns]` table omits `enabled` now loads with the rest
+  of the file intact instead of discarding every setting in it. An explicitly
+  present `servers` list is taken as written, including an empty one; the
+  default servers apply only when the key is absent.
 - On xray TUN, excluded routes now bypass the TUN device, including DNS
   capture on port 53.
 - Terminal color escapes are no longer written to `backend.log` or shown on
