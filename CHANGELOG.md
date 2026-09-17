@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the idle timeout applies to v2ray and xray, the WebSocket ping interval to
   xray only, the DNS server detour takes effect on xray only while TUN is on,
   and `native` and `disabled` DNS hijack modes both leave DNS uncaptured.
+- A DNS server whose address is a loopback, private, link-local, or unique-local
+  IP literal and whose queries the active backend sends through the proxy is
+  called out: an inline warning in the server dialog, the same warning on its
+  row and in the primary list, and one log line per flagged server at config
+  generation. Saving and connecting stay allowed. The IP strategy row also
+  notes that the Prefer options query only the preferred address family on
+  xray and v2ray.
 
 ### Changed
 - A DNS server whose protocol is downgraded for the selected backend (DoT,
