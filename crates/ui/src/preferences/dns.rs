@@ -708,7 +708,7 @@ fn backend_display_name(b: BackendType) -> &'static str {
 pub(crate) fn strategy_family_note(backend: BackendType) -> Option<&'static str> {
     match backend {
         BackendType::Xray | BackendType::V2ray => Some(
-            "Prefer options query only the preferred address family; sing-box picks the fastest family",
+            "Prefer IPv4 and Prefer IPv6 query only the preferred address family on this backend",
         ),
         BackendType::SingBox => None,
     }
@@ -1942,9 +1942,10 @@ mod tests {
         for backend in [BackendType::Xray, BackendType::V2ray] {
             let note = strategy_family_note(backend)
                 .unwrap_or_else(|| panic!("{backend:?} must show the strategy note"));
-            assert!(
-                note.contains("preferred address family"),
-                "{backend:?}: {note}"
+            assert_eq!(
+                note,
+                "Prefer IPv4 and Prefer IPv6 query only the preferred address family on this backend",
+                "{backend:?} note mismatch"
             );
         }
         assert_eq!(
