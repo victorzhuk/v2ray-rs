@@ -1,7 +1,9 @@
 ## Purpose
 
 Defines persistence of application settings, latency snapshots, and TUN configuration to disk, including forward-compatible deserialization from older `settings.toml` and snapshot formats.
+
 ## Requirements
+
 ### Requirement: Latency snapshot includes Real Delay samples
 The system SHALL extend the persisted latency snapshot (under `state_dir/`) so that each entry can carry an optional `last_real_delay_ms` value in addition to the existing TCP sample. The serialized format SHALL be forward-compatible: a snapshot written by an older build SHALL load without error, with the missing Real Delay field defaulting to `None`; a snapshot written by a newer build that contains Real Delay values SHALL be ignored by older builds without preventing startup.
 
@@ -54,3 +56,17 @@ exclusion lists empty) without prompting or erroring.
 - **WHEN** a `settings.toml` written by a newer build contains TUN fields an older build does not recognize, or a `[tun]` section written before this change that lacks `exclude_processes`/`exclude_domains`
 - **THEN** the build SHALL load the recognized fields, default the missing exclusion lists to empty, ignore unknown ones, and SHALL NOT fail startup
 
+### Requirement: Logging settings persistence
+The system SHALL persist backend logging preferences in `settings.toml` as a `[logging]` section with `backend_level` (one of `error`, `warning`, `info`, `debug`) and `connection_log` (bool). When the section or a key is absent, the system SHALL load `backend_level = "warning"` and `connection_log = false` without prompting or erroring. Changing either value while connected SHALL count as a restart-relevant change.
+
+#### Scenario: Legacy settings without the section
+- **WHEN** an existing `settings.toml` has no `[logging]` section
+- **THEN** settings SHALL load with `backend_level = "warning"` and `connection_log = false` and SHALL NOT log an error
+
+#### Scenario: Round-trip
+- **WHEN** the user sets the level to `debug` and turns the connection log on, and the app restarts
+- **THEN** the reloaded settings SHALL contain `backend_level = "debug"` and `connection_log = true`
+
+#### Scenario: Change while connected
+- **WHEN** the user changes the backend log level while connected
+- **THEN** the pending-restart indication SHALL appear as for other config-changing settings
