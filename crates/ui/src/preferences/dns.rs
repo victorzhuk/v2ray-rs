@@ -1865,8 +1865,14 @@ mod tests {
     #[test]
     fn detour_note_matches_backend_detour_capabilities() {
         let singbox = detour_note(BackendType::SingBox).expect("sing-box honors detour");
-        assert!(singbox.contains("proxy"), "sing-box: proxy detour explained");
-        assert!(singbox.contains("direct"), "sing-box: direct detour explained");
+        assert!(
+            singbox.contains("proxy"),
+            "sing-box: proxy detour explained"
+        );
+        assert!(
+            singbox.contains("direct"),
+            "sing-box: direct detour explained"
+        );
 
         let xray = detour_note(BackendType::Xray).expect("xray has a direct-only note");
         assert!(xray.contains("TUN"), "xray detour only applies under TUN");

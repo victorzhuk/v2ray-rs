@@ -125,7 +125,9 @@ pub(super) fn build_network_page(
 
     let idle_timeout_row = adw::SpinRow::builder()
         .title("Idle connection timeout (seconds)")
-        .subtitle("v2ray and xray only. sing-box ignores it. Streams idle longer than this are closed")
+        .subtitle(
+            "v2ray and xray only. sing-box ignores it. Streams idle longer than this are closed",
+        )
         .adjustment(&gtk::Adjustment::new(
             s.idle_timeout_secs as f64,
             60.0,
