@@ -697,6 +697,18 @@ fn backend_display_name(b: BackendType) -> &'static str {
     }
 }
 
+pub(crate) fn detour_note(backend: BackendType) -> Option<&'static str> {
+    match backend {
+        BackendType::SingBox => Some(
+            "Both detours work: 'proxy' sends DNS through the proxy, 'direct' dials it directly",
+        ),
+        BackendType::Xray => {
+            Some("Only 'direct' has an effect, and only while TUN is enabled; 'proxy' does nothing")
+        }
+        BackendType::V2ray => None,
+    }
+}
+
 fn validate_dns_settings_for_backend(settings: &AppSettings) -> Result<(), String> {
     settings.dns.validate().map_err(|err| err.to_string())
 }
@@ -1261,6 +1273,9 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         .model(&gtk::StringList::new(&["proxy", "direct"]))
         .selected(if init_detour == "direct" { 1 } else { 0 })
         .build();
+    if let Some(note) = detour_note(backend) {
+        detour_combo.set_subtitle(note);
+    }
     group.add(&detour_combo);
 
     let error_label = gtk::Label::builder()
@@ -1845,5 +1860,21 @@ mod tests {
             assert_eq!(writes.get(), 0, "the handler must not write the value back");
             assert!(!suppress.get(), "the guard must be released");
         });
+    }
+
+    #[test]
+    fn detour_note_matches_backend_detour_capabilities() {
+        let singbox = detour_note(BackendType::SingBox).expect("sing-box honors detour");
+        assert!(singbox.contains("proxy"), "sing-box: proxy detour explained");
+        assert!(singbox.contains("direct"), "sing-box: direct detour explained");
+
+        let xray = detour_note(BackendType::Xray).expect("xray has a direct-only note");
+        assert!(xray.contains("TUN"), "xray detour only applies under TUN");
+
+        assert_eq!(
+            detour_note(BackendType::V2ray),
+            None,
+            "v2ray has neither mechanism, so the row is hidden with no subtitle"
+        );
     }
 }
