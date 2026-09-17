@@ -131,8 +131,11 @@ a single `pkexec` elevation (one shell invocation, paths passed as positional
 args to avoid injection). `tun.rs` holds `TunRuntime` and the xray-specific
 helpers: `wait_for_device()` polls `/sys/class/net/<iface>`, then invokes
 `netctl xray-up`. sing-box programs its own routes via `auto_route`. Each
-helper call is bounded at 10s, killed and reaped on timeout, and its output goes
-to the process log stream.
+call's bound is a named constant: the device wait uses `DEVICE_TIMEOUT`, the
+`netctl xray-up`/`xray-down` calls and the startup `recover` pass use
+`HELPER_TIMEOUT` — all 10s (`recover_tun_session` reuses `HELPER_TIMEOUT`; there
+is no separate recovery constant). A timed-out call is killed and reaped, and
+its output goes to the process log stream.
 
 Connection setup and teardown are serialized by a single lock held for a
 connection's whole lifetime, and the startup route-recovery pass takes the same
