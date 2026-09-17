@@ -496,12 +496,16 @@ pub(super) fn build_dns_page(
 
         let sync_dns_ui_observer = sync_dns_ui.clone();
         let ctx = dns_ctx.clone();
-        let last_backend = Rc::new(RefCell::new(ctx.state.borrow().backend.backend_type));
+        let last_render_inputs = Rc::new(RefCell::new((
+            ctx.state.borrow().backend.backend_type,
+            ctx.state.borrow().tun.enabled,
+        )));
         subscribe_settings(settings_observers, move |settings| {
             let backend = settings.backend.backend_type;
             sync_dns_ui_observer(settings);
-            if backend != *last_backend.borrow() {
-                *last_backend.borrow_mut() = backend;
+            let render_inputs = (backend, settings.tun.enabled);
+            if render_inputs != *last_render_inputs.borrow() {
+                *last_render_inputs.borrow_mut() = render_inputs;
                 render_dns_servers(&ctx);
                 render_primary_dns_servers(&ctx);
             }
@@ -707,6 +711,56 @@ pub(crate) fn detour_note(backend: BackendType) -> Option<&'static str> {
         }
         BackendType::V2ray => None,
     }
+}
+
+const PRIVATE_DNS_WARNING: &str = "This server uses a private IP address, so DNS queries would resolve against the proxy server's network, where it is unreachable or points at the wrong host. Switch the Detour to direct, or use a public address.";
+
+fn private_dns_warning_text(
+    server: &DnsServerConfig,
+    backend: BackendType,
+    tun_enabled: bool,
+) -> Option<&'static str> {
+    server
+        .resolves_via_proxy_private(backend, tun_enabled)
+        .then_some(PRIVATE_DNS_WARNING)
+}
+
+fn server_row_subtitle(
+    server: &DnsServerConfig,
+    backend: BackendType,
+    tun_enabled: bool,
+) -> String {
+    let mut subtitle = format!(
+        "{}://{}:{}",
+        format!("{:?}", server.protocol).to_lowercase(),
+        server.address,
+        server
+            .port
+            .unwrap_or_else(|| server.protocol.default_port())
+    );
+
+    if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
+        subtitle.push_str(&format!(
+            "\nDowngraded to {} on {}",
+            protocol_display_name(fallback),
+            backend_display_name(backend)
+        ));
+    }
+
+    if let Some(warning) = private_dns_warning_text(server, backend, tun_enabled) {
+        subtitle.push('\n');
+        subtitle.push_str(warning);
+    }
+
+    subtitle
+}
+
+fn primary_dns_subtitle(
+    server: &DnsServerConfig,
+    backend: BackendType,
+    tun_enabled: bool,
+) -> String {
+    server_row_subtitle(server, backend, tun_enabled)
 }
 
 fn validate_dns_settings_for_backend(settings: &AppSettings) -> Result<(), String> {
@@ -925,27 +979,11 @@ fn render_dns_servers(ctx: &DnsRenderCtx) {
 
     let servers = ctx.state.borrow().dns.servers.clone();
     let backend = ctx.state.borrow().backend.backend_type;
+    let tun_enabled = ctx.state.borrow().tun.enabled;
 
     let mut added = ctx.added_servers.borrow_mut();
     for server in &servers {
-        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-
-        let mut subtitle = format!(
-            "{}://{}:{}",
-            protocol_str,
-            server.address,
-            server
-                .port
-                .unwrap_or_else(|| server.protocol.default_port())
-        );
-
-        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
-            subtitle.push_str(&format!(
-                "\nDowngraded to {} on {}",
-                protocol_display_name(fallback),
-                backend_display_name(backend)
-            ));
-        }
+        let subtitle = server_row_subtitle(server, backend, tun_enabled);
 
         let row = adw::ActionRow::builder()
             .title(&server.tag)
@@ -1059,28 +1097,14 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
 fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
     let servers = ctx.state.borrow().dns.servers.clone();
     let backend = ctx.state.borrow().backend.backend_type;
+    let tun_enabled = ctx.state.borrow().tun.enabled;
 
     let remote_server = servers.iter().find(|s| s.tag == "remote");
     let domestic_server = servers.iter().find(|s| s.tag == "domestic");
 
     if let Some(server) = remote_server {
-        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let mut subtitle = format!(
-            "{}://{}:{}",
-            protocol_str,
-            server.address,
-            server
-                .port
-                .unwrap_or_else(|| server.protocol.default_port())
-        );
-        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
-            subtitle.push_str(&format!(
-                "\nDowngraded to {} on {}",
-                protocol_display_name(fallback),
-                backend_display_name(backend)
-            ));
-        }
-        ctx.remote_row.set_subtitle(&subtitle);
+        ctx.remote_row
+            .set_subtitle(&primary_dns_subtitle(server, backend, tun_enabled));
         ctx.remote_edit_btn.set_sensitive(true);
     } else {
         ctx.remote_row
@@ -1089,23 +1113,8 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
     }
 
     if let Some(server) = domestic_server {
-        let protocol_str = format!("{:?}", server.protocol).to_lowercase();
-        let mut subtitle = format!(
-            "{}://{}:{}",
-            protocol_str,
-            server.address,
-            server
-                .port
-                .unwrap_or_else(|| server.protocol.default_port())
-        );
-        if let Some(fallback) = server.protocol.fallback_protocol_for_backend(backend) {
-            subtitle.push_str(&format!(
-                "\nDowngraded to {} on {}",
-                protocol_display_name(fallback),
-                backend_display_name(backend)
-            ));
-        }
-        ctx.domestic_row.set_subtitle(&subtitle);
+        ctx.domestic_row
+            .set_subtitle(&primary_dns_subtitle(server, backend, tun_enabled));
         ctx.domestic_edit_btn.set_sensitive(true);
     } else {
         ctx.domestic_row
@@ -1295,9 +1304,18 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         .visible(false)
         .build();
 
+    let private_warning_label = gtk::Label::builder()
+        .label("")
+        .wrap(true)
+        .xalign(0.0)
+        .halign(gtk::Align::Start)
+        .visible(false)
+        .build();
+
     content.append(&group);
     content.append(&error_label);
     content.append(&warning_label);
+    content.append(&private_warning_label);
     dialog.set_extra_child(Some(&content));
 
     let update_warning: Rc<dyn Fn()> = Rc::new({
@@ -1322,6 +1340,46 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
     {
         let update_warning = update_warning.clone();
         protocol_combo.connect_selected_notify(move |_| update_warning());
+    }
+
+    let tun_enabled = ctx.state.borrow().tun.enabled;
+    let update_private_warning: Rc<dyn Fn()> = Rc::new({
+        let private_warning_label = private_warning_label.clone();
+        let protocol_combo = protocol_combo.clone();
+        let address_entry = address_entry.clone();
+        let detour_combo = detour_combo.clone();
+        move || {
+            let server = DnsServerConfig {
+                tag: String::new(),
+                protocol: index_to_protocol(protocol_combo.selected()),
+                address: address_entry.text().to_string(),
+                port: None,
+                detour: Some(["proxy", "direct"][detour_combo.selected() as usize].to_string()),
+            };
+            match private_dns_warning_text(&server, backend, tun_enabled) {
+                Some(warning) => {
+                    private_warning_label.set_text(warning);
+                    private_warning_label.set_visible(true);
+                }
+                None => {
+                    private_warning_label.set_text("");
+                    private_warning_label.set_visible(false);
+                }
+            }
+        }
+    });
+    update_private_warning();
+    {
+        let update_private_warning = update_private_warning.clone();
+        address_entry.connect_changed(move |_| update_private_warning());
+    }
+    {
+        let update_private_warning = update_private_warning.clone();
+        protocol_combo.connect_selected_notify(move |_| update_private_warning());
+    }
+    {
+        let update_private_warning = update_private_warning.clone();
+        detour_combo.connect_selected_notify(move |_| update_private_warning());
     }
 
     let validate: Rc<dyn Fn() -> Result<DnsServerConfig, String>> = Rc::new({
@@ -1882,5 +1940,80 @@ mod tests {
             None,
             "v2ray has neither mechanism, so the row is hidden with no subtitle"
         );
+    }
+
+    fn flagged_server(address: &str, detour: Option<&str>) -> DnsServerConfig {
+        DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: address.into(),
+            port: Some(53),
+            detour: detour.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn test_private_dns_warning_text() {
+        let warning =
+            private_dns_warning_text(&flagged_server("127.0.0.1", Some("proxy")), BackendType::SingBox, true)
+                .expect("private IP on the proxy detour is flagged");
+        assert!(warning.contains("proxy server's network"), "{warning}");
+        assert!(warning.contains("direct"), "{warning}");
+
+        for unflagged in [
+            flagged_server("127.0.0.1", Some("direct")),
+            flagged_server("1.1.1.1", Some("proxy")),
+            flagged_server("dns.google", Some("proxy")),
+        ] {
+            assert_eq!(
+                private_dns_warning_text(&unflagged, BackendType::SingBox, true),
+                None,
+                "{:?}",
+                unflagged
+            );
+        }
+        assert_eq!(
+            private_dns_warning_text(&flagged_server("127.0.0.1", Some("proxy")), BackendType::V2ray, true),
+            None,
+            "v2ray is never flagged"
+        );
+    }
+
+    #[test]
+    fn test_flagged_private_server_still_validates() {
+        let mut settings = AppSettings::default();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![flagged_server("192.168.1.1", Some("proxy"))];
+
+        assert!(
+            validate_dns_settings_for_backend(&settings).is_ok(),
+            "a flagged private server is a warning, not a validation error"
+        );
+    }
+
+    #[test]
+    fn test_server_row_subtitle_appends_private_warning() {
+        let flagged = flagged_server("127.0.0.1", Some("proxy"));
+        let subtitle = server_row_subtitle(&flagged, BackendType::SingBox, true);
+        assert!(subtitle.starts_with("udp://127.0.0.1:53"), "{subtitle}");
+        assert!(subtitle.contains(PRIVATE_DNS_WARNING), "{subtitle}");
+
+        let direct = flagged_server("127.0.0.1", Some("direct"));
+        let subtitle = server_row_subtitle(&direct, BackendType::SingBox, true);
+        assert!(subtitle.starts_with("udp://127.0.0.1:53"), "{subtitle}");
+        assert!(!subtitle.contains(PRIVATE_DNS_WARNING), "{subtitle}");
+    }
+
+    #[test]
+    fn test_primary_row_subtitle_appends_private_warning() {
+        let flagged = flagged_server("10.0.0.1", Some("proxy"));
+        let subtitle = primary_dns_subtitle(&flagged, BackendType::SingBox, true);
+        assert!(subtitle.starts_with("udp://10.0.0.1:53"), "{subtitle}");
+        assert!(subtitle.contains(PRIVATE_DNS_WARNING), "{subtitle}");
+
+        let direct = flagged_server("10.0.0.1", Some("direct"));
+        let subtitle = primary_dns_subtitle(&direct, BackendType::SingBox, true);
+        assert!(!subtitle.contains(PRIVATE_DNS_WARNING), "{subtitle}");
     }
 }
