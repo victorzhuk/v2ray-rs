@@ -8,8 +8,8 @@ use std::rc::Rc;
 use std::str::FromStr;
 
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
-    HostOverride, builtin_dns_presets, AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
+    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, builtin_dns_presets,
 };
 
 use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
@@ -1131,8 +1131,10 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
             .set_subtitle(&primary_dns_subtitle(server, backend, tun_enabled));
         ctx.remote_edit_btn.set_sensitive(true);
     } else {
-        ctx.remote_row
-            .set_subtitle(primary_row_missing_note(AUTO_SPLIT_REMOTE_TAG, use_custom_rules));
+        ctx.remote_row.set_subtitle(primary_row_missing_note(
+            AUTO_SPLIT_REMOTE_TAG,
+            use_custom_rules,
+        ));
         ctx.remote_edit_btn.set_sensitive(false);
     }
 
