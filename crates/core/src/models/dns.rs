@@ -198,11 +198,11 @@ pub struct DnsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct DnsConfigWire {
+    #[serde(default)]
     enabled: bool,
     #[serde(default)]
     strategy: DnsStrategy,
-    #[serde(default)]
-    servers: Vec<DnsServerConfig>,
+    servers: Option<Vec<DnsServerConfig>>,
     remote: Option<LegacyDnsServer>,
     domestic: Option<LegacyDnsServer>,
     #[serde(default)]
@@ -234,15 +234,18 @@ enum LegacyDnsProtocol {
 
 impl From<DnsConfigWire> for DnsConfig {
     fn from(wire: DnsConfigWire) -> Self {
-        let servers = if !wire.servers.is_empty() {
-            wire.servers
-        } else if let (Some(remote), Some(domestic)) = (wire.remote, wire.domestic) {
-            vec![
-                migrate_legacy_server("remote", remote),
-                migrate_legacy_server("domestic", domestic),
-            ]
-        } else {
-            DnsConfig::default().servers
+        let servers = match wire.servers {
+            Some(servers) => servers,
+            None => {
+                if let (Some(remote), Some(domestic)) = (wire.remote, wire.domestic) {
+                    vec![
+                        migrate_legacy_server("remote", remote),
+                        migrate_legacy_server("domestic", domestic),
+                    ]
+                } else {
+                    DnsConfig::default().servers
+                }
+            }
         };
 
         Self {
@@ -702,6 +705,45 @@ domestic = { protocol = "plain", address = "223.5.5.5" }
         assert_eq!(cfg.servers[1].tag, "domestic");
         assert_eq!(cfg.servers[1].protocol, DnsProtocol::Udp);
         assert_eq!(cfg.servers[1].address, "223.5.5.5");
+    }
+
+    #[test]
+    fn test_dns_config_missing_enabled_defaults_false() {
+        let toml_str = r#"
+[[servers]]
+tag = "cloudflare"
+protocol = "doh"
+address = "1.1.1.1"
+"#;
+
+        let cfg: DnsConfig = toml::from_str(toml_str).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.servers.len(), 1);
+    }
+
+    #[test]
+    fn test_dns_config_empty_servers_list_roundtrip() {
+        let cfg = DnsConfig {
+            enabled: true,
+            servers: Vec::new(),
+            ..DnsConfig::default()
+        };
+
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let back: DnsConfig = toml::from_str(&toml_str).unwrap();
+        assert!(back.enabled);
+        assert_eq!(back.servers.len(), 0);
+    }
+
+    #[test]
+    fn test_dns_config_missing_servers_without_legacy_gets_defaults() {
+        let toml_str = r#"
+enabled = false
+"#;
+
+        let cfg: DnsConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.servers, DnsConfig::default().servers);
+        assert_eq!(cfg.servers.len(), 2);
     }
 
     #[test]
