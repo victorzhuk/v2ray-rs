@@ -851,6 +851,19 @@ fn dns_server_entry(
     entry
 }
 
+fn warn_flagged_private(server: &DnsServerConfig, backend: V2rayFamilyBackend, tun_xray: bool) {
+    let backend = match backend {
+        V2rayFamilyBackend::V2ray => BackendType::V2ray,
+        V2rayFamilyBackend::Xray => BackendType::Xray,
+    };
+    if server.resolves_via_proxy_private(backend, tun_xray) {
+        log::warn!(
+            "DNS server {} ({}) is a private address but resolves through the proxy; the remote end cannot reach it",
+            server.tag, server.address
+        );
+    }
+}
+
 fn build_user_dns_servers(
     rules: &[RoutingRule],
     settings: &AppSettings,
@@ -861,6 +874,7 @@ fn build_user_dns_servers(
 
     if settings.dns.use_custom_rules {
         for server in &settings.dns.servers {
+            warn_flagged_private(server, backend, tun_xray);
             let domains: Vec<String> = settings
                 .dns
                 .rules
@@ -912,6 +926,7 @@ fn build_user_dns_servers(
         }
 
         for server in &settings.dns.servers {
+            warn_flagged_private(server, backend, tun_xray);
             let domains = match server.tag.as_str() {
                 "remote" if !remote_domains.is_empty() => Some(remote_domains.clone()),
                 "domestic" if !domestic_domains.is_empty() => Some(domestic_domains.clone()),
@@ -3038,5 +3053,49 @@ mod tests {
             generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::V2ray);
 
         assert!(config.get("dns").is_none());
+    }
+
+    #[test]
+    fn test_xray_generation_flags_private_proxy_detoured_server() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.tun.enabled = true;
+        let server = |detour: Option<&str>| DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "127.0.0.1".to_string(),
+            port: None,
+            detour: detour.map(str::to_string),
+        };
+
+        assert!(server(Some("proxy")).resolves_via_proxy_private(BackendType::Xray, true));
+        assert!(server(None).resolves_via_proxy_private(BackendType::Xray, true));
+
+        settings.dns.servers = vec![server(Some("proxy"))];
+        let config =
+            generate_v2ray_family_config(&[vless_node()], &[], &settings, V2rayFamilyBackend::Xray);
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert!(
+            servers
+                .iter()
+                .any(|s| s == "127.0.0.1" || s["address"] == "127.0.0.1"),
+            "flagged server must survive generation: {servers:?}"
+        );
+    }
+
+    #[test]
+    fn test_v2ray_family_never_flags_private_server() {
+        let server = |detour: Option<&str>| DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "127.0.0.1".to_string(),
+            port: None,
+            detour: detour.map(str::to_string),
+        };
+
+        assert!(!server(Some("proxy")).resolves_via_proxy_private(BackendType::V2ray, false));
+        assert!(!server(Some("proxy")).resolves_via_proxy_private(BackendType::V2ray, true));
+        assert!(!server(Some("direct")).resolves_via_proxy_private(BackendType::Xray, true));
     }
 }

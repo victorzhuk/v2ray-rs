@@ -464,6 +464,13 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             server["detour"] = json!(first_proxy_tag);
         }
 
+        if server_cfg.resolves_via_proxy_private(BackendType::SingBox, settings.tun.enabled) {
+            log::warn!(
+                "DNS server {} ({}) is a private address but resolves through the proxy; the remote end cannot reach it",
+                server_cfg.tag, server_cfg.address
+            );
+        }
+
         // sing-box rejects a DNS server addressed by hostname at startup
         // ("missing domain resolver for domain server address") unless that
         // server carries its own `domain_resolver` dial field - the route-level
@@ -2397,5 +2404,31 @@ mod tests {
             assert!(rule.get("process_name").is_none());
             assert!(rule.get("domain_suffix").is_none());
         }
+    }
+
+    #[test]
+    fn test_singbox_generation_flags_private_proxy_detoured_server() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "127.0.0.1".to_string(),
+            port: None,
+            detour: Some("proxy".to_string()),
+        }];
+
+        let node = ss_node();
+        let first_proxy_tag = crate::config::common::outbound_tag(&node, 0);
+        assert!(settings.dns.servers[0].resolves_via_proxy_private(BackendType::SingBox, false));
+
+        let config = SingboxGenerator.generate(&[node], &[], &settings).unwrap();
+        let server = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == "domestic")
+            .expect("flagged server must survive generation");
+        assert_eq!(server["detour"], first_proxy_tag);
     }
 }
