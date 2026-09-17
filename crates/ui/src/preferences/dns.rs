@@ -726,9 +726,9 @@ pub(crate) fn detour_note(backend: BackendType) -> Option<&'static str> {
     }
 }
 
-const PRIVATE_DNS_WARNING: &str = "This server uses a private IP address, so DNS queries would resolve against the proxy server's network, where it is unreachable or points at the wrong host. Switch the Detour to direct, or use a public address.";
+const PRIVATE_DNS_WARNING: &str = "Queries to this private address go through the proxy and reach the proxy server's network, not yours. Set Detour to 'direct' if this resolver is on your network.";
 
-fn private_dns_warning_text(
+fn private_dns_warning(
     server: &DnsServerConfig,
     backend: BackendType,
     tun_enabled: bool,
@@ -760,7 +760,7 @@ fn server_row_subtitle(
         ));
     }
 
-    if let Some(warning) = private_dns_warning_text(server, backend, tun_enabled) {
+    if let Some(warning) = private_dns_warning(server, backend, tun_enabled) {
         subtitle.push('\n');
         subtitle.push_str(warning);
     }
@@ -1355,13 +1355,17 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
         protocol_combo.connect_selected_notify(move |_| update_warning());
     }
 
-    let tun_enabled = ctx.state.borrow().tun.enabled;
     let update_private_warning: Rc<dyn Fn()> = Rc::new({
+        let state = ctx.state.clone();
         let private_warning_label = private_warning_label.clone();
         let protocol_combo = protocol_combo.clone();
         let address_entry = address_entry.clone();
         let detour_combo = detour_combo.clone();
         move || {
+            let (backend, tun_enabled) = {
+                let state = state.borrow();
+                (state.backend.backend_type, state.tun.enabled)
+            };
             let server = DnsServerConfig {
                 tag: String::new(),
                 protocol: index_to_protocol(protocol_combo.selected()),
@@ -1369,7 +1373,7 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
                 port: None,
                 detour: Some(["proxy", "direct"][detour_combo.selected() as usize].to_string()),
             };
-            match private_dns_warning_text(&server, backend, tun_enabled) {
+            match private_dns_warning(&server, backend, tun_enabled) {
                 Some(warning) => {
                     private_warning_label.set_text(warning);
                     private_warning_label.set_visible(true);
@@ -1983,13 +1987,14 @@ mod tests {
     }
 
     #[test]
-    fn test_private_dns_warning_text() {
-        let warning = private_dns_warning_text(
+    fn test_private_dns_warning() {
+        let warning = private_dns_warning(
             &flagged_server("127.0.0.1", Some("proxy")),
             BackendType::SingBox,
             true,
         )
         .expect("private IP on the proxy detour is flagged");
+        assert_eq!(warning, PRIVATE_DNS_WARNING);
         assert!(warning.contains("proxy server's network"), "{warning}");
         assert!(warning.contains("direct"), "{warning}");
 
@@ -1999,14 +2004,14 @@ mod tests {
             flagged_server("dns.google", Some("proxy")),
         ] {
             assert_eq!(
-                private_dns_warning_text(&unflagged, BackendType::SingBox, true),
+                private_dns_warning(&unflagged, BackendType::SingBox, true),
                 None,
                 "{:?}",
                 unflagged
             );
         }
         assert_eq!(
-            private_dns_warning_text(
+            private_dns_warning(
                 &flagged_server("127.0.0.1", Some("proxy")),
                 BackendType::V2ray,
                 true
