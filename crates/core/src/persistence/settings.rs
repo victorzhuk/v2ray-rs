@@ -163,6 +163,46 @@ mod tests {
     }
 
     #[test]
+    fn test_load_settings_partial_dns_preserves_other_sections() {
+        let (_tmp, paths) = super::super::test_paths();
+        paths.ensure_dirs().unwrap();
+        fs::write(
+            paths.settings_path(),
+            r#"
+version = 1
+socks_port = 9999
+http_port = 1081
+auto_update_subscriptions = true
+subscription_update_interval_secs = 86400
+auto_update_geodata = true
+geodata_update_interval_secs = 604800
+language = "russian"
+minimize_to_tray = true
+notifications_enabled = true
+onboarding_complete = false
+
+[backend]
+backend_type = "xray"
+
+[dns]
+
+[[dns.servers]]
+tag = "cloudflare"
+protocol = "doh"
+address = "1.1.1.1"
+"#,
+        )
+        .unwrap();
+
+        let loaded = load_settings(&paths).unwrap();
+        assert_eq!(loaded.socks_port, 9999);
+        assert_eq!(loaded.language, Language::Russian);
+        assert_eq!(loaded.backend.backend_type, BackendType::Xray);
+        assert!(!loaded.dns.enabled);
+        assert_eq!(loaded.dns.servers.len(), 1);
+    }
+
+    #[test]
     fn test_corrupt_config_falls_back() {
         let (_tmp, paths) = super::super::test_paths();
         paths.ensure_dirs().unwrap();
