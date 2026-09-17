@@ -113,6 +113,10 @@ pub(super) fn build_tun_page(
     // advanced rows: xray gets a udp/53 routing rule plus a `dns` outbound.
     let hijack_row = adw::ComboRow::builder()
         .title("DNS hijack")
+        .subtitle(
+            "Hijack routes captured DNS to the backend resolver; native and disabled \
+             currently behave the same",
+        )
         .model(&gtk::StringList::new(&["hijack", "native", "disabled"]))
         .selected(hijack_to_index(state.borrow().tun.dns_hijack))
         .build();
