@@ -20,6 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `native` and `disabled` DNS hijack modes both leave DNS uncaptured.
 
 ### Changed
+- A DNS server whose protocol is downgraded for the selected backend (DoT,
+  DoQ, or H3 on v2ray; H3 on xray) is emitted with the DoH default port
+  instead of the port set for its original protocol.
 - Excluded routes with prefix length 0 (such as `0.0.0.0/0`), or more than 256
   of them, are refused. A list over 256 entries must be trimmed in
   `settings.toml`.
@@ -30,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `utc_offset=±HH:MM`.
 
 ### Fixed
+- A `settings.toml` whose `[dns]` table omits `enabled`, or whose `servers`
+  list is empty, now loads instead of discarding every setting in the file;
+  defaults apply only to keys that are absent.
 - On xray TUN, excluded routes now bypass the TUN device, including DNS
   capture on port 53.
 - Terminal color escapes are no longer written to `backend.log` or shown on
