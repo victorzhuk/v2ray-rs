@@ -80,21 +80,31 @@ fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
         rules.push(hosts_rule(settings));
     }
 
-    servers.push(json!({
+    let mut doh = json!({
         "tag": DERIVED_DNS_TAG,
         "type": "https",
         "server": "1.1.1.1",
         "server_port": 443,
         "path": "/dns-query",
         "detour": first_proxy_tag,
-    }));
+    });
+    if let Some(subnet) = &settings.dns.client_subnet {
+        doh["client_subnet"] = json!(subnet);
+    }
+    servers.push(doh);
 
-    json!({
+    let mut dns_config = json!({
         "strategy": strategy_str(settings.dns.strategy),
         "servers": servers,
         "rules": rules,
         "final": DERIVED_DNS_TAG,
-    })
+    });
+
+    if settings.dns.disable_cache {
+        dns_config["disable_cache"] = json!(true);
+    }
+
+    dns_config
 }
 
 fn hosts_server(settings: &AppSettings) -> Option<Value> {
@@ -2003,6 +2013,60 @@ mod tests {
             if server["type"] != "hosts" && server["type"] != "fakeip" {
                 assert_eq!(server["client_subnet"], "203.0.113.1");
             }
+        }
+    }
+
+    #[test]
+    fn test_derived_tun_dns_carries_disable_cache() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+        settings.dns.disable_cache = true;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        assert_eq!(config["dns"]["disable_cache"], true);
+    }
+
+    #[test]
+    fn test_derived_tun_dns_carries_client_subnet() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+        settings.dns.client_subnet = Some("203.0.113.1".to_string());
+        settings.dns.hosts = vec![HostOverride {
+            domain: "example.com".to_string(),
+            ip: "93.184.216.34".to_string(),
+        }];
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert_eq!(servers.len(), 2);
+        for server in servers {
+            if server["type"] == "hosts" {
+                assert!(server.get("client_subnet").is_none());
+            } else {
+                assert_eq!(server["client_subnet"], "203.0.113.1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_derived_tun_dns_without_cache_settings_emits_neither_key() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = false;
+
+        let generator = SingboxGenerator;
+        let config = generator.generate(&[ss_node()], &[], &settings).unwrap();
+
+        assert!(config["dns"].get("disable_cache").is_none());
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        for server in servers {
+            assert!(server.get("client_subnet").is_none());
         }
     }
 
