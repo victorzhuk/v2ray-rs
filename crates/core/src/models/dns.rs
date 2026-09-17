@@ -102,9 +102,6 @@ impl DnsServerConfig {
     /// the v2ray backend are never flagged; xray without TUN has no direct
     /// route, so every private literal is flagged regardless of detour.
     pub fn resolves_via_proxy_private(&self, backend: BackendType, tun_enabled: bool) -> bool {
-        if backend == BackendType::V2ray {
-            return false;
-        }
         let private = self.private_dns_ip();
         if !private {
             return false;
@@ -121,14 +118,7 @@ impl DnsServerConfig {
             return false;
         };
         match ip {
-            IpAddr::V4(v4) => {
-                let o = v4.octets();
-                o[0] == 127
-                    || o[0] == 10
-                    || (o[0] == 172 && (o[1] & 0xf0) == 16)
-                    || (o[0] == 192 && o[1] == 168)
-                    || (o[0] == 169 && o[1] == 254)
-            }
+            IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
             IpAddr::V6(v6) => {
                 if let Some(v4) = v6.to_ipv4_mapped() {
                     return v4.is_private() || v4.is_loopback() || v4.is_link_local();
