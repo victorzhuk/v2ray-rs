@@ -146,8 +146,9 @@ one.
 
 `PidFile` writes an ownership record (binary path + config path) and
 `check_and_kill_orphaned()` kills stale processes from a previous run using
-`kill(pid, 0)` as a liveness probe. `ProbeRunner` generates a minimal backend
-config and runs it briefly to verify the binary works before a real connect.
+`kill(pid, 0)` as a liveness probe. `ProbeRunner` runs a temporary backend
+instance for Real Delay measurement; `measure_real_delay` in `real_delay.rs`
+is its only user.
 
 ### `netctl` (`v2ray-rs-netctl`)
 
