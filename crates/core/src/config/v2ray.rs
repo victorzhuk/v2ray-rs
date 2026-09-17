@@ -997,7 +997,7 @@ fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamily
         );
     }
 
-    effective_protocol.server_address(&server.address, server.port)
+    effective_protocol.server_address(&server.address, if effective_protocol != server.protocol { None } else { server.port })
 }
 
 #[cfg(test)]
@@ -2093,6 +2093,53 @@ mod tests {
             let servers = dns["servers"].as_array().unwrap();
             assert_eq!(servers[0].as_str(), Some(expected_address));
         }
+    }
+
+    #[test]
+    fn test_dns_downgraded_server_uses_doh_default_port() {
+        let server = |protocol: DnsProtocol, port: Option<u16>| DnsServerConfig {
+            tag: "test".to_string(),
+            protocol,
+            address: "dns.google".to_string(),
+            port,
+            detour: None,
+        };
+
+        assert_eq!(
+            dns_server_address_for_backend(&server(DnsProtocol::Dot, Some(853)), V2rayFamilyBackend::V2ray),
+            "https://dns.google/dns-query"
+        );
+        assert_eq!(
+            dns_server_address_for_backend(&server(DnsProtocol::H3, Some(8443)), V2rayFamilyBackend::Xray),
+            "https://dns.google/dns-query"
+        );
+    }
+
+    #[test]
+    fn test_dns_native_doh_keeps_explicit_port() {
+        let server = DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "doh.example.com".to_string(),
+            port: Some(8443),
+            detour: None,
+        };
+
+        assert_eq!(
+            dns_server_address_for_backend(&server, V2rayFamilyBackend::V2ray),
+            "https://doh.example.com:8443/dns-query"
+        );
+        let dot_native = DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Dot,
+            address: "dns.google".to_string(),
+            port: Some(8530),
+            detour: None,
+        };
+        assert_eq!(
+            dns_server_address_for_backend(&dot_native, V2rayFamilyBackend::Xray),
+            "tls://dns.google:8530"
+        );
     }
 
     #[test]
