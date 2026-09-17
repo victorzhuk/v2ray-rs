@@ -1,6 +1,7 @@
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 use super::settings::BackendType;
 
@@ -93,6 +94,44 @@ impl DnsServerConfig {
     /// TUN is the proxy — including the "proxy" value the server dialog stores.
     pub fn detours_direct(&self) -> bool {
         self.detour.as_deref() == Some("direct")
+    }
+
+    /// A loopback/private/link-local/unique-local IP literal routed through the
+    /// proxy chain would resolve against the remote network, where it is
+    /// unreachable or points at the wrong host. Hostname-addressed servers and
+    /// the v2ray backend are never flagged; xray without TUN has no direct
+    /// route, so every private literal is flagged regardless of detour.
+    pub fn resolves_via_proxy_private(&self, backend: BackendType, tun_enabled: bool) -> bool {
+        if backend == BackendType::V2ray {
+            return false;
+        }
+        let private = self.private_dns_ip();
+        if !private {
+            return false;
+        }
+        match backend {
+            BackendType::V2ray => false,
+            BackendType::SingBox => self.detour.as_deref().is_some_and(|d| d != "direct"),
+            BackendType::Xray => !(tun_enabled && self.detours_direct()),
+        }
+    }
+
+    fn private_dns_ip(&self) -> bool {
+        let Ok(ip) = self.address.trim().parse::<IpAddr>() else {
+            return false;
+        };
+        match ip {
+            IpAddr::V4(v4) => {
+                let o = v4.octets();
+                o[0] == 127 || o[0] == 10 || (o[0] == 172 && (o[1] & 0xf0) == 16) || (o[0] == 192 && o[1] == 168) || (o[0] == 169 && o[1] == 254)
+            }
+            IpAddr::V6(v6) => {
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return v4.is_private() || v4.is_loopback() || v4.is_link_local();
+                }
+                v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_unicast_link_local()
+            }
+        }
     }
 }
 
@@ -468,6 +507,75 @@ pub enum DnsValidationError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn server(address: &str, detour: Option<&str>) -> DnsServerConfig {
+        DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: address.to_string(),
+            port: None,
+            detour: detour.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_resolves_via_proxy_private_matrix() {
+        let flagged = [
+            "127.0.0.1", "::1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.1.1", "fe80::1",
+            "fd00::1",
+        ];
+        let not_flagged = ["1.1.1.1", "dns.google"];
+        let detours: [Option<&str>; 3] = [Some("proxy"), Some("direct"), None];
+
+        for address in flagged {
+            for detour in detours {
+                let s = server(address, detour);
+                // sing-box: only an explicit "direct" detour clears the flag.
+                assert_eq!(
+                    s.resolves_via_proxy_private(BackendType::SingBox, true),
+                    detour.is_some_and(|d| d != "direct"),
+                    "{address} {detour:?}"
+                );
+                // xray with TUN: direct is routed directly, everything else flagged.
+                assert_eq!(
+                    s.resolves_via_proxy_private(BackendType::Xray, true),
+                    detour != Some("direct"),
+                    "{address} {detour:?}"
+                );
+                // xray without TUN: no directly routed option exists.
+                assert!(s.resolves_via_proxy_private(BackendType::Xray, false), "{address} {detour:?} xray tun off");
+                // v2ray is never flagged.
+                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, true), "{address} v2ray");
+                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, false), "{address} v2ray");
+            }
+        }
+
+        for address in not_flagged {
+            for detour in detours {
+                let s = server(address, detour);
+                assert!(!s.resolves_via_proxy_private(BackendType::SingBox, true), "{address} {detour:?}");
+                assert!(!s.resolves_via_proxy_private(BackendType::Xray, true), "{address} {detour:?}");
+                assert!(!s.resolves_via_proxy_private(BackendType::Xray, false), "{address} {detour:?}");
+                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, true), "{address}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_resolves_via_proxy_private_address_edges() {
+        // IPv4-mapped IPv6 normalized and classified by the v4 ranges.
+        assert!(server("::ffff:127.0.0.1", Some("proxy"))
+            .resolves_via_proxy_private(BackendType::SingBox, true));
+        // Unspecified address matches none of the listed ranges.
+        assert!(!server("0.0.0.0", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        // Zone ids make it a non-literal for parsing purposes.
+        assert!(!server("fe80::1%eth0", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        // Surrounding whitespace is trimmed before parsing.
+        assert!(server(" 10.0.0.1 ", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        // Unparseable addresses never panic and are never flagged.
+        assert!(!server("999.1.1.1", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(!server("", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+    }
 
     #[test]
     fn test_dns_protocol_udp_default_port() {
