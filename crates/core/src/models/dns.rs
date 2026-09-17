@@ -123,13 +123,19 @@ impl DnsServerConfig {
         match ip {
             IpAddr::V4(v4) => {
                 let o = v4.octets();
-                o[0] == 127 || o[0] == 10 || (o[0] == 172 && (o[1] & 0xf0) == 16) || (o[0] == 192 && o[1] == 168) || (o[0] == 169 && o[1] == 254)
+                o[0] == 127
+                    || o[0] == 10
+                    || (o[0] == 172 && (o[1] & 0xf0) == 16)
+                    || (o[0] == 192 && o[1] == 168)
+                    || (o[0] == 169 && o[1] == 254)
             }
             IpAddr::V6(v6) => {
                 if let Some(v4) = v6.to_ipv4_mapped() {
                     return v4.is_private() || v4.is_loopback() || v4.is_link_local();
                 }
-                v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00 || v6.is_unicast_link_local()
+                v6.is_loopback()
+                    || (v6.segments()[0] & 0xfe00) == 0xfc00
+                    || v6.is_unicast_link_local()
             }
         }
     }
@@ -521,7 +527,13 @@ mod tests {
     #[test]
     fn test_resolves_via_proxy_private_matrix() {
         let flagged = [
-            "127.0.0.1", "::1", "10.1.2.3", "172.20.0.1", "192.168.1.1", "169.254.1.1", "fe80::1",
+            "127.0.0.1",
+            "::1",
+            "10.1.2.3",
+            "172.20.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "fe80::1",
             "fd00::1",
         ];
         let not_flagged = ["1.1.1.1", "dns.google"];
@@ -543,20 +555,41 @@ mod tests {
                     "{address} {detour:?}"
                 );
                 // xray without TUN: no directly routed option exists.
-                assert!(s.resolves_via_proxy_private(BackendType::Xray, false), "{address} {detour:?} xray tun off");
+                assert!(
+                    s.resolves_via_proxy_private(BackendType::Xray, false),
+                    "{address} {detour:?} xray tun off"
+                );
                 // v2ray is never flagged.
-                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, true), "{address} v2ray");
-                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, false), "{address} v2ray");
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::V2ray, true),
+                    "{address} v2ray"
+                );
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::V2ray, false),
+                    "{address} v2ray"
+                );
             }
         }
 
         for address in not_flagged {
             for detour in detours {
                 let s = server(address, detour);
-                assert!(!s.resolves_via_proxy_private(BackendType::SingBox, true), "{address} {detour:?}");
-                assert!(!s.resolves_via_proxy_private(BackendType::Xray, true), "{address} {detour:?}");
-                assert!(!s.resolves_via_proxy_private(BackendType::Xray, false), "{address} {detour:?}");
-                assert!(!s.resolves_via_proxy_private(BackendType::V2ray, true), "{address}");
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::SingBox, true),
+                    "{address} {detour:?}"
+                );
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::Xray, true),
+                    "{address} {detour:?}"
+                );
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::Xray, false),
+                    "{address} {detour:?}"
+                );
+                assert!(
+                    !s.resolves_via_proxy_private(BackendType::V2ray, true),
+                    "{address}"
+                );
             }
         }
     }
@@ -564,16 +597,30 @@ mod tests {
     #[test]
     fn test_resolves_via_proxy_private_address_edges() {
         // IPv4-mapped IPv6 normalized and classified by the v4 ranges.
-        assert!(server("::ffff:127.0.0.1", Some("proxy"))
-            .resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(
+            server("::ffff:127.0.0.1", Some("proxy"))
+                .resolves_via_proxy_private(BackendType::SingBox, true)
+        );
         // Unspecified address matches none of the listed ranges.
-        assert!(!server("0.0.0.0", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(
+            !server("0.0.0.0", Some("proxy"))
+                .resolves_via_proxy_private(BackendType::SingBox, true)
+        );
         // Zone ids make it a non-literal for parsing purposes.
-        assert!(!server("fe80::1%eth0", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(
+            !server("fe80::1%eth0", Some("proxy"))
+                .resolves_via_proxy_private(BackendType::SingBox, true)
+        );
         // Surrounding whitespace is trimmed before parsing.
-        assert!(server(" 10.0.0.1 ", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(
+            server(" 10.0.0.1 ", Some("proxy"))
+                .resolves_via_proxy_private(BackendType::SingBox, true)
+        );
         // Unparseable addresses never panic and are never flagged.
-        assert!(!server("999.1.1.1", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
+        assert!(
+            !server("999.1.1.1", Some("proxy"))
+                .resolves_via_proxy_private(BackendType::SingBox, true)
+        );
         assert!(!server("", Some("proxy")).resolves_via_proxy_private(BackendType::SingBox, true));
     }
 

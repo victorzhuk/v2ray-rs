@@ -1984,9 +1984,12 @@ mod tests {
 
     #[test]
     fn test_private_dns_warning_text() {
-        let warning =
-            private_dns_warning_text(&flagged_server("127.0.0.1", Some("proxy")), BackendType::SingBox, true)
-                .expect("private IP on the proxy detour is flagged");
+        let warning = private_dns_warning_text(
+            &flagged_server("127.0.0.1", Some("proxy")),
+            BackendType::SingBox,
+            true,
+        )
+        .expect("private IP on the proxy detour is flagged");
         assert!(warning.contains("proxy server's network"), "{warning}");
         assert!(warning.contains("direct"), "{warning}");
 
@@ -2003,7 +2006,11 @@ mod tests {
             );
         }
         assert_eq!(
-            private_dns_warning_text(&flagged_server("127.0.0.1", Some("proxy")), BackendType::V2ray, true),
+            private_dns_warning_text(
+                &flagged_server("127.0.0.1", Some("proxy")),
+                BackendType::V2ray,
+                true
+            ),
             None,
             "v2ray is never flagged"
         );

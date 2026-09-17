@@ -467,7 +467,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         if server_cfg.resolves_via_proxy_private(BackendType::SingBox, settings.tun.enabled) {
             log::warn!(
                 "DNS server {} ({}) is a private address but resolves through the proxy; the remote end cannot reach it",
-                server_cfg.tag, server_cfg.address
+                server_cfg.tag,
+                server_cfg.address
             );
         }
 

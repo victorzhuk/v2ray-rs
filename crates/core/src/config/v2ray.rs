@@ -859,7 +859,8 @@ fn warn_flagged_private(server: &DnsServerConfig, backend: V2rayFamilyBackend, t
     if server.resolves_via_proxy_private(backend, tun_xray) {
         log::warn!(
             "DNS server {} ({}) is a private address but resolves through the proxy; the remote end cannot reach it",
-            server.tag, server.address
+            server.tag,
+            server.address
         );
     }
 }
