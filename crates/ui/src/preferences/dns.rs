@@ -480,6 +480,10 @@ pub(super) fn build_dns_page(
             move |settings| {
                 let dns_enabled = settings.dns.enabled;
                 strategy_row.set_sensitive(dns_enabled);
+                match strategy_family_note(settings.backend.backend_type) {
+                    Some(note) => strategy_row.set_subtitle(note),
+                    None => strategy_row.set_subtitle(""),
+                }
                 remote_server_row.set_sensitive(dns_enabled);
                 domestic_server_row.set_sensitive(dns_enabled);
                 advanced_expander.set_sensitive(dns_enabled);
@@ -698,6 +702,15 @@ fn backend_display_name(b: BackendType) -> &'static str {
         BackendType::V2ray => "v2ray",
         BackendType::Xray => "xray",
         BackendType::SingBox => "sing-box",
+    }
+}
+
+pub(crate) fn strategy_family_note(backend: BackendType) -> Option<&'static str> {
+    match backend {
+        BackendType::Xray | BackendType::V2ray => Some(
+            "Prefer options query only the preferred address family; sing-box picks the fastest family",
+        ),
+        BackendType::SingBox => None,
     }
 }
 
@@ -1918,6 +1931,23 @@ mod tests {
             assert_eq!(writes.get(), 0, "the handler must not write the value back");
             assert!(!suppress.get(), "the guard must be released");
         });
+    }
+
+    #[test]
+    fn test_strategy_family_note_per_backend() {
+        for backend in [BackendType::Xray, BackendType::V2ray] {
+            let note = strategy_family_note(backend)
+                .unwrap_or_else(|| panic!("{backend:?} must show the strategy note"));
+            assert!(
+                note.contains("preferred address family"),
+                "{backend:?}: {note}"
+            );
+        }
+        assert_eq!(
+            strategy_family_note(BackendType::SingBox),
+            None,
+            "sing-box has native family handling, no note"
+        );
     }
 
     #[test]
