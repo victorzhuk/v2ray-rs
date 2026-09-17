@@ -433,6 +433,55 @@ fn hostname_only_dns_servers_pass_sing_box_check() {
     check("hostname-only-dns-servers", &settings);
 }
 
+/// Auto-derived DNS rules must only name server tags that actually exist in
+/// dns.servers: with no server tagged `domestic`, a Direct GeoSite rule used to
+/// produce a rule pointing at a missing server.
+#[test]
+fn missing_domestic_tag_derived_rules_pass_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns.enabled = true;
+    settings.dns.use_custom_rules = false;
+    settings.dns.servers = vec![
+        DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        },
+        DnsServerConfig {
+            tag: "lan".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "223.5.5.5".to_string(),
+            port: None,
+            detour: None,
+        },
+    ];
+    let rules = vec![RoutingRule {
+        id: uuid::Uuid::new_v4(),
+        match_condition: RuleMatch::GeoSite {
+            category: "category-ru".into(),
+        },
+        action: RuleAction::Direct,
+        enabled: true,
+        group: None,
+        via_node: None,
+    }];
+
+    check_with_rules("missing domestic tag", &settings, &rules, |config| {
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        assert!(
+            !dns_rules.iter().any(|r| r["server"] == "domestic"),
+            "no dns rule may reference the absent 'domestic' tag: {dns_rules:?}"
+        );
+    });
+}
+
 /// v2fly/xray bundle RFC 1918 private ranges as GeoIP "private"; SagerNet's
 /// sing-geoip mirror ships no such .srs, so treating it like any other
 /// country code makes sing-box try to download a file that 404s. Must become
