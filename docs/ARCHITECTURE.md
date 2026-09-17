@@ -334,6 +334,18 @@ the settings-free `direct` outbound makes the daemon refuse to start even
 though `sing-box check` accepts it. That gap between validation and startup is
 why the sing-box tests also start the real binary.
 
+Applicability of the related settings, per backend. `idle_timeout_secs`
+reaches only the v2ray/xray family — emitted as `policy.levels.0.connIdle` —
+and is inert under sing-box, whose streams keep the backend's stock idle
+timeout. The per-server DNS `detour` is honored on xray only as `direct`, and
+only under TUN, where the tag and its routing rule are gated (mechanism 3
+above); sing-box honors proxy detours, rewritten to the first proxy outbound,
+and expresses `direct` by omission as covered just above; v2ray ignores the
+field, since the `dns-direct` tag exists only on xray's TUN path.
+`tun.dns_hijack` distinguishes only `hijack`: `native` and `disabled` produce
+identical configs, because `hijack` alone emits the `dns-out` outbound plus
+the port-53 rule (xray) or the `hijack-dns` route action (sing-box).
+
 `capture_dns` for netctl is derived from the generated config, not from the
 lookup: it is armed only when every hostname node has an override xray can
 answer with, and the `TunRuntime` is built from the same effective settings the
