@@ -14,6 +14,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Known backend deprecation and security warnings, such as xray's REALITY
   `potential MITM or redirection`, raise a toast once per warning per
   connection.
+- Network, TUN, and DNS preference rows note which backends honor a setting:
+  the idle timeout applies to v2ray and xray, the WebSocket ping interval to
+  xray only, the DNS server detour takes effect on xray only while TUN is on,
+  and `native` and `disabled` DNS hijack modes both leave DNS uncaptured.
 
 ### Changed
 - Excluded routes with prefix length 0 (such as `0.0.0.0/0`), or more than 256
