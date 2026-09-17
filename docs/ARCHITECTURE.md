@@ -461,6 +461,19 @@ with the same qualifier, falling back to `<data_dir>/state` and
 Dev mode (`AppProfile::Development`) uses the qualifier `v2ray-rs-dev`,
 keeping its paths fully separate from production.
 
+### File-only settings
+
+Four settings live only in `settings.toml` — the Preferences UI has no widget
+for any of them:
+
+- `tun.address_v6` — optional IPv6 tunnel address for TUN mode.
+- `auto_update_geodata` — enables the background geodata refresh.
+- `geodata_update_interval_secs` — geodata refresh interval in seconds
+  (floored at 60 by the refresh service).
+- `backend.config_output_dir` — writes the generated backend config to this
+  directory instead of `<runtime_dir>/generated/`
+  (`crates/core/src/config/writer.rs`).
+
 ## Logging
 
 The app keeps two size-rotated logs under `<state_dir>/logs`
