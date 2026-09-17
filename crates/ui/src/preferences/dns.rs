@@ -9,7 +9,7 @@ use std::str::FromStr;
 
 use v2ray_rs_core::models::{
     AppSettings, BackendType, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
-    HostOverride, builtin_dns_presets,
+    HostOverride, builtin_dns_presets, AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG,
 };
 
 use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
@@ -1107,10 +1107,21 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
     }
 }
 
+fn primary_row_missing_note(tag: &str, use_custom_rules: bool) -> &'static str {
+    if use_custom_rules {
+        "Not configured - set up in Advanced"
+    } else if tag == AUTO_SPLIT_REMOTE_TAG {
+        "Not configured - routing-derived DNS rules for proxied domains are skipped"
+    } else {
+        "Not configured - routing-derived DNS rules for direct traffic are skipped"
+    }
+}
+
 fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
     let servers = ctx.state.borrow().dns.servers.clone();
     let backend = ctx.state.borrow().backend.backend_type;
     let tun_enabled = ctx.state.borrow().tun.enabled;
+    let use_custom_rules = ctx.state.borrow().dns.use_custom_rules;
 
     let remote_server = servers.iter().find(|s| s.tag == "remote");
     let domestic_server = servers.iter().find(|s| s.tag == "domestic");
@@ -1121,7 +1132,7 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
         ctx.remote_edit_btn.set_sensitive(true);
     } else {
         ctx.remote_row
-            .set_subtitle("Not configured - set up in Advanced");
+            .set_subtitle(primary_row_missing_note(AUTO_SPLIT_REMOTE_TAG, use_custom_rules));
         ctx.remote_edit_btn.set_sensitive(false);
     }
 
@@ -1130,8 +1141,10 @@ fn render_primary_dns_servers(ctx: &DnsRenderCtx) {
             .set_subtitle(&primary_dns_subtitle(server, backend, tun_enabled));
         ctx.domestic_edit_btn.set_sensitive(true);
     } else {
-        ctx.domestic_row
-            .set_subtitle("Not configured - set up in Advanced");
+        ctx.domestic_row.set_subtitle(primary_row_missing_note(
+            AUTO_SPLIT_DOMESTIC_TAG,
+            use_custom_rules,
+        ));
         ctx.domestic_edit_btn.set_sensitive(false);
     }
 }
@@ -2058,5 +2071,29 @@ mod tests {
         let direct = flagged_server("10.0.0.1", Some("direct"));
         let subtitle = primary_dns_subtitle(&direct, BackendType::SingBox, true);
         assert!(!subtitle.contains(PRIVATE_DNS_WARNING), "{subtitle}");
+    }
+
+    #[test]
+    fn test_primary_row_missing_note_states_skipped_derived_rules() {
+        assert_eq!(
+            primary_row_missing_note(AUTO_SPLIT_REMOTE_TAG, false),
+            "Not configured - routing-derived DNS rules for proxied domains are skipped"
+        );
+        assert_eq!(
+            primary_row_missing_note(AUTO_SPLIT_DOMESTIC_TAG, false),
+            "Not configured - routing-derived DNS rules for direct traffic are skipped"
+        );
+    }
+
+    #[test]
+    fn test_primary_row_missing_note_custom_rules_shows_plain_not_configured() {
+        assert_eq!(
+            primary_row_missing_note(AUTO_SPLIT_REMOTE_TAG, true),
+            "Not configured - set up in Advanced"
+        );
+        assert_eq!(
+            primary_row_missing_note(AUTO_SPLIT_DOMESTIC_TAG, true),
+            "Not configured - set up in Advanced"
+        );
     }
 }
