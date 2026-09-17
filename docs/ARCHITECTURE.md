@@ -434,13 +434,13 @@ $XDG_CACHE_HOME/v2ray-rs/
   geodata/                   — .dat files (v2ray/xray); rule-sets/*.srs (sing-box)
   geodata-index/             — searchable index over geodata
 
-$XDG_RUNTIME_DIR/v2ray-rs/
+$XDG_RUNTIME_DIR/v2ray-rs/     (else ~/.local/share/v2ray-rs/runtime/)
   v2ray-rs.lock              — exclusive flock for single-instance
   backend.pid                — PID + ownership record
   generated/
     {v2ray,xray,sing-box}.json  — generated backend config (0o600)
 
-$XDG_STATE_HOME/v2ray-rs/
+$XDG_STATE_HOME/v2ray-rs/      (else ~/.local/share/v2ray-rs/state/)
   instance.json              — InstanceStamp (version, first/last started)
   tun_session.json           — TUN active marker
   latency_snapshot.json      — per-node TCP latency cache
@@ -449,13 +449,19 @@ $XDG_STATE_HOME/v2ray-rs/
     backend.log              — backend output + session/exit records (same)
 ```
 
+`state_dir` and `runtime_dir` follow `$XDG_STATE_HOME` and `$XDG_RUNTIME_DIR`
+with the same qualifier, falling back to `<data_dir>/state` and
+`<data_dir>/runtime` when the variable is unset
+(`crates/core/src/persistence/mod.rs`).
+
 Dev mode (`AppProfile::Development`) uses the qualifier `v2ray-rs-dev`,
 keeping its paths fully separate from production.
 
 ## Logging
 
-The app keeps two size-rotated logs under `$XDG_STATE_HOME/v2ray-rs/logs/`
-(`<state_dir>/logs`). Each rotates when the next record would push the active
+The app keeps two size-rotated logs under `<state_dir>/logs`
+(`$XDG_STATE_HOME/v2ray-rs/logs/`, else `~/.local/share/v2ray-rs/state/logs/`).
+Each rotates when the next record would push the active
 file past 5 MiB: the oldest generation is deleted, `.2`→`.3`, `.1`→`.2`, the
 active file becomes `.1` (newest first), and a fresh file is opened — four
 files, ~20 MiB per log name. Both files are created 0o600 in a 0o700
