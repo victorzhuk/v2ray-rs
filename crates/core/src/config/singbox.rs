@@ -4,10 +4,10 @@ use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator};
 use crate::models::{
-    AppSettings, BackendType, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRuleMatch,
-    DnsStrategy, GrpcSettings, H2Settings, ProxyNode, RoutingRule, RuleAction, RuleMatch,
-    ShadowsocksConfig, TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig,
-    WsSettings,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
+    DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
+    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
+    TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -594,18 +594,40 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             }
         }
 
+        for (tag, skipped) in [
+            (
+                AUTO_SPLIT_REMOTE_TAG,
+                remote_geosite.len() + remote_domains.len(),
+            ),
+            (
+                AUTO_SPLIT_DOMESTIC_TAG,
+                domestic_geosite.len() + domestic_domains.len(),
+            ),
+        ] {
+            if !settings.dns.has_server_tag(tag)
+                && let Some(warning) = super::common::skipped_derived_warning(tag, skipped)
+            {
+                log::warn!("{warning}");
+            }
+        }
+
         let mut derived_rules: Vec<Value> = Vec::new();
-        if !remote_geosite.is_empty() {
-            derived_rules.push(json!({ "rule_set": remote_geosite, "server": "remote" }));
+        if settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG) && !remote_geosite.is_empty() {
+            derived_rules
+                .push(json!({ "rule_set": remote_geosite, "server": AUTO_SPLIT_REMOTE_TAG }));
         }
-        if !remote_domains.is_empty() {
-            derived_rules.push(json!({ "domain_suffix": remote_domains, "server": "remote" }));
+        if settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG) && !remote_domains.is_empty() {
+            derived_rules
+                .push(json!({ "domain_suffix": remote_domains, "server": AUTO_SPLIT_REMOTE_TAG }));
         }
-        if !domestic_geosite.is_empty() {
-            derived_rules.push(json!({ "rule_set": domestic_geosite, "server": "domestic" }));
+        if settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG) && !domestic_geosite.is_empty() {
+            derived_rules
+                .push(json!({ "rule_set": domestic_geosite, "server": AUTO_SPLIT_DOMESTIC_TAG }));
         }
-        if !domestic_domains.is_empty() {
-            derived_rules.push(json!({ "domain_suffix": domestic_domains, "server": "domestic" }));
+        if settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG) && !domestic_domains.is_empty() {
+            derived_rules.push(
+                json!({ "domain_suffix": domestic_domains, "server": AUTO_SPLIT_DOMESTIC_TAG }),
+            );
         }
 
         let mut all = tun_exclusion_rules;
@@ -2432,5 +2454,119 @@ mod tests {
             .expect("flagged server must survive generation");
         assert_eq!(server["detour"], first_proxy_tag);
     }
+
+    #[test]
+    fn test_singbox_derived_domestic_tag_missing_emits_no_domestic_rule() {
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::GeoSite {
+                category: "category-ru".to_string(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }];
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &rules, &settings)
+            .unwrap();
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let tags: Vec<&str> = servers.iter().filter_map(|s| s["tag"].as_str()).collect();
+        let rules = config["dns"]["rules"].as_array().unwrap();
+        for rule in rules {
+            if let Some(server) = rule["server"].as_str() {
+                assert!(
+                    tags.contains(&server),
+                    "dns rule references missing server tag '{server}': {rule}"
+                );
+            }
+        }
+        assert!(
+            rules.iter().all(|r| r["server"] != "domestic"),
+            "domestic rule must not be emitted without a domestic server"
+        );
+    }
+
+    #[test]
+    fn test_singbox_derived_standard_tags_emit_both_split_rules() {
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoSite {
+                    category: "google".to_string(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::GeoSite {
+                    category: "category-ru".to_string(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: "lan".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "223.5.5.5".to_string(),
+                port: None,
+                detour: None,
+            },
+        ];
+        // The domestic split needs a `domestic` server to be legal.
+        settings.dns.servers.push(DnsServerConfig {
+            tag: AUTO_SPLIT_DOMESTIC_TAG.to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".to_string(),
+            port: None,
+            detour: None,
+        });
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &rules, &settings)
+            .unwrap();
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let remote = dns_rules
+            .iter()
+            .find(|r| r["server"] == AUTO_SPLIT_REMOTE_TAG)
+            .expect("remote split rule missing");
+        let domestic = dns_rules
+            .iter()
+            .find(|r| r["server"] == AUTO_SPLIT_DOMESTIC_TAG)
+            .expect("domestic split rule missing");
+        assert_eq!(remote["rule_set"], json!(["geosite-google"]));
+        assert_eq!(domestic["rule_set"], json!(["geosite-category-ru"]));
+    }
 }
-                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
