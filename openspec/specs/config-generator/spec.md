@@ -322,6 +322,10 @@ For xray under TUN the generator SHALL emit bootstrap DNS servers for every name
 - **WHEN** TUN is enabled and the DNS feature is enabled with user servers
 - **THEN** the user's servers SHALL be emitted as today, and (xray) the `dns-internal` inboundTag rule SHALL still be present so internal queries traverse the proxy
 
+#### Scenario: Cache control and client subnet survive the sing-box derived path
+- **WHEN** TUN is enabled, the DNS feature is disabled, the backend is sing-box, and settings carry `disable_cache = true` and `client_subnet = "203.0.113.1"`
+- **THEN** the derived `dns` section SHALL contain `"disable_cache": true` and the derived DoH server SHALL contain `"client_subnet": "203.0.113.1"`, matching the user-configured path
+
 ### Requirement: sing-box rule-sets prefer local cached files
 When generating a sing-box config, each referenced GeoIP/GeoSite rule-set SHALL be emitted as `type: "local"` with `format: "binary"` and the absolute path of the cached `.srs` file when that file exists in the geodata cache, and as `type: "remote"` otherwise.
 
