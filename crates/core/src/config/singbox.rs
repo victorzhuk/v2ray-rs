@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use crate::config::{ConfigError, ConfigGenerator};
+use crate::config::{ConfigError, ConfigGenerator, common::strip_suffix_wildcard};
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
     DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
@@ -546,7 +546,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         }
         if !settings.tun.exclude_domains.is_empty() {
             tun_exclusion_rules.push(json!({
-                "domain_suffix": &settings.tun.exclude_domains,
+                "domain_suffix": stripped_domains(&settings.tun.exclude_domains),
                 "server": &direct_tag,
             }));
         }
@@ -563,7 +563,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
                     "server": rule.server_tag,
                 }),
                 DnsRuleMatch::DomainSuffix { suffix } => json!({
-                    "domain_suffix": [suffix],
+                    "domain_suffix": [strip_suffix_wildcard(suffix)],
                     "server": rule.server_tag,
                 }),
                 DnsRuleMatch::DomainKeyword { keyword } => json!({
@@ -596,8 +596,12 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
                     }
                 }
                 RuleMatch::Domain { pattern } => match rule.action {
-                    RuleAction::Proxy => remote_domains.push(pattern.clone()),
-                    RuleAction::Direct => domestic_domains.push(pattern.clone()),
+                    RuleAction::Proxy => {
+                        remote_domains.push(strip_suffix_wildcard(pattern).to_string())
+                    }
+                    RuleAction::Direct => {
+                        domestic_domains.push(strip_suffix_wildcard(pattern).to_string())
+                    }
                     RuleAction::Block => {}
                 },
                 _ => {}
@@ -704,7 +708,7 @@ fn build_route(
         }
         if !settings.tun.exclude_domains.is_empty() {
             route_rules.push(json!({
-                "domain_suffix": &settings.tun.exclude_domains,
+                "domain_suffix": stripped_domains(&settings.tun.exclude_domains),
                 "outbound": "direct",
             }));
         }
@@ -799,6 +803,13 @@ pub(crate) fn apply_local_rule_sets(config: &mut Value, rule_sets_dir: &std::pat
     }
 }
 
+fn stripped_domains(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|d| super::common::strip_suffix_wildcard(d).to_string())
+        .collect()
+}
+
 fn build_route_rule(
     rule: &RoutingRule,
     first_proxy_tag: &str,
@@ -834,7 +845,7 @@ fn build_route_rule(
             "outbound": outbound,
         }),
         RuleMatch::Domain { pattern } => json!({
-            "domain_suffix": [pattern],
+            "domain_suffix": [strip_suffix_wildcard(pattern)],
             "outbound": outbound,
         }),
         RuleMatch::DomainKeyword { keyword } => json!({
@@ -1417,16 +1428,28 @@ mod tests {
     #[test]
     fn test_singbox_domain_route_stays_suffix() {
         let generator = SingboxGenerator;
-        let rules = vec![RoutingRule {
-            id: uuid::Uuid::new_v4(),
-            match_condition: RuleMatch::Domain {
-                pattern: "example.com".into(),
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "example.com".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
             },
-            action: RuleAction::Proxy,
-            enabled: true,
-            group: None,
-            via_node: None,
-        }];
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.google.com".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
 
         let config = generator
             .generate(&[ss_node()], &rules, &default_settings())
@@ -1434,6 +1457,7 @@ mod tests {
 
         let route_rules = config["route"]["rules"].as_array().unwrap();
         assert_eq!(route_rules[0]["domain_suffix"][0], "example.com");
+        assert_eq!(route_rules[1]["domain_suffix"][0], "google.com");
     }
 
     #[test]
@@ -1584,6 +1608,12 @@ mod tests {
                 },
                 server_tag: "domestic".to_string(),
             },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: "*.google.com".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            },
         ];
 
         let generator = SingboxGenerator;
@@ -1598,6 +1628,12 @@ mod tests {
 
         let full_rule = rules.iter().find(|r| r["server"] == "domestic").unwrap();
         assert_eq!(full_rule["domain"], json!(["example.com"]));
+
+        let suffix_rule = rules
+            .iter()
+            .find(|r| r.get("domain_suffix").is_some())
+            .unwrap();
+        assert_eq!(suffix_rule["domain_suffix"], json!(["google.com"]));
     }
 
     #[test]
@@ -2380,7 +2416,7 @@ mod tests {
     fn test_singbox_tun_exclusion_domain() {
         let mut settings = default_settings();
         settings.tun.enabled = true;
-        settings.tun.exclude_domains = vec!["example.com".to_string()];
+        settings.tun.exclude_domains = vec!["example.com".to_string(), "*.example.org".to_string()];
         settings.dns.enabled = true;
 
         let generator = SingboxGenerator;
@@ -2391,7 +2427,10 @@ mod tests {
             .iter()
             .find(|r| r.get("domain_suffix").is_some())
             .expect("domain_suffix route rule not found");
-        assert_eq!(domain_rule["domain_suffix"], json!(["example.com"]));
+        assert_eq!(
+            domain_rule["domain_suffix"],
+            json!(["example.com", "example.org"])
+        );
         assert_eq!(domain_rule["outbound"], "direct");
 
         let dns_rules = config["dns"]["rules"].as_array().unwrap();
@@ -2399,7 +2438,107 @@ mod tests {
             .iter()
             .find(|r| r.get("domain_suffix").is_some())
             .expect("domain_suffix DNS rule not found");
-        assert_eq!(dns_first["domain_suffix"], json!(["example.com"]));
+        assert_eq!(dns_first["domain_suffix"], json!(["example.com", "example.org"]));
+    }
+
+    #[test]
+    fn test_singbox_derived_dns_wildcard_domains_stripped() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.google.com".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.example.com".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &rules, &settings)
+            .unwrap();
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let remote = dns_rules
+            .iter()
+            .find(|r| r["server"] == "remote")
+            .expect("remote derived rule not found");
+        assert!(
+            remote["domain_suffix"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "google.com")
+        );
+
+        let domestic = dns_rules
+            .iter()
+            .find(|r| r["server"] == "domestic")
+            .expect("domestic derived rule not found");
+        assert_eq!(domestic["domain_suffix"], json!(["example.com"]));
+    }
+
+    #[test]
+    fn test_singbox_no_emitted_domain_suffix_contains_wildcard() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["*.excluded.example".to_string()];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::DomainSuffix {
+                suffix: "*.google.com".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        }];
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "*.wildcard.example".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &rules, &settings)
+            .unwrap();
+
+        fn assert_no_wildcard(value: &Value) {
+            match value {
+                Value::Array(items) => {
+                    for item in items {
+                        assert!(
+                            !item.as_str().unwrap_or("").contains('*'),
+                            "wildcard leaked into emitted list: {item}"
+                        );
+                        assert_no_wildcard(item);
+                    }
+                }
+                Value::Object(map) => {
+                    for value in map.values() {
+                        assert_no_wildcard(value);
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_no_wildcard(&config);
     }
 
     #[test]
