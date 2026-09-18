@@ -1,0 +1,3 @@
+schema: spec-driven
+created: 2026-09-18
+goal: Emit equivalent suffix matchers for routing, DNS, and TUN exclusions
