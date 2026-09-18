@@ -7,10 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed
-- Routing rules whose domain pattern starts with `*.` emit the bare domain
-  (`google.com`) to backend configs, which already treat it as a wildcard.
-
 ### Added
 - Preferences → System → Diagnostics sets the backend log level (`error`,
   `warning`, `info`, `debug`; default `warning`) and a Connection log switch
@@ -31,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   xray and v2ray.
 
 ### Changed
+- Routing rules, custom DNS rules, derived DNS domain lists, and TUN exclusions
+  whose domain starts with `*.` now emit the bare name — `domain:google.com`
+  on xray/v2ray, `domain_suffix` on sing-box — which every backend already
+  treats as matching the domain and its subdomains. Keyword and full-domain
+  matchers are unchanged.
 - A DNS server whose protocol is downgraded for the selected backend (DoT,
   DoQ, or H3 on v2ray; H3 on xray) is emitted with the DoH default port
   instead of the port set for its original protocol.
@@ -44,6 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `utc_offset=±HH:MM`.
 
 ### Fixed
+- xray/v2ray TUN excluded domains are emitted as `domain:<name>` suffix
+  matches instead of unprefixed names, which the backend read as substring
+  matches — an excluded `wb.ru` also matched `xwb.ru.example`, and a `*.`
+  pattern matched nothing at all.
 - A `settings.toml` whose `[dns]` table omits `enabled` now loads with the rest
   of the file intact instead of discarding every setting in it. An explicitly
   present `servers` list is taken as written, including an empty one; the
