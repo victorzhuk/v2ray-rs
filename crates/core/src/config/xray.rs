@@ -427,6 +427,27 @@ mod tests {
     }
 
     #[test]
+    fn test_xray_domain_wildcard_emitted_as_domain_suffix() {
+        let rules = vec![RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "*.google.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }];
+
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &rules, &AppSettings::default())
+            .unwrap();
+
+        let routing_rules = config["routing"]["rules"].as_array().unwrap();
+        assert_eq!(routing_rules[0]["domain"][0], "domain:google.com");
+    }
+
+    #[test]
     fn test_xray_verify_on_omits_allow_insecure() {
         let config = XrayGenerator
             .generate(&[xray_vless_with_xtls()], &[], &AppSettings::default())

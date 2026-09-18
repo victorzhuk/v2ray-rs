@@ -549,9 +549,10 @@ fn build_routing(
             }));
         }
         if !settings.tun.exclude_domains.is_empty() {
+            let domains: Vec<String> = settings.tun.exclude_domains.iter().map(|d| format!("domain:{}", super::common::strip_suffix_wildcard(d))).collect();
             routing_rules.push(json!({
                 "type": "field",
-                "domain": &settings.tun.exclude_domains,
+                "domain": domains,
                 "outboundTag": "direct",
             }));
         }
@@ -884,7 +885,7 @@ fn build_user_dns_servers(
                 .filter(|rule| rule.server_tag == server.tag)
                 .map(|rule| match &rule.match_condition {
                     DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
-                    DnsRuleMatch::DomainSuffix { suffix } => format!("domain:{suffix}"),
+                    DnsRuleMatch::DomainSuffix { suffix } => format!("domain:{}", super::common::strip_suffix_wildcard(suffix)),
                     DnsRuleMatch::DomainKeyword { keyword } => keyword.clone(),
                     DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
                 })
@@ -904,7 +905,7 @@ fn build_user_dns_servers(
         for rule in rules.iter().filter(|r| r.enabled) {
             let entry = match &rule.match_condition {
                 RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
-                RuleMatch::Domain { pattern } => Some(format!("domain:{pattern}")),
+                RuleMatch::Domain { pattern } => Some(format!("domain:{}", super::common::strip_suffix_wildcard(pattern))),
                 RuleMatch::DomainKeyword { keyword } => Some(keyword.clone()),
                 RuleMatch::DomainFull { domain } => Some(format!("full:{domain}")),
                 _ => None,
@@ -923,7 +924,7 @@ fn build_user_dns_servers(
             && !settings.tun.exclude_domains.is_empty()
         {
             for d in &settings.tun.exclude_domains {
-                domestic_domains.push(d.clone());
+                domestic_domains.push(format!("domain:{}", super::common::strip_suffix_wildcard(d)));
             }
         }
 
@@ -973,10 +974,16 @@ fn attach_exclude_domains(
     settings: &AppSettings,
     backend: V2rayFamilyBackend,
 ) {
+    let exclude_domains: Vec<String> = settings
+        .tun
+        .exclude_domains
+        .iter()
+        .map(|d| format!("domain:{}", super::common::strip_suffix_wildcard(d)))
+        .collect();
     let Some(target) = super::common::split_horizon_server(settings) else {
         servers.push(json!({
             "address": "localhost",
-            "domains": &settings.tun.exclude_domains,
+            "domains": &exclude_domains,
         }));
         return;
     };
@@ -995,13 +1002,13 @@ fn attach_exclude_domains(
 
     if entry.is_string() {
         let addr = entry.as_str().unwrap_or_default().to_string();
-        *entry = json!({ "address": addr, "domains": &settings.tun.exclude_domains });
+        *entry = json!({ "address": addr, "domains": &exclude_domains });
     } else if let Some(Value::Array(domains)) = entry.get_mut("domains") {
-        for d in &settings.tun.exclude_domains {
+        for d in &exclude_domains {
             domains.push(json!(d));
         }
     } else {
-        entry["domains"] = json!(&settings.tun.exclude_domains);
+        entry["domains"] = json!(&exclude_domains);
     }
 }
 
@@ -2446,7 +2453,7 @@ mod tests {
             .find(|r| r.get("domain").is_some())
             .expect("domain exclusion rule not found");
         assert_eq!(domain_rule["type"], "field");
-        assert_eq!(domain_rule["domain"], json!(["example.com"]));
+        assert_eq!(domain_rule["domain"], json!(["domain:example.com"]));
         assert_eq!(domain_rule["outboundTag"], "direct");
     }
 
@@ -2514,6 +2521,118 @@ mod tests {
             .collect()
     }
 
+    fn assert_no_wildcard_domains(config: &Value) {
+        fn walk(value: &Value) {
+            match value {
+                Value::Object(map) => {
+                    for (key, v) in map {
+                        if key == "domain" || key == "domains" {
+                            for d in v.as_array().unwrap_or(&Vec::new()) {
+                                assert!(
+                                    !d.as_str().unwrap_or_default().contains('*'),
+                                    "emitted {key} value contains '*': {d}"
+                                );
+                            }
+                        }
+                        walk(v);
+                    }
+                }
+                Value::Array(items) => items.iter().for_each(walk),
+                _ => {}
+            }
+        }
+        walk(config);
+    }
+
+    #[test]
+    fn test_xray_tun_exclusion_wildcard_domain_normalized() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["*.corp.example".to_string()];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let rules = config["routing"]["rules"].as_array().unwrap();
+        let domain_rule = rules
+            .iter()
+            .find(|r| r.get("domain").is_some())
+            .expect("domain exclusion rule not found");
+        assert_eq!(domain_rule["domain"], json!(["domain:corp.example"]));
+        assert_no_wildcard_domains(&config);
+    }
+
+    #[test]
+    fn test_dns_custom_rules_wildcard_suffix_normalized() {
+        use crate::models::{DnsRule, DnsRuleMatch};
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::DomainSuffix {
+                suffix: "*.google.com".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        }];
+
+        let dns = build_dns(&[], &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert_eq!(
+            servers[0]["domains"],
+            json!(["domain:google.com"]),
+            "wildcard suffix must be normalized, not emitted verbatim"
+        );
+        assert_no_wildcard_domains(&dns);
+    }
+
+    #[test]
+    fn test_dns_derived_wildcard_rules_normalized() {
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.google.com".into(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.ru.example".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+
+        let dns = build_dns(&rules, &settings);
+        let servers = dns["servers"].as_array().unwrap();
+        assert!(servers.iter().any(|s| s["domains"]
+            .as_array()
+            .is_some_and(|d| d.contains(&json!("domain:google.com")))));
+        assert!(servers.iter().any(|s| s["domains"]
+            .as_array()
+            .is_some_and(|d| d.contains(&json!("domain:ru.example")))));
+        assert_no_wildcard_domains(&dns);
+    }
+
     #[test]
     fn test_xray_tun_exclusion_dns() {
         let mut settings = default_settings();
@@ -2528,7 +2647,7 @@ mod tests {
         assert!(
             servers.iter().any(|s| s["domains"]
                 .as_array()
-                .is_some_and(|d| d.contains(&json!("example.com")))),
+                .is_some_and(|d| d.contains(&json!("domain:example.com")))),
             "no server answers the excluded domain"
         );
     }
@@ -2566,7 +2685,7 @@ mod tests {
             .find(|s| {
                 s["domains"]
                     .as_array()
-                    .is_some_and(|d| d.contains(&json!("corp.example")))
+                    .is_some_and(|d| d.contains(&json!("domain:corp.example")))
             })
             .expect("no server answers the excluded domain");
         assert_eq!(answering["address"], "77.88.8.8");
