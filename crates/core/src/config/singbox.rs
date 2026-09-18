@@ -2438,7 +2438,10 @@ mod tests {
             .iter()
             .find(|r| r.get("domain_suffix").is_some())
             .expect("domain_suffix DNS rule not found");
-        assert_eq!(dns_first["domain_suffix"], json!(["example.com", "example.org"]));
+        assert_eq!(
+            dns_first["domain_suffix"],
+            json!(["example.com", "example.org"])
+        );
     }
 
     #[test]

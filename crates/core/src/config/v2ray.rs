@@ -549,7 +549,12 @@ fn build_routing(
             }));
         }
         if !settings.tun.exclude_domains.is_empty() {
-            let domains: Vec<String> = settings.tun.exclude_domains.iter().map(|d| format!("domain:{}", super::common::strip_suffix_wildcard(d))).collect();
+            let domains: Vec<String> = settings
+                .tun
+                .exclude_domains
+                .iter()
+                .map(|d| format!("domain:{}", super::common::strip_suffix_wildcard(d)))
+                .collect();
             routing_rules.push(json!({
                 "type": "field",
                 "domain": domains,
@@ -885,7 +890,9 @@ fn build_user_dns_servers(
                 .filter(|rule| rule.server_tag == server.tag)
                 .map(|rule| match &rule.match_condition {
                     DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
-                    DnsRuleMatch::DomainSuffix { suffix } => format!("domain:{}", super::common::strip_suffix_wildcard(suffix)),
+                    DnsRuleMatch::DomainSuffix { suffix } => {
+                        format!("domain:{}", super::common::strip_suffix_wildcard(suffix))
+                    }
                     DnsRuleMatch::DomainKeyword { keyword } => keyword.clone(),
                     DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
                 })
@@ -905,7 +912,10 @@ fn build_user_dns_servers(
         for rule in rules.iter().filter(|r| r.enabled) {
             let entry = match &rule.match_condition {
                 RuleMatch::GeoSite { category } => Some(format!("geosite:{category}")),
-                RuleMatch::Domain { pattern } => Some(format!("domain:{}", super::common::strip_suffix_wildcard(pattern))),
+                RuleMatch::Domain { pattern } => Some(format!(
+                    "domain:{}",
+                    super::common::strip_suffix_wildcard(pattern)
+                )),
                 RuleMatch::DomainKeyword { keyword } => Some(keyword.clone()),
                 RuleMatch::DomainFull { domain } => Some(format!("full:{domain}")),
                 _ => None,
@@ -924,7 +934,10 @@ fn build_user_dns_servers(
             && !settings.tun.exclude_domains.is_empty()
         {
             for d in &settings.tun.exclude_domains {
-                domestic_domains.push(format!("domain:{}", super::common::strip_suffix_wildcard(d)));
+                domestic_domains.push(format!(
+                    "domain:{}",
+                    super::common::strip_suffix_wildcard(d)
+                ));
             }
         }
 
@@ -2624,12 +2637,16 @@ mod tests {
 
         let dns = build_dns(&rules, &settings);
         let servers = dns["servers"].as_array().unwrap();
-        assert!(servers.iter().any(|s| s["domains"]
-            .as_array()
-            .is_some_and(|d| d.contains(&json!("domain:google.com")))));
-        assert!(servers.iter().any(|s| s["domains"]
-            .as_array()
-            .is_some_and(|d| d.contains(&json!("domain:ru.example")))));
+        assert!(servers.iter().any(|s| {
+            s["domains"]
+                .as_array()
+                .is_some_and(|d| d.contains(&json!("domain:google.com")))
+        }));
+        assert!(servers.iter().any(|s| {
+            s["domains"]
+                .as_array()
+                .is_some_and(|d| d.contains(&json!("domain:ru.example")))
+        }));
         assert_no_wildcard_domains(&dns);
     }
 
