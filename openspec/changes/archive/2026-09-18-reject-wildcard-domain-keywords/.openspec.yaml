@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-09-18
+goal: Prevent new wildcard keyword rules while preserving and flagging stored
+  invalid rules
