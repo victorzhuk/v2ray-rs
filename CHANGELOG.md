@@ -30,6 +30,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Keyword routing rules containing `*` are rejected with an explanatory
   validation error: a keyword is a plain substring, and wildcard suffixes
   belong to the Domain rule type.
+- Stored routing and DNS keyword rules that fail validation (for example a
+  legacy `*.ru` keyword) load unchanged, but their rows are marked invalid
+  with the validation error as the subtitle until edited or deleted.
 - Routing rules, custom DNS rules, derived DNS domain lists, and TUN exclusions
   whose domain starts with `*.` now emit the bare name — `domain:google.com`
   on xray/v2ray, `domain_suffix` on sing-box — which every backend already
