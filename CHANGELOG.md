@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Terminal color escapes are no longer written to `backend.log` or shown on
   the logs page.
 - Backend lines printed during startup now reach the logs page.
+- Auto-derived DNS rules skip a routing rule whose `remote` or `domestic`
+  server tag is missing, with one warning per skipped tag and a count summary;
+  sing-box derived TUN DNS keeps the cache and client subnet settings; the DNS
+  preferences rows explain which routing-derived rules were skipped.
 
 ## [0.18.0] - 2026-09-12
 
