@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   xray and v2ray.
 
 ### Changed
+- Keyword routing rules containing `*` are rejected with an explanatory
+  validation error: a keyword is a plain substring, and wildcard suffixes
+  belong to the Domain rule type.
 - Routing rules, custom DNS rules, derived DNS domain lists, and TUN exclusions
   whose domain starts with `*.` now emit the bare name — `domain:google.com`
   on xray/v2ray, `domain_suffix` on sing-box — which every backend already
