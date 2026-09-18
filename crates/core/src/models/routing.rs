@@ -142,6 +142,7 @@ impl Default for RoutingRuleSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::validation::{validate_domain_keyword, validate_rule_match};
 
     fn make_rule(country: &str, action: RuleAction) -> RoutingRule {
         RoutingRule {
@@ -528,5 +529,45 @@ mod tests {
 
         let result = set.edit_rule(&id, Some(invalid_match), None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_wildcard_domain_keyword_rejected() {
+        let wildcard = RuleMatch::DomainKeyword {
+            keyword: "*.ru".to_string(),
+        };
+
+        assert!(matches!(
+            validate_domain_keyword("*.ru"),
+            Err(ValidationError::WildcardDomainKeyword(_))
+        ));
+        assert!(matches!(
+            validate_rule_match(&wildcard),
+            Err(ValidationError::WildcardDomainKeyword(_))
+        ));
+
+        let mut set = RoutingRuleSet::new();
+        let mut rule = make_rule("US", RuleAction::Proxy);
+        rule.match_condition = wildcard.clone();
+        assert!(set.add_validated(rule.clone()).is_err());
+        assert!(set.add_at(0, rule.clone()).is_err());
+        assert_eq!(set.rules().len(), 0);
+
+        set.add_validated(make_rule("RU", RuleAction::Direct)).unwrap();
+        let id = set.rules()[0].id;
+        assert!(set.edit_rule(&id, Some(wildcard), None).is_err());
+        assert_ne!(
+            set.rules()[0].match_condition,
+            RuleMatch::DomainKeyword {
+                keyword: "*.ru".to_string()
+            }
+        );
+
+        assert!(validate_domain_keyword("sina").is_ok());
+        let mut plain = make_rule("DE", RuleAction::Proxy);
+        plain.match_condition = RuleMatch::DomainKeyword {
+            keyword: "sina".to_string(),
+        };
+        assert!(set.add_validated(plain).is_ok());
     }
 }

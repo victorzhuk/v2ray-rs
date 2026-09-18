@@ -13,6 +13,8 @@ pub enum ValidationError {
     InvalidDomainPattern(String),
     #[error("invalid domain keyword: {0}")]
     InvalidDomainKeyword(String),
+    #[error("invalid domain keyword '{0}': a keyword is a plain substring and cannot contain '*'; use the Domain rule type for wildcard suffixes like '*.example.com'")]
+    WildcardDomainKeyword(String),
     #[error("invalid geosite category: {0}")]
     InvalidGeoSiteCategory(String),
     #[error("invalid protocol name: {0}")]
@@ -122,12 +124,15 @@ pub fn validate_domain_pattern(pattern: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validates a domain keyword: a bare substring match, so unlike
-/// [`validate_domain_pattern`] it has neither a required dot nor a
-/// leading-dot restriction — only non-empty and free of whitespace.
+/// Validates a domain keyword: a plain substring match — non-empty, no
+/// whitespace, no `*` (wildcard suffixes belong to [`validate_domain_pattern`]
+/// and the `Domain` rule type).
 pub fn validate_domain_keyword(keyword: &str) -> Result<(), ValidationError> {
     if keyword.is_empty() || keyword.chars().any(char::is_whitespace) {
         return Err(ValidationError::InvalidDomainKeyword(keyword.to_string()));
+    }
+    if keyword.contains('*') {
+        return Err(ValidationError::WildcardDomainKeyword(keyword.to_string()));
     }
     Ok(())
 }
@@ -368,6 +373,8 @@ mod tests {
             (".example", true),
             ("", false),
             ("has space", false),
+            ("*.ru", false),
+            ("a*b", false),
         ];
 
         for (keyword, expected_valid) in tests {
