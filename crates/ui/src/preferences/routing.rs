@@ -229,6 +229,10 @@ fn build_routing_rule_row(
         .title(format_match(&rule.match_condition))
         .subtitle(format_action(&rule.action))
         .build();
+    if let Some(msg) = rule_row_validation_error(rule) {
+        row.set_subtitle(&msg);
+        row.add_css_class("error");
+    }
 
     let switch = gtk::Switch::builder()
         .active(rule.enabled)
@@ -965,6 +969,12 @@ fn format_action(action: &RuleAction) -> &'static str {
     }
 }
 
+fn rule_row_validation_error(rule: &RoutingRule) -> Option<String> {
+    validate_rule_match(&rule.match_condition)
+        .err()
+        .map(|e| e.to_string())
+}
+
 fn format_match(m: &RuleMatch) -> String {
     match m {
         RuleMatch::GeoIp { country_code } => format!("GeoIP: {country_code}"),
@@ -976,5 +986,47 @@ fn format_match(m: &RuleMatch) -> String {
         RuleMatch::Protocol { name } => format!("Protocol: {name}"),
         RuleMatch::Port { spec } => format!("Port: {spec}"),
         RuleMatch::Network { spec } => format!("Network: {spec}"),
+    }
+}
+
+#[cfg(test)]
+mod routing_row_tests {
+    use super::*;
+
+    fn rule(m: RuleMatch) -> RoutingRule {
+        RoutingRule {
+            id: Uuid::new_v4(),
+            match_condition: m,
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }
+    }
+
+    #[test]
+    fn rule_row_validation_error_flags_wildcard_keyword() {
+        let msg = rule_row_validation_error(&rule(RuleMatch::DomainKeyword {
+            keyword: "*.ru".to_string(),
+        }))
+        .expect("wildcard keyword must be flagged");
+        assert!(msg.contains("plain substring"), "msg: {msg}");
+        assert!(msg.contains("Domain rule type"), "msg: {msg}");
+    }
+
+    #[test]
+    fn rule_row_validation_error_passes_valid_rules() {
+        assert_eq!(
+            rule_row_validation_error(&rule(RuleMatch::DomainKeyword {
+                keyword: "sina".to_string()
+            })),
+            None
+        );
+        assert_eq!(
+            rule_row_validation_error(&rule(RuleMatch::GeoIp {
+                country_code: "RU".to_string()
+            })),
+            None
+        );
     }
 }
