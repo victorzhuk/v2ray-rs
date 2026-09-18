@@ -10,6 +10,7 @@ use std::str::FromStr;
 use v2ray_rs_core::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
     DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, builtin_dns_presets,
+    validate_domain_keyword,
 };
 
 use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
@@ -938,6 +939,15 @@ fn dns_server_from_inputs(
     })
 }
 
+fn dns_rule_match_validation_error(m: &DnsRuleMatch) -> Option<String> {
+    match m {
+        DnsRuleMatch::DomainKeyword { keyword } => {
+            validate_domain_keyword(keyword).err().map(|e| e.to_string())
+        }
+        _ => None,
+    }
+}
+
 fn dns_rule_from_inputs(
     match_combo: &adw::ComboRow,
     value_entry: &adw::EntryRow,
@@ -955,6 +965,9 @@ fn dns_rule_from_inputs(
         3 => DnsRuleMatch::DomainFull { domain: value },
         _ => DnsRuleMatch::GeoSite { category: value },
     };
+    if let Some(msg) = dns_rule_match_validation_error(&match_condition) {
+        return Err(msg);
+    }
 
     let server_idx = server_combo.selected() as usize;
     let Some(server_tag) = servers.get(server_idx) else {
@@ -1066,8 +1079,13 @@ fn render_dns_rules(ctx: &DnsRenderCtx) {
 
         let row = adw::ActionRow::builder()
             .title(format!("{match_type}: {value}"))
-            .subtitle(format!("Server: {}", rule.server_tag))
             .build();
+        if let Some(msg) = dns_rule_match_validation_error(&rule.match_condition) {
+            row.add_css_class("error");
+            row.set_subtitle(&msg);
+        } else {
+            row.set_subtitle(&format!("Server: {}", rule.server_tag));
+        }
 
         let edit_btn = gtk::Button::builder()
             .icon_name("document-edit-symbolic")
@@ -1990,6 +2008,40 @@ mod tests {
             None,
             "v2ray has neither mechanism, so the row is hidden with no subtitle"
         );
+    }
+
+    fn dns_rule_with_keyword(keyword: &str) -> DnsRuleMatch {
+        DnsRuleMatch::DomainKeyword {
+            keyword: keyword.to_string(),
+        }
+    }
+
+    #[test]
+    fn dns_rule_match_validation_error_rejects_wildcard_and_whitespace() {
+        let msg = dns_rule_match_validation_error(&dns_rule_with_keyword("*.ru"))
+            .expect("wildcard keyword must be rejected");
+        assert!(msg.contains("plain substring"), "{msg}");
+        assert!(msg.contains("Domain rule type"), "{msg}");
+
+        assert!(dns_rule_match_validation_error(&dns_rule_with_keyword("has space")).is_some());
+    }
+
+    #[test]
+    fn dns_rule_match_validation_error_passes_plain_keyword_and_other_matches() {
+        assert_eq!(dns_rule_match_validation_error(&dns_rule_with_keyword("sina")), None);
+        for m in [
+            DnsRuleMatch::DomainSuffix {
+                suffix: ".ru".to_string(),
+            },
+            DnsRuleMatch::GeoSite {
+                category: "google".to_string(),
+            },
+            DnsRuleMatch::DomainFull {
+                domain: "example.com".to_string(),
+            },
+        ] {
+            assert_eq!(dns_rule_match_validation_error(&m), None, "{m:?}");
+        }
     }
 
     fn flagged_server(address: &str, detour: Option<&str>) -> DnsServerConfig {

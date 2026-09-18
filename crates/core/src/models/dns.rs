@@ -956,6 +956,16 @@ server_tag = "google"
         let json = serde_json::to_string(&rule).unwrap();
         let back: DnsRule = serde_json::from_str(&json).unwrap();
         assert_eq!(rule, back);
+
+        let wildcard = DnsRule {
+            match_condition: DnsRuleMatch::DomainKeyword {
+                keyword: "*.cn".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        };
+        let json = serde_json::to_string(&wildcard).unwrap();
+        let back: DnsRule = serde_json::from_str(&json).unwrap();
+        assert_eq!(wildcard, back);
     }
 
     #[test]
