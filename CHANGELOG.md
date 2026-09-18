@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Routing rules whose domain pattern starts with `*.` emit the bare domain
+  (`google.com`) to backend configs, which already treat it as a wildcard.
+
 ### Added
 - Preferences → System → Diagnostics sets the backend log level (`error`,
   `warning`, `info`, `debug`; default `warning`) and a Connection log switch
