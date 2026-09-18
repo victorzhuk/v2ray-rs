@@ -23,3 +23,35 @@ pub(crate) fn split_horizon_server(settings: &AppSettings) -> Option<&DnsServerC
         .find(|s| s.detours_direct())
         .or_else(|| servers.first())
 }
+
+/// Removes exactly one leading `*.` from a domain pattern, leaving any
+/// residual wildcard intact.
+pub(crate) fn strip_suffix_wildcard(pattern: &str) -> &str {
+    pattern.strip_prefix("*.").unwrap_or(pattern)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_suffix_wildcard;
+
+    #[test]
+    fn strips_one_leading_wildcard() {
+        assert_eq!(strip_suffix_wildcard("*.google.com"), "google.com");
+    }
+
+    #[test]
+    fn plain_name_unchanged() {
+        assert_eq!(strip_suffix_wildcard("google.com"), "google.com");
+    }
+
+    #[test]
+    fn strips_only_once() {
+        assert_eq!(strip_suffix_wildcard("*.*.example.com"), "*.example.com");
+    }
+
+    #[test]
+    fn empty_and_bare_star_unchanged() {
+        assert_eq!(strip_suffix_wildcard(""), "");
+        assert_eq!(strip_suffix_wildcard("*"), "*");
+    }
+}
