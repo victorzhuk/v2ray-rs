@@ -611,7 +611,7 @@ fn build_routing_rule(
         }),
         RuleMatch::Domain { pattern } => json!({
             "type": "field",
-            "domain": [format!("domain:{pattern}")],
+            "domain": [format!("domain:{}", super::common::strip_suffix_wildcard(pattern))],
             "outboundTag": outbound_tag,
         }),
         RuleMatch::DomainKeyword { keyword } => json!({
@@ -1602,7 +1602,7 @@ mod tests {
             .unwrap();
 
         let routing_rules = config["routing"]["rules"].as_array().unwrap();
-        assert_eq!(routing_rules[0]["domain"][0], "domain:*.google.com");
+        assert_eq!(routing_rules[0]["domain"][0], "domain:google.com");
     }
 
     #[test]
