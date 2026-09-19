@@ -141,8 +141,8 @@ impl Default for RoutingRuleSet {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::validation::{validate_domain_keyword, validate_rule_match};
+    use super::*;
 
     fn make_rule(country: &str, action: RuleAction) -> RoutingRule {
         RoutingRule {
@@ -553,7 +553,8 @@ mod tests {
         assert!(set.add_at(0, rule.clone()).is_err());
         assert_eq!(set.rules().len(), 0);
 
-        set.add_validated(make_rule("RU", RuleAction::Direct)).unwrap();
+        set.add_validated(make_rule("RU", RuleAction::Direct))
+            .unwrap();
         let id = set.rules()[0].id;
         assert!(set.edit_rule(&id, Some(wildcard), None).is_err());
         assert_ne!(

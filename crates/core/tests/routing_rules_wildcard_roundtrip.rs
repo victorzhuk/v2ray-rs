@@ -1,7 +1,7 @@
 #![cfg(feature = "test-utils")]
 
 use uuid::Uuid;
-use v2ray_rs_core::models::{RuleAction, RuleMatch, RoutingRule, RoutingRuleSet};
+use v2ray_rs_core::models::{RoutingRule, RoutingRuleSet, RuleAction, RuleMatch};
 use v2ray_rs_core::persistence::{AppPaths, load_routing_rules, save_routing_rules};
 use v2ray_rs_core::profile::AppProfile;
 

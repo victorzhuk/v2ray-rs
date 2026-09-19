@@ -1192,21 +1192,23 @@ mod tests {
 
     #[test]
     fn imported_profile_dns_marked_profile() {
-        let mut profile_dns = DnsConfig::default();
-        profile_dns.enabled = true;
-        profile_dns.servers = vec![server("provider", DnsProtocol::Doh, "doh.provider.example")];
+        let profile_dns = DnsConfig {
+            enabled: true,
+            servers: vec![server("provider", DnsProtocol::Doh, "doh.provider.example")],
+            ..Default::default()
+        };
         let sub = profile_subscription(profile_dns);
         let settings = default_settings();
 
         let (rules, effective_settings) = crate::models::resolve_effective_config(
             &node_ref(&sub),
-            &[sub.clone()],
+            std::slice::from_ref(&sub),
             &[],
             &settings,
         );
         assert!(crate::models::uses_imported_profile(
             &node_ref(&sub),
-            &[sub.clone()]
+            std::slice::from_ref(&sub)
         ));
 
         let mut summary = effective_dns(
@@ -1294,9 +1296,9 @@ mod tests {
         let summary = effective_dns(BackendType::Xray, &settings, &[], &["example.com"]);
         let lines = summary.log_lines();
 
-        assert!(lines.contains(&format!(
-            "server=1.1.1.1 path=direct source=bootstrap scope=example.com"
-        )));
+        assert!(lines.contains(
+            &"server=1.1.1.1 path=direct source=bootstrap scope=example.com".to_string()
+        ));
         assert!(lines.contains(&format!(
             "server={FALLBACK_DNS} path=direct source=bootstrap scope=example.com"
         )));

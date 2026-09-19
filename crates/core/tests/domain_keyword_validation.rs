@@ -40,7 +40,11 @@ fn wildcard_keyword_is_rejected() {
 #[test]
 fn plain_keyword_is_accepted() {
     for keyword in ["sina", "sina.com", ".example"] {
-        assert_eq!(validate_domain_keyword(keyword), Ok(()), "keyword={keyword}");
+        assert_eq!(
+            validate_domain_keyword(keyword),
+            Ok(()),
+            "keyword={keyword}"
+        );
     }
 }
 

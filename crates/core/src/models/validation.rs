@@ -13,7 +13,9 @@ pub enum ValidationError {
     InvalidDomainPattern(String),
     #[error("invalid domain keyword: {0}")]
     InvalidDomainKeyword(String),
-    #[error("invalid domain keyword '{0}': a keyword is a plain substring and cannot contain '*'; use the Domain rule type for wildcard suffixes like '*.example.com'")]
+    #[error(
+        "invalid domain keyword '{0}': a keyword is a plain substring and cannot contain '*'; use the Domain rule type for wildcard suffixes like '*.example.com'"
+    )]
     WildcardDomainKeyword(String),
     #[error("invalid geosite category: {0}")]
     InvalidGeoSiteCategory(String),
