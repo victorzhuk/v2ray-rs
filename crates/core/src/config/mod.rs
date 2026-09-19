@@ -1,4 +1,5 @@
 mod common;
+pub mod effective_dns;
 mod probe;
 mod redact;
 pub(crate) mod singbox;
