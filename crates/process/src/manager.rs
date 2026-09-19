@@ -171,6 +171,7 @@ pub struct ProcessManager {
     cached_version: Option<Option<String>>,
     stop_reason: StopReason,
     session_fields: Option<String>,
+    session_extra: Vec<String>,
     #[cfg(any(test, feature = "test-utils"))]
     host_probe: Option<HostProbe>,
 }
@@ -213,6 +214,7 @@ impl ProcessManager {
             cached_version: None,
             stop_reason: StopReason::UserStop,
             session_fields: None,
+            session_extra: Vec::new(),
             #[cfg(any(test, feature = "test-utils"))]
             host_probe: None,
         }
@@ -274,6 +276,12 @@ impl ProcessManager {
     /// Appends caller-decided `key=value` fields to every session record.
     pub fn with_session_fields(mut self, fields: String) -> Self {
         self.session_fields = Some(fields);
+        self
+    }
+
+    /// Writes one `dns` stream line per entry right after each session record.
+    pub fn with_session_extra(mut self, lines: Vec<String>) -> Self {
+        self.session_extra = lines;
         self
     }
 
@@ -704,6 +712,9 @@ impl ProcessManager {
             record.push_str(&truncate_reason(fields));
         }
         write_stream_line(&self.log_writer, "session", &record);
+        for line in &self.session_extra {
+            write_stream_line(&self.log_writer, "dns", &truncate_reason(line));
+        }
     }
 
     // Diagnostics-only probe for the session record: runs at most once per
@@ -1546,6 +1557,108 @@ mod tests {
             "{}",
             sessions[0]
         );
+    }
+
+    #[tokio::test]
+    async fn session_extra_dns_lines_follow_session_on_start() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_session_extra(vec!["dns server=udp://1.1.1.1".into(), "dns server=udp://8.8.8.8".into()]);
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 3).await;
+        assert!(lines[0].contains("session backend="), "{}", lines[0]);
+        assert!(lines[1].contains("dns server=udp://1.1.1.1"), "{}", lines[1]);
+        assert!(lines[2].contains("dns server=udp://8.8.8.8"), "{}", lines[2]);
+        assert_eq!(lines.iter().filter(|l| l.contains(" session ")).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_extra_dns_lines_repeat_after_crash_respawn() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let script = format!("{VERSION_STUB}{}", crashing_backend(dir.path(), 1));
+        let mut mgr = manager_for(&dir, &script)
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_session_extra(vec!["dns server=udp://9.9.9.9".into(), "dns server=udp://1.0.0.1".into()]);
+        mgr.restart_delay = Duration::from_millis(50);
+        mgr.start().await.unwrap();
+        mgr.wait_and_handle_exit().await.unwrap();
+        mgr.shutdown().await;
+
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 7).await;
+        let dns = lines.iter().filter(|l| l.contains(" dns server=")).count();
+        assert_eq!(dns, 4, "{lines:#?}");
+        let records: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.contains("session backend=") || l.contains(" dns server=") || l.contains(" exit ")
+            })
+            .collect();
+        assert_eq!(records.len(), 8, "{lines:#?}");
+        let sessions: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.contains("session backend="))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(sessions, [0, 4], "{records:#?}");
+        assert!(
+            records[1].contains("dns server=udp://9.9.9.9"),
+            "{}",
+            records[1]
+        );
+        assert!(
+            records[2].contains("dns server=udp://1.0.0.1"),
+            "{}",
+            records[2]
+        );
+        assert!(
+            records[5].contains("dns server=udp://9.9.9.9"),
+            "{}",
+            records[5]
+        );
+        assert!(
+            records[6].contains("dns server=udp://1.0.0.1"),
+            "{}",
+            records[6]
+        );
+    }
+
+    #[tokio::test]
+    async fn session_extra_flattens_newlines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())))
+            .with_session_extra(vec!["dns server=udp://1.1.1.1\n2026-01-01 dns forged=true".into()]);
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = read_lines(&dir.path().join("backend.log"));
+        let dns: Vec<&String> = lines.iter().filter(|l| l.contains(" dns ")).collect();
+        assert_eq!(dns.len(), 1, "{lines:?}");
+        assert!(
+            dns[0].contains("dns server=udp://1.1.1.1 2026-01-01 dns forged=true"),
+            "{}",
+            dns[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn no_session_extra_writes_no_dns_lines() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
+            .with_log_file(Some(backend_log(dir.path())));
+
+        mgr.start().await.unwrap();
+        mgr.stop().await.unwrap();
+
+        let lines = wait_for_lines(&dir.path().join("backend.log"), 2).await;
+        assert!(lines.iter().all(|l| !l.contains(" dns ")), "{lines:?}");
+        assert!(lines[0].contains("session backend="), "{}", lines[0]);
     }
 
     #[tokio::test]
