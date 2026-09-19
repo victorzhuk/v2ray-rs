@@ -7,18 +7,23 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 
+use v2ray_rs_core::config::effective_dns::{EffectiveDns, DnsSource, effective_dns};
 use v2ray_rs_core::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
-    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, builtin_dns_presets,
-    validate_domain_keyword,
+    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, RoutingRuleSet, Subscription,
+    builtin_dns_presets, validate_domain_keyword,
 };
 
-use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
+use super::{
+    SettingsCallback, SettingsObservers, clear_preferences_group, emit, subscribe_settings,
+};
 
 pub(super) fn build_dns_page(
     state: &Rc<RefCell<AppSettings>>,
     cb: &SettingsCallback,
     settings_observers: &SettingsObservers,
+    rules: &Rc<RefCell<RoutingRuleSet>>,
+    subscriptions: &[Subscription],
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("DNS")
@@ -259,6 +264,31 @@ pub(super) fn build_dns_page(
     advanced_expander.add_row(&client_subnet_error);
 
     let advanced_group = adw::PreferencesGroup::new();
+
+    let effective_group = adw::PreferencesGroup::builder()
+        .title("Effective DNS")
+        .build();
+    {
+        let rules = rules.clone();
+        let effective_group = effective_group.clone();
+        let profile_subscriptions = dns_profile_subscription_names(subscriptions);
+        let render_effective = move |settings: &AppSettings| {
+            clear_preferences_group(&effective_group);
+            let summary = effective_dns(
+                settings.backend.backend_type,
+                settings,
+                rules.borrow().rules(),
+                &[],
+            );
+            for row in effective_dns_rows(&summary, &profile_subscriptions) {
+                effective_group.add(&adw::ActionRow::builder().title(row).build());
+            }
+        };
+        render_effective(&state.borrow());
+        subscribe_settings(settings_observers, render_effective);
+    }
+
+    page.add(&effective_group);
     advanced_group.add(&advanced_expander);
     page.add(&advanced_group);
 
@@ -737,6 +767,60 @@ fn private_dns_warning(
     server
         .resolves_via_proxy_private(backend, tun_enabled)
         .then_some(PRIVATE_DNS_WARNING)
+}
+
+/// Names of enabled subscriptions whose imported provider profile carries its
+/// own DNS config — those nodes bypass the app-wide DNS settings.
+fn dns_profile_subscription_names(subscriptions: &[Subscription]) -> Vec<String> {
+    subscriptions
+        .iter()
+        .filter(|sub| {
+            sub.enabled
+                && sub.use_imported_profile
+                && sub
+                    .imported_profile
+                    .as_ref()
+                    .is_some_and(|profile| profile.dns.is_some())
+        })
+        .map(|sub| sub.name.clone())
+        .collect()
+}
+
+/// Pure rendering of the effective-DNS summary: one line per resolver, with
+/// consecutive bootstrap resolvers collapsed into a single explanatory row,
+/// plus one row per DNS-carrying profile subscription.
+fn effective_dns_rows(summary: &EffectiveDns, profile_subscriptions: &[String]) -> Vec<String> {
+    let mut rows: Vec<String> = Vec::new();
+    let mut in_bootstrap_run = false;
+    for entry in summary.entries() {
+        if entry.source() == DnsSource::Bootstrap {
+            if !in_bootstrap_run {
+                in_bootstrap_run = true;
+                rows.push("bootstrap resolvers for proxy hostnames (xray TUN)".to_string());
+            }
+            continue;
+        }
+        in_bootstrap_run = false;
+        let transport = entry
+            .transport()
+            .map(protocol_display_name)
+            .map(|name| format!(" [{name}]"))
+            .unwrap_or_default();
+        rows.push(format!(
+            "{}{} path={} source={} scope={}",
+            entry.address(),
+            transport,
+            entry.path().as_str(),
+            entry.source().as_str(),
+            entry.scope()
+        ));
+    }
+    rows.extend(
+        profile_subscriptions
+            .iter()
+            .map(|name| format!("nodes from \"{name}\" use the imported profile's DNS instead")),
+    );
+    rows
 }
 
 fn server_row_subtitle(
@@ -1921,11 +2005,132 @@ fn show_dns_providers_dialog(ctx: &DnsRenderCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use v2ray_rs_core::models::{DnsConfig, ImportedProfile};
 
     /// The crash this guard exists for: `set_selected` emits `notify::selected`
     /// synchronously, so a handler holding the shared state would re-enter and
     /// panic. GTK is needed for the real signal emission, so skip where there
     /// is no display to initialize against.
+    fn effective_dns_rows_xray_tun(dns_enabled: bool) -> EffectiveDns {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = dns_enabled;
+        effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"])
+    }
+
+    #[test]
+    fn effective_dns_rows_lists_fallback_pair_when_dns_off() {
+        let rows = effective_dns_rows(&effective_dns_rows_xray_tun(false), &[]);
+        assert_eq!(rows.len(), 2, "both fallback DoH resolvers, one row each");
+        assert!(
+            rows[0]
+                .starts_with("https://1.1.1.1/dns-query [DoH] path=proxy source=fallback scope=all"),
+            "got: {}",
+            rows[0]
+        );
+        assert!(
+            rows[1]
+                .starts_with("https://8.8.8.8/dns-query [DoH] path=proxy source=fallback scope=all"),
+            "got: {}",
+            rows[1]
+        );
+    }
+
+    #[test]
+    fn effective_dns_rows_follow_enabled_dns() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "main".into(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".into(),
+            port: None,
+            detour: None,
+        }];
+        let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
+        let rows = effective_dns_rows(&summary, &[]);
+        assert!(
+            rows.iter().all(|row| !row.contains("source=fallback")),
+            "configured servers must replace the fallback rows: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("8.8.8.8 [UDP]")
+                    && row.contains("source=user")
+                    && row.ends_with("scope=all")),
+            "got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn effective_dns_rows_names_imported_profile_subscription() {
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.imported_profile = Some(ImportedProfile {
+            rules: Vec::new(),
+            dns: Some(DnsConfig::default()),
+            skipped: Vec::new(),
+            imported_at: Utc::now(),
+        });
+        let mut without_dns = Subscription::new_from_url("Plain", "https://example.com/plain");
+        without_dns.enabled = false;
+
+        assert_eq!(
+            dns_profile_subscription_names(&[sub, without_dns]),
+            vec!["Provider".to_string()],
+            "only the enabled DNS-carrying profile subscription is listed"
+        );
+
+        let rows = effective_dns_rows(&effective_dns_rows_xray_tun(true), &["Provider".into()]);
+        assert!(
+            rows.contains(&"nodes from \"Provider\" use the imported profile's DNS instead".into()),
+            "got: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn effective_dns_rows_collapses_bootstrap_pair() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "main".into(),
+            protocol: DnsProtocol::Udp,
+            address: "dns.example.com".into(),
+            port: None,
+            detour: None,
+        }];
+        let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
+        assert!(
+            summary
+                .entries()
+                .iter()
+                .filter(|entry| entry.source() == DnsSource::Bootstrap)
+                .count()
+                >= 2,
+            "fixture must produce the consecutive bootstrap pair"
+        );
+        let rows = effective_dns_rows(&summary, &[]);
+        assert_eq!(
+            rows.iter()
+                .filter(|row| *row == "bootstrap resolvers for proxy hostnames (xray TUN)")
+                .count(),
+            1,
+            "the bootstrap pair collapses to one row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn effective_dns_rows_no_profile_row_without_profiles() {
+        let rows = effective_dns_rows(&effective_dns_rows_xray_tun(true), &[]);
+        assert!(
+            rows.iter()
+                .all(|row| !row.contains("use the imported profile's DNS")),
+            "no profile subscription, no profile row: {rows:?}"
+        );
+    }
+
     #[test]
     fn programmatic_selection_does_not_re_enter_the_handler() {
         crate::gtk_test::run(|| {

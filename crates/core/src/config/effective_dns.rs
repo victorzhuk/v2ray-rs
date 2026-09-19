@@ -64,7 +64,7 @@ pub enum DnsScope {
 }
 
 impl DnsPath {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             DnsPath::Direct => "direct",
             DnsPath::Proxy => "proxy",
@@ -76,7 +76,7 @@ impl DnsPath {
 }
 
 impl DnsSource {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             DnsSource::User => "user",
             DnsSource::Fallback => "fallback",
@@ -607,6 +607,28 @@ fn server_scope_singbox(
     }
 
     scope_from(domains)
+}
+
+impl EffectiveDnsEntry {
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    pub fn transport(&self) -> Option<DnsProtocol> {
+        self.transport
+    }
+
+    pub fn path(&self) -> DnsPath {
+        self.path
+    }
+
+    pub fn source(&self) -> DnsSource {
+        self.source
+    }
+
+    pub fn scope(&self) -> &DnsScope {
+        &self.scope
+    }
 }
 
 impl EffectiveDns {

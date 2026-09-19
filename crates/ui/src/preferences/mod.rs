@@ -78,7 +78,14 @@ pub fn show_preferences(
     };
     dialog.add(&routing_page);
 
-    let dns_page = build_dns_page(&settings_state, &settings_cb, &settings_observers);
+    let subscriptions = store.load_subscriptions().unwrap_or_default();
+    let dns_page = build_dns_page(
+        &settings_state,
+        &settings_cb,
+        &settings_observers,
+        &routing_state,
+        &subscriptions,
+    );
     dialog.add(&dns_page);
 
     let tun_page = build_tun_page(
