@@ -656,6 +656,8 @@ impl EffectiveDns {
 mod tests {
     use super::*;
     use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
+    use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
+    use crate::config::{ConfigGenerator, SingboxGenerator};
     use crate::models::{
         ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, HostOverride,
         ImportedProfile, ProxyNode, Subscription,
@@ -1245,5 +1247,289 @@ mod tests {
         assert!(lines
             .iter()
             .all(|l| !l.contains("pinned.local") && !l.contains("source=static")));
+    }
+
+    /// The summary stores sing-box addresses raw (`1.1.1.1`) while the derived
+    /// TUN resolver and the v2ray family use URL forms for DoH
+    /// (`https://1.1.1.1/dns-query`); the host is the common denominator both
+    /// sides share for the same logical resolver.
+    fn canonical_address(address: &str) -> String {
+        for scheme in ["https://", "h3://", "tls://", "quic://", "tcp://"] {
+            if let Some(rest) = address.strip_prefix(scheme) {
+                return rest.split(['/', ':']).next().unwrap_or(rest).to_string();
+            }
+        }
+        address.to_string()
+    }
+
+    /// (address set, has-system-resolver) as the generated config carries them.
+    /// `system` is true for a missing dns section or an OS-resolver server
+    /// (`localhost` for the v2ray family, a `local`-typed server for sing-box).
+    fn generated_dns_addresses(
+        config: &serde_json::Value,
+        backend: BackendType,
+    ) -> (std::collections::HashSet<String>, bool) {
+        let Some(dns) = config.get("dns") else {
+            return (Default::default(), true);
+        };
+        let mut addresses = std::collections::HashSet::new();
+        let mut system = false;
+        for server in dns["servers"].as_array().expect("dns.servers array") {
+            match backend {
+                BackendType::V2ray | BackendType::Xray => {
+                    let address = server
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| {
+                            server["address"]
+                                .as_str()
+                                .expect("server address")
+                                .to_string()
+                        });
+                    if address == "localhost" {
+                        system = true;
+                    }
+                    addresses.insert(canonical_address(&address));
+                }
+                BackendType::SingBox => match server["type"].as_str().unwrap_or_default() {
+                    "fakeip" | "hosts" => {}
+                    "local" => {
+                        system = true;
+                        addresses.insert("local".to_string());
+                    }
+                    _ => {
+                        addresses.insert(canonical_address(
+                            server["server"].as_str().expect("typed server address"),
+                        ));
+                    }
+                },
+            }
+        }
+        (addresses, system)
+    }
+
+    fn summary_addresses(summary: &EffectiveDns) -> std::collections::HashSet<String> {
+        summary
+            .entries()
+            .iter()
+            // Static hosts entries are table overrides, not resolvers; the
+            // `system` placeholder stands for an absent dns section, which
+            // contributes no generated server.
+            .filter(|e| {
+                e.path != DnsPath::Static && !(e.path == DnsPath::System && e.address == "system")
+            })
+            .map(|e| canonical_address(&e.address))
+            .collect()
+    }
+
+    fn assert_cross_check(config: &serde_json::Value, summary: &EffectiveDns, backend: BackendType, label: &str) {
+        let (generated, generated_system) = generated_dns_addresses(config, backend);
+        assert_eq!(
+            summary_addresses(summary),
+            generated,
+            "{label}: summary addresses diverge from generated dns.servers"
+        );
+        assert_eq!(
+            summary.system_resolver(),
+            generated_system,
+            "{label}: system_resolver diverges from generated config"
+        );
+    }
+
+    fn matrix_settings(tun: bool, dns_enabled: bool, server_mode: &str) -> AppSettings {
+        let mut settings = default_settings();
+        settings.tun.enabled = tun;
+        settings.dns.enabled = dns_enabled;
+        if dns_enabled {
+            match server_mode {
+                "unscoped" => {
+                    settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
+                }
+                "custom-rules" => {
+                    settings.dns.use_custom_rules = true;
+                    settings.dns.servers = vec![
+                        server("remote", DnsProtocol::Doh, "1.1.1.1"),
+                        server("domestic", DnsProtocol::Udp, "77.88.8.8"),
+                    ];
+                    settings.dns.rules = vec![
+                        dns_rule("google.com", "remote"),
+                        dns_rule("ru", "domestic"),
+                    ];
+                }
+                "auto-split" => {
+                    settings.dns.servers = vec![
+                        server("remote", DnsProtocol::Doh, "1.1.1.1"),
+                        server("domestic", DnsProtocol::Udp, "77.88.8.8"),
+                    ];
+                }
+                _ => unreachable!(),
+            }
+        } else {
+            // Must be ignored: no configured server may reach the summary or
+            // the generated config while DNS is disabled.
+            settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
+        }
+        settings
+    }
+
+    #[test]
+    fn effective_dns_addresses_match_generated_servers() {
+        let node_kinds = ["203.0.113.10", "example.com"];
+        let server_modes = ["unscoped", "custom-rules", "auto-split"];
+        let mut cases = 0;
+
+        for tun in [false, true] {
+            for dns_enabled in [false, true] {
+                let modes: &[&str] = if dns_enabled {
+                    &server_modes
+                } else {
+                    &["unscoped"]
+                };
+                for server_mode in modes {
+                    for node_addr in node_kinds {
+                        let settings =
+                            matrix_settings(tun, dns_enabled, server_mode);
+                        let rules: Vec<RoutingRule> = if dns_enabled && *server_mode == "auto-split" {
+                            vec![
+                                RoutingRule {
+                                    id: Uuid::new_v4(),
+                                    match_condition: RuleMatch::Domain {
+                                        pattern: "google.com".into(),
+                                    },
+                                    action: RuleAction::Proxy,
+                                    enabled: true,
+                                    group: None,
+                                    via_node: None,
+                                },
+                                RoutingRule {
+                                    id: Uuid::new_v4(),
+                                    match_condition: RuleMatch::Domain {
+                                        pattern: "example.ru".into(),
+                                    },
+                                    action: RuleAction::Direct,
+                                    enabled: true,
+                                    group: None,
+                                    via_node: None,
+                                },
+                            ]
+                        } else {
+                            Vec::new()
+                        };
+                        let label =
+                            format!("{tun}/{dns_enabled}/{server_mode}/{node_addr}");
+
+                        for (backend, family) in [
+                            (BackendType::V2ray, V2rayFamilyBackend::V2ray),
+                            (BackendType::Xray, V2rayFamilyBackend::Xray),
+                        ] {
+                            let config = generate_v2ray_family_config(
+                                &[node_with_address(node_addr)],
+                                &rules,
+                                &settings,
+                                family,
+                            );
+                            let summary =
+                                effective_dns(backend, &settings, &rules, &[node_addr]);
+                            assert_cross_check(&config, &summary, backend, &label);
+                        }
+
+                        let config = SingboxGenerator
+                            .generate(&[node_with_address(node_addr)], &rules, &settings)
+                            .expect("sing-box config");
+                        let summary = effective_dns(
+                            BackendType::SingBox,
+                            &settings,
+                            &rules,
+                            &[node_addr],
+                        );
+                        assert_cross_check(
+                            &config,
+                            &summary,
+                            BackendType::SingBox,
+                            &label,
+                        );
+
+                        // 48-case budget counts one cell per backend.
+                        cases += 3;
+                    }
+                }
+            }
+        }
+
+        assert_eq!(cases, 48, "matrix must cover 48 cells");
+    }
+
+    #[test]
+    fn hosts_keys_equal_static_entry_scopes_and_stay_out_of_servers() {
+        for backend in [
+            BackendType::V2ray,
+            BackendType::Xray,
+            BackendType::SingBox,
+        ] {
+            let mut settings = default_settings();
+            settings.dns.enabled = true;
+            settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
+            settings.dns.hosts = vec![
+                host("router.local", "192.168.1.1"),
+                host("nas.local", "192.168.1.2"),
+            ];
+            let nodes = [node_with_address("203.0.113.10")];
+
+            let config = match backend {
+                BackendType::SingBox => SingboxGenerator
+                    .generate(&nodes, &[], &settings)
+                    .expect("sing-box config"),
+                BackendType::V2ray => generate_v2ray_family_config(
+                    &nodes,
+                    &[],
+                    &settings,
+                    V2rayFamilyBackend::V2ray,
+                ),
+                BackendType::Xray => generate_v2ray_family_config(
+                    &nodes,
+                    &[],
+                    &settings,
+                    V2rayFamilyBackend::Xray,
+                ),
+            };
+            let summary = effective_dns(backend, &settings, &[], &["203.0.113.10"]);
+
+            let static_domains: std::collections::HashSet<String> = summary
+                .entries()
+                .iter()
+                .filter(|e| e.path == DnsPath::Static)
+                .map(|e| e.address.clone())
+                .collect();
+            let expected: std::collections::HashSet<String> = ["router.local", "nas.local"]
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(static_domains, expected, "{backend:?}");
+
+            // The generated hosts table carries exactly those keys.
+            let table = match backend {
+                BackendType::SingBox => &config["dns"]["servers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["type"] == "hosts")
+                    .expect("hosts server")["predefined"],
+                _ => &config["dns"]["hosts"],
+            };
+            let table_keys: std::collections::HashSet<String> = table
+                .as_object()
+                .expect("hosts table object")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(table_keys, expected, "{backend:?}");
+
+            // Static entries are not resolvers: absent from log lines and from
+            // the generated server address set, which still matches exactly.
+            assert!(summary.log_lines().iter().all(|l| {
+                !l.contains("router.local") && !l.contains("nas.local")
+            }));
+            assert_cross_check(&config, &summary, backend, "hosts cell");
+        }
     }
 }
