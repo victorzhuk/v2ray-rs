@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-19
+
 ### Added
 - Preferences → System → Diagnostics sets the backend log level (`error`,
   `warning`, `info`, `debug`; default `warning`) and a Connection log switch
@@ -748,7 +750,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.4...v0.18.0
 [0.17.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.3...v0.17.4
 [0.17.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.2...v0.17.3
