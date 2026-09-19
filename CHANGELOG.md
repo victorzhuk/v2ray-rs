@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.1] - 2026-09-19
+
+### Fixed
+- The TUN capability gate tests pass when the suite runs as root, where the
+  capability probe is skipped by design.
+
 ## [0.19.0] - 2026-09-19
 
 ### Added
@@ -750,7 +756,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.1...HEAD
+[0.19.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.4...v0.18.0
 [0.17.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.3...v0.17.4
