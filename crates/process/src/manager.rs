@@ -1564,15 +1564,26 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
             .with_log_file(Some(backend_log(dir.path())))
-            .with_session_extra(vec!["dns server=udp://1.1.1.1".into(), "dns server=udp://8.8.8.8".into()]);
+            .with_session_extra(vec![
+                "dns server=udp://1.1.1.1".into(),
+                "dns server=udp://8.8.8.8".into(),
+            ]);
 
         mgr.start().await.unwrap();
         mgr.stop().await.unwrap();
 
         let lines = wait_for_lines(&dir.path().join("backend.log"), 3).await;
         assert!(lines[0].contains("session backend="), "{}", lines[0]);
-        assert!(lines[1].contains("dns server=udp://1.1.1.1"), "{}", lines[1]);
-        assert!(lines[2].contains("dns server=udp://8.8.8.8"), "{}", lines[2]);
+        assert!(
+            lines[1].contains("dns server=udp://1.1.1.1"),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2].contains("dns server=udp://8.8.8.8"),
+            "{}",
+            lines[2]
+        );
         assert_eq!(lines.iter().filter(|l| l.contains(" session ")).count(), 1);
     }
 
@@ -1582,7 +1593,10 @@ mod tests {
         let script = format!("{VERSION_STUB}{}", crashing_backend(dir.path(), 1));
         let mut mgr = manager_for(&dir, &script)
             .with_log_file(Some(backend_log(dir.path())))
-            .with_session_extra(vec!["dns server=udp://9.9.9.9".into(), "dns server=udp://1.0.0.1".into()]);
+            .with_session_extra(vec![
+                "dns server=udp://9.9.9.9".into(),
+                "dns server=udp://1.0.0.1".into(),
+            ]);
         mgr.restart_delay = Duration::from_millis(50);
         mgr.start().await.unwrap();
         mgr.wait_and_handle_exit().await.unwrap();
@@ -1632,7 +1646,9 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
             .with_log_file(Some(backend_log(dir.path())))
-            .with_session_extra(vec!["dns server=udp://1.1.1.1\n2026-01-01 dns forged=true".into()]);
+            .with_session_extra(vec![
+                "dns server=udp://1.1.1.1\n2026-01-01 dns forged=true".into(),
+            ]);
 
         mgr.start().await.unwrap();
         mgr.stop().await.unwrap();

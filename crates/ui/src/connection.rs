@@ -2235,7 +2235,12 @@ exit 1"#,
             None
         );
         assert_eq!(
-            fallback_dns_notice(&dns_summary(BackendType::V2ray, false), false, true, BackendType::V2ray),
+            fallback_dns_notice(
+                &dns_summary(BackendType::V2ray, false),
+                false,
+                true,
+                BackendType::V2ray
+            ),
             None
         );
     }
@@ -2317,11 +2322,9 @@ exit 1"#,
         assert_error_terminal(terminal);
 
         assert!(
-            lines
-                .iter()
-                .all(|l| !l.contains("DNS is disabled")
-                    && !l.contains("fallback 1.1.1.1")
-                    && !l.contains(FALLBACK_DNS_SCOPED_NOTICE)),
+            lines.iter().all(|l| !l.contains("DNS is disabled")
+                && !l.contains("fallback 1.1.1.1")
+                && !l.contains(FALLBACK_DNS_SCOPED_NOTICE)),
             "{lines:#?}"
         );
         let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
@@ -2429,11 +2432,7 @@ exit 1"#,
 
         let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
             .expect("backend.log readable");
-        assert_eq!(
-            log.matches(" source=profile ").count(),
-            2,
-            "{log}"
-        );
+        assert_eq!(log.matches(" source=profile ").count(), 2, "{log}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -7,7 +7,7 @@ use std::net::IpAddr;
 use std::rc::Rc;
 use std::str::FromStr;
 
-use v2ray_rs_core::config::effective_dns::{EffectiveDns, DnsSource, effective_dns};
+use v2ray_rs_core::config::effective_dns::{DnsSource, EffectiveDns, effective_dns};
 use v2ray_rs_core::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
     DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, RoutingRuleSet, Subscription,
@@ -1025,9 +1025,9 @@ fn dns_server_from_inputs(
 
 fn dns_rule_match_validation_error(m: &DnsRuleMatch) -> Option<String> {
     match m {
-        DnsRuleMatch::DomainKeyword { keyword } => {
-            validate_domain_keyword(keyword).err().map(|e| e.to_string())
-        }
+        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword)
+            .err()
+            .map(|e| e.to_string()),
         _ => None,
     }
 }
@@ -2024,14 +2024,16 @@ mod tests {
         let rows = effective_dns_rows(&effective_dns_rows_xray_tun(false), &[]);
         assert_eq!(rows.len(), 2, "both fallback DoH resolvers, one row each");
         assert!(
-            rows[0]
-                .starts_with("https://1.1.1.1/dns-query [DoH] path=proxy source=fallback scope=all"),
+            rows[0].starts_with(
+                "https://1.1.1.1/dns-query [DoH] path=proxy source=fallback scope=all"
+            ),
             "got: {}",
             rows[0]
         );
         assert!(
-            rows[1]
-                .starts_with("https://8.8.8.8/dns-query [DoH] path=proxy source=fallback scope=all"),
+            rows[1].starts_with(
+                "https://8.8.8.8/dns-query [DoH] path=proxy source=fallback scope=all"
+            ),
             "got: {}",
             rows[1]
         );
@@ -2056,10 +2058,9 @@ mod tests {
             "configured servers must replace the fallback rows: {rows:?}"
         );
         assert!(
-            rows.iter()
-                .any(|row| row.starts_with("8.8.8.8 [UDP]")
-                    && row.contains("source=user")
-                    && row.ends_with("scope=all")),
+            rows.iter().any(|row| row.starts_with("8.8.8.8 [UDP]")
+                && row.contains("source=user")
+                && row.ends_with("scope=all")),
             "got: {rows:?}"
         );
     }
@@ -2233,7 +2234,10 @@ mod tests {
 
     #[test]
     fn dns_rule_match_validation_error_passes_plain_keyword_and_other_matches() {
-        assert_eq!(dns_rule_match_validation_error(&dns_rule_with_keyword("sina")), None);
+        assert_eq!(
+            dns_rule_match_validation_error(&dns_rule_with_keyword("sina")),
+            None
+        );
         for m in [
             DnsRuleMatch::DomainSuffix {
                 suffix: ".ru".to_string(),
