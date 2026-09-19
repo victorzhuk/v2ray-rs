@@ -2068,10 +2068,13 @@ exit 1"#,
         let ProcessState::Error(msg) = state else {
             panic!("expected the capability gate to fail the start, got {state:?}");
         };
+        // Root skips the capability gate, so there the route helper preflight
+        // is the gate that stops the start when the helper is not installed.
         assert!(
             msg.contains("CAP_NET_ADMIN")
                 || msg.contains("TUN capabilities")
-                || msg.contains("ignores file capabilities"),
+                || msg.contains("ignores file capabilities")
+                || msg.contains("route helper v2ray-rs-netctl not found"),
             "start should fail at the capability gate: {msg}"
         );
         assert_eq!(
