@@ -2098,6 +2098,10 @@ mod tests {
 
     #[tokio::test]
     async fn tun_start_refuses_without_capability() {
+        // Root skips the capability probe by design, so there is no gate to hit.
+        if !crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw()) {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let config = dir.path().join("config.json");
         std::fs::write(&config, "{}").unwrap();
