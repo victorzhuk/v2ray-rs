@@ -622,6 +622,18 @@ impl EffectiveDns {
         self.system_resolver
     }
 
+    /// Relabels user-configured entries as profile-sourced. Called by the
+    /// connection layer after `resolve_effective_config` applied an imported
+    /// provider profile's DNS; app-derived fallback, bootstrap and system
+    /// entries keep their provenance.
+    pub fn mark_profile(&mut self) {
+        for entry in &mut self.entries {
+            if entry.source == DnsSource::User {
+                entry.source = DnsSource::Profile;
+            }
+        }
+    }
+
     /// One line per non-static entry, for the connection log.
     pub fn log_lines(&self) -> Vec<String> {
         self.entries
@@ -645,8 +657,10 @@ mod tests {
     use super::*;
     use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
     use crate::models::{
-        DnsRule, DnsRuleMatch, DnsServerConfig, HostOverride, ProxyNode,
+        ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, HostOverride,
+        ImportedProfile, ProxyNode, Subscription,
     };
+    use chrono::Utc;
     use uuid::Uuid;
 
     fn node_with_address(address: &str) -> ProxyNode {
@@ -1147,6 +1161,59 @@ mod tests {
         );
         assert_eq!(statics[1].address, "nas.local");
         assert!(!summary.log_lines().iter().any(|l| l.contains("router.local")));
+    }
+
+    #[test]
+    fn imported_profile_dns_marked_profile() {
+        let mut profile_dns = DnsConfig::default();
+        profile_dns.enabled = true;
+        profile_dns.servers = vec![server("provider", DnsProtocol::Doh, "doh.provider.example")];
+        let sub = profile_subscription(profile_dns);
+        let settings = default_settings();
+
+        let (rules, effective_settings) =
+            crate::models::resolve_effective_config(&node_ref(&sub), &[sub.clone()], &[], &settings);
+        assert!(crate::models::uses_imported_profile(&node_ref(&sub), &[sub.clone()]));
+
+        let mut summary = effective_dns(
+            BackendType::Xray,
+            &effective_settings,
+            &rules,
+            &["203.0.113.10"],
+        );
+        // The connection layer applies this when the profile DNS was used.
+        summary.mark_profile();
+
+        let user = summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "https://doh.provider.example/dns-query")
+            .unwrap();
+        assert_eq!(user.source, DnsSource::Profile);
+        assert!(summary
+            .entries()
+            .iter()
+            .all(|e| e.source != DnsSource::User));
+    }
+
+    #[test]
+    fn mark_profile_leaves_fallback_bootstrap_and_system() {
+        let mut summary = EffectiveDns {
+            entries: vec![
+                entry("9.9.9.9", Some(DnsProtocol::Udp), DnsPath::Direct, DnsSource::Bootstrap, DnsScope::All),
+                entry(FALLBACK_DNS, Some(DnsProtocol::Doh), DnsPath::Proxy, DnsSource::Fallback, DnsScope::All),
+                entry("localhost", None, DnsPath::System, DnsSource::System, DnsScope::All),
+                entry("1.1.1.1", Some(DnsProtocol::Udp), DnsPath::Routing, DnsSource::User, DnsScope::All),
+            ],
+            uses_fallback: true,
+            system_resolver: true,
+        };
+        summary.mark_profile();
+
+        assert_eq!(summary.entries()[0].source, DnsSource::Bootstrap);
+        assert_eq!(summary.entries()[1].source, DnsSource::Fallback);
+        assert_eq!(summary.entries()[2].source, DnsSource::System);
+        assert_eq!(summary.entries()[3].source, DnsSource::Profile);
     }
 
     #[test]
