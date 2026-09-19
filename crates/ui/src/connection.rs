@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Semaphore, broadcast, mpsc};
 use tokio::task::{JoinHandle, JoinSet};
 use v2ray_rs_core::ansi::strip_ansi;
 use v2ray_rs_core::config::ConfigWriter;
+use v2ray_rs_core::config::effective_dns::{EffectiveDns, effective_dns};
 use v2ray_rs_core::models::{
     AppSettings, BackendType, ConnectionMetadata, ConnectionNodeRef, DnsHijackMode, HostOverride,
     ManualNode, ProxyNode, RoutingRule, Subscription, resolve_effective_config,
@@ -211,6 +212,9 @@ fn spawn_with(
         // Once per connection, like the strict-route notice, so a failover
         // cannot repeat it.
         let mut capture_notice_sent = false;
+        // Same once-per-connection lifetime: a failover candidate must not
+        // repeat the fallback-DNS notice.
+        let mut dns_notice_sent = false;
         let warnings = Arc::new(std::sync::Mutex::new(BackendWarnings::new(
             settings.backend.backend_type,
         )));
@@ -305,6 +309,30 @@ fn spawn_with(
             };
 
             let tun = build_tun_runtime(&effective_settings, pinned);
+            let node_hosts: Vec<&str> = nodes.iter().map(|node| node.address()).collect();
+            let mut summary = effective_dns(
+                settings.backend.backend_type,
+                &effective_settings,
+                &effective_rules,
+                &node_hosts,
+            );
+            if uses_imported_profile(&candidate.node_ref, &subscriptions) {
+                summary.mark_profile();
+            }
+            if !dns_notice_sent
+                && let Some(notice) = fallback_dns_notice(
+                    &summary,
+                    effective_settings.dns.enabled,
+                    tun.as_ref().is_some(),
+                    settings.backend.backend_type,
+                )
+            {
+                dns_notice_sent = true;
+                if let Some(log) = &backend_log {
+                    log.append_line("notice", notice);
+                }
+                sender.emit(AppMsg::ProcessLogLine(generation, notice.to_string()));
+            }
             let session_fields = format!(
                 "hijack={} capture_dns={} strict={} nodes_pinned={pinned} profile={}",
                 tun.as_ref()
@@ -350,6 +378,7 @@ fn spawn_with(
                 .with_backend(settings.backend.backend_type)
                 .with_log_file(backend_log.clone())
                 .with_session_fields(session_fields)
+                .with_session_extra(summary.log_lines())
                 .with_ready_probe(effective_settings.local_endpoint(effective_settings.socks_port)),
             );
             // xray prints deprecation warnings milliseconds after spawn, before
@@ -546,6 +575,37 @@ fn spawn_with(
 }
 
 const STRICT_ROUTE_NOTICE: &str = "notice: kernel IPv6 is disabled; sing-box strict_route turned off for this session (IPv4 routing unchanged)";
+
+const FALLBACK_DNS_DISABLED_NOTICE_XRAY: &str = "DNS is disabled; TUN resolves through fallback DoH 1.1.1.1/8.8.8.8 via the proxy. Enable DNS in Preferences to use your servers";
+
+const FALLBACK_DNS_DISABLED_NOTICE_SINGBOX: &str = "DNS is disabled; TUN resolves through the fallback DoH 1.1.1.1 via the proxy. Enable DNS in Preferences to use your servers";
+
+const FALLBACK_DNS_SCOPED_NOTICE: &str = "Every configured DNS server is domain-scoped; the fallback 1.1.1.1 answers all other domains. Add an unscoped server in Preferences to change that";
+
+/// Selects the fallback-DNS notice for a candidate, or `None` when the
+/// effective DNS layout needs no explanation.
+fn fallback_dns_notice(
+    summary: &EffectiveDns,
+    dns_enabled: bool,
+    tun: bool,
+    backend: BackendType,
+) -> Option<&'static str> {
+    if !tun {
+        return None;
+    }
+    if !dns_enabled {
+        return match backend {
+            BackendType::Xray => Some(FALLBACK_DNS_DISABLED_NOTICE_XRAY),
+            BackendType::SingBox => Some(FALLBACK_DNS_DISABLED_NOTICE_SINGBOX),
+            BackendType::V2ray => None,
+        };
+    }
+    if summary.uses_fallback() {
+        Some(FALLBACK_DNS_SCOPED_NOTICE)
+    } else {
+        None
+    }
+}
 
 const PIN_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -1185,7 +1245,8 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use v2ray_rs_core::models::{
-        DnsStrategy, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TunConfig,
+        DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
+        ImportedProfile, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TunConfig,
         VlessConfig, XhttpSettings,
     };
     use v2ray_rs_core::persistence::load_tun_session;
@@ -2127,6 +2188,251 @@ exit 1"#,
                 "hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
             ),
             "{contents}"
+        );
+    }
+
+    #[test]
+    fn fallback_dns_notice_selects_the_xray_disabled_text_verbatim() {
+        let summary = dns_summary(BackendType::Xray, false);
+        assert_eq!(
+            fallback_dns_notice(&summary, false, true, BackendType::Xray),
+            Some(FALLBACK_DNS_DISABLED_NOTICE_XRAY)
+        );
+    }
+
+    #[test]
+    fn fallback_dns_notice_selects_the_singbox_disabled_text_verbatim() {
+        let summary = dns_summary(BackendType::SingBox, false);
+        assert_eq!(
+            fallback_dns_notice(&summary, false, true, BackendType::SingBox),
+            Some(FALLBACK_DNS_DISABLED_NOTICE_SINGBOX)
+        );
+    }
+
+    #[test]
+    fn fallback_dns_notice_selects_the_scoped_text_verbatim() {
+        let summary = scoped_dns_summary();
+        assert_eq!(
+            fallback_dns_notice(&summary, true, true, BackendType::Xray),
+            Some(FALLBACK_DNS_SCOPED_NOTICE)
+        );
+    }
+
+    #[test]
+    fn fallback_dns_notice_stays_silent_without_tun_or_fallback() {
+        let summary = dns_summary(BackendType::Xray, false);
+        assert_eq!(
+            fallback_dns_notice(&summary, false, false, BackendType::Xray),
+            None
+        );
+        let unscoped = dns_summary(BackendType::Xray, true);
+        assert_eq!(
+            fallback_dns_notice(&unscoped, true, true, BackendType::Xray),
+            None
+        );
+        assert_eq!(
+            fallback_dns_notice(&scoped_dns_summary(), true, false, BackendType::Xray),
+            None
+        );
+        assert_eq!(
+            fallback_dns_notice(&dns_summary(BackendType::V2ray, false), false, true, BackendType::V2ray),
+            None
+        );
+    }
+
+    fn dns_summary(backend: BackendType, dns_enabled: bool) -> EffectiveDns {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = dns_enabled;
+        effective_dns(backend, &settings, &[], &["203.0.113.10"])
+    }
+
+    fn scoped_dns_summary() -> EffectiveDns {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".into(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::DomainSuffix {
+                suffix: "ru".into(),
+            },
+            server_tag: "domestic".into(),
+        }];
+        effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"])
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fallback_notice_once_across_two_failed_candidates() {
+        let (stub, mut settings, _host, probe) = xray_tun_stub_with_probe("v2rsdnsn1");
+        settings.dns.enabled = false;
+        let (_handle, rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        let (terminal, lines, toasts) = drain_within(&rx, Duration::from_secs(60)).await;
+        assert_error_terminal(terminal);
+
+        let notices: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains(FALLBACK_DNS_DISABLED_NOTICE_XRAY))
+            .collect();
+        assert_eq!(notices.len(), 1, "{lines:#?}");
+        assert_eq!(notices[0], &FALLBACK_DNS_DISABLED_NOTICE_XRAY);
+        assert!(
+            toasts.iter().all(|t| !t.contains("DNS is disabled")),
+            "{toasts:#?}"
+        );
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(
+            log.matches(FALLBACK_DNS_DISABLED_NOTICE_XRAY).count(),
+            1,
+            "{log}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_notice_with_dns_enabled_unscoped_server() {
+        let (stub, mut settings, _host, probe) = xray_tun_stub_with_probe("v2rsdnsn2");
+        settings.dns.enabled = true;
+        let (_handle, rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        let (terminal, lines, _) = drain_within(&rx, Duration::from_secs(60)).await;
+        assert_error_terminal(terminal);
+
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("DNS is disabled")
+                    && !l.contains("fallback 1.1.1.1")
+                    && !l.contains(FALLBACK_DNS_SCOPED_NOTICE)),
+            "{lines:#?}"
+        );
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert!(!log.contains("DNS is disabled"), "{log}");
+        assert!(!log.contains(FALLBACK_DNS_SCOPED_NOTICE), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dns_lines_follow_session_in_backend_log() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; exec sleep 30"#,
+        );
+        let host = tempfile::tempdir().unwrap();
+        let getcap = host.path().join("getcap");
+        std::fs::write(&getcap, "#!/bin/sh\necho \"$1 cap_net_admin=ep\"\n").unwrap();
+        std::fs::set_permissions(&getcap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let probe = v2ray_rs_process::HostProbe {
+            getcap,
+            helper: executable(host.path(), "v2ray-rs-netctl"),
+        };
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "v2rsdnsl3".into();
+        settings.tun.strict_route = false;
+        settings.dns.enabled = false;
+        let (_handle, rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        let (terminal, _) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        let lines: Vec<&str> = log.lines().collect();
+        let session_at = lines
+            .iter()
+            .position(|l| l.contains(" session "))
+            .expect("session record");
+        assert!(
+            lines[session_at + 1].contains(" dns server=https://1.1.1.1/dns-query"),
+            "{}",
+            lines[session_at + 1]
+        );
+        assert!(
+            lines[session_at + 2].contains(" dns server=https://8.8.8.8/dns-query"),
+            "{}",
+            lines[session_at + 2]
+        );
+        assert_eq!(
+            lines.iter().filter(|l| l.contains(" dns server=")).count(),
+            2,
+            "{log}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn dns_lines_carry_source_profile_for_imported_profile_candidate() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; exec sleep 30"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.use_imported_profile = true;
+        sub.imported_profile = Some(ImportedProfile {
+            rules: Vec::new(),
+            dns: Some(DnsConfig {
+                enabled: true,
+                ..DnsConfig::default()
+            }),
+            skipped: Vec::new(),
+            imported_at: chrono::Utc::now(),
+        });
+        let candidate = ConnectionCandidate {
+            node_ref: ConnectionNodeRef::Subscription {
+                subscription_id: sub.id,
+                node_id: uuid::Uuid::new_v4(),
+            },
+            ..candidate("203.0.113.9")
+        };
+        let mut req = request(&stub, settings, vec![candidate]);
+        req.subscriptions = vec![sub];
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let handle = spawn_with(req, tx, |mgr| mgr);
+
+        loop {
+            let (state, _) = next_state(&rx).await;
+            assert!(relays(&state), "reported {state:?}");
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+        }
+        handle.stop(StopReason::UserStop);
+        loop {
+            let (state, _) = next_state(&rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+
+        let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
+            .expect("backend.log readable");
+        assert_eq!(
+            log.matches(" source=profile ").count(),
+            2,
+            "{log}"
         );
     }
 
