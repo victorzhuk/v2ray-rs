@@ -494,7 +494,7 @@ For large features, we recommend:
 ### Resources
 
 - [README.md](README.md) - Project overview
-- [CLAUDE.md](CLAUDE.md) - Development guidelines
+- [AGENTS.md](AGENTS.md) - Development guidelines
 - [openspec/](openspec/) - Feature specifications
 
 ### Common Issues
