@@ -5,8 +5,8 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::models::{
-    AutoResolveStrategy, ConnectionNodeRef, LastSuccessMetadata, LatencySample, ManualNode,
-    ProxyNode, RoutingRule, Subscription,
+    AutoResolveStrategy, ConnectionNodeRef, EgressSample, LastSuccessMetadata, LatencySample,
+    ManualNode, ProxyNode, RoutingRule, Subscription, VerdictRecord,
 };
 
 /// Resolves the nodes named by rules' `via_node`, in first-appearance order
@@ -133,6 +133,11 @@ impl LatencySnapshot {
         self.samples.get(&node_ref)
     }
 
+    /// Every node reference with a recorded sample.
+    pub fn keys(&self) -> impl Iterator<Item = ConnectionNodeRef> + '_ {
+        self.samples.keys().copied()
+    }
+
     pub fn upsert(
         &mut self,
         node_ref: ConnectionNodeRef,
@@ -146,6 +151,8 @@ impl LatencySnapshot {
                 latency_ms: None,
                 measured_at,
                 real_delay_ms: None,
+                egress: None,
+                verdicts: HashMap::new(),
             });
         entry.latency_ms = Some(latency_ms);
         entry.measured_at = measured_at;
@@ -164,9 +171,59 @@ impl LatencySnapshot {
                 latency_ms: None,
                 measured_at,
                 real_delay_ms: None,
+                egress: None,
+                verdicts: HashMap::new(),
             });
         entry.real_delay_ms = Some(real_delay_ms);
         entry.measured_at = measured_at;
+    }
+
+    /// Records a successful egress detection for `node_ref`. A failed egress
+    /// fetch is simply not recorded, so the previous sample survives.
+    pub fn upsert_egress(
+        &mut self,
+        node_ref: ConnectionNodeRef,
+        address: String,
+        location: String,
+        checked_at: DateTime<Utc>,
+    ) {
+        let entry = self
+            .samples
+            .entry(node_ref)
+            .or_insert_with(|| LatencySample {
+                latency_ms: None,
+                measured_at: checked_at,
+                real_delay_ms: None,
+                egress: None,
+                verdicts: HashMap::new(),
+            });
+        entry.egress = Some(EgressSample {
+            address,
+            location,
+            checked_at,
+        });
+    }
+
+    /// Replaces the availability verdicts recorded for `node_ref` with the
+    /// results of the latest probe pass, keeping each verdict's checked-at
+    /// time.
+    pub fn upsert_verdicts(
+        &mut self,
+        node_ref: ConnectionNodeRef,
+        verdicts: HashMap<String, VerdictRecord>,
+        checked_at: DateTime<Utc>,
+    ) {
+        let entry = self
+            .samples
+            .entry(node_ref)
+            .or_insert_with(|| LatencySample {
+                latency_ms: None,
+                measured_at: checked_at,
+                real_delay_ms: None,
+                egress: None,
+                verdicts: HashMap::new(),
+            });
+        entry.verdicts = verdicts;
     }
 
     /// Drops samples whose node is no longer among `valid`, keeping the snapshot
@@ -407,6 +464,7 @@ impl ConnectionPlanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geo_probe::AvailabilityVerdict;
     use crate::models::{ProxyNode, Subscription, SubscriptionNode, VlessConfig};
     use chrono::Utc;
 
@@ -644,6 +702,88 @@ mod tests {
         });
         let legacy_snapshot: LatencySnapshot = serde_json::from_value(legacy).unwrap();
         assert_eq!(legacy_snapshot.len(), 1);
+    }
+
+    #[test]
+    fn snapshot_round_trips_egress_and_verdicts() {
+        let mut snapshot = LatencySnapshot::new();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        let checked_at = Utc::now();
+        snapshot.upsert_egress(node_ref, "2001:db8::1".into(), "AT".into(), checked_at);
+        snapshot.upsert_verdicts(
+            node_ref,
+            HashMap::from([
+                (
+                    "notebooklm".to_string(),
+                    VerdictRecord {
+                        result: AvailabilityVerdict::Blocked,
+                        checked_at,
+                    },
+                ),
+                (
+                    "gemini".to_string(),
+                    VerdictRecord {
+                        result: AvailabilityVerdict::Available,
+                        checked_at,
+                    },
+                ),
+            ]),
+            checked_at,
+        );
+
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let reloaded: LatencySnapshot = serde_json::from_str(&json).unwrap();
+        let sample = reloaded.get(node_ref).unwrap();
+        let egress = sample.egress.as_ref().expect("egress persisted");
+        assert_eq!(egress.address, "2001:db8::1");
+        assert_eq!(egress.location, "AT");
+        assert_eq!(egress.checked_at, checked_at);
+        assert_eq!(sample.verdicts.len(), 2);
+        assert_eq!(
+            sample.verdicts["notebooklm"].result,
+            AvailabilityVerdict::Blocked
+        );
+        assert_eq!(sample.verdicts["gemini"].checked_at, checked_at);
+    }
+
+    #[test]
+    fn snapshot_hydrates_egress_and_verdicts_from_fixture() {
+        let fixture = serde_json::json!({
+            "samples": [{
+                "node_ref": { "type": "manual", "node_id": uuid::Uuid::new_v4() },
+                "sample": {
+                    "latency_ms": 80,
+                    "measured_at": "2025-01-01T00:00:00Z",
+                    "egress": {
+                        "address": "203.0.113.7",
+                        "location": "DE",
+                        "checked_at": "2025-02-02T03:04:05Z"
+                    },
+                    "verdicts": {
+                        "notebooklm": {
+                            "result": "unknown",
+                            "checked_at": "2025-02-02T03:04:05Z"
+                        }
+                    }
+                }
+            }]
+        });
+        let snapshot: LatencySnapshot = serde_json::from_value(fixture).unwrap();
+        let node_ref = snapshot
+            .keys()
+            .next()
+            .expect("fixture holds one entry")
+            .to_owned();
+        let sample = snapshot.get(node_ref).unwrap();
+        assert_eq!(sample.latency_ms, Some(80));
+        let egress = sample.egress.as_ref().expect("egress hydrated");
+        assert_eq!(egress.location, "DE");
+        assert_eq!(
+            sample.verdicts["notebooklm"].result,
+            AvailabilityVerdict::Unknown
+        );
     }
 
     #[test]

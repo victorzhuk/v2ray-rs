@@ -12,8 +12,9 @@ pub(crate) mod xray;
 pub use redact::redact_json;
 
 pub use probe::{
-    PROBE_TAG_PREFIX, ProbeConfigGenerator, SingboxProbeGenerator, V2rayProbeGenerator,
-    XrayProbeGenerator, probe_generator_for, probe_tag,
+    EGRESS_TAG_PREFIX, PROBE_TAG_PREFIX, ProbeConfigGenerator, SingboxProbeGenerator,
+    V2rayProbeGenerator, XrayProbeGenerator, egress_inbound_ports, egress_tag,
+    pick_free_loopback_ports, probe_generator_for, probe_tag,
 };
 pub use singbox::SingboxGenerator;
 pub use v2ray::V2rayGenerator;

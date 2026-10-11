@@ -6,9 +6,10 @@ use relm4::prelude::*;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
+use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, builtin_service_checks};
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, RealDelayCapability, RealDelaySettings, Subscription,
-    SubscriptionSource,
+    AppSettings, BackendType, EgressSample, RealDelayCapability, RealDelaySettings, Subscription,
+    SubscriptionSource, VerdictRecord,
 };
 use v2ray_rs_core::persistence::{AppPaths, PersistenceError};
 use v2ray_rs_core::runtime_snapshot::subscriptions_runtime_state_eq;
@@ -33,6 +34,10 @@ pub struct SubscriptionsPage {
     testing_latency: HashSet<Uuid>,
     testing_real_delay: HashMap<Uuid, u64>,
     real_delay_run_token: u64,
+    testing_availability: HashMap<Uuid, u64>,
+    availability_run_token: u64,
+    egress_samples: HashMap<(Uuid, Uuid), EgressSample>,
+    verdicts: HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
     expanded_subs: HashSet<Uuid>,
     active_node: Option<(Uuid, Uuid)>,
     tun_active: bool,
@@ -59,6 +64,9 @@ struct RenderState<'a> {
     locked: bool,
     active_node: Option<(Uuid, Uuid)>,
     tun_active: bool,
+    egress_samples: &'a HashMap<(Uuid, Uuid), EgressSample>,
+    verdicts: &'a HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
+    testing_availability: &'a HashMap<Uuid, u64>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -93,6 +101,8 @@ pub enum SubscriptionsMsg {
     SortByLatency(Uuid),
     TestRealDelay(Uuid),
     SortByRealDelay(Uuid),
+    CheckAvailability(Uuid),
+    ShowAvailability(Uuid),
     EnableAllNodes(Uuid),
     DisableAllNodes(Uuid),
     DragDropSubscription(usize, usize),
@@ -118,6 +128,7 @@ pub enum SubscriptionsCmdOutput {
     RefreshDone(Subscription, UpdateResult),
     LatencyResult(Uuid, Vec<Option<u64>>),
     RealDelayResult(Uuid, u64, RealDelayReport),
+    AvailabilityResult(Uuid, u64, RealDelayReport),
     RefreshFailed(Uuid, SubscriptionError),
     AddFailed(SubscriptionError),
     AutoUpdateDone(AutoUpdateRefreshBatch),
@@ -236,6 +247,8 @@ impl Component for SubscriptionsPage {
                 Some(format!("Subscriptions are read-only: {err}")),
             ),
         };
+        let mut egress_samples = HashMap::new();
+        let mut verdicts = HashMap::new();
         if let Ok(snapshot) = store.load_latency_snapshot() {
             for sub in &mut subscriptions {
                 for node in &mut sub.nodes {
@@ -246,6 +259,12 @@ impl Component for SubscriptionsPage {
                     if let Some(sample) = snapshot.get(node_ref) {
                         node.last_latency_ms = sample.latency_ms;
                         node.last_real_delay_ms = sample.real_delay_ms;
+                        if let Some(egress) = sample.egress.clone() {
+                            egress_samples.insert((sub.id, node.id), egress);
+                        }
+                        if !sample.verdicts.is_empty() {
+                            verdicts.insert((sub.id, node.id), sample.verdicts.clone());
+                        }
                     }
                 }
             }
@@ -273,6 +292,10 @@ impl Component for SubscriptionsPage {
             testing_latency: HashSet::new(),
             testing_real_delay: HashMap::new(),
             real_delay_run_token: 0,
+            testing_availability: HashMap::new(),
+            availability_run_token: 0,
+            egress_samples,
+            verdicts,
             expanded_subs: HashSet::new(),
             active_node: None,
             tun_active: false,
@@ -300,6 +323,9 @@ impl Component for SubscriptionsPage {
                 locked: model.load_error.is_some(),
                 active_node: model.active_node,
                 tun_active: model.tun_active,
+                egress_samples: &model.egress_samples,
+                verdicts: &model.verdicts,
+                testing_availability: &model.testing_availability,
             },
         );
 
@@ -610,11 +636,87 @@ impl Component for SubscriptionsPage {
                         Ok(report) => report,
                         Err(_) => RealDelayReport {
                             results: vec![None; node_count],
+                            egress: vec![None; node_count],
+                            verdicts: vec![HashMap::new(); node_count],
                             diagnostic: Some("Real Delay probe timed out".to_string()),
                         },
                     };
                     SubscriptionsCmdOutput::RealDelayResult(id, run_token, report)
                 });
+                return;
+            }
+            SubscriptionsMsg::CheckAvailability(id) => {
+                if self.testing_availability.contains_key(&id) {
+                    return;
+                }
+                if !self.real_delay_settings.enabled {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "Real Delay testing is disabled in Preferences".to_string(),
+                    ));
+                    return;
+                }
+                let sub = match self.subscriptions.iter().find(|s| s.id == id) {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                let Some(binary) = &self.binary_path else {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "No backend binary configured".to_string(),
+                    ));
+                    return;
+                };
+                let node_refs: Vec<v2ray_rs_core::models::SubscriptionNode> = sub.nodes.clone();
+                let backend_type = self.backend_type;
+                let binary = binary.clone();
+                let real_delay_settings = self.real_delay_settings.clone();
+                let paths = self.paths.clone();
+                let node_count = node_refs.len();
+                let services: Vec<ServiceCheck> = builtin_service_checks().to_vec();
+                let service_count = services.len();
+                self.availability_run_token = self.availability_run_token.wrapping_add(1);
+                let run_token = self.availability_run_token;
+                self.testing_availability.insert(id, run_token);
+                sender.oneshot_command(async move {
+                    // Same per-node pass as Real Delay, plus one request per
+                    // service per node through its tunnel.
+                    let timeout = std::time::Duration::from_millis(
+                        u64::from(real_delay_settings.timeout_ms)
+                            + 15_000
+                            + 30_000 * service_count as u64,
+                    );
+                    let report = match tokio::time::timeout(timeout, async {
+                        let node_ref_ptrs: Vec<&v2ray_rs_core::models::SubscriptionNode> =
+                            node_refs.iter().collect();
+                        v2ray_rs_subscription::check_node_availability(
+                            backend_type,
+                            &binary,
+                            &node_ref_ptrs,
+                            &real_delay_settings,
+                            &paths,
+                            &services,
+                        )
+                        .await
+                    })
+                    .await
+                    {
+                        Ok(report) => report,
+                        Err(_) => RealDelayReport {
+                            results: vec![None; node_count],
+                            egress: vec![None; node_count],
+                            verdicts: vec![HashMap::new(); node_count],
+                            diagnostic: Some("Availability probe timed out".to_string()),
+                        },
+                    };
+                    SubscriptionsCmdOutput::AvailabilityResult(id, run_token, report)
+                });
+                return;
+            }
+            SubscriptionsMsg::ShowAvailability(id) => {
+                let sub = match self.subscriptions.iter().find(|s| s.id == id) {
+                    Some(s) => s.clone(),
+                    None => return,
+                };
+                show_availability_dialog(&sub, &self.verdicts, &self.egress_samples);
                 return;
             }
             SubscriptionsMsg::SortByRealDelay(id) => {
@@ -838,6 +940,9 @@ impl Component for SubscriptionsPage {
                 locked: self.load_error.is_some(),
                 active_node: self.active_node,
                 tun_active: self.tun_active,
+                egress_samples: &self.egress_samples,
+                verdicts: &self.verdicts,
+                testing_availability: &self.testing_availability,
             },
         );
     }
@@ -939,20 +1044,31 @@ impl Component for SubscriptionsPage {
                     return;
                 }
                 self.testing_real_delay.remove(&id);
+                let now = chrono::Utc::now();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
                     for (node, delay) in sub.nodes.iter_mut().zip(report.results.iter()) {
                         node.last_real_delay_ms = *delay;
                     }
                     if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
-                        let now = chrono::Utc::now();
-                        for (node, delay) in sub.nodes.iter().zip(report.results.iter()) {
+                        for (idx, (node, delay)) in
+                            sub.nodes.iter().zip(report.results.iter()).enumerate()
+                        {
+                            let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                                subscription_id: sub.id,
+                                node_id: node.id,
+                            };
                             if let Some(value) = delay {
-                                let node_ref =
-                                    v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                                        subscription_id: sub.id,
-                                        node_id: node.id,
-                                    };
                                 snapshot.upsert_real_delay(node_ref, *value, now);
+                            }
+                            if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
+                                snapshot.upsert_egress(
+                                    node_ref,
+                                    sample.address.clone(),
+                                    sample.location.clone(),
+                                    sample.checked_at,
+                                );
+                                self.egress_samples
+                                    .insert((sub.id, node.id), sample.clone());
                             }
                         }
                         if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
@@ -960,7 +1076,6 @@ impl Component for SubscriptionsPage {
                         }
                     }
                 }
-
                 // Update capability based on results for Xray/V2ray backends
                 if matches!(self.backend_type, BackendType::Xray | BackendType::V2ray) {
                     let has_any_result = report.results.iter().any(|r| r.is_some());
@@ -982,6 +1097,54 @@ impl Component for SubscriptionsPage {
                     };
                 }
 
+                if let Some(diagnostic) = report.diagnostic {
+                    let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
+                }
+            }
+            SubscriptionsCmdOutput::AvailabilityResult(id, run_token, report) => {
+                if self.testing_availability.get(&id).copied() != Some(run_token) {
+                    return;
+                }
+                self.testing_availability.remove(&id);
+                let now = chrono::Utc::now();
+                if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
+                    for (node, delay) in sub.nodes.iter_mut().zip(report.results.iter()) {
+                        node.last_real_delay_ms = *delay;
+                    }
+                    if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
+                        for (idx, node) in sub.nodes.iter().enumerate() {
+                            let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                                subscription_id: sub.id,
+                                node_id: node.id,
+                            };
+                            if let Some(value) = report.results.get(idx).and_then(|r| r.as_ref()) {
+                                snapshot.upsert_real_delay(node_ref, *value, now);
+                            }
+                            if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
+                                snapshot.upsert_egress(
+                                    node_ref,
+                                    sample.address.clone(),
+                                    sample.location.clone(),
+                                    sample.checked_at,
+                                );
+                                self.egress_samples
+                                    .insert((sub.id, node.id), sample.clone());
+                            }
+                            if let Some(verdict_map) = report.verdicts.get(idx)
+                                && !verdict_map.is_empty()
+                            {
+                                snapshot.upsert_verdicts(node_ref, verdict_map.clone(), now);
+                                self.verdicts.insert((sub.id, node.id), verdict_map.clone());
+                            }
+                        }
+                        if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
+                            log::error!("save latency snapshot: {e}");
+                        }
+                    }
+                }
+                if let Some(sub) = self.subscriptions.iter().find(|s| s.id == id) {
+                    show_availability_dialog(sub, &self.verdicts, &self.egress_samples);
+                }
                 if let Some(diagnostic) = report.diagnostic {
                     let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
                 }
@@ -1111,6 +1274,9 @@ impl Component for SubscriptionsPage {
                 locked: self.load_error.is_some(),
                 active_node: self.active_node,
                 tun_active: self.tun_active,
+                egress_samples: &self.egress_samples,
+                verdicts: &self.verdicts,
+                testing_availability: &self.testing_availability,
             },
         );
     }
@@ -1451,19 +1617,12 @@ fn build_subscription_group(
     let expander = build_expander_header(sub, state.expanded_subs.contains(&sub.id), sender);
     attach_drag_handle(&expander, sub_idx, sender, state.locked);
     attach_subscription_toggle(&expander, sub.id, sub.enabled, sender, state.locked);
-    let menu = build_subscription_menu(
-        sub,
-        sender,
-        state.testing_latency.contains(&sub.id),
-        state.testing_real_delay.contains_key(&sub.id),
-        state.real_delay_available,
-        state.real_delay_capability,
-        state.tun_active,
-    );
+    let menu = build_subscription_menu(sub, sender, state);
     expander.add_suffix(&menu);
 
     for (idx, node) in sub.nodes.iter().enumerate() {
         let active = state.active_node == Some((sub.id, node.id));
+        let egress = state.egress_samples.get(&(sub.id, node.id));
         expander.add_row(&build_node_row(
             sub.id,
             idx,
@@ -1471,6 +1630,7 @@ fn build_subscription_group(
             sender,
             state.locked,
             active,
+            egress,
         ));
     }
 
@@ -1621,12 +1781,19 @@ fn attach_profile_toggle(
 fn build_subscription_menu(
     sub: &Subscription,
     sender: &ComponentSender<SubscriptionsPage>,
-    is_testing: bool,
-    is_testing_real_delay: bool,
-    real_delay_available: bool,
-    real_delay_capability: &RealDelayCapability,
-    tun_active: bool,
+    state: &RenderState<'_>,
 ) -> gtk::MenuButton {
+    let is_testing = state.testing_latency.contains(&sub.id);
+    let is_testing_real_delay = state.testing_real_delay.contains_key(&sub.id);
+    let real_delay_available = state.real_delay_available;
+    let real_delay_capability = state.real_delay_capability;
+    let tun_active = state.tun_active;
+    let is_testing_availability = state.testing_availability.contains_key(&sub.id);
+    let has_availability = sub
+        .nodes
+        .iter()
+        .any(|n| state.verdicts.contains_key(&(sub.id, n.id)));
+
     let menu_btn = gtk::MenuButton::builder()
         .icon_name("view-more-symbolic")
         .valign(gtk::Align::Center)
@@ -1835,6 +2002,47 @@ fn build_subscription_menu(
     }
     popover_box.append(&sort_real_delay_btn);
 
+    // Availability probe: same backend-support rules as Real Delay, since it
+    // rides the same ephemeral session and per-node inbounds.
+    let check_availability_btn = gtk::Button::builder()
+        .label(if is_testing_availability {
+            "Checking Availability..."
+        } else {
+            "Check Availability"
+        })
+        .has_frame(false)
+        .sensitive(!is_testing_availability && real_delay_available && btn_sensitive && !tun_active)
+        .build();
+    if !real_delay_available || !btn_sensitive {
+        check_availability_btn.set_tooltip_text(Some(
+            "Availability checks use the same ephemeral backend session as Real Delay",
+        ));
+    }
+    {
+        let s = sender.clone();
+        let p = popover.clone();
+        check_availability_btn.connect_clicked(move |_| {
+            p.popdown();
+            s.input(SubscriptionsMsg::CheckAvailability(id));
+        });
+    }
+    popover_box.append(&check_availability_btn);
+
+    let availability_results_btn = gtk::Button::builder()
+        .label("Availability Results")
+        .has_frame(false)
+        .sensitive(has_availability)
+        .build();
+    {
+        let s = sender.clone();
+        let p = popover.clone();
+        availability_results_btn.connect_clicked(move |_| {
+            p.popdown();
+            s.input(SubscriptionsMsg::ShowAvailability(id));
+        });
+    }
+    popover_box.append(&availability_results_btn);
+
     popover_box.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     popover_box.append(&enable_all_btn);
     popover_box.append(&disable_all_btn);
@@ -1856,6 +2064,7 @@ fn build_node_row(
     sender: &ComponentSender<SubscriptionsPage>,
     locked: bool,
     active: bool,
+    egress: Option<&EgressSample>,
 ) -> adw::ActionRow {
     let protocol = match &node.node {
         v2ray_rs_core::models::ProxyNode::Vless(_) => "VLESS",
@@ -1869,7 +2078,7 @@ fn build_node_row(
 
     let row = adw::ActionRow::builder()
         .title(name)
-        .subtitle(&address)
+        .subtitle(format_node_subtitle(&address, egress))
         .build();
 
     if !node.enabled {
@@ -2053,6 +2262,113 @@ fn truncate(s: &str, max: usize) -> String {
             .unwrap_or(0);
         format!("{}...", &s[..boundary])
     }
+}
+
+/// Node row subtitle: the address, plus the last known egress when one exists.
+fn format_node_subtitle(address: &str, egress: Option<&EgressSample>) -> String {
+    match egress {
+        Some(sample) => format!("{address} · exit: {} · {}", sample.location, sample.address),
+        None => address.to_string(),
+    }
+}
+
+/// Inline hint shown next to a blocked verdict, so the rejected exit is
+/// visible instead of inferable.
+fn format_blocked_hint(egress: &EgressSample) -> String {
+    format!("exit: {} · {}", egress.location, egress.address)
+}
+
+/// Badge styling for a verdict: available and blocked are colored, unknown is
+/// styled distinct from both.
+fn verdict_css_classes(verdict: AvailabilityVerdict) -> &'static [&'static str] {
+    match verdict {
+        AvailabilityVerdict::Available => &["caption", "success"],
+        AvailabilityVerdict::Blocked => &["caption", "error"],
+        AvailabilityVerdict::Unknown => &["caption", "dim-label"],
+    }
+}
+
+/// Opens the availability results view: probed nodes against the built-in
+/// services, one badge per verdict with its checked-at time, and the node's
+/// last known egress next to blocked verdicts.
+fn show_availability_dialog(
+    sub: &Subscription,
+    verdicts: &HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
+    egress_samples: &HashMap<(Uuid, Uuid), EgressSample>,
+) {
+    let dialog = adw::AlertDialog::builder()
+        .heading(format!("Availability — {}", sub.name))
+        .body("Verdicts are measured through each node's own tunnel without touching the active connection")
+        .build();
+    dialog.add_response("close", "Close");
+    dialog.set_close_response("close");
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .build();
+
+    let services = builtin_service_checks();
+    let mut rendered = 0usize;
+    for node in &sub.nodes {
+        let Some(node_verdicts) = verdicts.get(&(sub.id, node.id)) else {
+            continue;
+        };
+        let group = adw::PreferencesGroup::builder()
+            .title(node.node.remark().unwrap_or("Unnamed Node"))
+            .build();
+        let mut group_rows = 0usize;
+        for service in services {
+            let Some(record) = node_verdicts.get(service.id) else {
+                continue;
+            };
+            let checked_at = record
+                .checked_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string();
+            let mut subtitle = format!("Checked: {checked_at}");
+            if record.result == AvailabilityVerdict::Blocked
+                && let Some(egress) = egress_samples.get(&(sub.id, node.id))
+            {
+                subtitle.push_str(&format!(" · {}", format_blocked_hint(egress)));
+            }
+            let row = adw::ActionRow::builder()
+                .title(service.name)
+                .subtitle(subtitle)
+                .build();
+            let badge = gtk::Label::builder()
+                .label(record.result.label())
+                .valign(gtk::Align::Center)
+                .build();
+            for class in verdict_css_classes(record.result) {
+                badge.add_css_class(class);
+            }
+            row.add_suffix(&badge);
+            group.add(&row);
+            group_rows += 1;
+            rendered += 1;
+        }
+        if group_rows > 0 {
+            content.append(&group);
+        }
+    }
+    if rendered == 0 {
+        let empty = gtk::Label::builder()
+            .label("No availability verdicts recorded yet. Run Check Availability first.")
+            .css_classes(["dim-label"])
+            .build();
+        content.append(&empty);
+    }
+
+    let scroll = gtk::ScrolledWindow::builder()
+        .min_content_height(200)
+        .max_content_height(420)
+        .propagate_natural_width(true)
+        .child(&content)
+        .build();
+    dialog.set_extra_child(Some(&scroll));
+    dialog.present(crate::active_window().as_ref());
 }
 
 fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
@@ -2261,6 +2577,53 @@ fn show_delete_dialog(id: Uuid, sender: ComponentSender<SubscriptionsPage>) {
     });
 
     dialog.present(crate::active_window().as_ref());
+}
+
+#[cfg(test)]
+mod availability_view_tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn egress(loc: &str, addr: &str) -> EgressSample {
+        EgressSample {
+            address: addr.to_string(),
+            location: loc.to_string(),
+            checked_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn node_subtitle_shows_exit_only_when_known() {
+        assert_eq!(
+            format_node_subtitle("a.example.com:443", None),
+            "a.example.com:443"
+        );
+        let sample = egress("AT", "2001:db8::1");
+        assert_eq!(
+            format_node_subtitle("a.example.com:443", Some(&sample)),
+            "a.example.com:443 · exit: AT · 2001:db8::1"
+        );
+    }
+
+    #[test]
+    fn blocked_hint_formats_location_and_address() {
+        assert_eq!(
+            format_blocked_hint(&egress("DE", "203.0.113.7")),
+            "exit: DE · 203.0.113.7"
+        );
+    }
+
+    #[test]
+    fn verdict_badge_styles_distinguish_the_three_states() {
+        let available = verdict_css_classes(AvailabilityVerdict::Available);
+        let blocked = verdict_css_classes(AvailabilityVerdict::Blocked);
+        let unknown = verdict_css_classes(AvailabilityVerdict::Unknown);
+        assert!(available.contains(&"success"));
+        assert!(blocked.contains(&"error"));
+        // Unknown must not share the colored styling of the other two.
+        assert!(!unknown.contains(&"success") && !unknown.contains(&"error"));
+        assert!(unknown.contains(&"dim-label"));
+    }
 }
 
 #[cfg(test)]

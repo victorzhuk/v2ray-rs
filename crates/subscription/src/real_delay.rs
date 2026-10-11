@@ -8,6 +8,7 @@
 //! v2ray-rs never implements proxy protocols itself: the dial is performed by
 //! the installed backend binary.
 
+use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::Path;
 use std::time::Duration;
@@ -18,23 +19,52 @@ use tokio::sync::Mutex;
 use crate::observatory::{
     ObservatoryError, ObservatoryStatus, query_v2ray_observatory, query_xray_observatory,
 };
+use chrono::Utc;
+use serde_json::Value;
 use std::time::Instant;
-use v2ray_rs_core::config::{probe_generator_for, probe_tag};
-use v2ray_rs_core::models::{BackendType, RealDelaySettings, SubscriptionNode};
+use v2ray_rs_core::config::{
+    egress_inbound_ports, pick_free_loopback_ports, probe_generator_for, probe_tag,
+};
+use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, derive_verdict};
+use v2ray_rs_core::models::{
+    BackendType, EgressSample, RealDelaySettings, SubscriptionNode, VerdictRecord,
+};
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_process::{ProbeError, ProbeRunner};
 
 /// At most one ephemeral probe backend may exist at a time per process, to
 /// bound resource use and avoid port conflicts between concurrent sessions.
+/// Both Real Delay and availability sessions take this lock, so an availability
+/// request during a running session queues instead of spawning a second
+/// ephemeral backend.
 static REAL_DELAY_LOCK: Mutex<()> = Mutex::const_new(());
 
 const WAIT_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// IP-echo endpoint queried through each node's tunnel to observe its egress.
+/// Anycast, key-less, not geo-fenced, plain-text answer (`ip=…`, `loc=…`).
+const EGRESS_ECHO_URL: &str = "https://www.cloudflare.com/cdn-cgi/trace";
+
+/// Conventional browser identity: Google serves different gate pages to
+/// unidentified clients.
+const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36";
+
+/// Redirect hops followed for an availability check.
+const REDIRECT_CAP: usize = 5;
+/// Body cap for an availability check reply.
+const AVAILABILITY_BODY_CAP: usize = 2 * 1024 * 1024;
+/// Body cap for the IP-echo reply.
+const EGRESS_BODY_CAP: usize = 64 * 1024;
+
 /// Outcome of a Real Delay session: one result per input node (in order) plus
 /// an optional human-readable diagnostic for the UI to surface as a toast.
+/// The egress and verdict vectors run parallel to `results`; a node without an
+/// egress inbound has `None` / an empty map there.
 #[derive(Debug, Clone)]
 pub struct RealDelayReport {
     pub results: Vec<Option<u64>>,
+    pub egress: Vec<Option<EgressSample>>,
+    pub verdicts: Vec<HashMap<String, VerdictRecord>>,
     pub diagnostic: Option<String>,
 }
 
@@ -42,6 +72,8 @@ impl RealDelayReport {
     fn failed(len: usize, diagnostic: impl Into<String>) -> Self {
         Self {
             results: vec![None; len],
+            egress: vec![None; len],
+            verdicts: vec![HashMap::new(); len],
             diagnostic: Some(diagnostic.into()),
         }
     }
@@ -57,7 +89,9 @@ struct ObservatoryDelaysResult {
     diagnostic: Option<String>,
 }
 
-/// Measures the Real Delay of each node through an ephemeral backend instance.
+/// Measures the Real Delay of each node through an ephemeral backend instance,
+/// also observing each node's egress. No availability checks are run; use
+/// [`check_node_availability`] for that.
 ///
 /// Returns one `Option<u64>` (milliseconds) per input node, in order; `None`
 /// indicates a failed or timed-out probe for that node. Total failures (the
@@ -70,10 +104,40 @@ pub async fn measure_real_delay(
     cfg: &RealDelaySettings,
     paths: &AppPaths,
 ) -> RealDelayReport {
+    run_probe_session(backend, binary, nodes, cfg, paths, &[]).await
+}
+
+/// Runs an availability probe: the same ephemeral session as Real Delay, plus
+/// one request per built-in service per node through the node's own tunnel,
+/// deriving a per-service verdict for each node.
+///
+/// Subject to the same single-session rule as Real Delay: the request queues
+/// behind a running session and never spawns a second ephemeral backend.
+pub async fn check_node_availability(
+    backend: BackendType,
+    binary: &Path,
+    nodes: &[&SubscriptionNode],
+    cfg: &RealDelaySettings,
+    paths: &AppPaths,
+    services: &[ServiceCheck],
+) -> RealDelayReport {
+    run_probe_session(backend, binary, nodes, cfg, paths, services).await
+}
+
+async fn run_probe_session(
+    backend: BackendType,
+    binary: &Path,
+    nodes: &[&SubscriptionNode],
+    cfg: &RealDelaySettings,
+    paths: &AppPaths,
+    services: &[ServiceCheck],
+) -> RealDelayReport {
     let len = nodes.len();
     if len == 0 {
         return RealDelayReport {
             results: Vec::new(),
+            egress: Vec::new(),
+            verdicts: Vec::new(),
             diagnostic: None,
         };
     }
@@ -92,8 +156,17 @@ pub async fn measure_real_delay(
     let Some(api_port) = pick_free_loopback_port() else {
         return RealDelayReport::failed(len, "could not allocate a loopback probe port");
     };
+    let Some(egress_ports) = pick_free_loopback_ports(len) else {
+        return RealDelayReport::failed(len, "could not allocate egress loopback ports");
+    };
 
-    let config = generator.generate(nodes, api_port, &cfg.test_url, cfg.timeout_ms);
+    let config = generator.generate(
+        nodes,
+        api_port,
+        &cfg.test_url,
+        cfg.timeout_ms,
+        &egress_ports,
+    );
     let config_json = match serde_json::to_vec_pretty(&config) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -135,41 +208,190 @@ pub async fn measure_real_delay(
         return RealDelayReport::failed(len, diagnostic);
     }
 
+    // The per-node pass (egress fetch, then one availability request per
+    // service) rides the same session, after the delay collection.
+    let node_pass = |config: &Value| {
+        let ports = egress_inbound_ports(config);
+        let timeout = Duration::from_millis(u64::from(cfg.timeout_ms));
+        let services: Vec<ServiceCheck> = services.to_vec();
+        (0..len).map(move |i| {
+            let services = services.clone();
+            let port = ports.get(&i).copied();
+            tokio::spawn(async move {
+                match port {
+                    Some(port) => {
+                        let (egress, verdicts) = probe_node_extras(port, &services, timeout).await;
+                        (egress, verdicts)
+                    }
+                    None => (None, HashMap::new()),
+                }
+            })
+        })
+    };
+
     match backend {
         BackendType::SingBox => {
             let results = singbox_delays(api_port, len, &cfg.test_url, cfg.timeout_ms).await;
+            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
+                futures_util::future::join_all(node_pass(&config))
+                    .await
+                    .into_iter()
+                    .map(|r| r.unwrap_or((None, HashMap::new())))
+                    .collect();
             let _ = runner.stop().await;
             drop(temp);
-            RealDelayReport {
-                results,
-                diagnostic: None,
-            }
+            finalize_report(results, extras, None)
         }
         BackendType::Xray => {
             let obs_result = observatory_delays_with_query(len, cfg.timeout_ms, || {
                 query_xray_observatory(api_port)
             })
             .await;
+            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
+                futures_util::future::join_all(node_pass(&config))
+                    .await
+                    .into_iter()
+                    .map(|r| r.unwrap_or((None, HashMap::new())))
+                    .collect();
             let _ = runner.stop().await;
             drop(temp);
-            RealDelayReport {
-                results: obs_result.results,
-                diagnostic: obs_result.diagnostic,
-            }
+            finalize_report(obs_result.results, extras, obs_result.diagnostic)
         }
         BackendType::V2ray => {
             let obs_result = observatory_delays_with_query(len, cfg.timeout_ms, || {
                 query_v2ray_observatory(api_port)
             })
             .await;
+            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
+                futures_util::future::join_all(node_pass(&config))
+                    .await
+                    .into_iter()
+                    .map(|r| r.unwrap_or((None, HashMap::new())))
+                    .collect();
             let _ = runner.stop().await;
             drop(temp);
-            RealDelayReport {
-                results: obs_result.results,
-                diagnostic: obs_result.diagnostic,
-            }
+            finalize_report(obs_result.results, extras, obs_result.diagnostic)
         }
     }
+}
+
+/// Assembles the session report from the delay results and the per-node
+/// egress/verdict extras.
+fn finalize_report(
+    results: Vec<Option<u64>>,
+    extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)>,
+    diagnostic: Option<String>,
+) -> RealDelayReport {
+    let mut egress = Vec::with_capacity(extras.len());
+    let mut verdicts = Vec::with_capacity(extras.len());
+    for (sample, verdict_map) in extras {
+        egress.push(sample);
+        verdicts.push(verdict_map);
+    }
+    RealDelayReport {
+        results,
+        egress,
+        verdicts,
+        diagnostic,
+    }
+}
+
+/// Runs the per-node HTTP pass through the node's loopback inbound: one
+/// IP-echo request to observe the egress, then one availability request per
+/// service. A transport failure yields an unknown verdict, never blocked.
+async fn probe_node_extras(
+    port: u16,
+    services: &[ServiceCheck],
+    timeout: Duration,
+) -> (Option<EgressSample>, HashMap<String, VerdictRecord>) {
+    let Some(client) = node_proxy_client(port, timeout) else {
+        return (None, HashMap::new());
+    };
+    let egress = fetch_egress(&client, EGRESS_ECHO_URL).await;
+    let mut verdicts = HashMap::with_capacity(services.len());
+    for check in services {
+        verdicts.insert(check.id.to_string(), check_service(&client, check).await);
+    }
+    (egress, verdicts)
+}
+
+/// Builds an HTTP client that sends all traffic through the node's loopback
+/// proxy inbound on `port`.
+fn node_proxy_client(port: u16, timeout: Duration) -> Option<reqwest::Client> {
+    let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{port}")).ok()?;
+    reqwest::Client::builder()
+        .proxy(proxy)
+        .user_agent(BROWSER_USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(REDIRECT_CAP))
+        .timeout(timeout)
+        .build()
+        .ok()
+}
+
+/// Reads the response body in chunks, capped at `cap` bytes.
+async fn fetch_capped(
+    response: &mut reqwest::Response,
+    cap: usize,
+) -> Result<String, reqwest::Error> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if bytes.len() + chunk.len() > cap {
+            let remaining = cap - bytes.len();
+            bytes.extend_from_slice(&chunk[..remaining]);
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() >= cap {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+/// Observes the node's egress through its tunnel. Any failure (timeout,
+/// non-200, unparseable body) yields `None` and leaves any previous sample
+/// intact — the caller simply does not record a new one.
+async fn fetch_egress(client: &reqwest::Client, echo_url: &str) -> Option<EgressSample> {
+    let mut response = client.get(echo_url).send().await.ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let body = fetch_capped(&mut response, EGRESS_BODY_CAP).await.ok()?;
+    let mut address = None;
+    let mut location = None;
+    for line in body.lines() {
+        if let Some(value) = line.strip_prefix("ip=") {
+            address = Some(value.trim().to_string());
+        } else if let Some(value) = line.strip_prefix("loc=") {
+            location = Some(value.trim().to_string());
+        }
+    }
+    let address = address.filter(|a| !a.is_empty())?;
+    let location = location.filter(|l| !l.is_empty())?;
+    Some(EgressSample {
+        address,
+        location,
+        checked_at: Utc::now(),
+    })
+}
+
+/// Runs one service check through the node's tunnel and derives the verdict
+/// from the final URL and body of the redirect chain. Transport failure maps
+/// to [`AvailabilityVerdict::Unknown`], never `blocked`.
+async fn check_service(client: &reqwest::Client, check: &ServiceCheck) -> VerdictRecord {
+    let checked_at = Utc::now();
+    let reply = async {
+        let mut response = client.get(check.url).send().await?;
+        let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+        let body = fetch_capped(&mut response, AVAILABILITY_BODY_CAP).await?;
+        Ok::<_, reqwest::Error>((final_url, status, body))
+    };
+    let result = match reply.await {
+        Ok((final_url, status, body)) => derive_verdict(check, &final_url, status, &body),
+        Err(_) => AvailabilityVerdict::Unknown,
+    };
+    VerdictRecord { result, checked_at }
 }
 
 /// Binds `127.0.0.1:0`, reads the assigned port, then closes the socket so the
@@ -305,6 +527,246 @@ where
     ObservatoryDelaysResult {
         results,
         diagnostic,
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener as TokioListener;
+
+    /// A canned response from the stub proxy: status code and body.
+    type Canned = (u16, &'static str);
+
+    fn http_response(status: u16, body: &str) -> String {
+        let reason = match status {
+            200 => "OK",
+            302 => "Found",
+            403 => "Forbidden",
+            404 => "Not Found",
+            _ => "Unknown",
+        };
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+    }
+
+    /// Spawns a stub HTTP proxy that answers every request with the next canned
+    /// response in sequence, repeating the last one; `None` answers nothing
+    /// (the client times out). Returns its loopback port.
+    async fn spawn_stub_proxy(responses: Vec<Option<Canned>>) -> u16 {
+        let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let cursor = std::sync::Arc::new(StdMutex::new(0usize));
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let responses = responses.clone();
+                let cursor = cursor.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = socket.read(&mut buf).await;
+                    let answer = {
+                        let mut idx = cursor.lock().unwrap();
+                        let answer = responses
+                            .get(*idx)
+                            .copied()
+                            .flatten()
+                            .or(responses.last().copied().flatten());
+                        *idx = (*idx + 1).min(responses.len().saturating_sub(1));
+                        answer
+                    };
+                    if let Some((status, body)) = answer {
+                        let wire = http_response(status, body);
+                        let _ = socket.write_all(wire.as_bytes()).await;
+                        let _ = socket.flush().await;
+                    }
+                    // Dropping the socket without answering hangs the client
+                    // into its timeout.
+                });
+            }
+        });
+        port
+    }
+
+    fn stub_check(url: String) -> ServiceCheck {
+        ServiceCheck {
+            id: "stub",
+            name: "Stub",
+            url: Box::leak(url.into_boxed_str()),
+            blocked_url_markers: &["location=unsupported"],
+            blocked_body_markers: &["not available in your country"],
+        }
+    }
+
+    fn stub_client(port: u16, timeout_ms: u64) -> reqwest::Client {
+        node_proxy_client(port, Duration::from_millis(timeout_ms)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn check_service_passes_on_unmarked_body() {
+        let port = spawn_stub_proxy(vec![Some((200, "sign-in page"))]).await;
+        let check = stub_check(format!("http://127.0.0.1:{port}/check"));
+        let client = stub_client(port, 2000);
+        let record = check_service(&client, &check).await;
+        assert_eq!(record.result, AvailabilityVerdict::Available);
+    }
+
+    #[tokio::test]
+    async fn check_service_redirect_chain_evaluated_at_final_url() {
+        // The gate semantics live in derive_verdict: the final URL of the
+        // chain, not the first hop, is what is matched.
+        let check = stub_check("http://127.0.0.1:1/check".into());
+        let verdict = derive_verdict(
+            &check,
+            "http://example.test/?location=unsupported",
+            200,
+            "sign-in page",
+        );
+        assert_eq!(verdict, AvailabilityVerdict::Blocked);
+        let first_hop_only = derive_verdict(&check, "http://example.test/", 200, "sign-in page");
+        assert_eq!(first_hop_only, AvailabilityVerdict::Available);
+    }
+
+    #[tokio::test]
+    async fn check_service_blocked_on_refusal_body() {
+        let port = spawn_stub_proxy(vec![Some((
+            200,
+            "Sorry, this service is not available in your country.",
+        ))])
+        .await;
+        let check = stub_check(format!("http://127.0.0.1:{port}/check"));
+        let client = stub_client(port, 2000);
+        let record = check_service(&client, &check).await;
+        assert_eq!(record.result, AvailabilityVerdict::Blocked);
+    }
+
+    #[tokio::test]
+    async fn check_service_timeout_is_unknown() {
+        // The stub accepts the connection but never answers.
+        let port = spawn_stub_proxy(vec![None]).await;
+        let check = stub_check(format!("http://127.0.0.1:{port}/check"));
+        let client = stub_client(port, 400);
+        let record = check_service(&client, &check).await;
+        assert_eq!(record.result, AvailabilityVerdict::Unknown);
+    }
+
+    #[tokio::test]
+    async fn check_service_non_200_final_status_is_unknown() {
+        let port = spawn_stub_proxy(vec![Some((403, "blocked"))]).await;
+        let check = stub_check(format!("http://127.0.0.1:{port}/check"));
+        let client = stub_client(port, 2000);
+        let record = check_service(&client, &check).await;
+        assert_eq!(record.result, AvailabilityVerdict::Unknown);
+    }
+
+    #[tokio::test]
+    async fn fetch_egress_parses_ip_and_loc() {
+        let port = spawn_stub_proxy(vec![Some((200, "fl=1\nip=2001:db8::1\nloc=AT\n"))]).await;
+        let client = stub_client(port, 2000);
+        let sample = fetch_egress(&client, &format!("http://127.0.0.1:{port}/trace"))
+            .await
+            .expect("sample parsed");
+        assert_eq!(sample.address, "2001:db8::1");
+        assert_eq!(sample.location, "AT");
+    }
+
+    #[tokio::test]
+    async fn fetch_egress_none_on_non_200() {
+        let port = spawn_stub_proxy(vec![Some((404, "nope"))]).await;
+        let client = stub_client(port, 2000);
+        assert!(
+            fetch_egress(&client, &format!("http://127.0.0.1:{port}/trace"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_egress_none_on_malformed_body() {
+        let port = spawn_stub_proxy(vec![Some((200, "hello world\nno keys here"))]).await;
+        let client = stub_client(port, 2000);
+        assert!(
+            fetch_egress(&client, &format!("http://127.0.0.1:{port}/trace"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_egress_none_on_timeout() {
+        let port = spawn_stub_proxy(vec![None]).await;
+        let client = stub_client(port, 400);
+        assert!(
+            fetch_egress(&client, &format!("http://127.0.0.1:{port}/trace"))
+                .await
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn finalize_report_keeps_delay_results_despite_failed_egress() {
+        let results = vec![Some(120), None];
+        let extras = vec![(None, HashMap::new()), (None, HashMap::new())];
+        let report = finalize_report(results.clone(), extras, None);
+        assert_eq!(report.results, results);
+        assert!(report.egress.iter().all(|e| e.is_none()));
+        assert!(report.verdicts.iter().all(|v| v.is_empty()));
+        assert_eq!(report.results.len(), report.egress.len());
+        assert_eq!(report.results.len(), report.verdicts.len());
+    }
+
+    #[tokio::test]
+    async fn availability_session_queues_behind_a_running_session() {
+        // Hold the shared session lock, as a running Real Delay session would.
+        let guard = REAL_DELAY_LOCK.lock().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(v2ray_rs_core::profile::AppProfile::Test, dir.path());
+        let node = SubscriptionNode::new(v2ray_rs_core::models::ProxyNode::Shadowsocks(
+            v2ray_rs_core::models::ShadowsocksConfig {
+                address: "ss.example.com".into(),
+                port: 8388,
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                remark: None,
+            },
+        ));
+
+        let task = tokio::spawn(async move {
+            let binary = Path::new("/nonexistent/v2ray");
+            let nodes = [&node];
+            check_node_availability(
+                BackendType::V2ray,
+                binary,
+                &nodes,
+                &RealDelaySettings::default(),
+                &paths,
+                &[],
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !task.is_finished(),
+            "availability probe must queue while a session holds the lock"
+        );
+
+        drop(guard);
+        let report = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("probe completes after the lock is released")
+            .expect("no join error");
+        // It proceeded to the (failing) session instead of spawning a second
+        // backend concurrently.
+        assert!(report.diagnostic.is_some());
     }
 }
 

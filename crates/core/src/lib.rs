@@ -3,6 +3,7 @@ pub mod backend;
 pub mod cli;
 pub mod config;
 pub(crate) mod fs;
+pub mod geo_probe;
 pub mod geodata;
 pub mod geodata_index;
 pub mod instance;

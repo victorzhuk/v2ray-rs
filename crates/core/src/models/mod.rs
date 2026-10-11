@@ -23,7 +23,8 @@ pub use proxy::{
     TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
 };
 pub use resolve::{
-    AutoResolveStrategy, ConnectionMetadata, ConnectionNodeRef, LastSuccessMetadata, LatencySample,
+    AutoResolveStrategy, ConnectionMetadata, ConnectionNodeRef, EgressSample, LastSuccessMetadata,
+    LatencySample, VerdictRecord,
 };
 pub use routing::{RoutingRule, RoutingRuleSet, RuleAction, RuleMatch};
 pub use settings::{
