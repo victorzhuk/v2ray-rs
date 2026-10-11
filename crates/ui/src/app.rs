@@ -148,6 +148,14 @@ pub enum AppMsg {
     TunGrantRequired(u64),
     NodePins(u64, Vec<HostOverride>),
     DownloadGeodata,
+    /// A classified connect failure offers a refresh of the subscription that
+    /// owns the failed node; the refresh itself stays user-initiated.
+    OfferSubscriptionRefresh {
+        subscription_id: uuid::Uuid,
+        message: String,
+    },
+    /// The user activated the offered refresh action.
+    RefreshSubscription(uuid::Uuid),
 }
 
 impl App {
@@ -1189,6 +1197,24 @@ impl SimpleComponent for App {
             }
             AppMsg::ShowToast(message) => {
                 self.show_toast(&message);
+            }
+            AppMsg::OfferSubscriptionRefresh {
+                subscription_id,
+                message,
+            } => {
+                let toast = adw::Toast::builder()
+                    .title(&message)
+                    .button_label("Refresh subscription")
+                    .build();
+                let s = sender.input_sender().clone();
+                toast.connect_button_clicked(move |_| {
+                    s.emit(AppMsg::RefreshSubscription(subscription_id));
+                });
+                self.toast_overlay.add_toast(toast);
+            }
+            AppMsg::RefreshSubscription(subscription_id) => {
+                self.subscriptions_page
+                    .emit(SubscriptionsMsg::UpdateSubscription(subscription_id));
             }
             AppMsg::DownloadGeodata => {
                 let paths = self.paths.clone();
@@ -3763,9 +3789,6 @@ fn install_resource_icon(
 ) -> bool {
     let icon_dir = data_dir.join(format!("icons/hicolor/{subdir}"));
     let icon_path = icon_dir.join(filename);
-    if icon_path.exists() {
-        return false;
-    }
 
     let Ok(svg) = gtk::gio::resources_lookup_data(
         &format!("{res_prefix}/{subdir}/{filename}"),
@@ -3773,6 +3796,15 @@ fn install_resource_icon(
     ) else {
         return false;
     };
+
+    // Refresh an already-installed copy that drifted from the resource: the
+    // user-local hicolor dir shadows the packaged icon, so a stale file here
+    // would keep overriding fixed icons from newer builds.
+    if let Ok(existing) = std::fs::read(&icon_path)
+        && existing == svg
+    {
+        return false;
+    }
 
     if let Err(err) = std::fs::create_dir_all(&icon_dir) {
         log::debug!("create icon dir {icon_dir:?}: {err}");
