@@ -48,6 +48,40 @@ pub(crate) fn warning_toast(line: &str) -> String {
     }
 }
 
+/// The classified cause of a candidate failure, matched against the whole
+/// captured backend output when the candidate is marked failed. Table-driven so
+/// future signatures (DNS bootstrap timeout, TLS verification refusal) slot in
+/// without touching the reporting path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FailureClassification {
+    pub cause: &'static str,
+}
+
+/// Signatures of known failure modes: `(backend, all-needles, classification)`.
+/// A signature matches when every needle appears in the captured output.
+const FAILURE_SIGNATURES: &[(BackendType, &[&str], &str)] = &[(
+    BackendType::Xray,
+    &["REALITY: received real certificate"],
+    "server rejected REALITY authentication; the subscription's REALITY keys may be stale",
+)];
+
+/// Classifies a candidate failure from its captured backend output, or `None`
+/// when nothing matches and the generic report applies. One call over one
+/// candidate's output yields at most one classification, however many times the
+/// backend repeated the signature.
+pub(crate) fn classify_failure(
+    backend: BackendType,
+    captured_output: &str,
+) -> Option<FailureClassification> {
+    FAILURE_SIGNATURES
+        .iter()
+        .filter(|(b, needles, _)| {
+            *b == backend && needles.iter().all(|n| captured_output.contains(n))
+        })
+        .map(|(_, _, cause)| FailureClassification { cause })
+        .next()
+}
+
 /// Remembers which patterns already toasted, so a warning the backend repeats
 /// for every connection it opens surfaces once per app connection.
 pub(crate) struct BackendWarnings {
@@ -162,5 +196,45 @@ mod tests {
         assert_eq!(warnings.toast_for(XRAY_REALITY), None);
         assert!(warnings.toast_for(XRAY_WEBSOCKET).is_some());
         assert_eq!(warnings.toast_for(XRAY_WEBSOCKET), None);
+    }
+
+    #[test]
+    fn classifies_reality_auth_rejection() {
+        let classification = classify_failure(BackendType::Xray, XRAY_REALITY)
+            .expect("the REALITY signature classifies");
+        assert_eq!(
+            classification.cause,
+            "server rejected REALITY authentication; the subscription's REALITY keys may be stale"
+        );
+    }
+
+    #[test]
+    fn classification_is_once_per_output_regardless_of_repeats() {
+        // The backend repeats the signature on every connection it opens before
+        // the candidate gives up; one output still classifies exactly once.
+        let output = format!("{XRAY_REALITY}\n{XRAY_REALITY}\n{XRAY_REALITY}");
+        let classification = classify_failure(BackendType::Xray, &output).expect("classified");
+        assert_eq!(
+            classification.cause,
+            "server rejected REALITY authentication; the subscription's REALITY keys may be stale"
+        );
+    }
+
+    #[test]
+    fn unmatched_failure_has_no_classification() {
+        assert_eq!(
+            classify_failure(
+                BackendType::Xray,
+                "2026/09/14 09:57:31 [Warning] failed to dial tcp: i/o timeout",
+            ),
+            None
+        );
+        assert_eq!(classify_failure(BackendType::Xray, ""), None);
+    }
+
+    #[test]
+    fn signatures_match_only_their_own_backend() {
+        assert_eq!(classify_failure(BackendType::SingBox, XRAY_REALITY), None);
+        assert_eq!(classify_failure(BackendType::V2ray, XRAY_REALITY), None);
     }
 }

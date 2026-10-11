@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use v2ray_rs_process::{
 };
 
 use crate::app::AppMsg;
-use crate::backend_warning::BackendWarnings;
+use crate::backend_warning::{BackendWarnings, FailureClassification, classify_failure};
 use crate::health::{DnsFailureWindow, HealthTracker};
 
 /// Serializes everything that mutates backend-process and kernel TUN state.
@@ -218,6 +218,10 @@ fn spawn_with(
         let warnings = Arc::new(std::sync::Mutex::new(BackendWarnings::new(
             settings.backend.backend_type,
         )));
+        // Subscriptions whose REALITY auth rejection was already offered a
+        // refresh in this connection: failover across several nodes of the same
+        // subscription must not stack repeated offers.
+        let mut refresh_offered: HashSet<uuid::Uuid> = HashSet::new();
         let total = candidates.len();
         'candidates: for (index, candidate) in candidates.into_iter().enumerate() {
             let position = index + 1;
@@ -428,17 +432,42 @@ fn spawn_with(
                         report(ProcessState::Error(e.to_string()), None);
                         return;
                     }
+                    // A start the backend itself failed (config rejected, exit
+                    // before ready) has its output in the manager's buffer, so
+                    // a known signature classifies here exactly as it does for
+                    // a later crash give-up.
+                    let classified = classify_candidate(&mgr, settings.backend.backend_type);
+                    let reason = classified
+                        .as_ref()
+                        .map(|c| c.cause.to_string())
+                        .unwrap_or_else(|| e.to_string());
                     record_failure(
                         &mut failures,
                         CandidateFailure::new(
                             &candidate_label,
-                            &e.to_string(),
+                            &reason,
                             &candidate_address,
                             candidate_port,
                         ),
                         position,
                         total,
                     );
+                    if let (
+                        Some(classification),
+                        ConnectionNodeRef::Subscription {
+                            subscription_id, ..
+                        },
+                    ) = (classified, candidate.node_ref)
+                    {
+                        emit_refresh_offer(
+                            &sender,
+                            &subscriptions,
+                            &mut refresh_offered,
+                            subscription_id,
+                            &candidate_label,
+                            classification.cause,
+                        );
+                    }
                     parked = Some(mgr);
                     if repeats_previous(&failures) {
                         break 'candidates;
@@ -539,17 +568,37 @@ fn spawn_with(
                         match mgr.state() {
                             ProcessState::Running => {}
                             ProcessState::Error(msg) => {
+                                let classified =
+                                    classify_candidate(&mgr, settings.backend.backend_type);
+                                let reason = classified
+                                    .as_ref()
+                                    .map(|c| c.cause.to_string())
+                                    .unwrap_or(msg);
                                 record_failure(
                                     &mut failures,
                                     CandidateFailure::new(
                                         &candidate_label,
-                                        &msg,
+                                        &reason,
                                         &candidate_address,
                                         candidate_port,
                                     ),
                                     position,
                                     total,
                                 );
+                                if let (Some(classification), ConnectionNodeRef::Subscription {
+                                    subscription_id,
+                                    ..
+                                }) = (classified, candidate.node_ref)
+                                {
+                                    emit_refresh_offer(
+                                        &sender,
+                                        &subscriptions,
+                                        &mut refresh_offered,
+                                        subscription_id,
+                                        &candidate_label,
+                                        classification.cause,
+                                    );
+                                }
                                 break;
                             }
                             _ => {
@@ -1088,6 +1137,50 @@ fn record_failure(
         failure.reason
     );
     failures.push(failure);
+}
+
+/// Classifies a failed candidate from the manager's captured backend output.
+/// The manager drains its log readers before reporting a failed start or a
+/// crash give-up, so the buffer holds every line the backend printed by the
+/// time the candidate is marked failed.
+fn classify_candidate(mgr: &ProcessManager, backend: BackendType) -> Option<FailureClassification> {
+    let buffer = mgr
+        .log_buffer()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let captured = buffer
+        .last_n(buffer.len())
+        .iter()
+        .map(|l| l.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    classify_failure(backend, &captured)
+}
+
+/// Offers a subscription refresh for a classified failure, at most once per
+/// connection per subscription: failover across several nodes of the same
+/// subscription must not stack repeated offers. The refresh itself stays
+/// user-initiated — nothing here starts an update.
+fn emit_refresh_offer(
+    sender: &relm4::Sender<AppMsg>,
+    subscriptions: &[Subscription],
+    offered: &mut HashSet<uuid::Uuid>,
+    subscription_id: uuid::Uuid,
+    label: &str,
+    cause: &str,
+) {
+    if !offered.insert(subscription_id) {
+        return;
+    }
+    let name = subscriptions
+        .iter()
+        .find(|s| s.id == subscription_id)
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| "subscription".to_string());
+    sender.emit(AppMsg::OfferSubscriptionRefresh {
+        subscription_id,
+        message: format!("{label} ({name}): {cause}"),
+    });
 }
 
 /// Whether the last two candidates failed the same way.
@@ -1765,6 +1858,166 @@ exit 1"#,
         }
         assert!(!msg.contains('\u{1b}'), "{msg}");
         assert_eq!(attempts(&marker), 3);
+    }
+
+    fn subscription_candidate(
+        sub: &v2ray_rs_core::models::Subscription,
+        idx: usize,
+    ) -> ConnectionCandidate {
+        ConnectionCandidate {
+            node_ref: ConnectionNodeRef::Subscription {
+                subscription_id: sub.id,
+                node_id: sub.nodes[idx].id,
+            },
+            source_name: sub.name.clone(),
+            node: sub.nodes[idx].node.clone(),
+            latency_ms: None,
+            real_delay_ms: None,
+        }
+    }
+
+    fn subscription_with_nodes(addresses: &[&str]) -> v2ray_rs_core::models::Subscription {
+        use v2ray_rs_core::models::{ShadowsocksConfig, SubscriptionNode};
+        let mut sub =
+            v2ray_rs_core::models::Subscription::new_from_url("vpndio", "https://example.com/sub");
+        for (i, address) in addresses.iter().enumerate() {
+            let mut node = SubscriptionNode::new(ProxyNode::Shadowsocks(ShadowsocksConfig {
+                address: (*address).into(),
+                port: 8388,
+                method: "aes-256-gcm".into(),
+                password: "pw".into(),
+                remark: Some(format!("node-{i}")),
+            }));
+            node.enabled = true;
+            sub.nodes.push(node);
+        }
+        sub
+    }
+
+    /// Drains until the terminal state, also counting refresh offers and any
+    /// direct update-start request.
+    async fn drain_with_offers(
+        rx: &relm4::Receiver<AppMsg>,
+    ) -> (Option<ProcessState>, usize, bool) {
+        let mut terminal = None;
+        let mut offers = 0;
+        let mut update_started = false;
+        loop {
+            let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+                .await
+                .expect("connection task outlived its terminal state");
+            match msg {
+                None => return (terminal, offers, update_started),
+                Some(AppMsg::OfferSubscriptionRefresh { .. }) => offers += 1,
+                Some(AppMsg::RefreshSubscription(_)) => update_started = true,
+                Some(AppMsg::ProcessStateConnection(_, state, _)) if !relays(&state) => {
+                    assert!(terminal.is_none(), "{state:?} after the terminal state");
+                    terminal = Some(state);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+
+    const REALITY_SIGNATURE: &str = "transport/internet/reality: REALITY: received real certificate (potential MITM or redirection)";
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reality_rejection_classifies_the_failure_report() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stub = stub(&format!(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0
+for i in 1 2 3; do echo "2026/09/14 09:57:30.532567 [Error] [1944052120] {REALITY_SIGNATURE}"; done
+exit 1"#
+        ));
+        let (_listener, settings) = ready_singbox_settings();
+        let mut settings = settings;
+        settings.backend.backend_type = BackendType::Xray;
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+        drop(handle);
+
+        let (terminal, offers, update_started) = drain_with_offers(&rx).await;
+        let Some(ProcessState::Error(msg)) = terminal else {
+            panic!("expected an error terminal, got {terminal:?}");
+        };
+        assert!(
+            msg.contains("server rejected REALITY authentication"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("REALITY keys may be stale"),
+            "cause must carry the stale-keys advice: {msg}"
+        );
+        assert!(
+            !msg.contains("process exited with code 1"),
+            "classified cause replaces the generic text: {msg}"
+        );
+        // A manual node has no owning subscription: no refresh offer.
+        assert_eq!(offers, 0);
+        // No update starts on its own.
+        assert!(!update_started);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reality_rejection_offers_refresh_once_per_subscription() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stub = stub(&format!(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0
+grep -q 203.0.113.1 "$3" && {{ for i in 1 2 3; do echo "{REALITY_SIGNATURE}"; done; exit 1; }}
+grep -q 203.0.113.4 "$3" && {{ for i in 1 2 3; do echo "{REALITY_SIGNATURE}"; done; exit 1; }}
+exec sleep 30"#
+        ));
+        let (_listener, settings) = ready_singbox_settings();
+        let mut settings = settings;
+        settings.backend.backend_type = BackendType::Xray;
+        let sub = subscription_with_nodes(&["203.0.113.1", "203.0.113.4"]);
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let req = ConnectionRequest {
+            subscriptions: vec![sub.clone()],
+            ..request(
+                &stub,
+                settings,
+                vec![
+                    subscription_candidate(&sub, 0),
+                    subscription_candidate(&sub, 1),
+                ],
+            )
+        };
+        let _handle = spawn_with(req, tx, |mgr| mgr);
+
+        let (terminal, offers, update_started) = drain_with_offers(&rx).await;
+        let Some(ProcessState::Error(msg)) = terminal else {
+            panic!("expected an error terminal, got {terminal:?}");
+        };
+        assert!(
+            msg.contains("server rejected REALITY authentication"),
+            "{msg}"
+        );
+        // Two classified candidates from the same subscription: one offer.
+        assert_eq!(offers, 1, "one offer per connection per subscription");
+        assert!(!update_started, "refresh stays user-initiated");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unmatched_failure_keeps_generic_report() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0
+echo "2026/09/14 09:57:31 [Warning] failed to dial tcp: i/o timeout"
+exit 1"#,
+        );
+        let (_listener, settings) = ready_singbox_settings();
+        let mut settings = settings;
+        settings.backend.backend_type = BackendType::Xray;
+        let (handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+        drop(handle);
+
+        let (terminal, offers, _) = drain_with_offers(&rx).await;
+        let Some(ProcessState::Error(msg)) = terminal else {
+            panic!("expected an error terminal, got {terminal:?}");
+        };
+        assert!(msg.contains("process exited with code 1"), "{msg}");
+        assert!(!msg.contains("REALITY"), "{msg}");
+        assert_eq!(offers, 0);
     }
 
     /// Drains the connection until its channel closes, returning the terminal
