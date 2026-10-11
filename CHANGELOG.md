@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-10-12
+
+### Added
+- A Real Delay probe session also determines each tested node's egress
+  address and location: the probe config gains one loopback HTTP inbound
+  per tested node routed exclusively to that node's outbound, and the
+  runner asks an IP-echo endpoint through it. The sample is persisted in
+  the latency snapshot next to the delay, and node rows show the last
+  known exit as `address · exit: <location> · <egress address>`, so
+  same-named nodes from differently-transported subscriptions become
+  distinguishable by measured egress.
+- Check Availability probes the selected nodes' built-in service checks
+  (NotebookLM, Gemini) through each node's own tunnel and records a
+  per-service verdict — available, blocked, or unknown — with a
+  checked-at time in the latency snapshot. A results view lists the
+  verdicts, and a blocked verdict is annotated with the node's last
+  known egress, making per-service exit-IP rejections visible instead of
+  inferable.
+- A connect candidate whose captured backend output contains the REALITY
+  auth-rejection signature (`REALITY: received real certificate`) fails
+  with a classified cause — the server rejected REALITY authentication,
+  the subscription's keys may be stale — at most once per candidate, and
+  the failure report offers a refresh of the subscription owning the
+  node, at most once per connection per subscription.
+
+### Fixed
+- Startup abort under GTK 4.24: the app icon's unused Inkscape filter
+  definitions carried `feTurbulence` with an `in` attribute, which
+  GTK's built-in SVG renderer rejects with a fatal assertion while
+  parsing the icon, taking the whole process down. The dead filter
+  definitions are stripped (rendering is pixel-identical), and an
+  installed user-local icon that drifted from the bundled resource is
+  refreshed instead of shadowing fixed icons forever.
+
 ## [0.19.1] - 2026-09-19
 
 ### Fixed
@@ -756,7 +790,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.1...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.17.4...v0.18.0
