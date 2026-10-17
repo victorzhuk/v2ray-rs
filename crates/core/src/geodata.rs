@@ -10,10 +10,14 @@ use crate::geodata_index::GeodataIndexManager;
 use crate::models::BackendType;
 use crate::persistence::AppPaths;
 
+#[cfg(feature = "geodata-fetch")]
 const GEODATA_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+#[cfg(feature = "geodata-fetch")]
 const MAX_GEODATA_SIZE: u64 = 100 * 1024 * 1024; // 100 MB
 
+#[cfg(feature = "geodata-fetch")]
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
+#[cfg(feature = "geodata-fetch")]
 const GEOSITE_RULESET_URL: &str =
     "https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set";
 
@@ -177,6 +181,7 @@ fn ensure_dir_0700(path: &Path) -> Result<(), GeodataError> {
     Ok(())
 }
 
+#[cfg(feature = "geodata-fetch")]
 fn rule_set_url(full_tag: &str) -> Option<String> {
     if full_tag.starts_with("geoip-") {
         Some(format!("{GEOIP_RULESET_URL}/{full_tag}.srs"))
