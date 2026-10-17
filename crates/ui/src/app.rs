@@ -13,7 +13,7 @@ use v2ray_rs_core::cli::PathOverrides;
 use v2ray_rs_core::config::ConfigWriter;
 use v2ray_rs_core::geodata::GeodataManager;
 use v2ray_rs_core::instance::{
-    CompatibilityResult, InstanceLock, InstanceStamp, check_compatibility, reset_instance,
+    CompatibilityResult, InstanceError, InstanceLock, InstanceStamp, check_compatibility,
 };
 use v2ray_rs_core::models::{
     AppSettings, AutoResolveStrategy, BackendType, ConnectionMetadata, ConnectionNodeRef,
@@ -100,7 +100,35 @@ pub struct App {
     health_failover: HealthFailover,
     reconnect_generation: u32,
     tun_release_in_flight: bool,
+    regen: RegenScheduler,
     _signal_sources: Vec<glib::SourceId>,
+}
+
+/// Coalesces config-regeneration requests so rapid changes produce one write
+/// of the newest state instead of stacking blocking work on the main loop.
+#[derive(Debug, Default)]
+struct RegenScheduler {
+    in_flight: bool,
+    pending: bool,
+}
+
+impl RegenScheduler {
+    /// Records a request. Returns true when the caller must start a new job.
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.pending = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    /// Closes the running job. Returns true when a coalesced request must rerun.
+    fn completed(&mut self) -> bool {
+        self.in_flight = false;
+        std::mem::replace(&mut self.pending, false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,6 +144,7 @@ pub enum ConnectOrigin {
 
 #[derive(Debug)]
 pub enum AppMsg {
+    ConfigRegenerated(Result<std::path::PathBuf, String>),
     OnboardingComplete(AppSettings, Option<(String, SubscriptionSource)>),
     SettingsChanged(AppSettings),
     ToggleConnection,
@@ -128,7 +157,7 @@ pub enum AppMsg {
     QuitSignal,
     ActiveNodesChanged(bool),
     ProcessStateConnection(u64, ProcessState, Option<ConnectionMetadata>),
-    ProcessLogLine(u64, String),
+    ProcessLogLines(u64, Vec<String>),
     ConnectionHealth(u64, Health),
     DnsHealth(u64, bool),
     OpenPreferences(Option<&'static str>),
@@ -377,15 +406,15 @@ impl App {
         }
     }
 
-    fn handle_manual_node_changed(&mut self) {
+    fn handle_manual_node_changed(&mut self, sender: &ComponentSender<Self>) {
         if runtime_process_active(&self.process_state) {
             self.restart_required = self.check_restart_required();
         } else {
-            self.regenerate_config_disconnected();
+            self.regenerate_config_disconnected(sender);
         }
     }
 
-    fn handle_subscription_changed(&mut self) {
+    fn handle_subscription_changed(&mut self, sender: &ComponentSender<Self>) {
         let subscriptions = match self.store.load_subscriptions() {
             Ok(s) => s,
             Err(err) => {
@@ -409,7 +438,7 @@ impl App {
         if runtime_process_active(&self.process_state) {
             self.restart_required = self.check_restart_required_with(&subscriptions, &manual_nodes);
         } else {
-            self.regenerate_config_with(&subscriptions, &manual_nodes);
+            self.regenerate_config_with(&subscriptions, &manual_nodes, sender);
         }
     }
 
@@ -462,7 +491,7 @@ impl App {
         self.has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
     }
 
-    fn regenerate_config_disconnected(&mut self) {
+    fn regenerate_config_disconnected(&mut self, sender: &ComponentSender<Self>) {
         let subscriptions = match self.store.load_subscriptions() {
             Ok(s) => s,
             Err(err) => {
@@ -471,13 +500,14 @@ impl App {
             }
         };
         let manual_nodes = self.store.load_manual_nodes_or_default();
-        self.regenerate_config_with(&subscriptions, &manual_nodes);
+        self.regenerate_config_with(&subscriptions, &manual_nodes, sender);
     }
 
     fn regenerate_config_with(
         &mut self,
         subscriptions: &[Subscription],
         manual_nodes: &[ManualNode],
+        sender: &ComponentSender<Self>,
     ) {
         let planner = ConnectionPlanner::new(
             self.settings.auto_resolve_strategy,
@@ -505,37 +535,36 @@ impl App {
             manual_nodes,
         ));
 
-        let connected_subnets: Vec<ipnet::IpNet> = if self.settings.backend.backend_type
-            == BackendType::SingBox
-            && effective_settings.tun.enabled
-        {
-            match v2ray_rs_process::connected_subnets(&effective_settings.tun.interface_name) {
-                Ok(subnets) => subnets,
-                Err(err) => {
-                    let message =
-                        format!("Failed to regenerate config: Collect connected subnets: {err}");
-                    log::error!("{message}");
-                    self.show_toast(&message);
-                    return;
-                }
-            }
-        } else {
-            Vec::new()
-        };
-
-        let writer = ConfigWriter::new(&self.settings, &self.paths);
-        match writer.write_config(
-            &nodes,
-            &effective_rules,
-            &effective_settings,
-            &connected_subnets,
-        ) {
-            Ok(path) => log::info!("Regenerated config at {:?}", path),
-            Err(e) => {
-                log::error!("Failed to regenerate config: {}", e);
-                self.show_toast(&format!("Failed to regenerate config: {e}"));
-            }
+        let tun_enabled = self.settings.backend.backend_type == BackendType::SingBox
+            && effective_settings.tun.enabled;
+        let tun_iface = effective_settings.tun.interface_name.clone();
+        if !self.regen.request() {
+            log::debug!("config regeneration already in flight, coalescing request");
+            return;
         }
+
+        let settings = self.settings.clone();
+        let paths = self.paths.clone();
+        let nodes = nodes.clone();
+        let rules = effective_rules.clone();
+        let effective_settings = effective_settings.clone();
+        let s = sender.input_sender().clone();
+        tokio::spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                let connected: Vec<ipnet::IpNet> = if tun_enabled {
+                    v2ray_rs_process::connected_subnets(&tun_iface)
+                        .map_err(|err| format!("Collect connected subnets: {err}"))?
+                } else {
+                    Vec::new()
+                };
+                ConfigWriter::new(&settings, &paths)
+                    .write_config(&nodes, &rules, &effective_settings, &connected)
+                    .map_err(|err| err.to_string())
+            })
+            .await
+            .unwrap_or_else(|err| Err(format!("regeneration task failed: {err}")));
+            s.emit(AppMsg::ConfigRegenerated(outcome));
+        });
     }
 
     fn load_pruned_latency_snapshot(
@@ -754,11 +783,15 @@ impl SimpleComponent for App {
                         },
                     },
                 }
-            } else if model.show_wizard {
-                model.wizard.widget().clone() {}
             } else {
                 gtk::Box {
-                    set_orientation: gtk::Orientation::Vertical,
+                    #[local_ref]
+                    toast_overlay -> adw::ToastOverlay {
+                        if model.show_wizard {
+                            model.wizard.widget().clone() {}
+                        } else {
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Vertical,
 
                     adw::HeaderBar {
                         #[wrap(Some)]
@@ -779,9 +812,7 @@ impl SimpleComponent for App {
                         },
                     },
 
-                    #[local_ref]
-                    toast_overlay -> adw::ToastOverlay {
-                        gtk::Box {
+                            gtk::Box {
                             set_orientation: gtk::Orientation::Vertical,
                             set_vexpand: true,
 
@@ -858,8 +889,7 @@ impl SimpleComponent for App {
                             #[wrap(Some)]
                             set_end_child = model.logs_page.widget(),
                         },
-                    },
-                },
+                            },
 
                 gtk::ActionBar {
                         set_hexpand: true,
@@ -914,6 +944,9 @@ impl SimpleComponent for App {
                             connect_clicked => AppMsg::ToggleConnection,
                         },
                     },
+                }
+                    }
+                }
                 }
             }
         }
@@ -1104,6 +1137,7 @@ impl SimpleComponent for App {
             connection_origin: ConnectOrigin::User,
             reconnect_generation: 0,
             tun_release_in_flight: false,
+            regen: RegenScheduler::default(),
             _signal_sources: signal_sources,
         };
 
@@ -1145,7 +1179,7 @@ impl SimpleComponent for App {
             AppMsg::OnboardingComplete(settings, subscription) => {
                 if let Err(err) = self.persist_settings(settings) {
                     log::error!("save settings: {err}");
-                    self.show_toast(&format!("Failed to save settings: {err}"));
+                    self.show_toast(&onboarding_persist_error_message(&err));
                     return;
                 }
                 self.show_wizard = false;
@@ -1212,7 +1246,7 @@ impl SimpleComponent for App {
                     });
                 self.restart_required = self.check_restart_required();
                 if self.process_handle.is_none() {
-                    self.regenerate_config_disconnected();
+                    self.regenerate_config_disconnected(&sender);
                 }
             }
             AppMsg::ActiveNodesChanged(_has) => {
@@ -1476,7 +1510,7 @@ impl SimpleComponent for App {
                     return;
                 }
                 if stopped && !self.reconnect_pending {
-                    self.regenerate_config_disconnected();
+                    self.regenerate_config_disconnected(&sender);
                 }
                 if stopped && self.health_failover.reconnect_pending {
                     self.health_failover.reconnect_pending = false;
@@ -1547,13 +1581,13 @@ impl SimpleComponent for App {
                     pins,
                 );
             }
-            AppMsg::ProcessLogLine(generation, line) => {
+            AppMsg::ProcessLogLines(generation, lines) => {
                 // A superseded connection keeps streaming until its teardown
                 // finishes; drop what it logged meanwhile.
                 if !is_current_generation(generation, self.connection_generation) {
                     return;
                 }
-                self.logs_page.emit(LogsMsg::AppendLine(line));
+                self.logs_page.emit(LogsMsg::AppendLines(lines));
             }
             AppMsg::ConnectionHealth(generation, health) => {
                 if !is_current_generation(generation, self.connection_generation) {
@@ -1727,15 +1761,28 @@ impl SimpleComponent for App {
                     ));
                 self.restart_required = self.check_restart_required();
                 if self.process_handle.is_none() {
-                    self.regenerate_config_disconnected();
+                    self.regenerate_config_disconnected(&sender);
                 }
             }
             AppMsg::ManualNodesChanged => {
                 self.refresh_has_active_nodes();
-                self.handle_manual_node_changed();
+                self.handle_manual_node_changed(&sender);
             }
             AppMsg::SubscriptionsChanged => {
-                self.handle_subscription_changed();
+                self.handle_subscription_changed(&sender);
+            }
+            AppMsg::ConfigRegenerated(result) => {
+                let rerun = self.regen.completed();
+                match result {
+                    Ok(path) => log::info!("Regenerated config at {path:?}"),
+                    Err(err) => {
+                        log::error!("Failed to regenerate config: {err}");
+                        self.show_toast(&format!("Failed to regenerate config: {err}"));
+                    }
+                }
+                if rerun {
+                    self.regenerate_config_disconnected(&sender);
+                }
             }
             AppMsg::ApplyAndRestart => {
                 self.restart_required = false;
@@ -3636,6 +3683,74 @@ mod tests {
             Some(&connection)
         ));
     }
+
+    #[test]
+    fn regen_scheduler_coalesces_pending_requests() {
+        let mut sched = RegenScheduler::default();
+        assert!(sched.request());
+        assert!(!sched.request(), "in-flight job must coalesce new requests");
+        assert!(sched.completed(), "pending request must trigger a rerun");
+        assert!(!sched.completed(), "idle completion must not rerun");
+        assert!(sched.request());
+    }
+
+    #[test]
+    fn onboarding_persist_error_message_is_visible() {
+        assert_eq!(
+            onboarding_persist_error_message("disk full"),
+            "Failed to save settings: disk full"
+        );
+    }
+
+    fn test_instance_paths() -> (tempfile::TempDir, AppPaths) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        (tmp, paths)
+    }
+
+    #[test]
+    fn reset_refuses_production_without_confirm() {
+        let (_tmp, paths) = test_instance_paths();
+        let err =
+            reset_instance_preserving_lock(&paths, &AppProfile::Production, false).unwrap_err();
+        assert!(matches!(err, InstanceError::ResetProductionDenied));
+    }
+
+    #[test]
+    fn reset_is_refused_while_another_instance_holds_the_lock() {
+        let (_tmp, paths) = test_instance_paths();
+        let _lock = InstanceLock::acquire(&paths).unwrap();
+        assert!(
+            matches!(
+                InstanceLock::acquire(&paths),
+                Err(InstanceError::LockHeld { .. })
+            ),
+            "second acquire must fail while the lock is held"
+        );
+    }
+
+    #[test]
+    fn reset_preserves_the_held_lock_file() {
+        let (_tmp, paths) = test_instance_paths();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.config_dir().join("settings.json"), "{}").unwrap();
+        std::fs::write(paths.runtime_dir().join("v2ray-rs.pid"), "123").unwrap();
+        let lock_path = paths.instance_lock_path();
+        let _lock = InstanceLock::acquire(&paths).unwrap();
+
+        reset_instance_preserving_lock(&paths, &AppProfile::Test, true).unwrap();
+
+        assert!(lock_path.exists(), "held lock file must survive reset");
+        assert!(!paths.config_dir().join("settings.json").exists());
+        assert!(!paths.runtime_dir().join("v2ray-rs.pid").exists());
+        assert!(
+            matches!(
+                InstanceLock::acquire(&paths),
+                Err(InstanceError::LockHeld { .. })
+            ),
+            "lock must still be held after reset"
+        );
+    }
 }
 
 fn tray_available() -> bool {
@@ -3840,11 +3955,59 @@ fn install_resource_icon(
     true
 }
 
+fn onboarding_persist_error_message(err: &str) -> String {
+    format!("Failed to save settings: {err}")
+}
+
 pub fn run() {
     if let Err(err) = try_run() {
         eprintln!("v2ray-rs startup failed: {err}");
         std::process::exit(1);
     }
+}
+
+fn reset_instance_preserving_lock(
+    paths: &AppPaths,
+    profile: &AppProfile,
+    confirm: bool,
+) -> Result<(), InstanceError> {
+    if *profile == AppProfile::Production && !confirm {
+        return Err(InstanceError::ResetProductionDenied);
+    }
+
+    remove_dir_contents_except(paths.config_dir(), None)?;
+    remove_dir_contents_except(paths.data_dir(), None)?;
+    remove_dir_contents_except(paths.cache_dir(), None)?;
+    remove_dir_contents_except(paths.runtime_dir(), Some(&paths.instance_lock_path()))?;
+    remove_dir_contents_except(paths.state_dir(), None)?;
+
+    paths.ensure_dirs()?;
+
+    Ok(())
+}
+
+fn remove_dir_contents_except(
+    dir: &std::path::Path,
+    skip: Option<&std::path::Path>,
+) -> Result<(), InstanceError> {
+    if !dir.exists() {
+        return Ok(());
+    }
+
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if skip.is_some_and(|s| path == s) {
+            continue;
+        }
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else {
+            std::fs::remove_file(&path)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn try_run() -> Result<(), String> {
@@ -3877,13 +4040,6 @@ fn try_run() -> Result<(), String> {
         profile.qualifier()
     );
 
-    if cli_args.reset_instance {
-        reset_instance(&paths, &profile, cli_args.i_understand)
-            .map_err(|e| format!("failed to reset instance: {e}"))?;
-        println!("Instance reset successfully.");
-        return Ok(());
-    }
-
     let _lock = InstanceLock::acquire(&paths).map_err(|e| {
         if let v2ray_rs_core::instance::InstanceError::LockHeld { pid, profile: p } = e {
             eprintln!("Another instance is already running (PID {pid}), profile '{p}' is locked.");
@@ -3891,6 +4047,13 @@ fn try_run() -> Result<(), String> {
         }
         format!("failed to acquire instance lock: {e}")
     })?;
+
+    if cli_args.reset_instance {
+        reset_instance_preserving_lock(&paths, &profile, cli_args.i_understand)
+            .map_err(|e| format!("failed to reset instance: {e}"))?;
+        println!("Instance reset successfully.");
+        return Ok(());
+    }
 
     let mut stamp = InstanceStamp::load_or_create(&paths)
         .map_err(|e| format!("failed to load instance stamp: {e}"))?;

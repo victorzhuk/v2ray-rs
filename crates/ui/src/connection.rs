@@ -244,9 +244,9 @@ fn spawn_with(
             if let Some(log) = &backend_log {
                 log.append_line("notice", STRICT_ROUTE_NOTICE);
             }
-            sender.emit(AppMsg::ProcessLogLine(
+            sender.emit(AppMsg::ProcessLogLines(
                 generation,
-                STRICT_ROUTE_NOTICE.into(),
+                vec![STRICT_ROUTE_NOTICE.into()],
             ));
         }
 
@@ -256,7 +256,7 @@ fn spawn_with(
             if let Some(log) = &backend_log {
                 log.append_line("warning", &warning);
             }
-            sender.emit(AppMsg::ProcessLogLine(generation, warning));
+            sender.emit(AppMsg::ProcessLogLines(generation, vec![warning]));
         }
 
         // Every hostname is looked up here, before any candidate's tunnel
@@ -420,7 +420,10 @@ fn spawn_with(
                 if let Some(log) = &backend_log {
                     log.append_line("notice", notice);
                 }
-                sender.emit(AppMsg::ProcessLogLine(generation, notice.to_string()));
+                sender.emit(AppMsg::ProcessLogLines(
+                    generation,
+                    vec![notice.to_string()],
+                ));
             }
             let session_fields = format!(
                 "hijack={} capture_dns={} strict={} nodes_pinned={pinned} profile={}",
@@ -446,7 +449,7 @@ fn spawn_with(
                 if let Some(log) = &backend_log {
                     log.append_line("notice", &notice);
                 }
-                sender.emit(AppMsg::ProcessLogLine(generation, notice));
+                sender.emit(AppMsg::ProcessLogLines(generation, vec![notice]));
                 sender.emit(AppMsg::ShowToast(dns_capture_off_toast(host)));
             }
             let mut mgr = configure(
@@ -584,6 +587,9 @@ fn spawn_with(
                 let mut dns = (backend == BackendType::Xray).then(DnsFailureWindow::default);
                 let mut dns_failing = false;
                 let mut recheck = tokio::time::interval(health_timing.dns_recheck);
+                let mut batcher = LogBatcher::default();
+                let mut flush = tokio::time::interval(LOG_FLUSH_INTERVAL);
+                flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 loop {
                     tokio::select! {
                         event = log_rx.recv() => match event {
@@ -595,7 +601,10 @@ fn spawn_with(
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                                     .toast_for(&line.content);
-                                log_sender.emit(AppMsg::ProcessLogLine(generation, line.content));
+                                batcher.push(line.content);
+                                if batcher.is_full() {
+                                    flush_log_batch(&log_sender, generation, batcher.take());
+                                }
                                 if let Some(toast) = toast {
                                     log_sender.emit(AppMsg::ShowToast(toast));
                                 }
@@ -605,6 +614,9 @@ fn spawn_with(
                             Err(broadcast::error::RecvError::Closed) => break,
                         },
                         _ = recheck.tick(), if dns.is_some() => {}
+                        _ = flush.tick() => {
+                            flush_log_batch(&log_sender, generation, batcher.take());
+                        }
                     }
                     if let Some(window) = &dns
                         && let Some(failing) = dns_flip(window, &mut dns_failing, Instant::now())
@@ -612,6 +624,7 @@ fn spawn_with(
                         log_sender.emit(AppMsg::DnsHealth(generation, failing));
                     }
                 }
+                flush_log_batch(&log_sender, generation, batcher.take());
             });
             let mut forwarders = vec![state_forwarder, log_forwarder];
             if effective_settings.health_check.enabled {
@@ -1049,6 +1062,7 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
             && settings.tun.dns_hijack == DnsHijackMode::Hijack
             && nodes_pinned,
         strict: settings.tun.strict_route,
+        device_ifindex: None,
         exclude_routes: if backend == BackendType::Xray {
             settings.tun.exclude_routes.clone()
         } else {
@@ -1151,6 +1165,70 @@ fn spawn_health_monitor(
             }
         }
     })
+}
+
+/// Log lines accumulate for at most this long before delivery.
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Maximum lines held in one pending batch; the oldest line is dropped
+/// beyond this so a fast backend cannot grow delivery memory without limit.
+const LOG_BATCH_CAP: usize = 512;
+
+/// A flushed batch of backend log lines with the count dropped before it.
+struct LogBatch {
+    lines: Vec<String>,
+    dropped: usize,
+}
+
+/// Buffers backend log lines for batched UI delivery. Ordering is FIFO.
+#[derive(Default)]
+struct LogBatcher {
+    lines: Vec<String>,
+    dropped: usize,
+}
+
+impl LogBatcher {
+    /// Buffers one line, dropping the oldest and counting it when full.
+    fn push(&mut self, line: String) {
+        if self.lines.len() >= LOG_BATCH_CAP {
+            self.lines.remove(0);
+            self.dropped += 1;
+        }
+        self.lines.push(line);
+    }
+
+    /// Whether the batch reached its cap and should flush immediately.
+    fn is_full(&self) -> bool {
+        self.lines.len() >= LOG_BATCH_CAP
+    }
+
+    /// Takes the pending batch, or `None` when nothing is buffered.
+    fn take(&mut self) -> Option<LogBatch> {
+        if self.lines.is_empty() {
+            return None;
+        }
+        Some(LogBatch {
+            lines: std::mem::take(&mut self.lines),
+            dropped: std::mem::take(&mut self.dropped),
+        })
+    }
+}
+
+/// Emits one batched log message, prepending a drop marker when lines were
+/// dropped before this batch.
+fn flush_log_batch(sender: &relm4::Sender<AppMsg>, generation: u64, batch: Option<LogBatch>) {
+    let Some(batch) = batch else { return };
+    let mut lines = batch.lines;
+    if batch.dropped > 0 {
+        lines.insert(
+            0,
+            format!(
+                "notice: {} backend log line(s) dropped before delivery under load",
+                batch.dropped
+            ),
+        );
+    }
+    sender.emit(AppMsg::ProcessLogLines(generation, lines));
 }
 
 /// The new DNS failing mark when it differs from the last one reported.
@@ -1418,6 +1496,75 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
+
+    #[test]
+    fn burst_flushes_as_one_ordered_batch() {
+        let mut batcher = LogBatcher::default();
+        for i in 0..100 {
+            batcher.push(format!("line-{i}"));
+        }
+
+        let batch = batcher.take().expect("pending burst");
+        assert_eq!(batch.dropped, 0);
+        let expected: Vec<String> = (0..100).map(|i| format!("line-{i}")).collect();
+        assert_eq!(batch.lines, expected);
+        assert!(batcher.take().is_none(), "batch must drain empty");
+    }
+
+    #[test]
+    fn full_batch_drops_oldest_and_reports_the_count() {
+        let mut batcher = LogBatcher::default();
+        let extra = 10;
+        for i in 0..(LOG_BATCH_CAP + extra) {
+            batcher.push(format!("line-{i}"));
+        }
+
+        let batch = batcher.take().expect("pending batch");
+        assert_eq!(batch.dropped, extra);
+        assert_eq!(batch.lines.len(), LOG_BATCH_CAP);
+        assert_eq!(batch.lines[0], format!("line-{extra}"));
+        assert_eq!(
+            batch.lines.last().map(String::as_str),
+            Some(format!("line-{}", LOG_BATCH_CAP + extra - 1)).as_deref()
+        );
+    }
+
+    #[test]
+    fn partial_batch_flushes_on_take() {
+        let mut batcher = LogBatcher::default();
+        batcher.push("a".into());
+        batcher.push("b".into());
+        batcher.push("c".into());
+
+        let batch = batcher.take().expect("pending partial batch");
+        assert_eq!(batch.lines, ["a", "b", "c"]);
+        assert_eq!(batch.dropped, 0);
+        assert!(batcher.take().is_none());
+    }
+
+    #[tokio::test]
+    async fn flush_reports_dropped_lines_with_a_marker() {
+        let (sender, rx) = relm4::channel::<AppMsg>();
+        flush_log_batch(
+            &sender,
+            GENERATION,
+            Some(LogBatch {
+                lines: vec!["kept".into()],
+                dropped: 2,
+            }),
+        );
+        drop(sender);
+
+        match rx.recv().await.expect("batch message") {
+            AppMsg::ProcessLogLines(generation, lines) => {
+                assert_eq!(generation, GENERATION);
+                assert_eq!(lines.len(), 2);
+                assert!(lines[0].contains('2'), "marker must report the count");
+                assert_eq!(lines[1], "kept");
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
     use v2ray_rs_core::models::{
         DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
         ImportedProfile, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TunConfig,
@@ -2121,9 +2268,9 @@ exit 1"#,
                 .expect("connection task outlived its terminal state");
             match msg {
                 None => return (terminal, lines),
-                Some(AppMsg::ProcessLogLine(generation, line)) => {
+                Some(AppMsg::ProcessLogLines(generation, batch)) => {
                     assert_eq!(generation, GENERATION);
-                    lines.push(line);
+                    lines.extend(batch);
                 }
                 Some(AppMsg::ProcessStateConnection(generation, state, _)) => {
                     assert_eq!(generation, GENERATION);
@@ -2435,9 +2582,12 @@ exit 1"#,
                 .await
                 .expect("no log line in time")
                 .expect("connection task ended before a log line");
-            if let AppMsg::ProcessLogLine(generation, line) = msg {
+            if let AppMsg::ProcessLogLines(generation, lines) = msg {
                 assert_eq!(generation, GENERATION);
-                assert_eq!(line, "v2rs-log-line");
+                assert!(
+                    lines.iter().any(|line| line == "v2rs-log-line"),
+                    "{lines:?}"
+                );
                 break;
             }
         }
@@ -3009,6 +3159,7 @@ exit 1"#,
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         }));
 
         assert!(probe_allowed(None));
@@ -3031,7 +3182,7 @@ exit 1"#,
                 .expect("connection task outlived its terminal state");
             match msg {
                 None => return (terminal, lines, toasts),
-                Some(AppMsg::ProcessLogLine(_, line)) => lines.push(line),
+                Some(AppMsg::ProcessLogLines(_, batch)) => lines.extend(batch),
                 Some(AppMsg::ShowToast(toast)) => toasts.push(toast),
                 Some(AppMsg::ProcessStateConnection(_, state, _)) if !relays(&state) => {
                     terminal = Some(state);
@@ -3062,7 +3213,9 @@ exit 1"#,
                     assert!(relays(&state), "reported {state:?}");
                     running |= matches!(state, ProcessState::Running);
                 }
-                AppMsg::ProcessLogLine(_, line) if line.contains(marker) => relayed += 1,
+                AppMsg::ProcessLogLines(_, batch) => {
+                    relayed += batch.iter().filter(|line| line.contains(marker)).count();
+                }
                 AppMsg::ShowToast(toast) => toasts.push(toast),
                 _ => {}
             }
@@ -3360,8 +3513,8 @@ exit 1"#,
                 .expect("connection task outlived its terminal state");
             match msg {
                 None => break,
-                Some(AppMsg::ProcessLogLine(_, line)) => {
-                    panic!("log line {line:?} relayed after the terminal state")
+                Some(AppMsg::ProcessLogLines(_, lines)) => {
+                    panic!("log lines {lines:?} relayed after the terminal state")
                 }
                 Some(AppMsg::ProcessStateConnection(_, state, _)) => {
                     panic!("{state:?} reported after the terminal state")
@@ -3612,7 +3765,9 @@ exit 1"#,
                     assert_eq!(generation, GENERATION);
                     reports.push(failing);
                 }
-                Some(AppMsg::ProcessLogLine(_, line)) if line == "dns-burst-done" => {
+                Some(AppMsg::ProcessLogLines(_, lines))
+                    if lines.iter().any(|line| line == "dns-burst-done") =>
+                {
                     handle.stop(StopReason::UserStop)
                 }
                 Some(_) => {}

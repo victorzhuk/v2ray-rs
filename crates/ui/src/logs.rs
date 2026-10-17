@@ -11,7 +11,7 @@ pub struct LogsPage {
 
 #[derive(Debug)]
 pub enum LogsMsg {
-    AppendLine(String),
+    AppendLines(Vec<String>),
     Clear,
     SetRunning(bool),
 }
@@ -104,13 +104,17 @@ impl SimpleComponent for LogsPage {
 
     fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
         match msg {
-            LogsMsg::AppendLine(line) => {
+            LogsMsg::AppendLines(lines) => {
+                if lines.is_empty() {
+                    return;
+                }
+                let text = lines.join("\n");
                 let mut end_iter = self.log_buffer.end_iter();
                 if self.log_buffer.char_count() > 0 {
                     self.log_buffer.insert(&mut end_iter, "\n");
                     end_iter = self.log_buffer.end_iter();
                 }
-                self.log_buffer.insert(&mut end_iter, &line);
+                self.log_buffer.insert(&mut end_iter, &text);
 
                 let line_count = self.log_buffer.line_count();
                 if line_count > MAX_LOG_LINES {

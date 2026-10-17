@@ -21,6 +21,7 @@ pub struct OnboardingWizard {
     subscription_name: String,
     subscription_url: String,
     subscription_file_path: String,
+    subscription_skipped: bool,
     custom_backend_type: BackendType,
     custom_backend_path: String,
     custom_backend_status: Option<String>,
@@ -328,6 +329,7 @@ impl SimpleComponent for OnboardingWizard {
             subscription_name: String::new(),
             subscription_url: String::new(),
             subscription_file_path: String::new(),
+            subscription_skipped: false,
             custom_backend_type: BackendType::Xray,
             custom_backend_path: String::new(),
             custom_backend_status: None,
@@ -434,10 +436,12 @@ impl SimpleComponent for OnboardingWizard {
             }
             WizardMsg::ImportSubscription => {
                 if subscription_inputs_valid(&self.subscription_url, &self.subscription_file_path) {
+                    self.subscription_skipped = false;
                     self.current_page = 3;
                 }
             }
             WizardMsg::SkipSubscription => {
+                self.subscription_skipped = true;
                 self.current_page = 3;
             }
             WizardMsg::CustomBackendTypeChanged(selected) => {
@@ -505,26 +509,12 @@ impl SimpleComponent for OnboardingWizard {
                 let mut settings = self.settings.clone();
                 settings.onboarding_complete = true;
 
-                let source = subscription_source_from_inputs(
+                let subscription = complete_subscription(
+                    self.subscription_skipped,
                     &self.subscription_url,
                     &self.subscription_file_path,
-                    "",
-                )
-                .and_then(|input| match input {
-                    SubscriptionSourceInput::Url(url) => Some(SubscriptionSource::Url { url }),
-                    SubscriptionSourceInput::File(path) => Some(SubscriptionSource::File { path }),
-                    SubscriptionSourceInput::Paste(_) => None,
-                });
-                let subscription = if let Some(source) = source {
-                    let name = if self.subscription_name.trim().is_empty() {
-                        default_subscription_name(&source).unwrap_or_else(|| "Subscription".into())
-                    } else {
-                        self.subscription_name.clone()
-                    };
-                    Some((name, source))
-                } else {
-                    None
-                };
+                    &self.subscription_name,
+                );
 
                 let _ = sender.output(WizardOutput::Complete {
                     settings,
@@ -706,6 +696,29 @@ fn subscription_inputs_valid(url: &str, file_path: &str) -> bool {
     !url.trim().is_empty() ^ !file_path.trim().is_empty()
 }
 
+fn complete_subscription(
+    skipped: bool,
+    subscription_url: &str,
+    subscription_file_path: &str,
+    subscription_name: &str,
+) -> Option<(String, SubscriptionSource)> {
+    if skipped {
+        return None;
+    }
+    let source = subscription_source_from_inputs(subscription_url, subscription_file_path, "")
+        .and_then(|input| match input {
+            SubscriptionSourceInput::Url(url) => Some(SubscriptionSource::Url { url }),
+            SubscriptionSourceInput::File(path) => Some(SubscriptionSource::File { path }),
+            SubscriptionSourceInput::Paste(_) => None,
+        })?;
+    let name = if subscription_name.trim().is_empty() {
+        default_subscription_name(&source).unwrap_or_else(|| "Subscription".into())
+    } else {
+        subscription_name.to_string()
+    };
+    Some((name, source))
+}
+
 fn default_subscription_name(source: &SubscriptionSource) -> Option<String> {
     match source {
         SubscriptionSource::Url { url } => extract_host(url),
@@ -771,5 +784,37 @@ mod tests {
         ];
 
         assert!(auto_selected_backend(&detected).is_none());
+    }
+
+    #[test]
+    fn complete_after_skip_emits_no_subscription() {
+        assert_eq!(
+            complete_subscription(true, "https://example.com/sub", "", "My Sub"),
+            None
+        );
+        assert_eq!(complete_subscription(true, "", "/tmp/subs.txt", ""), None);
+    }
+
+    #[test]
+    fn complete_without_skip_keeps_source() {
+        let (name, source) =
+            complete_subscription(false, "https://example.com/sub", "", "").expect("source");
+        assert_eq!(name, "example.com");
+        assert_eq!(
+            source,
+            SubscriptionSource::Url {
+                url: "https://example.com/sub".into()
+            }
+        );
+
+        let (name, source) =
+            complete_subscription(false, "", "/tmp/proxies.txt", "Named").expect("source");
+        assert_eq!(name, "Named");
+        assert_eq!(
+            source,
+            SubscriptionSource::File {
+                path: "/tmp/proxies.txt".into()
+            }
+        );
     }
 }

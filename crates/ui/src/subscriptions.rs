@@ -1424,6 +1424,22 @@ fn merge_refreshed_subscription(current: &Subscription, refreshed: Subscription)
     }
 }
 
+fn redact_uri(uri: &str) -> String {
+    let Some((scheme, rest)) = uri.split_once("://") else {
+        return "unrecognized entry".to_string();
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = match authority.rsplit_once('@') {
+        Some((_, host)) => host,
+        None => authority,
+    };
+    if host.is_empty() {
+        "unrecognized entry".to_string()
+    } else {
+        format!("{scheme}://{host}")
+    }
+}
+
 fn format_update_summary(name: &str, action: &str, result: &UpdateResult) -> String {
     let mut summary = if result.parse_failures.is_empty() {
         format!(
@@ -1435,7 +1451,8 @@ fn format_update_summary(name: &str, action: &str, result: &UpdateResult) -> Str
             .parse_failures
             .iter()
             .take(2)
-            .map(|failure| failure.uri.as_str())
+            .enumerate()
+            .map(|(idx, failure)| format!("line {}: {}", idx + 1, redact_uri(&failure.uri)))
             .collect::<Vec<_>>()
             .join(", ");
         let suffix = if result.parse_failures.len() > 2 {
@@ -1485,7 +1502,8 @@ fn format_subscription_error(error: &SubscriptionError) -> String {
                 let details = failures
                     .iter()
                     .take(2)
-                    .map(|failure| failure.uri.as_str())
+                    .enumerate()
+                    .map(|(idx, failure)| format!("line {}: {}", idx + 1, redact_uri(&failure.uri)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let suffix = if failures.len() > 2 { ", ..." } else { "" };
@@ -2720,6 +2738,7 @@ mod tests {
     use super::*;
     use std::net::SocketAddr;
     use v2ray_rs_core::models::{ProxyNode, SubscriptionNode, VlessConfig};
+    use v2ray_rs_subscription::ParseFailure;
 
     fn create_test_subscription(
         name: &str,
@@ -2800,6 +2819,63 @@ mod tests {
             auto_update_outcome_toast(&mut streaks, id, "Corp", &fail),
             Some("Auto-update failed for Corp: timeout".to_string())
         );
+    }
+
+    fn parse_failure(uri: &str) -> ParseFailure {
+        ParseFailure {
+            uri: uri.to_string(),
+            error: "unsupported scheme".to_string(),
+        }
+    }
+
+    #[test]
+    fn update_summary_redacts_credentials() {
+        let result = UpdateResult {
+            added: 1,
+            removed: 0,
+            unchanged: 2,
+            parse_failures: vec![parse_failure(
+                "trojan://secret-password@example.com:443?allowInsecure=1#node-1",
+            )],
+            profile: None,
+        };
+
+        let summary = format_update_summary("Corp", "Updated", &result);
+        assert!(summary.contains("example.com:443"), "{summary}");
+        assert!(!summary.contains("secret-password"), "{summary}");
+        assert!(!summary.contains("allowInsecure"), "{summary}");
+        assert!(!summary.contains("node-1"), "{summary}");
+        assert!(summary.contains("1 invalid URI(s)"), "{summary}");
+        assert!(summary.contains("line 1:"), "{summary}");
+    }
+
+    #[test]
+    fn subscription_error_redacts_credentials() {
+        let error = SubscriptionError::Update(UpdateError::InvalidContent {
+            failures: vec![parse_failure(
+                "vless://11111111-2222-3333-4444-555555555555@203.0.113.7:8443?type=ws",
+            )],
+        });
+
+        let message = format_subscription_error(&error);
+        assert!(message.contains("203.0.113.7:8443"), "{message}");
+        assert!(
+            !message.contains("11111111-2222-3333-4444-555555555555"),
+            "{message}"
+        );
+        assert!(!message.contains("type=ws"), "{message}");
+
+        let raw = parse_failure("not even a uri");
+        let result = UpdateResult {
+            added: 0,
+            removed: 0,
+            unchanged: 0,
+            parse_failures: vec![raw],
+            profile: None,
+        };
+        let summary = format_update_summary("Corp", "Updated", &result);
+        assert!(!summary.contains("not even a uri"), "{summary}");
+        assert!(summary.contains("unrecognized entry"), "{summary}");
     }
 
     #[test]
