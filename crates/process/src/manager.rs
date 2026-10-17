@@ -582,7 +582,9 @@ impl ProcessManager {
             // in Error with no child: release any routing state and reach a
             // terminal state instead of parking in Error.
             ProcessState::Error(_) if self.child.is_none() => {
-                self.teardown_tun().await;
+                if let Err(failure) = self.teardown_tun().await {
+                    return Err(ProcessError::TunHelper(failure));
+                }
                 self.state.transition(ProcessState::Stopped, None)?;
                 return Ok(());
             }
@@ -594,7 +596,17 @@ impl ProcessManager {
             }
         }
         self.graceful_stop().await;
-        self.teardown_tun().await;
+        if let Err(failure) = self.teardown_tun().await {
+            // A failed teardown leaves strict-routing rules installed; the
+            // Error state (not Stopped) keeps the TUN session marker alive so
+            // startup recovery can clean the kernel up.
+            self.state.transition(
+                ProcessState::Error(format!("TUN teardown failed: {failure}")),
+                None,
+            )?;
+            self.pid_file.remove().ok();
+            return Err(ProcessError::TunHelper(failure));
+        }
         self.state.transition(ProcessState::Stopped, None)?;
         self.pid_file.remove().ok();
         Ok(())
@@ -1079,13 +1091,15 @@ impl ProcessManager {
         self.crash_times.retain(|t| t.elapsed() < CRASH_WINDOW);
     }
 
-    async fn teardown_tun(&self) {
+    async fn teardown_tun(&self) -> Result<(), String> {
         if let Some(rt) = self.tun.clone()
             && rt.needs_helper()
         {
             let run = tun::xray_down(&rt).await;
             self.log_helper("xray-down", &run);
+            return run.result;
         }
+        Ok(())
     }
 
     fn log_helper(&self, verb: &str, run: &HelperRun) {
@@ -2474,6 +2488,11 @@ mod tests {
         let mut mgr = manager_for(&dir, "exec sleep 30\n");
         mgr.start().await.unwrap();
 
+        // A stand-in for the TUN session marker: it must survive the failed
+        // teardown so startup recovery can clean the kernel up.
+        let marker = dir.path().join("tun_session.json");
+        std::fs::write(&marker, "{}").unwrap();
+
         let calls = dir.path().join("calls");
         let helper = dir.path().join("netctl");
         std::fs::write(
@@ -2494,8 +2513,17 @@ mod tests {
             exclude_routes: Vec::new(),
         });
 
-        mgr.stop().await.unwrap();
-        assert_eq!(mgr.state(), ProcessState::Stopped);
+        let err = mgr.stop().await.unwrap_err();
+        assert!(err.to_string().contains("xray-down"), "{err}");
+        assert!(
+            matches!(mgr.state(), ProcessState::Error(msg) if msg.contains("TUN teardown failed")),
+            "expected Error state, got {:?}",
+            mgr.state()
+        );
+        assert!(
+            marker.exists(),
+            "session marker must survive failed teardown"
+        );
         assert_eq!(std::fs::read_to_string(&calls).unwrap(), "xray-down\n");
         let logged = mgr
             .log_buffer()
@@ -2505,6 +2533,12 @@ mod tests {
             .iter()
             .any(|l| l.content.contains("xray-down failed"));
         assert!(logged, "expected the teardown failure in the log buffer");
+
+        // stop() still works from Error without a child; the failing helper
+        // keeps the manager in Error instead of a clean Stopped.
+        assert!(mgr.stop().await.is_err());
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(marker.exists());
     }
 
     #[test]

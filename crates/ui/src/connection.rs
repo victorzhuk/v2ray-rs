@@ -154,10 +154,32 @@ fn spawn_with(
         // UI while an orphan is signalled and waited on.
         {
             let orphan_pid = pid_path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
+            let cleanup = tokio::task::spawn_blocking(move || {
                 v2ray_rs_process::PidFile::new(orphan_pid).check_and_kill_orphaned()
             })
             .await;
+            // A failed orphan reap must not start a session that could race
+            // the survivor for ports or the TUN interface.
+            let reaped = match cleanup {
+                Ok(Ok(reaped)) => reaped,
+                Ok(Err(err)) => {
+                    report(
+                        ProcessState::Error(format!("Orphan cleanup failed: {err}")),
+                        None,
+                    );
+                    return;
+                }
+                Err(err) => {
+                    report(
+                        ProcessState::Error(format!("Orphan cleanup failed: {err}")),
+                        None,
+                    );
+                    return;
+                }
+            };
+            if reaped {
+                log::info!("reaped orphaned backend from a previous run");
+            }
         }
 
         // Collected once per connection, before any candidate: the snapshot
@@ -273,6 +295,8 @@ fn spawn_with(
             if let Ok(ConnectionCmd::Stop(reason)) = cmd_rx.try_recv() {
                 if let Some(mut failed) = parked.take() {
                     failed.shutdown_with(reason).await;
+                    report(failed.state(), None);
+                    return;
                 }
                 report(ProcessState::Stopped, None);
                 return;
@@ -317,6 +341,19 @@ fn spawn_with(
             }
             let unpinned = unpinned_host(&effective_settings, &nodes);
             let pinned = unpinned.is_none();
+            let tun = build_tun_runtime(&effective_settings, pinned);
+            // Written before any config write or kernel touch: startup and
+            // terminal-error recovery are gated on this marker, so a session
+            // must not start if the recovery pass cannot be recorded.
+            if let Some(rt) = &tun
+                && let Err(err) = save_tun_session(&paths, &tun_session_for(rt))
+            {
+                report(
+                    ProcessState::Error(format!("Failed to record TUN session: {err}")),
+                    None,
+                );
+                return;
+            }
             let config_path = match writer.write_config(
                 &nodes,
                 &effective_rules,
@@ -361,7 +398,6 @@ fn spawn_with(
                 connected_since: chrono::Utc::now(),
             };
 
-            let tun = build_tun_runtime(&effective_settings, pinned);
             let node_hosts: Vec<&str> = nodes.iter().map(|node| node.address()).collect();
             let mut summary = effective_dns(
                 settings.backend.backend_type,
@@ -413,13 +449,6 @@ fn spawn_with(
                 sender.emit(AppMsg::ProcessLogLine(generation, notice));
                 sender.emit(AppMsg::ShowToast(dns_capture_off_toast(host)));
             }
-            // Written before the backend or the route helper touches the kernel,
-            // so a crash mid-start still leaves the next launch a recovery pass.
-            if let Some(rt) = &tun
-                && let Err(err) = save_tun_session(&paths, &tun_session_for(rt))
-            {
-                log::warn!("save tun session marker: {err}");
-            }
             let mut mgr = configure(
                 ProcessManager::new(
                     binary_path.clone(),
@@ -445,7 +474,7 @@ fn spawn_with(
                     if let Some(mut failed) = parked.take() {
                         failed.shutdown_with(reason).await;
                     }
-                    report(ProcessState::Stopped, None);
+                    report(mgr.state(), None);
                     return;
                 }
                 started = mgr.start_with_connection(Some(meta.clone())) => started,
@@ -458,7 +487,7 @@ fn spawn_with(
                     // back to Connected with a dead handle.
                     if let Ok(ConnectionCmd::Stop(reason)) = cmd_rx.try_recv() {
                         mgr.shutdown_with(reason).await;
-                        report(ProcessState::Stopped, None);
+                        report(mgr.state(), None);
                         return;
                     }
                     report(ProcessState::Running, Some(meta.clone()));
@@ -606,7 +635,7 @@ fn spawn_with(
                     Some(ConnectionCmd::Stop(reason)) = cmd_rx.recv() => {
                         mgr.shutdown_with(reason).await;
                         halt(forwarders).await;
-                        report(ProcessState::Stopped, None);
+                        report(mgr.state(), None);
                         return;
                     }
                     _ = mgr.wait_and_handle_exit() => {
@@ -2445,6 +2474,37 @@ exit 1"#,
             })
         );
         assert_nothing_after_terminal(&rx).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn marker_write_failure_blocks_start() {
+        let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "v2rstest0".into();
+        // Force the marker write to fail: a directory where the session file
+        // must be written.
+        let marker_path = stub.paths.tun_session_path();
+        std::fs::create_dir_all(&marker_path).unwrap();
+
+        let (_handle, rx) = connect(&stub, settings, vec![candidate("203.0.113.1")]);
+
+        let (state, _) = next_state(&rx).await;
+        let ProcessState::Error(msg) = state else {
+            panic!("expected the marker failure to stop the start, got {state:?}");
+        };
+        assert!(
+            msg.starts_with("Failed to record TUN session: "),
+            "unexpected error text: {msg}"
+        );
+        assert_nothing_after_terminal(&rx).await;
+        // Terminal before any backend spawn: the log file itself is opened
+        // once before the candidate loop, so only its contents are
+        // guaranteed clean; no session record, no config write either.
+        if let Ok(contents) = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log")) {
+            assert!(!contents.contains(" session "), "{contents}");
+        }
+        assert!(!stub.paths.generated_dir().join("xray.json").exists());
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -159,6 +159,17 @@ impl PidFile {
                     }
                 }
                 if process_exists(record.pid) {
+                    // The 1s wait is a window for PID reuse: re-verify the
+                    // recorded start time immediately before escalating, or an
+                    // unrelated process could eat the SIGKILL. An unreadable
+                    // start time counts as changed.
+                    if process_start_time(record.pid)
+                        .map(|start| start != record.start_time_ticks)
+                        .unwrap_or(true)
+                    {
+                        self.remove()?;
+                        return Ok(false);
+                    }
                     let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGKILL);
                     for _ in 0..5 {
                         std::thread::sleep(std::time::Duration::from_millis(100));
