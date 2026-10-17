@@ -2,6 +2,7 @@
 name = "v2ray-rs-ui"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 v2ray-rs-core.workspace = true
