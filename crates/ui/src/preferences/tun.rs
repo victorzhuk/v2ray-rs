@@ -253,7 +253,7 @@ pub(super) fn build_tun_page(
         let routes_group = routes_group.clone();
         let state = state.clone();
         let cb = cb.clone();
-        let added_rows = added_rows.clone();
+        let toast_cb = toast_cb.clone();
         let render_slot = render_slot.clone();
         Rc::new(move || {
             for row in added_rows.borrow().iter() {
@@ -271,14 +271,17 @@ pub(super) fn build_tun_page(
                 {
                     let state = state.clone();
                     let cb = cb.clone();
+                    let toast_cb = toast_cb.clone();
                     let render_slot = render_slot.clone();
                     delete.connect_clicked(move |_| {
-                        let _ = apply_tun_mutation(&state, &cb, |s| {
+                        if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                             if index < s.tun.exclude_routes.len() {
                                 s.tun.exclude_routes.remove(index);
                             }
                             Ok(())
-                        });
+                        }) {
+                            toast_cb(&err);
+                        }
                         if let Some(render) = render_slot.borrow().as_ref() {
                             render();
                         }
@@ -297,38 +300,24 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let render_routes = render_routes.clone();
+        let toast_cb = toast_cb.clone();
         add_row.connect_activated(move |_| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Add excluded route")
-                .build();
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("add", "Add");
-            dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("add"));
-            dialog.set_close_response("cancel");
-
-            let entry = adw::EntryRow::builder()
-                .title("CIDR (e.g. 192.168.0.0/16)")
-                .build();
-            let group = adw::PreferencesGroup::new();
-            group.add(&entry);
-            dialog.set_extra_child(Some(&group));
-
             let state = state.clone();
             let cb = cb.clone();
             let render_routes = render_routes.clone();
-            let entry = entry.clone();
-            dialog.connect_response(Some("add"), move |_, _| {
-                let value = entry.text().trim().to_string();
-                if validate_exclude_route(&value).is_ok() {
-                    let _ = apply_tun_mutation(&state, &cb, |s| {
-                        s.tun.exclude_routes.push(value.clone());
+            present_add_dialog(
+                "Add excluded route",
+                "CIDR (e.g. 192.168.0.0/16)",
+                &toast_cb,
+                move |value| validate_exclude_route(value).map_err(|err| err.to_string()),
+                Rc::new(move |value: &str| {
+                    apply_tun_mutation(&state, &cb, |s| {
+                        s.tun.exclude_routes.push(value.to_string());
                         Ok(())
-                    });
-                    render_routes();
-                }
-            });
-            dialog.present(crate::active_window().as_ref());
+                    })
+                }),
+                render_routes,
+            );
         });
     }
 
@@ -351,6 +340,7 @@ pub(super) fn build_tun_page(
         let domains_group = domains_group.clone();
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         let added_rows = domains_added_rows.clone();
         let render_slot = domains_render_slot.clone();
         Rc::new(move || {
@@ -369,14 +359,17 @@ pub(super) fn build_tun_page(
                 {
                     let state = state.clone();
                     let cb = cb.clone();
+                    let toast_cb = toast_cb.clone();
                     let render_slot = render_slot.clone();
                     delete.connect_clicked(move |_| {
-                        let _ = apply_tun_mutation(&state, &cb, |s| {
+                        if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                             if index < s.tun.exclude_domains.len() {
                                 s.tun.exclude_domains.remove(index);
                             }
                             Ok(())
-                        });
+                        }) {
+                            toast_cb(&err);
+                        }
                         if let Some(render) = render_slot.borrow().as_ref() {
                             render();
                         }
@@ -395,38 +388,24 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let render_domains = render_domains.clone();
+        let toast_cb = toast_cb.clone();
         add_domain_row.connect_activated(move |_| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Add excluded domain")
-                .build();
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("add", "Add");
-            dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("add"));
-            dialog.set_close_response("cancel");
-
-            let entry = adw::EntryRow::builder()
-                .title("Domain suffix (e.g. example.com)")
-                .build();
-            let group = adw::PreferencesGroup::new();
-            group.add(&entry);
-            dialog.set_extra_child(Some(&group));
-
             let state = state.clone();
             let cb = cb.clone();
             let render_domains = render_domains.clone();
-            let entry = entry.clone();
-            dialog.connect_response(Some("add"), move |_, _| {
-                let value = entry.text().trim().to_string();
-                if validate_domain_pattern(&value).is_ok() {
-                    let _ = apply_tun_mutation(&state, &cb, |s| {
-                        s.tun.exclude_domains.push(value.clone());
+            present_add_dialog(
+                "Add excluded domain",
+                "Domain suffix (e.g. example.com)",
+                &toast_cb,
+                |value| validate_domain_pattern(value).map_err(|err| err.to_string()),
+                Rc::new(move |value: &str| {
+                    apply_tun_mutation(&state, &cb, |s| {
+                        s.tun.exclude_domains.push(value.to_string());
                         Ok(())
-                    });
-                    render_domains();
-                }
-            });
-            dialog.present(crate::active_window().as_ref());
+                    })
+                }),
+                render_domains,
+            );
         });
     }
 
@@ -455,6 +434,7 @@ pub(super) fn build_tun_page(
         let apps_group = apps_group.clone();
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         let added_rows = apps_added_rows.clone();
         let render_slot = apps_render_slot.clone();
         Rc::new(move || {
@@ -473,14 +453,17 @@ pub(super) fn build_tun_page(
                 {
                     let state = state.clone();
                     let cb = cb.clone();
+                    let toast_cb = toast_cb.clone();
                     let render_slot = render_slot.clone();
                     delete.connect_clicked(move |_| {
-                        let _ = apply_tun_mutation(&state, &cb, |s| {
+                        if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                             if index < s.tun.exclude_processes.len() {
                                 s.tun.exclude_processes.remove(index);
                             }
                             Ok(())
-                        });
+                        }) {
+                            toast_cb(&err);
+                        }
                         if let Some(render) = render_slot.borrow().as_ref() {
                             render();
                         }
@@ -499,38 +482,32 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let render_apps = render_apps.clone();
+        let toast_cb = toast_cb.clone();
         add_app_row.connect_activated(move |_| {
-            let dialog = adw::AlertDialog::builder()
-                .heading("Add excluded application")
-                .build();
-            dialog.add_response("cancel", "Cancel");
-            dialog.add_response("add", "Add");
-            dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
-            dialog.set_default_response(Some("add"));
-            dialog.set_close_response("cancel");
-
-            let entry = adw::EntryRow::builder()
-                .title("Process name (e.g. cloudflared)")
-                .build();
-            let group = adw::PreferencesGroup::new();
-            group.add(&entry);
-            dialog.set_extra_child(Some(&group));
-
             let state = state.clone();
             let cb = cb.clone();
             let render_apps = render_apps.clone();
-            let entry = entry.clone();
-            dialog.connect_response(Some("add"), move |_, _| {
-                let value = entry.text().trim().to_string();
-                if !value.is_empty() && !value.contains('/') && !value.contains('\\') {
-                    let _ = apply_tun_mutation(&state, &cb, |s| {
-                        s.tun.exclude_processes.push(value.clone());
+            present_add_dialog(
+                "Add excluded application",
+                "Process name (e.g. cloudflared)",
+                &toast_cb,
+                |value| {
+                    if value.is_empty() {
+                        return Err("Process name must not be empty".to_string());
+                    }
+                    if value.contains('/') || value.contains('\\') {
+                        return Err("Process name must not contain path separators".to_string());
+                    }
+                    Ok(())
+                },
+                Rc::new(move |value: &str| {
+                    apply_tun_mutation(&state, &cb, |s| {
+                        s.tun.exclude_processes.push(value.to_string());
                         Ok(())
-                    });
-                    render_apps();
-                }
-            });
-            dialog.present(crate::active_window().as_ref());
+                    })
+                }),
+                render_apps,
+            );
         });
     }
 
@@ -719,10 +696,14 @@ pub(super) fn build_tun_page(
         let warned = Rc::new(Cell::new(false));
         enable_row.connect_active_notify(move |row| {
             let enabled = row.is_active();
-            let _ = apply_tun_mutation(&state, &cb, |s| {
+            if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.enabled = enabled;
                 Ok(())
-            });
+            }) {
+                toast_cb(&format!("Failed to save TUN setting: {err}"));
+                row.set_active(state.borrow().tun.enabled);
+                return;
+            }
             if enabled && !warned.replace(true) {
                 toast_cb("TUN routes all system traffic through the active proxy.");
             }
@@ -731,15 +712,19 @@ pub(super) fn build_tun_page(
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         iface_row.connect_apply(move |row| {
             let value = row.text().trim().to_string();
             match validate_tun_interface_name(&value) {
                 Ok(()) => {
                     row.remove_css_class("error");
-                    let _ = apply_tun_mutation(&state, &cb, |s| {
+                    if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                         s.tun.interface_name = value.clone();
                         Ok(())
-                    });
+                    }) {
+                        toast_cb(&format!("Failed to save TUN setting: {err}"));
+                        row.set_text(&state.borrow().tun.interface_name);
+                    }
                 }
                 Err(_) => {
                     row.add_css_class("error");
@@ -751,15 +736,19 @@ pub(super) fn build_tun_page(
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         address_row.connect_apply(move |row| {
             let value = row.text().trim().to_string();
             match validate_ip_cidr(&value) {
                 Ok(()) => {
                     row.remove_css_class("error");
-                    let _ = apply_tun_mutation(&state, &cb, |s| {
+                    if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                         s.tun.address_v4 = value.clone();
                         Ok(())
-                    });
+                    }) {
+                        toast_cb(&format!("Failed to save TUN setting: {err}"));
+                        row.set_text(&state.borrow().tun.address_v4);
+                    }
                 }
                 Err(_) => {
                     row.add_css_class("error");
@@ -771,45 +760,61 @@ pub(super) fn build_tun_page(
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         mtu_row.connect_changed(move |row| {
             let mtu = row.value() as u16;
-            let _ = apply_tun_mutation(&state, &cb, |s| {
+            if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.mtu = mtu;
                 Ok(())
-            });
+            }) {
+                toast_cb(&format!("Failed to save TUN setting: {err}"));
+                row.set_value(state.borrow().tun.mtu as f64);
+            }
         });
     }
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         stack_row.connect_selected_notify(move |row| {
             let stack = index_to_stack(row.selected());
-            let _ = apply_tun_mutation(&state, &cb, |s| {
+            if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.stack = stack;
                 Ok(())
-            });
+            }) {
+                toast_cb(&format!("Failed to save TUN setting: {err}"));
+                row.set_selected(stack_to_index(state.borrow().tun.stack));
+            }
         });
     }
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         strict_row.connect_active_notify(move |row| {
             let active = row.is_active();
-            let _ = apply_tun_mutation(&state, &cb, |s| {
+            if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.strict_route = active;
                 Ok(())
-            });
+            }) {
+                toast_cb(&format!("Failed to save TUN setting: {err}"));
+                row.set_active(state.borrow().tun.strict_route);
+            }
         });
     }
     {
         let state = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         hijack_row.connect_selected_notify(move |row| {
             let mode = index_to_hijack(row.selected());
-            let _ = apply_tun_mutation(&state, &cb, |s| {
+            if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.dns_hijack = mode;
                 Ok(())
-            });
+            }) {
+                toast_cb(&format!("Failed to save TUN setting: {err}"));
+                row.set_selected(hijack_to_index(state.borrow().tun.dns_hijack));
+            }
         });
     }
 
@@ -876,6 +881,92 @@ fn excluded_domains_description(backend: BackendType) -> &'static str {
             "Domain suffixes that bypass the tunnel; applies on next connect"
         }
     }
+}
+
+type ApplyMutation = Rc<dyn Fn(&str) -> Result<(), String>>;
+
+/// Small add-item dialog. Validation failures stay inline with the dialog
+/// open; a mutation failure (the value itself was accepted but the settings
+/// write rejected it) is toasted and the dialog stays open on the bad value.
+fn present_add_dialog(
+    title: &str,
+    entry_title: &str,
+    toast_cb: &ToastCallback,
+    validate: impl Fn(&str) -> Result<(), String> + 'static,
+    apply: ApplyMutation,
+    applied: Rc<dyn Fn()>,
+) {
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .width_request(420)
+        .build();
+
+    let entry = adw::EntryRow::builder().title(entry_title).build();
+    let error_label = gtk::Label::builder()
+        .visible(false)
+        .wrap(true)
+        .xalign(0.0)
+        .css_classes(["error"])
+        .build();
+    let group = adw::PreferencesGroup::new();
+    group.add(&entry);
+
+    let cancel = gtk::Button::builder().label("Cancel").build();
+    let add = gtk::Button::builder()
+        .label("Add")
+        .css_classes(["suggested-action"])
+        .build();
+
+    let content = gtk::Box::builder()
+        .orientation(gtk::Orientation::Vertical)
+        .spacing(12)
+        .margin_top(24)
+        .margin_bottom(12)
+        .margin_start(12)
+        .margin_end(12)
+        .build();
+    content.append(&group);
+    content.append(&error_label);
+    let buttons = gtk::Box::builder()
+        .orientation(gtk::Orientation::Horizontal)
+        .spacing(12)
+        .halign(gtk::Align::End)
+        .build();
+    buttons.append(&cancel);
+    buttons.append(&add);
+    content.append(&buttons);
+    dialog.set_child(Some(&content));
+    dialog.set_default_widget(Some(&add));
+
+    {
+        let dialog = dialog.clone();
+        cancel.connect_clicked(move |_| {
+            dialog.close();
+        });
+    }
+    {
+        let dialog = dialog.clone();
+        let entry = entry.clone();
+        let error_label = error_label.clone();
+        let toast_cb = toast_cb.clone();
+        // gtk handlers are Fn; every closure here is callable repeatedly.
+        add.connect_clicked(move |_| {
+            error_label.set_visible(false);
+            let value = entry.text().trim().to_string();
+            if let Err(err) = validate(&value) {
+                error_label.set_text(&err);
+                error_label.set_visible(true);
+                return;
+            }
+            if let Err(err) = apply(&value) {
+                toast_cb(&format!("Failed to save: {err}"));
+                return;
+            }
+            dialog.close();
+            applied();
+        });
+    }
+    dialog.present(crate::active_window().as_ref());
 }
 
 fn apply_tun_mutation<F>(
@@ -1119,5 +1210,56 @@ mod tests {
         let (message, grant) = capability_status(Some(&backend_probe), true, &helper);
         assert!(message.contains("Cannot read capabilities"));
         assert!(!grant);
+    }
+
+    /// The dialog surfaces exactly this error string inline, and
+    /// `apply_tun_mutation` must have left the settings untouched.
+    #[test]
+    fn rejected_exclusion_is_reported_and_not_saved() {
+        let state = Rc::new(RefCell::new(AppSettings::default()));
+        let notifications = Rc::new(Cell::new(0_u32));
+        let cb: SettingsCallback = {
+            let notifications = notifications.clone();
+            Rc::new(move |_| notifications.set(notifications.get() + 1))
+        };
+
+        let err = apply_tun_mutation(&state, &cb, |s| {
+            s.tun.exclude_routes.push("0.0.0.0/0".to_string());
+            Ok(())
+        })
+        .expect_err("an all-address exclusion must be rejected");
+
+        assert!(err.contains("0.0.0.0/0"), "{err}");
+        assert!(
+            state.borrow().tun.exclude_routes.is_empty(),
+            "rejected input must not mutate settings"
+        );
+        assert_eq!(
+            notifications.get(),
+            0,
+            "rejected input must not notify observers"
+        );
+    }
+
+    #[test]
+    fn overflowing_exclusion_is_reported_and_not_saved() {
+        let state = Rc::new(RefCell::new(AppSettings::default()));
+        for octet in 0..=255u8 {
+            state
+                .borrow_mut()
+                .tun
+                .exclude_routes
+                .push(format!("10.0.{octet}.0/24"));
+        }
+        let cb: SettingsCallback = Rc::new(|_| {});
+
+        let err = apply_tun_mutation(&state, &cb, |s| {
+            s.tun.exclude_routes.push("10.1.0.0/24".to_string());
+            Ok(())
+        })
+        .expect_err("entry 257 must be rejected");
+
+        assert!(err.contains("at most 256"), "{err}");
+        assert_eq!(state.borrow().tun.exclude_routes.len(), 256);
     }
 }

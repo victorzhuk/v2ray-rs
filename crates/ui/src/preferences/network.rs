@@ -3,6 +3,7 @@ use relm4::adw;
 use relm4::gtk;
 use relm4::gtk::glib;
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use v2ray_rs_core::backend::{DetectedBackend, detect_all, validate_custom_path};
@@ -379,6 +380,43 @@ pub(super) fn build_network_page(
 
     drop(s);
 
+    // One token guards custom-path validation results: any change to the
+    // validated inputs (custom path, backend type, backend selection)
+    // invalidates an in-flight result so it can no longer overwrite
+    // `settings.backend`.
+    let validation_generation = Rc::new(Cell::new(0_u64));
+    let custom_type_suppress = Rc::new(Cell::new(false));
+    let tracked_backend = Rc::new(RefCell::new(backend_selection(&state.borrow())));
+    let invalidate_validation = {
+        let validation_generation = validation_generation.clone();
+        let validate_custom_spinner = validate_custom_spinner.clone();
+        let validate_custom_btn = validate_custom_btn.clone();
+        Rc::new(move || {
+            invalidate_validation(&validation_generation);
+            // A discarded result would otherwise leave the spinner running
+            // and the button disabled forever.
+            validate_custom_spinner.stop();
+            validate_custom_spinner.set_visible(false);
+            validate_custom_btn.set_sensitive(true);
+        })
+    };
+    {
+        let invalidate = invalidate_validation.clone();
+        custom_path_row.connect_changed(move |_| {
+            invalidate();
+        });
+    }
+    {
+        let invalidate = invalidate_validation.clone();
+        let suppress = custom_type_suppress.clone();
+        custom_type_row.connect_selected_notify(move |_| {
+            if suppress.get() {
+                return;
+            }
+            invalidate();
+        });
+    }
+
     {
         let backend_group = backend_group.clone();
         let st = state.clone();
@@ -424,7 +462,6 @@ pub(super) fn build_network_page(
         let validate_custom_btn = validate_custom_btn.clone();
         let validate_custom_spinner = validate_custom_spinner.clone();
         let detected_state = detected_state.clone();
-        let validation_generation = Rc::new(Cell::new(0_u64));
         validate_custom_btn.clone().connect_clicked(move |_| {
             let path_text = custom_path_row.text().trim().to_string();
             if path_text.is_empty() {
@@ -659,8 +696,18 @@ pub(super) fn build_network_page(
         let detected_state = detected_state.clone();
         let paths = paths.clone();
         let ws_heartbeat_row = ws_heartbeat_row.clone();
+        let invalidate = invalidate_validation.clone();
+        let tracked_backend = tracked_backend.clone();
+        let custom_type_suppress = custom_type_suppress.clone();
         subscribe_settings(settings_observers, move |settings| {
+            let selection = backend_selection(settings);
+            if *tracked_backend.borrow() != selection {
+                *tracked_backend.borrow_mut() = selection;
+                invalidate();
+            }
+            custom_type_suppress.set(true);
             custom_type_row.set_selected(settings.backend.backend_type.to_index());
+            custom_type_suppress.set(false);
             ws_heartbeat_row.set_sensitive(settings.backend.backend_type == BackendType::Xray);
 
             let detected = detected_state.borrow();
@@ -680,6 +727,20 @@ pub(super) fn build_network_page(
 
 fn is_loopback_listen_address(addr: &str) -> bool {
     matches!(addr, "127.0.0.1" | "::1")
+}
+
+/// The backend identity whose change invalidates an in-flight custom-path
+/// validation, because the validation result would target a stale selection.
+fn backend_selection(settings: &AppSettings) -> (BackendType, Option<PathBuf>) {
+    (
+        settings.backend.backend_type,
+        settings.backend.binary_path.clone(),
+    )
+}
+
+/// Invalidates all validation requests issued before this call.
+fn invalidate_validation(generation: &Cell<u64>) {
+    generation.set(generation.get().wrapping_add(1));
 }
 
 fn listen_address_status_text(addr: &str) -> String {
@@ -720,5 +781,42 @@ fn real_delay_preset_url(index: u32) -> Option<&'static str> {
         1 => Some("https://cp.cloudflare.com/generate_204"),
         2 => Some("https://www.apple.com/library/test/success.html"),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The guard at the validation completion site is a generation compare;
+    /// once the path is edited mid-flight, the in-flight request id must no
+    /// longer match, so its success branch (which overwrites
+    /// `settings.backend`) can never run.
+    #[test]
+    fn stale_validation_result_is_discarded_after_path_edit() {
+        let generation = Cell::new(0_u64);
+        generation.set(generation.get() + 1);
+        let request = generation.get();
+
+        assert_eq!(generation.get(), request, "fresh request is current");
+        invalidate_validation(&generation);
+        assert_ne!(generation.get(), request, "path edit invalidates it");
+    }
+
+    #[test]
+    fn backend_selection_change_invalidates_validation() {
+        let generation = Cell::new(0_u64);
+        generation.set(generation.get() + 1);
+        let request = generation.get();
+
+        let mut settings = AppSettings::default();
+        let tracked = backend_selection(&settings);
+        settings.backend.binary_path = Some(PathBuf::from("/usr/bin/xray"));
+
+        // The subscriber invalidates when the tracked selection differs.
+        if backend_selection(&settings) != tracked {
+            invalidate_validation(&generation);
+        }
+        assert_ne!(generation.get(), request);
     }
 }
