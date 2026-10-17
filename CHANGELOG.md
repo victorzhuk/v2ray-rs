@@ -26,6 +26,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overwrite a newer selection.
 - TUN address fields reject the wrong address family, and backend version
   discovery is time-bounded so a hung binary cannot stall the wizard.
+- Subscription add and refresh failures no longer print node UUIDs or
+  proxy passwords in the message or the log; only the scheme, host, port,
+  and line index are shown.
+- Onboarding no longer imports a subscription after Skip, and a save
+  failure while finishing setup is visible instead of silently ignored.
+- The log view applies backend output in bounded batches, so a
+  debug-level session no longer floods the UI queue one line at a time.
+- Geodata downloads are size-capped while streaming and refuse a
+  redirect that downgrades to plaintext.
+- TUN teardown targets the device identity the app created, and the
+  architecture notes now state the real guarantee: the `v2ray-rs` group
+  is the authorization boundary for the route helper.
 
 ### Security
 - Updated `rustls` to 0.23.46 and `h2` to 0.4.16, clearing the reachable
