@@ -4,12 +4,13 @@ use gtk::gdk;
 use relm4::adw;
 use relm4::prelude::*;
 use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 use uuid::Uuid;
 
 use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, builtin_service_checks};
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, EgressSample, RealDelayCapability, RealDelaySettings, Subscription,
-    SubscriptionSource, VerdictRecord,
+    AppSettings, BackendType, ConnectionNodeRef, EgressSample, RealDelayCapability,
+    RealDelaySettings, Subscription, SubscriptionSource, VerdictRecord,
 };
 use v2ray_rs_core::persistence::{AppPaths, PersistenceError};
 use v2ray_rs_core::runtime_snapshot::subscriptions_runtime_state_eq;
@@ -32,6 +33,8 @@ pub struct SubscriptionsPage {
     auto_update_generation: u64,
     auto_update_streaks: HashMap<Uuid, FailureStreak>,
     testing_latency: HashSet<Uuid>,
+    refreshing: HashSet<Uuid>,
+    persister: SubscriptionPersister,
     testing_real_delay: HashMap<Uuid, u64>,
     real_delay_run_token: u64,
     testing_availability: HashMap<Uuid, u64>,
@@ -126,30 +129,87 @@ pub enum SubscriptionsMsg {
 pub enum SubscriptionsCmdOutput {
     AddDone(SubscriptionImportOutcome),
     RefreshDone(Subscription, UpdateResult),
-    LatencyResult(Uuid, Vec<Option<u64>>),
-    RealDelayResult(Uuid, u64, RealDelayReport),
-    AvailabilityResult(Uuid, u64, RealDelayReport),
+    LatencyResult(Uuid, Vec<Uuid>, Vec<Option<u64>>),
+    RealDelayResult(Uuid, u64, Vec<Uuid>, RealDelayReport),
+    AvailabilityResult(Uuid, u64, Vec<Uuid>, RealDelayReport),
     RefreshFailed(Uuid, SubscriptionError),
     AddFailed(SubscriptionError),
     AutoUpdateDone(AutoUpdateRefreshBatch),
     AutoUpdateTick(u64),
     BackgroundLatencyTick,
+    SubscriptionsSaved(Result<(), PersistenceError>),
+    SnapshotSaved(Result<(), PersistenceError>),
+}
+
+/// Serializes full-snapshot saves off the GTK thread. Latest snapshot wins:
+/// a job that loses the race against a newer dispatch writes the newer
+/// snapshot and skips its own stale one.
+#[derive(Clone, Default)]
+struct SubscriptionPersister {
+    pending: Arc<Mutex<Option<Vec<Subscription>>>>,
+}
+
+impl SubscriptionPersister {
+    fn submit(
+        &self,
+        store: &WorkspaceStore,
+        sender: &ComponentSender<SubscriptionsPage>,
+        snapshot: Vec<Subscription>,
+    ) {
+        *self.lock_pending() = Some(snapshot);
+        let this = self.clone();
+        let store = store.clone();
+        sender.oneshot_command(async move {
+            let result = tokio::task::spawn_blocking(move || this.drain(&store))
+                .await
+                .unwrap_or_else(|join_err| {
+                    Err(PersistenceError::Io(std::io::Error::other(join_err)))
+                });
+            SubscriptionsCmdOutput::SubscriptionsSaved(result)
+        });
+    }
+
+    fn lock_pending(&self) -> MutexGuard<'_, Option<Vec<Subscription>>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn drain(&self, store: &WorkspaceStore) -> Result<(), PersistenceError> {
+        while let Some(snapshot) = self.lock_pending().take() {
+            store.save_subscriptions(&snapshot)?;
+        }
+        Ok(())
+    }
 }
 
 fn commit_subscriptions_mutation<R>(
-    store: &WorkspaceStore,
     subscriptions: &mut Vec<Subscription>,
     mutate: impl FnOnce(&mut Vec<Subscription>) -> Option<R>,
-) -> Result<Option<R>, PersistenceError> {
+) -> Option<R> {
     let mut next = subscriptions.clone();
-    let result = mutate(&mut next);
-    let Some(result) = result else {
-        return Ok(None);
-    };
-
-    store.save_subscriptions(&next)?;
+    let result = mutate(&mut next)?;
     *subscriptions = next;
-    Ok(Some(result))
+    Some(result)
+}
+
+fn subscription_persist_notice(err: &PersistenceError) -> String {
+    format!("Failed to save subscriptions: {err}")
+}
+
+fn should_start_refresh(refreshing: &HashSet<Uuid>, id: Uuid) -> bool {
+    !refreshing.contains(&id)
+}
+
+async fn run_latency_probe(
+    nodes: Vec<v2ray_rs_core::models::SubscriptionNode>,
+) -> (Vec<Uuid>, Vec<Option<u64>>) {
+    let mut snapshot_ids = Vec::with_capacity(nodes.len());
+    for node in &nodes {
+        snapshot_ids.push(node.id);
+    }
+    let results = v2ray_rs_subscription::ping_nodes(&nodes).await;
+    (snapshot_ids, results)
 }
 
 fn report_subscription_persist_error(
@@ -157,9 +217,57 @@ fn report_subscription_persist_error(
     err: &PersistenceError,
 ) {
     log::error!("save subscriptions: {err}");
-    let _ = sender.output(SubscriptionsOutput::Notice(format!(
-        "Failed to save subscriptions: {err}"
+    let _ = sender.output(SubscriptionsOutput::Notice(subscription_persist_notice(
+        err,
     )));
+}
+
+/// Maps a probe result index back to the current node list through the
+/// snapshot's node ids. Results for nodes that no longer exist are dropped.
+fn node_by_snapshot_id<'a>(
+    sub: &'a mut Subscription,
+    snapshot_ids: &[Uuid],
+    idx: usize,
+) -> Option<&'a mut v2ray_rs_core::models::SubscriptionNode> {
+    let id = *snapshot_ids.get(idx)?;
+    sub.nodes.iter_mut().find(|n| n.id == id)
+}
+
+fn apply_latency_by_ids(sub: &mut Subscription, snapshot_ids: &[Uuid], results: &[Option<u64>]) {
+    for (idx, latency) in results.iter().enumerate() {
+        if let Some(node) = node_by_snapshot_id(sub, snapshot_ids, idx) {
+            node.last_latency_ms = *latency;
+        }
+    }
+}
+
+fn apply_real_delay_by_ids(sub: &mut Subscription, snapshot_ids: &[Uuid], results: &[Option<u64>]) {
+    for (idx, delay) in results.iter().enumerate() {
+        if let Some(node) = node_by_snapshot_id(sub, snapshot_ids, idx) {
+            node.last_real_delay_ms = *delay;
+        }
+    }
+}
+
+/// Runs a load-modify-save of the latency snapshot on a blocking thread.
+fn persist_latency_snapshot<F>(
+    sender: &ComponentSender<SubscriptionsPage>,
+    store: &WorkspaceStore,
+    apply: F,
+) where
+    F: FnOnce(&mut v2ray_rs_core::resolve::LatencySnapshot) + Send + 'static,
+{
+    let store = store.clone();
+    sender.oneshot_command(async move {
+        let result = tokio::task::spawn_blocking(move || {
+            let mut snapshot = store.load_latency_snapshot()?;
+            apply(&mut snapshot);
+            store.save_latency_snapshot(&snapshot)
+        })
+        .await
+        .unwrap_or_else(|join_err| Err(PersistenceError::Io(std::io::Error::other(join_err))));
+        SubscriptionsCmdOutput::SnapshotSaved(result)
+    });
 }
 
 #[relm4::component(pub)]
@@ -290,6 +398,8 @@ impl Component for SubscriptionsPage {
             auto_update_generation: 0,
             auto_update_streaks: HashMap::new(),
             testing_latency: HashSet::new(),
+            refreshing: HashSet::new(),
+            persister: SubscriptionPersister::default(),
             testing_real_delay: HashMap::new(),
             real_delay_run_token: 0,
             testing_availability: HashMap::new(),
@@ -370,142 +480,114 @@ impl Component for SubscriptionsPage {
 
         match msg {
             SubscriptionsMsg::ToggleSubscription(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
+                if let Some(hint) =
+                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
                         let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
                         sub.enabled = !sub.enabled;
                         Some(RenderHint::SubscriptionToggle(id))
-                    },
-                ) {
-                    Ok(Some(hint)) => {
-                        subscriptions_changed = true;
-                        render_hint = hint;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    })
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
+                    render_hint = hint;
                 }
             }
             SubscriptionsMsg::ToggleUseImportedProfile(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        sub.use_imported_profile = !sub.use_imported_profile;
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                    sub.use_imported_profile = !sub.use_imported_profile;
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::ToggleNode(sub_id, idx) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
+                if let Some(hint) =
+                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
                         let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
                         let node = sub.nodes.get_mut(idx)?;
                         node.enabled = !node.enabled;
                         Some(RenderHint::NodeToggle(sub_id, idx))
-                    },
-                ) {
-                    Ok(Some(hint)) => {
-                        subscriptions_changed = true;
-                        render_hint = hint;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    })
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
+                    render_hint = hint;
                 }
             }
             SubscriptionsMsg::RenameSubscription(id, new_name) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
+                if let Some(hint) =
+                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
                         let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
                         sub.name = new_name;
                         Some(RenderHint::SubscriptionRename(id))
-                    },
-                ) {
-                    Ok(Some(hint)) => {
-                        render_hint = hint;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    })
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    render_hint = hint;
                 }
             }
             SubscriptionsMsg::MoveSubscription(id, direction) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let pos = subscriptions.iter().position(|s| s.id == id)?;
-                        let new_pos = match direction {
-                            Direction::Up if pos > 0 => pos - 1,
-                            Direction::Down if pos + 1 < subscriptions.len() => pos + 1,
-                            _ => pos,
-                        };
-                        if new_pos == pos {
-                            return None;
-                        }
-                        subscriptions.swap(pos, new_pos);
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let pos = subscriptions.iter().position(|s| s.id == id)?;
+                    let new_pos = match direction {
+                        Direction::Up if pos > 0 => pos - 1,
+                        Direction::Down if pos + 1 < subscriptions.len() => pos + 1,
+                        _ => pos,
+                    };
+                    if new_pos == pos {
+                        return None;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    subscriptions.swap(pos, new_pos);
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::MoveNode(sub_id, idx, direction) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
-                        let new_idx = match direction {
-                            Direction::Up if idx > 0 => idx - 1,
-                            Direction::Down if idx + 1 < sub.nodes.len() => idx + 1,
-                            _ => idx,
-                        };
-                        if new_idx == idx {
-                            return None;
-                        }
-                        sub.nodes.swap(idx, new_idx);
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
+                    let new_idx = match direction {
+                        Direction::Up if idx > 0 => idx - 1,
+                        Direction::Down if idx + 1 < sub.nodes.len() => idx + 1,
+                        _ => idx,
+                    };
+                    if new_idx == idx {
+                        return None;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    sub.nodes.swap(idx, new_idx);
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::DeleteSubscription(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let initial_len = subscriptions.len();
-                        subscriptions.retain(|s| s.id != id);
-                        (subscriptions.len() != initial_len).then_some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        self.expanded_subs.remove(&id);
-                        subscriptions_changed = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let initial_len = subscriptions.len();
+                    subscriptions.retain(|s| s.id != id);
+                    (subscriptions.len() != initial_len).then_some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    self.expanded_subs.remove(&id);
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::AddSubscription(name, source_input) => {
@@ -536,11 +618,15 @@ impl Component for SubscriptionsPage {
                 return;
             }
             SubscriptionsMsg::UpdateSubscription(id) => {
+                if !should_start_refresh(&self.refreshing, id) {
+                    return;
+                }
                 let svc = self.service.clone();
                 let subscription = match self.subscriptions.iter().find(|s| s.id == id) {
                     Some(subscription) => subscription.clone(),
                     None => return,
                 };
+                self.refreshing.insert(id);
                 sender.oneshot_command(async move {
                     match svc.refresh(subscription).await {
                         Ok((sub, result)) => SubscriptionsCmdOutput::RefreshDone(sub, result),
@@ -560,30 +646,25 @@ impl Component for SubscriptionsPage {
                 self.testing_latency.insert(id);
                 let nodes = sub.nodes.clone();
                 sender.oneshot_command(async move {
-                    let results = v2ray_rs_subscription::ping_nodes(&nodes).await;
-                    SubscriptionsCmdOutput::LatencyResult(id, results)
+                    let (snapshot_ids, results) = run_latency_probe(nodes).await;
+                    SubscriptionsCmdOutput::LatencyResult(id, snapshot_ids, results)
                 });
-                return;
             }
             SubscriptionsMsg::SortByLatency(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        sub.nodes.sort_by(|a, b| {
-                            let la = a.last_latency_ms.unwrap_or(u64::MAX);
-                            let lb = b.last_latency_ms.unwrap_or(u64::MAX);
-                            la.cmp(&lb)
-                        });
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                    sub.nodes.sort_by(|a, b| {
+                        let la = a.last_latency_ms.unwrap_or(u64::MAX);
+                        let lb = b.last_latency_ms.unwrap_or(u64::MAX);
+                        la.cmp(&lb)
+                    });
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::TestRealDelay(id) => {
@@ -615,6 +696,7 @@ impl Component for SubscriptionsPage {
                 self.real_delay_run_token = self.real_delay_run_token.wrapping_add(1);
                 let run_token = self.real_delay_run_token;
                 self.testing_real_delay.insert(id, run_token);
+                let snapshot_ids: Vec<Uuid> = node_refs.iter().map(|n| n.id).collect();
                 sender.oneshot_command(async move {
                     let timeout = std::time::Duration::from_millis(
                         u64::from(real_delay_settings.timeout_ms) + 15_000,
@@ -641,9 +723,8 @@ impl Component for SubscriptionsPage {
                             diagnostic: Some("Real Delay probe timed out".to_string()),
                         },
                     };
-                    SubscriptionsCmdOutput::RealDelayResult(id, run_token, report)
+                    SubscriptionsCmdOutput::RealDelayResult(id, run_token, snapshot_ids, report)
                 });
-                return;
             }
             SubscriptionsMsg::CheckAvailability(id) => {
                 if self.testing_availability.contains_key(&id) {
@@ -676,6 +757,7 @@ impl Component for SubscriptionsPage {
                 self.availability_run_token = self.availability_run_token.wrapping_add(1);
                 let run_token = self.availability_run_token;
                 self.testing_availability.insert(id, run_token);
+                let snapshot_ids: Vec<Uuid> = node_refs.iter().map(|n| n.id).collect();
                 sender.oneshot_command(async move {
                     // Same per-node pass as Real Delay, plus one request per
                     // service per node through its tunnel.
@@ -707,9 +789,8 @@ impl Component for SubscriptionsPage {
                             diagnostic: Some("Availability probe timed out".to_string()),
                         },
                     };
-                    SubscriptionsCmdOutput::AvailabilityResult(id, run_token, report)
+                    SubscriptionsCmdOutput::AvailabilityResult(id, run_token, snapshot_ids, report)
                 });
-                return;
             }
             SubscriptionsMsg::ShowAvailability(id) => {
                 let sub = match self.subscriptions.iter().find(|s| s.id == id) {
@@ -720,103 +801,83 @@ impl Component for SubscriptionsPage {
                 return;
             }
             SubscriptionsMsg::SortByRealDelay(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        sub.nodes.sort_by(|a, b| {
-                            let la = a.last_real_delay_ms.unwrap_or(u64::MAX);
-                            let lb = b.last_real_delay_ms.unwrap_or(u64::MAX);
-                            la.cmp(&lb)
-                        });
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
-                    }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                    sub.nodes.sort_by(|a, b| {
+                        let la = a.last_real_delay_ms.unwrap_or(u64::MAX);
+                        let lb = b.last_real_delay_ms.unwrap_or(u64::MAX);
+                        la.cmp(&lb)
+                    });
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::EnableAllNodes(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        for node in &mut sub.nodes {
-                            node.enabled = true;
-                        }
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                    for node in &mut sub.nodes {
+                        node.enabled = true;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::DisableAllNodes(id) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        for node in &mut sub.nodes {
-                            node.enabled = false;
-                        }
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
+                    for node in &mut sub.nodes {
+                        node.enabled = false;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::DragDropSubscription(from, to) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        if from == to || from >= subscriptions.len() || to >= subscriptions.len() {
-                            return None;
-                        }
-                        let sub = subscriptions.remove(from);
-                        subscriptions.insert(to, sub);
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    if from == to || from >= subscriptions.len() || to >= subscriptions.len() {
+                        return None;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    let sub = subscriptions.remove(from);
+                    subscriptions.insert(to, sub);
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::DragDropNode(sub_id, from, to) => {
-                match commit_subscriptions_mutation(
-                    &self.store,
-                    &mut self.subscriptions,
-                    |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
-                        if from == to || from >= sub.nodes.len() || to >= sub.nodes.len() {
-                            return None;
-                        }
-                        let node = sub.nodes.remove(from);
-                        sub.nodes.insert(to, node);
-                        Some(())
-                    },
-                ) {
-                    Ok(Some(())) => {
-                        subscriptions_changed = true;
+                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
+                    let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
+                    if from == to || from >= sub.nodes.len() || to >= sub.nodes.len() {
+                        return None;
                     }
-                    Ok(None) => {}
-                    Err(err) => report_subscription_persist_error(&sender, &err),
+                    let node = sub.nodes.remove(from);
+                    sub.nodes.insert(to, node);
+                    Some(())
+                })
+                .is_some()
+                {
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::SetActiveNode(active) => {
@@ -957,20 +1018,15 @@ impl Component for SubscriptionsPage {
             SubscriptionsCmdOutput::AddDone(outcome) => {
                 let summary =
                     format_update_summary(&outcome.subscription.name, "Imported", &outcome.result);
-                self.subscriptions.push(outcome.subscription.clone());
-                if let Err(err) = self.store.save_subscriptions(&self.subscriptions) {
-                    log::error!("save subscriptions: {err}");
-                    let _ = self.subscriptions.pop();
-                    let _ = sender.output(SubscriptionsOutput::Notice(format!(
-                        "Failed to save imported subscription: {err}"
-                    )));
-                } else {
-                    let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-                    let _ = sender.output(SubscriptionsOutput::Notice(summary));
-                }
+                self.subscriptions.push(outcome.subscription);
+                self.persister
+                    .submit(&self.store, &sender, self.subscriptions.clone());
+                let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                let _ = sender.output(SubscriptionsOutput::Notice(summary));
             }
             SubscriptionsCmdOutput::RefreshDone(sub, result) => {
                 let id = sub.id;
+                self.refreshing.remove(&id);
                 if let Some(pos) = self.subscriptions.iter().position(|s| s.id == id) {
                     let name = self.subscriptions[pos].name.clone();
                     let previous = self.subscriptions[pos].clone();
@@ -979,26 +1035,18 @@ impl Component for SubscriptionsPage {
                     let merged = merge_refreshed_subscription(&previous, sub);
                     let runtime_changed = !previous.runtime_state_eq(&merged);
                     self.subscriptions[pos] = merged;
-                    if let Err(err) = self.store.save_subscriptions(&self.subscriptions) {
-                        log::error!("save subscriptions: {err}");
-                        self.subscriptions[pos] = previous;
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    let _ = sender.output(SubscriptionsOutput::Notice(format_update_summary(
+                        &name, "Updated", &result,
+                    )));
+                    if runtime_changed {
+                        let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                    }
+                    if lost_profile {
                         let _ = sender.output(SubscriptionsOutput::Notice(format!(
-                            "Failed to save updated subscription: {err}"
+                            "{name}: source no longer carries a routing profile — keeping the existing one"
                         )));
-                    } else {
-                        if runtime_changed {
-                            let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-                        }
-                        if !result.parse_failures.is_empty() {
-                            let _ = sender.output(SubscriptionsOutput::Notice(
-                                format_update_summary(&name, "Updated", &result),
-                            ));
-                        }
-                        if lost_profile {
-                            let _ = sender.output(SubscriptionsOutput::Notice(format!(
-                                "{name}: source no longer carries a routing profile — keeping the existing one"
-                            )));
-                        }
                     }
                 }
                 let name = self
@@ -1015,67 +1063,79 @@ impl Component for SubscriptionsPage {
                     result.parse_failures.len()
                 );
             }
-            SubscriptionsCmdOutput::LatencyResult(id, results) => {
+            SubscriptionsCmdOutput::LatencyResult(id, snapshot_ids, results) => {
                 self.testing_latency.remove(&id);
+                let mut latency_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    for (node, latency) in sub.nodes.iter_mut().zip(results.iter()) {
-                        node.last_latency_ms = *latency;
-                    }
-                    if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
-                        let now = chrono::Utc::now();
-                        for (node, latency) in sub.nodes.iter().zip(results.iter()) {
-                            if let Some(value) = latency {
-                                let node_ref =
-                                    v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                                        subscription_id: sub.id,
-                                        node_id: node.id,
-                                    };
-                                snapshot.upsert(node_ref, *value, now);
-                            }
-                        }
-                        if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
-                            log::error!("save latency snapshot: {e}");
+                    apply_latency_by_ids(sub, &snapshot_ids, &results);
+                    for (idx, latency) in results.iter().enumerate() {
+                        if let (Some(node_id), Some(value)) =
+                            (snapshot_ids.get(idx).copied(), latency)
+                        {
+                            latency_updates.push((node_id, *value));
                         }
                     }
                 }
+                let now = chrono::Utc::now();
+                persist_latency_snapshot(&sender, &self.store, move |snapshot| {
+                    for (node_id, value) in latency_updates {
+                        snapshot.upsert(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            value,
+                            now,
+                        );
+                    }
+                });
             }
-            SubscriptionsCmdOutput::RealDelayResult(id, run_token, report) => {
+            SubscriptionsCmdOutput::RealDelayResult(id, run_token, snapshot_ids, report) => {
                 if self.testing_real_delay.get(&id).copied() != Some(run_token) {
                     return;
                 }
                 self.testing_real_delay.remove(&id);
                 let now = chrono::Utc::now();
+                let mut delay_updates = Vec::new();
+                let mut egress_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    for (node, delay) in sub.nodes.iter_mut().zip(report.results.iter()) {
-                        node.last_real_delay_ms = *delay;
-                    }
-                    if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
-                        for (idx, (node, delay)) in
-                            sub.nodes.iter().zip(report.results.iter()).enumerate()
-                        {
-                            let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                                subscription_id: sub.id,
-                                node_id: node.id,
-                            };
-                            if let Some(value) = delay {
-                                snapshot.upsert_real_delay(node_ref, *value, now);
-                            }
-                            if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
-                                snapshot.upsert_egress(
-                                    node_ref,
-                                    sample.address.clone(),
-                                    sample.location.clone(),
-                                    sample.checked_at,
-                                );
-                                self.egress_samples
-                                    .insert((sub.id, node.id), sample.clone());
-                            }
+                    apply_real_delay_by_ids(sub, &snapshot_ids, &report.results);
+                    for idx in 0..snapshot_ids.len() {
+                        let node_id = snapshot_ids[idx];
+                        if let Some(value) = report.results.get(idx).copied().flatten() {
+                            delay_updates.push((node_id, value));
                         }
-                        if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
-                            log::error!("save latency snapshot: {e}");
+                        if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
+                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
+                                self.egress_samples.insert((id, node.id), sample.clone());
+                            }
+                            egress_updates.push((node_id, sample.clone()));
                         }
                     }
                 }
+                persist_latency_snapshot(&sender, &self.store, move |snapshot| {
+                    for (node_id, value) in delay_updates {
+                        snapshot.upsert_real_delay(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            value,
+                            now,
+                        );
+                    }
+                    for (node_id, sample) in egress_updates {
+                        snapshot.upsert_egress(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            sample.address.clone(),
+                            sample.location.clone(),
+                            sample.checked_at,
+                        );
+                    }
+                });
                 // Update capability based on results for Xray/V2ray backends
                 if matches!(self.backend_type, BackendType::Xray | BackendType::V2ray) {
                     let has_any_result = report.results.iter().any(|r| r.is_some());
@@ -1101,47 +1161,71 @@ impl Component for SubscriptionsPage {
                     let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
                 }
             }
-            SubscriptionsCmdOutput::AvailabilityResult(id, run_token, report) => {
+            SubscriptionsCmdOutput::AvailabilityResult(id, run_token, snapshot_ids, report) => {
                 if self.testing_availability.get(&id).copied() != Some(run_token) {
                     return;
                 }
                 self.testing_availability.remove(&id);
                 let now = chrono::Utc::now();
+                let mut delay_updates = Vec::new();
+                let mut egress_updates = Vec::new();
+                let mut verdict_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    for (node, delay) in sub.nodes.iter_mut().zip(report.results.iter()) {
-                        node.last_real_delay_ms = *delay;
-                    }
-                    if let Ok(mut snapshot) = self.store.load_latency_snapshot() {
-                        for (idx, node) in sub.nodes.iter().enumerate() {
-                            let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                                subscription_id: sub.id,
-                                node_id: node.id,
-                            };
-                            if let Some(value) = report.results.get(idx).and_then(|r| r.as_ref()) {
-                                snapshot.upsert_real_delay(node_ref, *value, now);
-                            }
-                            if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
-                                snapshot.upsert_egress(
-                                    node_ref,
-                                    sample.address.clone(),
-                                    sample.location.clone(),
-                                    sample.checked_at,
-                                );
-                                self.egress_samples
-                                    .insert((sub.id, node.id), sample.clone());
-                            }
-                            if let Some(verdict_map) = report.verdicts.get(idx)
-                                && !verdict_map.is_empty()
-                            {
-                                snapshot.upsert_verdicts(node_ref, verdict_map.clone(), now);
-                                self.verdicts.insert((sub.id, node.id), verdict_map.clone());
-                            }
+                    apply_real_delay_by_ids(sub, &snapshot_ids, &report.results);
+                    for idx in 0..snapshot_ids.len() {
+                        let node_id = snapshot_ids[idx];
+                        if let Some(value) = report.results.get(idx).copied().flatten() {
+                            delay_updates.push((node_id, value));
                         }
-                        if let Err(e) = self.store.save_latency_snapshot(&snapshot) {
-                            log::error!("save latency snapshot: {e}");
+                        if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
+                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
+                                self.egress_samples.insert((id, node.id), sample.clone());
+                            }
+                            egress_updates.push((node_id, sample.clone()));
+                        }
+                        if let Some(verdict_map) =
+                            report.verdicts.get(idx).filter(|v| !v.is_empty())
+                        {
+                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
+                                self.verdicts.insert((id, node.id), verdict_map.clone());
+                            }
+                            verdict_updates.push((node_id, verdict_map.clone()));
                         }
                     }
                 }
+                persist_latency_snapshot(&sender, &self.store, move |snapshot| {
+                    for (node_id, value) in delay_updates {
+                        snapshot.upsert_real_delay(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            value,
+                            now,
+                        );
+                    }
+                    for (node_id, sample) in egress_updates {
+                        snapshot.upsert_egress(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            sample.address.clone(),
+                            sample.location.clone(),
+                            sample.checked_at,
+                        );
+                    }
+                    for (node_id, verdicts) in verdict_updates {
+                        snapshot.upsert_verdicts(
+                            ConnectionNodeRef::Subscription {
+                                subscription_id: id,
+                                node_id,
+                            },
+                            verdicts,
+                            now,
+                        );
+                    }
+                });
                 if let Some(sub) = self.subscriptions.iter().find(|s| s.id == id) {
                     show_availability_dialog(sub, &self.verdicts, &self.egress_samples);
                 }
@@ -1150,6 +1234,7 @@ impl Component for SubscriptionsPage {
                 }
             }
             SubscriptionsCmdOutput::RefreshFailed(id, error) => {
+                self.refreshing.remove(&id);
                 let name = self
                     .subscriptions
                     .iter()
@@ -1180,54 +1265,58 @@ impl Component for SubscriptionsPage {
                             *existing = merge_refreshed_subscription(existing, updated.clone());
                         }
                     }
-                    if let Err(err) = self.store.save_subscriptions(&self.subscriptions) {
-                        log::error!("save subscriptions: {err}");
-                        self.subscriptions = previous;
-                        let _ = sender.output(SubscriptionsOutput::Notice(format!(
-                            "Failed to save auto-updated subscriptions: {err}"
-                        )));
-                    } else {
-                        let runtime_changed =
-                            !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
-                        if runtime_changed {
-                            let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-                        }
-                        for (id, result) in &results {
-                            let name = self
-                                .subscriptions
-                                .iter()
-                                .find(|s| s.id == *id)
-                                .map(|s| s.name.as_str())
-                                .unwrap_or("unknown");
-                            match result {
-                                Ok((_, r)) => {
-                                    log::info!(
-                                        "auto-updated {name}: +{} -{} ={}",
-                                        r.added,
-                                        r.removed,
-                                        r.unchanged
-                                    );
-                                    auto_update_outcome_toast(
-                                        &mut self.auto_update_streaks,
-                                        *id,
-                                        name,
-                                        result,
-                                    );
-                                }
-                                Err(e) => {
-                                    log::warn!("auto-update {name} failed: {e}");
-                                    if let Some(toast) = auto_update_outcome_toast(
-                                        &mut self.auto_update_streaks,
-                                        *id,
-                                        name,
-                                        result,
-                                    ) {
-                                        let _ = sender.output(SubscriptionsOutput::Notice(toast));
-                                    }
+                    let runtime_changed =
+                        !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
+                    self.persister
+                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    if runtime_changed {
+                        let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                    }
+                    for (id, result) in &results {
+                        let name = self
+                            .subscriptions
+                            .iter()
+                            .find(|s| s.id == *id)
+                            .map(|s| s.name.as_str())
+                            .unwrap_or("unknown");
+                        match result {
+                            Ok((_, r)) => {
+                                log::info!(
+                                    "auto-updated {name}: +{} -{} ={}",
+                                    r.added,
+                                    r.removed,
+                                    r.unchanged
+                                );
+                                auto_update_outcome_toast(
+                                    &mut self.auto_update_streaks,
+                                    *id,
+                                    name,
+                                    result,
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("auto-update {name} failed: {e}");
+                                if let Some(toast) = auto_update_outcome_toast(
+                                    &mut self.auto_update_streaks,
+                                    *id,
+                                    name,
+                                    result,
+                                ) {
+                                    let _ = sender.output(SubscriptionsOutput::Notice(toast));
                                 }
                             }
                         }
                     }
+                }
+            }
+            SubscriptionsCmdOutput::SubscriptionsSaved(result) => {
+                if let Err(err) = result {
+                    report_subscription_persist_error(&sender, &err);
+                }
+            }
+            SubscriptionsCmdOutput::SnapshotSaved(result) => {
+                if let Err(err) = result {
+                    log::error!("save latency snapshot: {err}");
                 }
             }
             SubscriptionsCmdOutput::AutoUpdateTick(generation) => {
@@ -2974,6 +3063,99 @@ mod tests {
             mode & 0o777,
             0o600,
             "subscription blob holds live credentials and must not be group/world readable"
+        );
+    }
+
+    #[test]
+    fn latency_results_follow_snapshot_ids_after_reorder() {
+        let mut sub = create_test_subscription(
+            "Reordered",
+            true,
+            vec![
+                create_test_node("10.0.0.1", 1001, true),
+                create_test_node("10.0.0.2", 1002, true),
+                create_test_node("10.0.0.3", 1003, true),
+            ],
+        );
+        let snapshot_ids: Vec<Uuid> = sub.nodes.iter().map(|n| n.id).collect();
+        let results = vec![Some(30), None, Some(70)];
+
+        sub.nodes.swap(0, 2);
+        apply_latency_by_ids(&mut sub, &snapshot_ids, &results);
+
+        let latency = |idx: usize| sub.nodes[idx].last_latency_ms;
+        assert_eq!(
+            latency(2),
+            Some(30),
+            "result must follow the node id, not position"
+        );
+        assert_eq!(latency(1), None);
+        assert_eq!(latency(0), Some(70));
+    }
+
+    #[test]
+    fn latency_results_for_removed_nodes_are_dropped() {
+        let mut sub = create_test_subscription(
+            "Shrunk",
+            true,
+            vec![
+                create_test_node("10.0.0.1", 1001, true),
+                create_test_node("10.0.0.2", 1002, true),
+            ],
+        );
+        let removed_id = sub.nodes[1].id;
+        let snapshot_ids = vec![sub.nodes[0].id, removed_id];
+        let results = vec![Some(11), Some(22)];
+
+        sub.nodes.remove(1);
+        apply_latency_by_ids(&mut sub, &snapshot_ids, &results);
+
+        assert_eq!(sub.nodes[0].last_latency_ms, Some(11));
+        assert!(
+            sub.nodes
+                .iter()
+                .all(|n| n.id == snapshot_ids[0] || n.last_latency_ms.is_none())
+        );
+    }
+
+    #[test]
+    fn real_delay_results_follow_snapshot_ids_after_reorder() {
+        let mut sub = create_test_subscription(
+            "Reordered delays",
+            true,
+            vec![
+                create_test_node("10.0.0.1", 1001, true),
+                create_test_node("10.0.0.2", 1002, true),
+            ],
+        );
+        let snapshot_ids: Vec<Uuid> = sub.nodes.iter().map(|n| n.id).collect();
+        let results = vec![Some(120), None];
+
+        sub.nodes.reverse();
+        apply_real_delay_by_ids(&mut sub, &snapshot_ids, &results);
+
+        assert_eq!(sub.nodes[1].last_real_delay_ms, Some(120));
+        assert_eq!(sub.nodes[0].last_real_delay_ms, None);
+    }
+
+    #[test]
+    fn duplicate_refresh_is_suppressed_until_completion_marker_clears_it() {
+        let id = Uuid::new_v4();
+        let mut refreshing = HashSet::new();
+
+        assert!(should_start_refresh(&refreshing, id));
+        refreshing.insert(id);
+        assert!(!should_start_refresh(&refreshing, id));
+        refreshing.remove(&id);
+        assert!(should_start_refresh(&refreshing, id));
+    }
+
+    #[test]
+    fn persist_failure_maps_to_save_notice() {
+        let err = PersistenceError::NoDirs;
+        assert_eq!(
+            subscription_persist_notice(&err),
+            "Failed to save subscriptions: failed to determine XDG directories"
         );
     }
 }
