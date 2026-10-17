@@ -42,6 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - Updated `rustls` to 0.23.46 and `h2` to 0.4.16, clearing the reachable
   RUSTSEC-2026-0285, -0349, and -0258 advisories.
+- Subscription and Real Delay fetches refuse a redirect that downgrades to
+  plaintext, so a credential-bearing subscription body cannot be steered
+  onto an unencrypted hop. CI now fails on a new dependency advisory.
 
 ## [0.20.1] - 2026-10-17
 

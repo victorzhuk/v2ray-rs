@@ -6,7 +6,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 use v2ray_rs_core::models::{Subscription, SubscriptionSource};
 
-use crate::fetch::{CONNECT_TIMEOUT, REQUEST_TIMEOUT, USER_AGENT};
+use crate::fetch::{CONNECT_TIMEOUT, REDIRECT_CAP, REQUEST_TIMEOUT, USER_AGENT, redirect_policy};
 use crate::update::{self, UpdateError, UpdateResult};
 
 const MAX_CONCURRENT_REFRESHES: usize = 4;
@@ -48,6 +48,7 @@ impl SubscriptionService {
             .connect_timeout(CONNECT_TIMEOUT)
             .timeout(REQUEST_TIMEOUT)
             .user_agent(USER_AGENT)
+            .redirect(redirect_policy(REDIRECT_CAP))
             .build();
         let refresh_gate = Arc::new(Semaphore::new(MAX_CONCURRENT_REFRESHES));
 

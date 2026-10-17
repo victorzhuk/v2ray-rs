@@ -16,6 +16,7 @@ use std::time::Duration;
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::sync::Mutex;
 
+use crate::fetch::redirect_policy;
 use crate::observatory::{
     ObservatoryError, ObservatoryStatus, query_v2ray_observatory, query_xray_observatory,
 };
@@ -313,7 +314,7 @@ fn node_proxy_client(port: u16, timeout: Duration) -> Option<reqwest::Client> {
     reqwest::Client::builder()
         .proxy(proxy)
         .user_agent(BROWSER_USER_AGENT)
-        .redirect(reqwest::redirect::Policy::limited(REDIRECT_CAP))
+        .redirect(redirect_policy(REDIRECT_CAP))
         .timeout(timeout)
         .build()
         .ok()

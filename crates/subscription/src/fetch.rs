@@ -8,6 +8,48 @@ use thiserror::Error;
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION"));
+pub(crate) const REDIRECT_CAP: usize = 10;
+
+/// Decides whether one redirect hop may be followed. Refuses a scheme
+/// downgrade from `https` to `http`, refuses any non-HTTP(S) scheme, and
+/// enforces the hop cap.
+pub(crate) fn redirect_allowed(
+    scheme_from: Option<&str>,
+    next: &reqwest::Url,
+    hops: usize,
+    cap: usize,
+) -> bool {
+    if hops >= cap {
+        return false;
+    }
+    match next.scheme() {
+        "https" => true,
+        "http" => !matches!(scheme_from, Some("https")),
+        _ => false,
+    }
+}
+
+/// Builds a redirect policy refusing plaintext downgrades and non-HTTP(S)
+/// schemes. Refusals surface as fetch errors naming only the host, never the
+/// credential-bearing URL.
+pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(move |attempt| {
+        let hops = attempt.previous().len();
+        let scheme_from = attempt.previous().last().map(|url| url.scheme());
+        if redirect_allowed(scheme_from, attempt.url(), hops, cap) {
+            attempt.follow()
+        } else {
+            let host = attempt.url().host_str().unwrap_or("unknown host");
+            let reason = if hops >= cap {
+                format!("too many redirects (host {host})")
+            } else {
+                format!("refusing insecure or unsupported redirect for host {host}")
+            };
+            attempt.error(reason)
+        }
+    })
+}
+
 const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 const MAX_ERROR_BODY_SIZE: usize = 4096; // 4 KiB
 #[derive(Debug, Error)]
@@ -403,6 +445,43 @@ mod tests {
         for piece in ["boom", "line2", "line3"] {
             assert!(msg.contains(piece), "{msg:?}");
         }
+    }
+
+    #[test]
+    fn https_to_https_allowed_within_cap() {
+        let next = reqwest::Url::parse("https://example.com/sub").unwrap();
+        assert!(redirect_allowed(Some("https"), &next, 0, 5));
+        assert!(redirect_allowed(Some("https"), &next, 4, 5));
+    }
+
+    #[test]
+    fn https_to_http_downgrade_refused() {
+        let next = reqwest::Url::parse("http://example.com/sub").unwrap();
+        assert!(!redirect_allowed(Some("https"), &next, 0, 5));
+    }
+
+    #[test]
+    fn http_to_http_allowed_within_cap() {
+        let next = reqwest::Url::parse("http://example.com/sub").unwrap();
+        assert!(redirect_allowed(Some("http"), &next, 0, 5));
+        assert!(redirect_allowed(None, &next, 0, 5));
+    }
+
+    #[test]
+    fn exhausted_cap_refused() {
+        let https = reqwest::Url::parse("https://example.com/sub").unwrap();
+        let http = reqwest::Url::parse("http://example.com/sub").unwrap();
+        assert!(!redirect_allowed(Some("https"), &https, 5, 5));
+        assert!(!redirect_allowed(Some("http"), &http, 6, 5));
+    }
+
+    #[test]
+    fn non_http_scheme_refused() {
+        let ftp = reqwest::Url::parse("ftp://example.com/sub").unwrap();
+        let file = reqwest::Url::parse("file:///etc/passwd").unwrap();
+        assert!(!redirect_allowed(Some("https"), &ftp, 0, 5));
+        assert!(!redirect_allowed(Some("http"), &file, 0, 5));
+        assert!(!redirect_allowed(None, &ftp, 0, 5));
     }
 
     #[tokio::test]
