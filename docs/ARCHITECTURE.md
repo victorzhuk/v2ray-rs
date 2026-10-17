@@ -149,13 +149,13 @@ its output goes to the process log stream.
 
 Connection setup and teardown are serialized by a single lock held for a
 connection's whole lifetime, and the startup route-recovery pass takes the same
-lock. This is load-bearing rather than defensive: `netctl` has no session
-identity, so a teardown deletes whatever currently holds the interface name and
-rule priorities, not specifically what that session installed. Without the lock a
-prompt reconnect sets up a session that the previous teardown then deletes,
-leaving a live backend with no tunnel. For the same reason each connection
-carries a generation number and the app ignores state reported by a superseded
-one.
+lock. This is load-bearing rather than defensive: a teardown removes the policy
+rules and the device the session installed, and the `--ifindex` pin only proves
+device identity, not that the rules belong to the newest session. Without the
+lock a prompt reconnect sets up a session that the previous teardown then
+deletes, leaving a live backend with no tunnel. For the same reason each
+connection carries a generation number and the app ignores state reported by a
+superseded one.
 
 `PidFile` writes an ownership record (binary path + config path) and
 `check_and_kill_orphaned()` kills stale processes from a previous run using
@@ -170,7 +170,7 @@ dependencies — deliberately minimal (rtnetlink, tokio current-thread, clap).
 
 Three subcommands, all idempotent and input-validated before any netlink call:
 
-- `xray-up --iface --addr [--addr6] [--bypass-uid] [--capture-dns] [--strict] [--exclude CIDR]...`: brings the
+- `xray-up --iface --addr [--addr6] [--ifindex N] [--bypass-uid] [--capture-dns] [--strict] [--exclude CIDR]...`: brings the
   link up, assigns the address, and installs the tunnel default route into table
   2023 plus the policy rules that steer traffic into it:
   - 9000 — `fwmark 0xff` → `main`, so xray's own sockets reach the real default
@@ -205,7 +205,7 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   address is refused rather than sent out the real interface. On a host with
   IPv6 disabled (no `/proc/sys/net/ipv6`) the IPv6 fallback and rules are
   skipped.
-- `xray-down --iface`: removes the policy rules, flushes table 2023 for both
+- `xray-down --iface [--ifindex N]`: removes the policy rules, flushes table 2023 for both
   families, then deletes the device (no-op when all are gone). The flush comes
   first so a failing device delete cannot leave the fallback blackholing traffic.
 - `recover --iface --singbox|--xray`: cleans up leftover TUN state after an
@@ -214,11 +214,23 @@ Three subcommands, all idempotent and input-validated before any netlink call:
 
 `xray-up` refuses any `--iface` that is not a TUN device (checked via
 `/sys/class/net/<iface>/tun_flags`), and the device-delete in `xray-down` /
-`recover` only ever deletes a TUN device. This stops a caller from pointing the
-helper at `lo`, a physical NIC, or another tunnel's link. As defence-in-depth,
-packaging restricts execution of `v2ray-rs-netctl` (0750) and `v2ray-rs-run`
-(4750) to the `v2ray-rs` group, so they are not runnable by every local
-process; the desktop user must be a member of that group for TUN mode.
+`recover` only ever deletes a TUN device. That stops a caller from pointing the
+helper at `lo`, a physical NIC, or an unrelated interface — it does **not** make
+the helper session-aware on its own: every TUN device exposes `tun_flags`, so a
+name that another tunnel (openvpn, tailscale, ...) reused would pass that check.
+
+The app therefore pins the device identity: `wait_for_device()` captures the
+kernel ifindex when the device appears and stores it on `TunRuntime`, and both
+`xray-up` and that session's `xray-down` pass it as `--ifindex`. When the flag is
+supplied and the live link's ifindex differs — the name was reused by another
+device — the helper refuses before any mutation, naming both indices. The
+authorization boundary remains membership in the `v2ray-rs` group: a group member
+who invokes the helper directly can still name any TUN device, with or without
+`--ifindex`. `recover` is name-scoped by design: it runs at startup, after the
+session that created the device is gone, so no remembered index exists to pin. As
+defence-in-depth, packaging restricts execution of `v2ray-rs-netctl` (0750) and
+`v2ray-rs-run` (4750) to the `v2ray-rs` group, so they are not runnable by every
+local process; the desktop user must be a member of that group for TUN mode.
 
 ### `tray` (`v2ray-rs-tray`)
 
@@ -383,11 +395,13 @@ The xray start sequence in `ProcessManager`:
    `noexec`, or unprobeable helper, and `has_net_admin(binary)` — fail early if
    the capability is missing.
 2. Spawn backend process.
-3. `wait_for_device(iface, 10s)` — poll `/sys/class/net/<iface>`.
-4. `netctl xray-up` — program address and split routes.
+3. `wait_for_device(iface, 10s)` — poll `/sys/class/net/<iface>`; the device's
+   kernel ifindex is captured and pinned onto `TunRuntime`.
+4. `netctl xray-up --ifindex N` — program address and split routes.
 
 Stop: SIGTERM lets xray close its TUN fd (kernel drops device-scoped routes),
-then `netctl xray-down` removes the policy rules and the strict fallback.
+then `netctl xray-down --ifindex N` removes the policy rules and the strict
+fallback, refusing the link if the name was reused by another device.
 `stop()` is the only place that teardown runs. A crash, a failed respawn, a
 partial `xray-up`, and the crash give-up all leave routing in place, so with
 `strict_route` the host stays fail-closed until the session is stopped or

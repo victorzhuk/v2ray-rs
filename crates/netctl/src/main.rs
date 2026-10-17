@@ -43,12 +43,20 @@ enum Command {
         /// Route this prefix via the main table instead of the tunnel. Repeatable.
         #[arg(long = "exclude", value_name = "CIDR", value_parser = validate::parse_exclusion)]
         exclude: Vec<(IpAddr, u8)>,
+        /// Kernel ifindex the caller observed for `--iface`. When given and the
+        /// live link has a different index, refuse before touching anything.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        ifindex: Option<u32>,
     },
     /// Remove the xray policy rules, flush the tunnel table (IPv4 and IPv6) and
     /// delete the xray TUN device (no-op if absent).
     XrayDown {
         #[arg(long)]
         iface: String,
+        /// Kernel ifindex the caller observed for `--iface`; refuses a link
+        /// that reused the name. Optional so legacy callers stay valid.
+        #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+        ifindex: Option<u32>,
     },
     /// Remove leftover TUN state after an unclean shutdown.
     Recover {
@@ -89,6 +97,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             capture_dns,
             strict,
             exclude,
+            ifindex,
         } => {
             validate::validate_iface(&iface)?;
             // The named device must be a TUN device the backend already created;
@@ -97,6 +106,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             if !validate::is_tun_device(&iface) {
                 return Err(format!("refusing xray-up on {iface}: not a TUN device"));
             }
+            if let Some(expected) = ifindex
+                && let Some(live) = validate::read_ifindex(&iface)?
+            {
+                validate::check_ifindex(&iface, expected, live)?;
+            }
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             validate::check_exclusion_count(exclude.len())?;
@@ -104,8 +118,13 @@ async fn run(cli: Cli) -> Result<(), String> {
             net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns, strict).await?;
             net::replace_exclusions(&handle, &exclude).await
         }
-        Command::XrayDown { iface } => {
+        Command::XrayDown { iface, ifindex } => {
             validate::validate_iface(&iface)?;
+            if let Some(expected) = ifindex
+                && let Some(live) = validate::read_ifindex(&iface)?
+            {
+                validate::check_ifindex(&iface, expected, live)?;
+            }
             let handle = net::connect()?;
             net::xray_down(&handle, &iface).await
         }
@@ -150,6 +169,45 @@ mod tests {
         assert!(matches!(
             parse(&[]).command,
             Command::XrayUp { strict: false, .. }
+        ));
+    }
+
+    #[test]
+    fn xray_subcommands_parse_optional_ifindex() {
+        let up = parse(&["--ifindex", "17"]);
+        assert!(matches!(
+            up.command,
+            Command::XrayUp {
+                ifindex: Some(17),
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(&[]).command,
+            Command::XrayUp { ifindex: None, .. }
+        ));
+
+        let down = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "xray-down",
+            "--iface",
+            "xtun0",
+            "--ifindex",
+            "42",
+        ])
+        .unwrap();
+        assert!(matches!(
+            down.command,
+            Command::XrayDown {
+                ifindex: Some(42),
+                ..
+            }
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["v2ray-rs-netctl", "xray-down", "--iface", "xtun0"])
+                .unwrap()
+                .command,
+            Command::XrayDown { ifindex: None, .. }
         ));
     }
 

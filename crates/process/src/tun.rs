@@ -46,6 +46,9 @@ pub struct TunRuntime {
     /// Destinations routed through the main table instead of the tunnel. xray
     /// only; sing-box excludes them in its own config.
     pub exclude_routes: Vec<String>,
+    /// Kernel ifindex captured when the device appeared. Passed to the helper
+    /// so teardown refuses a link that reused the name after the backend died.
+    pub device_ifindex: Option<u32>,
 }
 
 impl TunRuntime {
@@ -512,19 +515,29 @@ fn family_str(addr: std::net::IpAddr) -> &'static str {
     }
 }
 
-/// Polls `/sys/class/net/<iface>` until the device exists or the timeout elapses.
-pub async fn wait_for_device(iface: &str, timeout: Duration) -> bool {
+/// Polls `/sys/class/net/<iface>` until the device exists or the timeout
+/// elapses. On success returns the device's kernel ifindex, so the session can
+/// pin teardown to the exact device it saw — a name reuse after a backend
+/// crash must not let `xray-down` delete another tunnel's link.
+pub async fn wait_for_device(iface: &str, timeout: Duration) -> Option<u32> {
     let path = device_path(iface);
     let deadline = Instant::now() + timeout;
     loop {
         if Path::new(&path).exists() {
-            return true;
+            return read_device_ifindex(iface);
         }
         if Instant::now() >= deadline {
-            return false;
+            return None;
         }
         sleep(Duration::from_millis(100)).await;
     }
+}
+
+/// Best-effort read of `/sys/class/net/<iface>/ifindex`.
+pub fn read_device_ifindex(iface: &str) -> Option<u32> {
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
 }
 
 fn device_path(iface: &str) -> String {
@@ -557,6 +570,9 @@ pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
         "--addr".to_string(),
         rt.addr_v4.clone(),
     ];
+    if let Some(idx) = rt.device_ifindex {
+        args.extend(["--ifindex".to_string(), idx.to_string()]);
+    }
     if let Some(v6) = &rt.addr_v6 {
         args.extend(["--addr6".to_string(), v6.clone()]);
     }
@@ -575,14 +591,22 @@ pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
     args
 }
 
-/// Runs `netctl xray-down` to remove the device (idempotent).
+/// Runs `netctl xray-down` to remove the device (idempotent). The captured
+/// ifindex pins the teardown to the device this session created.
 pub(crate) async fn xray_down(rt: &TunRuntime) -> HelperRun {
-    let args = [
+    run_helper(&rt.helper_path, &xray_down_args(rt), HELPER_TIMEOUT).await
+}
+
+pub(crate) fn xray_down_args(rt: &TunRuntime) -> Vec<String> {
+    let mut args = vec![
         "xray-down".to_string(),
         "--iface".to_string(),
         rt.iface.clone(),
     ];
-    run_helper(&rt.helper_path, &args, HELPER_TIMEOUT).await
+    if let Some(idx) = rt.device_ifindex {
+        args.extend(["--ifindex".to_string(), idx.to_string()]);
+    }
+    args
 }
 
 /// Runs the route helper with its output captured and its lifetime bounded.
@@ -674,12 +698,20 @@ mod tests {
     #[tokio::test]
     async fn wait_for_existing_device_returns_immediately() {
         // `lo` always exists on Linux.
-        assert!(wait_for_device("lo", Duration::from_secs(1)).await);
+        assert!(
+            wait_for_device("lo", Duration::from_secs(1))
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
     async fn wait_for_missing_device_times_out() {
-        assert!(!wait_for_device("nonexistent-tun-xyz", Duration::from_millis(250)).await);
+        assert!(
+            wait_for_device("nonexistent-tun-xyz", Duration::from_millis(250))
+                .await
+                .is_none()
+        );
     }
 
     mod connected_subnets {
@@ -970,6 +1002,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());
@@ -986,6 +1019,7 @@ mod tests {
             capture_dns: true,
             strict,
             exclude_routes: vec!["10.15.12.100/32".into()],
+            device_ifindex: None,
         }
     }
 
@@ -1008,6 +1042,43 @@ mod tests {
                 "--exclude",
                 "10.15.12.100/32",
             ]
+        );
+    }
+
+    #[test]
+    fn helper_args_pass_captured_ifindex() {
+        let rt = TunRuntime {
+            addr_v6: None,
+            bypass_uid: None,
+            capture_dns: false,
+            exclude_routes: Vec::new(),
+            device_ifindex: Some(31),
+            ..xray_rt(false)
+        };
+        assert_eq!(
+            xray_up_args(&rt),
+            [
+                "xray-up",
+                "--iface",
+                "tun0",
+                "--addr",
+                "172.19.0.1/30",
+                "--ifindex",
+                "31",
+            ]
+        );
+        assert_eq!(
+            xray_down_args(&rt),
+            ["xray-down", "--iface", "tun0", "--ifindex", "31"]
+        );
+    }
+
+    #[test]
+    fn helper_args_omit_ifindex_when_unknown() {
+        assert!(!xray_up_args(&xray_rt(false)).contains(&"--ifindex".to_string()));
+        assert_eq!(
+            xray_down_args(&xray_rt(false)),
+            ["xray-down", "--iface", "tun0"]
         );
     }
 

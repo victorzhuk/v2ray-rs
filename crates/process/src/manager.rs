@@ -740,10 +740,15 @@ impl ProcessManager {
         if let Some(rt) = self.tun.clone()
             && rt.needs_helper()
         {
-            if !tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await {
+            let Some(ifindex) = tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await else {
                 self.stop_child(false, StopReason::StartFailed.as_str())
                     .await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
+            };
+            // Pin teardown to the exact device the backend created, so a name
+            // reuse after a crash cannot redirect xray-down at another tunnel.
+            if let Some(rt) = self.tun.as_mut() {
+                rt.device_ifindex = Some(ifindex);
             }
             let run = tun::xray_up(&rt).await;
             self.log_helper("xray-up", &run);
@@ -1972,6 +1977,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         }
     }
 
@@ -2198,6 +2204,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         }));
 
         let result = mgr.start_with_connection(None).await;
@@ -2235,6 +2242,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         }))
         .with_backend(BackendType::Xray)
         .with_log_file(Some(backend_log(dir.path())));
@@ -2323,6 +2331,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         }))
         .with_backend(BackendType::SingBox);
 
@@ -2471,6 +2480,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         });
 
         let mut rx = mgr.subscribe();
@@ -2511,6 +2521,7 @@ mod tests {
             capture_dns: false,
             strict: true,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         });
 
         let err = mgr.stop().await.unwrap_err();
@@ -2735,6 +2746,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))
@@ -2776,6 +2788,7 @@ mod tests {
             capture_dns: false,
             strict: false,
             exclude_routes: Vec::new(),
+            device_ifindex: None,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))

@@ -25,6 +25,46 @@ pub fn is_tun_device(iface: &str) -> bool {
     std::path::Path::new(&format!("/sys/class/net/{iface}/tun_flags")).exists()
 }
 
+/// Parses a sysfs `ifindex` value: positive decimal, whitespace-trimmed.
+pub fn parse_ifindex(raw: &str) -> Result<u32, String> {
+    let idx: u32 = raw
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid ifindex: {raw:?}"))?;
+    if idx == 0 {
+        return Err(format!("invalid ifindex: {raw:?}"));
+    }
+    Ok(idx)
+}
+
+/// Reads the live kernel ifindex of `iface`. `Ok(None)` when the link is
+/// absent, so teardown keeps its existing no-op path. A link whose ifindex
+/// cannot be read or parsed is an error, never an assumed match.
+pub fn read_ifindex(iface: &str) -> Result<Option<u32>, String> {
+    let dir = std::path::Path::new("/sys/class/net").join(iface);
+    if !dir.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(dir.join("ifindex"))
+        .map_err(|e| format!("cannot read ifindex of {iface}: {e}"))?;
+    parse_ifindex(&raw)
+        .map(Some)
+        .map_err(|e| format!("{iface}: {e}"))
+}
+
+/// Device-identity pin: refuses to act on a link that reused the name of the
+/// device the caller observed. Both indices are named so the operator can tell
+/// which tunnel the helper was about to touch.
+pub fn check_ifindex(iface: &str, expected: u32, live: u32) -> Result<(), String> {
+    if expected == live {
+        Ok(())
+    } else {
+        Err(format!(
+            "refusing to act on {iface}: ifindex mismatch (expected {expected}, found {live})"
+        ))
+    }
+}
+
 /// Parses and validates a CIDR string into its address and prefix length.
 pub fn parse_cidr(cidr: &str) -> Result<(IpAddr, u8), String> {
     let (ip_str, prefix_str) = cidr
@@ -155,5 +195,36 @@ mod tests {
         assert!(check_exclusion_count(0).is_ok());
         assert!(check_exclusion_count(256).is_ok());
         assert!(check_exclusion_count(257).unwrap_err().contains("257"));
+    }
+
+    #[test]
+    fn ifindex_accepts_positive_decimal() {
+        assert_eq!(parse_ifindex("42"), Ok(42));
+        assert_eq!(parse_ifindex("  42\n"), Ok(42));
+    }
+
+    #[test]
+    fn ifindex_refuses_zero_and_garbage() {
+        for bad in ["0", "-1", "abc", "", "4.2"] {
+            assert!(parse_ifindex(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn ifindex_pin_accepts_matching_index() {
+        assert!(check_ifindex("tun0", 17, 17).is_ok());
+    }
+
+    #[test]
+    fn ifindex_pin_refuses_mismatch_naming_both() {
+        let err = check_ifindex("tun0", 17, 99).unwrap_err();
+        assert!(err.contains("17") && err.contains("99"), "{err}");
+        assert!(err.contains("tun0"), "{err}");
+    }
+
+    #[test]
+    fn ifindex_missing_link_is_none() {
+        // Nothing lives at this sysfs name in the test namespace.
+        assert_eq!(read_ifindex("nonexistent-iface-xyz"), Ok(None));
     }
 }
