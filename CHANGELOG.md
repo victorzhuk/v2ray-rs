@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- A failed TUN teardown now ends in an error state instead of a clean
+  disconnect, and keeps the session marker so the next startup can remove
+  leftover strict-routing rules; a failure to write that marker now aborts
+  the connection before any config write or backend spawn.
+- Orphan cleanup failures stop connection setup instead of being ignored,
+  and the orphan SIGKILL re-checks process identity so a recycled PID is
+  never signalled.
+- Subscription probes apply latency, Real Delay, and availability results by
+  node identity, so moving or refreshing nodes during a probe no longer
+  attaches results to the wrong node; duplicate refreshes are suppressed and
+  a clean refresh reports completion.
+- Real Delay, ping, and subscription refresh work share bounded concurrency
+  instead of spawning one task per node.
+- Preferences report rejected TUN exclusions and failed mutations instead of
+  closing silently, and a stale backend validation result can no longer
+  overwrite a newer selection.
+- TUN address fields reject the wrong address family, and backend version
+  discovery is time-bounded so a hung binary cannot stall the wizard.
+
+### Security
+- Updated `rustls` to 0.23.46 and `h2` to 0.4.16, clearing the reachable
+  RUSTSEC-2026-0285, -0349, and -0258 advisories.
+
 ## [0.20.1] - 2026-10-17
 
 ### Fixed
