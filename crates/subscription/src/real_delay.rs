@@ -56,6 +56,11 @@ const AVAILABILITY_BODY_CAP: usize = 2 * 1024 * 1024;
 /// Body cap for the IP-echo reply.
 const EGRESS_BODY_CAP: usize = 64 * 1024;
 
+/// Upper bound on per-node probe futures in flight at once. Shared by the
+/// delay pass and the sing-box API pass so a large node list does not put
+/// every node's probe in flight simultaneously.
+const MAX_CONCURRENT_NODE_PROBES: usize = 8;
+
 /// Outcome of a Real Delay session: one result per input node (in order) plus
 /// an optional human-readable diagnostic for the UI to surface as a toast.
 /// The egress and verdict vectors run parallel to `results`; a node without an
@@ -209,35 +214,31 @@ async fn run_probe_session(
     }
 
     // The per-node pass (egress fetch, then one availability request per
-    // service) rides the same session, after the delay collection.
+    // service) rides the same session, after the delay collection. The pass
+    // is bounded: at most MAX_CONCURRENT_NODE_PROBES futures are in flight.
     let node_pass = |config: &Value| {
         let ports = egress_inbound_ports(config);
         let timeout = Duration::from_millis(u64::from(cfg.timeout_ms));
         let services: Vec<ServiceCheck> = services.to_vec();
-        (0..len).map(move |i| {
-            let services = services.clone();
-            let port = ports.get(&i).copied();
-            tokio::spawn(async move {
-                match port {
-                    Some(port) => {
-                        let (egress, verdicts) = probe_node_extras(port, &services, timeout).await;
-                        (egress, verdicts)
+        run_bounded(
+            MAX_CONCURRENT_NODE_PROBES,
+            (0..len).map(move |i| {
+                let services = services.clone();
+                let port = ports.get(&i).copied();
+                async move {
+                    match port {
+                        Some(port) => probe_node_extras(port, &services, timeout).await,
+                        None => (None, HashMap::new()),
                     }
-                    None => (None, HashMap::new()),
                 }
-            })
-        })
+            }),
+        )
     };
 
     match backend {
         BackendType::SingBox => {
             let results = singbox_delays(api_port, len, &cfg.test_url, cfg.timeout_ms).await;
-            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
-                futures_util::future::join_all(node_pass(&config))
-                    .await
-                    .into_iter()
-                    .map(|r| r.unwrap_or((None, HashMap::new())))
-                    .collect();
+            let extras = node_pass(&config).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(results, extras, None)
@@ -247,12 +248,7 @@ async fn run_probe_session(
                 query_xray_observatory(api_port)
             })
             .await;
-            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
-                futures_util::future::join_all(node_pass(&config))
-                    .await
-                    .into_iter()
-                    .map(|r| r.unwrap_or((None, HashMap::new())))
-                    .collect();
+            let extras = node_pass(&config).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
@@ -262,12 +258,7 @@ async fn run_probe_session(
                 query_v2ray_observatory(api_port)
             })
             .await;
-            let extras: Vec<(Option<EgressSample>, HashMap<String, VerdictRecord>)> =
-                futures_util::future::join_all(node_pass(&config))
-                    .await
-                    .into_iter()
-                    .map(|r| r.unwrap_or((None, HashMap::new())))
-                    .collect();
+            let extras = node_pass(&config).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
@@ -419,23 +410,29 @@ async fn singbox_delays(
     // Allow the backend's own per-probe timeout to elapse before we give up.
     let request_timeout = Duration::from_millis(u64::from(timeout_ms) + 3000);
 
-    let mut handles = Vec::with_capacity(count);
-    for i in 0..count {
+    let futures = (0..count).map(|i| {
         let client = client.clone();
         let url = format!(
             "http://127.0.0.1:{api_port}/proxies/{tag}/delay?url={encoded_url}&timeout={timeout_ms}",
             tag = probe_tag(i),
         );
-        handles.push(tokio::spawn(async move {
-            query_singbox_delay(&client, &url, request_timeout).await
-        }));
-    }
+        async move { query_singbox_delay(&client, &url, request_timeout).await }
+    });
+    run_bounded(MAX_CONCURRENT_NODE_PROBES, futures).await
+}
 
-    let mut results = Vec::with_capacity(count);
-    for handle in handles {
-        results.push(handle.await.ok().flatten());
-    }
-    results
+/// Polls per-item futures with at most `limit` in flight, returning results
+/// in input order.
+async fn run_bounded<I, F, T>(limit: usize, items: I) -> Vec<T>
+where
+    I: IntoIterator<Item = F>,
+    F: Future<Output = T>,
+{
+    use futures_util::StreamExt;
+    futures_util::stream::iter(items)
+        .buffered(limit)
+        .collect()
+        .await
 }
 
 async fn query_singbox_delay(
@@ -1253,6 +1250,38 @@ mod tests {
             elapsed.as_millis() >= 1900,
             "Minimum deadline guard failed: elapsed only {}ms",
             elapsed.as_millis()
+        );
+    }
+}
+
+#[cfg(test)]
+mod concurrency_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn bounded_pass_caps_peak_in_flight_and_keeps_order() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futures = (0..200).map(|i| {
+            let in_flight = Arc::clone(&in_flight);
+            let peak = Arc::clone(&peak);
+            async move {
+                let now = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                i
+            }
+        });
+        let results = run_bounded(MAX_CONCURRENT_NODE_PROBES, futures).await;
+        assert_eq!(results, (0..200).collect::<Vec<_>>());
+        assert!(
+            peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_NODE_PROBES,
+            "peak in-flight {} exceeded cap {}",
+            peak.load(Ordering::SeqCst),
+            MAX_CONCURRENT_NODE_PROBES
         );
     }
 }
