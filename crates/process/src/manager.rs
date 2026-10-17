@@ -108,6 +108,20 @@ pub enum ProcessError {
     )]
     TunHelperCapabilityMissing(PathBuf),
     #[error(
+        "TUN access requires membership in the v2ray-rs group. Grant TUN privileges to enroll this account"
+    )]
+    TunHelperEnrollmentRequired,
+    #[error(
+        "route helper {0} must be owned by root:v2ray-rs with mode 0750. Grant TUN privileges to repair it"
+    )]
+    TunHelperPermissions(PathBuf),
+    #[error(
+        "route helper {0} is on a noexec filesystem. Move or reinstall it on an executable filesystem"
+    )]
+    TunHelperNoExec(PathBuf),
+    #[error("could not verify route helper {path}: {detail}")]
+    TunHelperAccessProbe { path: PathBuf, detail: String },
+    #[error(
         "installed {backend} {installed} is too old; {backend} {required} or newer is required"
     )]
     BackendTooOld {
@@ -136,8 +150,30 @@ impl ProcessError {
                 | ProcessError::TunHelperMissing
                 | ProcessError::TunHelperRelogin
                 | ProcessError::TunHelperCapabilityMissing(_)
+                | ProcessError::TunHelperEnrollmentRequired
+                | ProcessError::TunHelperPermissions(_)
+                | ProcessError::TunHelperNoExec(_)
+                | ProcessError::TunHelperAccessProbe { .. }
                 | ProcessError::BackendTooOld { .. }
         )
+    }
+
+    /// Maps the shared helper-access classification onto the startup and UI
+    /// error surface. `Ready` needs no error.
+    pub fn from_helper_access(path: &Path, access: crate::tun::HelperAccess) -> Option<Self> {
+        use crate::tun::HelperAccess as Access;
+        Some(match access {
+            Access::Ready => return None,
+            Access::Missing => ProcessError::TunHelperMissing,
+            Access::EnrollmentRequired => ProcessError::TunHelperEnrollmentRequired,
+            Access::ReloginRequired => ProcessError::TunHelperRelogin,
+            Access::Permissions => ProcessError::TunHelperPermissions(path.to_path_buf()),
+            Access::NoExec => ProcessError::TunHelperNoExec(path.to_path_buf()),
+            Access::ProbeFailed(detail) => ProcessError::TunHelperAccessProbe {
+                path: path.to_path_buf(),
+                detail,
+            },
+        })
     }
 }
 
@@ -184,6 +220,9 @@ pub struct ProcessManager {
 pub struct HostProbe {
     pub getcap: PathBuf,
     pub helper: PathBuf,
+    /// Pinned helper verdict; `None` runs the real `helper_access` on the
+    /// stored helper path. Pin `Ready` only when a test exercises a later gate.
+    pub helper_access: Option<crate::tun::HelperAccess>,
 }
 
 impl ProcessManager {
@@ -409,14 +448,35 @@ impl ProcessManager {
                 None
             };
             if let Some(installed) = &route_helper {
-                if !installed.is_absolute() || !installed.exists() {
-                    return self.fail_with(connection.as_ref(), ProcessError::TunHelperMissing);
-                }
-                // A freshly granted relocated helper is group-executable
-                // only; a session that has not picked up its new group yet
-                // cannot run it at all.
-                if nix::unistd::access(installed, nix::unistd::AccessFlags::X_OK).is_err() {
-                    return self.fail_with(connection.as_ref(), ProcessError::TunHelperRelogin);
+                #[cfg(any(test, feature = "test-utils"))]
+                let pinned = self
+                    .host_probe
+                    .as_ref()
+                    .and_then(|probe| probe.helper_access.clone());
+                #[cfg(not(any(test, feature = "test-utils")))]
+                let pinned = None;
+                let access = match pinned {
+                    Some(access) => access,
+                    None => {
+                        let path = installed.clone();
+                        match tokio::task::spawn_blocking(move || crate::tun::helper_access(&path))
+                            .await
+                        {
+                            Ok(access) => access,
+                            Err(join) => {
+                                return self.fail_with(
+                                    connection.as_ref(),
+                                    ProcessError::TunHelperAccessProbe {
+                                        path: installed.clone(),
+                                        detail: join.to_string(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+                };
+                if let Some(error) = ProcessError::from_helper_access(installed, access) {
+                    return self.fail_with(connection.as_ref(), error);
                 }
             }
 
@@ -2203,8 +2263,8 @@ mod tests {
 
         let result = mgr.start_with_connection(None).await;
         assert!(
-            matches!(result, Err(ProcessError::TunHelperRelogin)),
-            "expected TunHelperRelogin, got {result:?}"
+            matches!(result, Err(ProcessError::TunHelperPermissions(_))),
+            "expected TunHelperPermissions, got {result:?}"
         );
         assert!(matches!(mgr.state(), ProcessState::Error(_)));
         assert!(mgr.child.is_none(), "no backend should have been spawned");
@@ -2563,6 +2623,7 @@ mod tests {
             .with_host_probe(HostProbe {
                 getcap: PathBuf::from("/bin/true"),
                 helper: dir.path().join("missing-netctl"),
+                helper_access: None,
             });
 
         let result = mgr.start_with_connection(None).await;
@@ -2801,6 +2862,22 @@ mod tests {
                 )),
                 true,
             ),
+            (ProcessError::TunHelperEnrollmentRequired, true),
+            (
+                ProcessError::TunHelperPermissions(PathBuf::from("/usr/local/bin/v2ray-rs-netctl")),
+                true,
+            ),
+            (
+                ProcessError::TunHelperNoExec(PathBuf::from("/usr/local/bin/v2ray-rs-netctl")),
+                true,
+            ),
+            (
+                ProcessError::TunHelperAccessProbe {
+                    path: PathBuf::from("/usr/local/bin/v2ray-rs-netctl"),
+                    detail: "probe failed".into(),
+                },
+                true,
+            ),
             (
                 ProcessError::BackendTooOld {
                     backend: BackendType::Xray,
@@ -2833,5 +2910,43 @@ mod tests {
         for (error, host_level) in cases {
             assert_eq!(error.is_host_level(), host_level, "{error}");
         }
+    }
+
+    #[test]
+    fn from_helper_access_maps_every_classification() {
+        use crate::tun::HelperAccess;
+
+        let helper = Path::new("/usr/local/bin/v2ray-rs-netctl");
+        assert!(ProcessError::from_helper_access(helper, HelperAccess::Ready).is_none());
+        assert!(matches!(
+            ProcessError::from_helper_access(helper, HelperAccess::Missing),
+            Some(ProcessError::TunHelperMissing)
+        ));
+        assert!(matches!(
+            ProcessError::from_helper_access(helper, HelperAccess::EnrollmentRequired),
+            Some(ProcessError::TunHelperEnrollmentRequired)
+        ));
+        assert!(matches!(
+            ProcessError::from_helper_access(helper, HelperAccess::ReloginRequired),
+            Some(ProcessError::TunHelperRelogin)
+        ));
+        assert!(matches!(
+            ProcessError::from_helper_access(helper, HelperAccess::Permissions),
+            Some(ProcessError::TunHelperPermissions(path))
+            if path == helper
+        ));
+        assert!(matches!(
+            ProcessError::from_helper_access(helper, HelperAccess::NoExec),
+            Some(ProcessError::TunHelperNoExec(path))
+            if path == helper
+        ));
+        assert!(matches!(
+            ProcessError::from_helper_access(
+                helper,
+                HelperAccess::ProbeFailed("mount unreadable".into())
+            ),
+            Some(ProcessError::TunHelperAccessProbe { path, detail })
+            if path == helper && detail == "mount unreadable"
+        ));
     }
 }

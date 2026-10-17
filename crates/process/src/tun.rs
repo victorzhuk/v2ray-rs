@@ -3,6 +3,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use ipnet::IpNet;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
@@ -148,11 +149,11 @@ pub fn relocated_helper_path() -> PathBuf {
 /// compares the wrong thing -- a rebuilt helper at the same version reads as
 /// current. The destination's mtime is the time of the last grant, so a source
 /// newer than that is exactly the "needs re-granting" condition.
-pub fn helpers_stale() -> bool {
+pub fn helpers_stale(installed: &Path) -> bool {
     let Some(src) = bundled_helper_path() else {
         return false;
     };
-    let (Ok(src_meta), Ok(dst_meta)) = (src.metadata(), relocated_helper_path().metadata()) else {
+    let (Ok(src_meta), Ok(dst_meta)) = (src.metadata(), installed.metadata()) else {
         return false;
     };
     stale_against(
@@ -180,16 +181,335 @@ fn stale_against(
     }
 }
 
-/// Whether the relocated helper exists but this process cannot execute it,
-/// which is what a freshly granted install looks like until the user picks up
-/// their new group membership.
-pub fn helper_needs_relogin() -> bool {
-    let helper = relocated_helper_path();
-    helper.exists() && !can_execute(&helper)
+/// Why the route helper is or is not usable by the current process. Every
+/// variant except `Ready` is terminal for startup; `NoExec` and
+/// `ProbeFailed` are never repairable by re-granting or re-login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HelperAccess {
+    Ready,
+    Missing,
+    EnrollmentRequired,
+    ReloginRequired,
+    Permissions,
+    NoExec,
+    ProbeFailed(String),
 }
 
-fn can_execute(path: &Path) -> bool {
-    nix::unistd::access(path, nix::unistd::AccessFlags::X_OK).is_ok()
+/// Classifies the helper at `path` for the calling account: executable now,
+/// absent, wrong ownership/mode, on a noexec mount, missing enrollment, or a
+/// session that predates enrollment. Blocking (NSS, `/proc/self/mounts`,
+/// `access`); callers on an async runtime should use `spawn_blocking`.
+pub fn helper_access(path: &Path) -> HelperAccess {
+    use std::os::unix::fs::MetadataExt;
+
+    // Only ever classify the exact stored path: a relative name would be
+    // resolved by the kernel against the CWD, not by the launch path.
+    if !path.is_absolute() {
+        return HelperAccess::Missing;
+    }
+    let lmeta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HelperAccess::Missing,
+        Err(e) => {
+            return HelperAccess::ProbeFailed(format!("helper metadata unreadable: {e}"));
+        }
+    };
+    let file_type = lmeta.file_type();
+    if file_type.is_symlink() || !file_type.is_file() {
+        return HelperAccess::ProbeFailed("target is not a regular file".into());
+    }
+    let mode = lmeta.mode() & 0o7777;
+    let owner = lmeta.uid();
+    let file_gid = lmeta.gid();
+    let canonical = match std::fs::canonicalize(path) {
+        Ok(canonical) => canonical,
+        Err(e) => {
+            return HelperAccess::ProbeFailed(format!("helper path unresolvable: {e}"));
+        }
+    };
+    let mount = mount_state(&canonical);
+    let root = nix::unistd::getuid().is_root();
+    let group = if root {
+        Ok(None)
+    } else {
+        nix::unistd::Group::from_name(crate::privilege::HELPER_GROUP)
+    };
+    let permission = if root {
+        // Root never consults the group: enrollment and re-login are
+        // non-root concepts, and invalid root metadata is a probe failure.
+        if owner == 0 && mode == 0o750 {
+            PermissionVerdict::Correct
+        } else {
+            PermissionVerdict::Incorrect
+        }
+    } else {
+        match &group {
+            Err(_) => PermissionVerdict::GroupQueryFailed,
+            Ok(None) if owner == 0 && mode == 0o750 => PermissionVerdict::Unenrolled,
+            Ok(Some(group)) if owner == 0 && mode == 0o750 && file_gid == group.gid.as_raw() => {
+                PermissionVerdict::Correct
+            }
+            Ok(_) => PermissionVerdict::Incorrect,
+        }
+    };
+    let group_gid = group.as_ref().ok().and_then(|g| g.as_ref()).map(|g| g.gid);
+    let live = if root {
+        Query::No
+    } else if let Some(gid) = group_gid {
+        match nix::unistd::getgroups() {
+            Ok(supplementary) => {
+                Query::from(supplementary.contains(&gid) || nix::unistd::getgid() == gid)
+            }
+            Err(_) => Query::Failed,
+        }
+    } else {
+        Query::No
+    };
+    let exec = match nix::unistd::access(path, nix::unistd::AccessFlags::X_OK) {
+        Ok(()) => ExecState::Ok,
+        Err(nix::errno::Errno::EACCES) => ExecState::Eacces,
+        Err(nix::errno::Errno::ENOENT) => ExecState::Noent,
+        Err(_) => ExecState::Other,
+    };
+    // Invariant: this condition mirrors the classifier's stale-session
+    // branch, so the account NSS query only runs when its answer is used.
+    let account = (!root
+        && permission == PermissionVerdict::Correct
+        && live == Query::No
+        && exec == ExecState::Eacces)
+        .then(|| account_membership(group_gid));
+    classify_helper_access(HelperFacts {
+        root,
+        mount,
+        permission,
+        live,
+        account,
+        exec,
+    })
+}
+
+/// Mount verdict for the canonical helper location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MountState {
+    Exec,
+    NoExec,
+    Unknown,
+}
+
+/// Ownership/mode verdict, already interpreted for the calling uid: `Correct`
+/// means root-owned, mode 0750 and, for non-root callers, owned by the
+/// dedicated group's GID.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PermissionVerdict {
+    Correct,
+    Incorrect,
+    GroupQueryFailed,
+    Unenrolled,
+}
+
+/// Outcome of a membership or execution query. Errors stay errors; they never
+/// read as negative membership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Query {
+    Yes,
+    No,
+    Failed,
+}
+
+impl From<bool> for Query {
+    fn from(member: bool) -> Self {
+        if member { Query::Yes } else { Query::No }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecState {
+    Ok,
+    Eacces,
+    Noent,
+    Other,
+}
+
+/// Everything the pure classifier needs; `account` stays `None` unless the
+/// stale-session branch actually requires it.
+struct HelperFacts {
+    root: bool,
+    mount: MountState,
+    permission: PermissionVerdict,
+    live: Query,
+    account: Option<Query>,
+    exec: ExecState,
+}
+
+const ROOT_EXEC_DENIED: &str =
+    "root execution access denied. Check parent directories and security policy";
+const ACTIVE_MEMBER_DENIED: &str = "execute permission denied despite active v2ray-rs group membership. Check parent directories and security policy";
+const EXEC_WITHOUT_MEMBERSHIP: &str = "execution access does not match v2ray-rs group membership";
+
+fn probe(detail: &str) -> HelperAccess {
+    HelperAccess::ProbeFailed(detail.to_string())
+}
+
+fn classify_helper_access(facts: HelperFacts) -> HelperAccess {
+    match facts.mount {
+        MountState::NoExec => return HelperAccess::NoExec,
+        MountState::Unknown => {
+            return probe("could not read the mount options covering the helper");
+        }
+        MountState::Exec => {}
+    }
+    if facts.root {
+        if facts.permission != PermissionVerdict::Correct {
+            return probe("helper is not root-owned with mode 0750");
+        }
+        return match facts.exec {
+            ExecState::Ok => HelperAccess::Ready,
+            ExecState::Noent => HelperAccess::Missing,
+            ExecState::Eacces => probe(ROOT_EXEC_DENIED),
+            ExecState::Other => probe("execution check failed"),
+        };
+    }
+    if facts.permission == PermissionVerdict::GroupQueryFailed {
+        return probe("v2ray-rs group lookup failed");
+    }
+    if facts.permission == PermissionVerdict::Incorrect {
+        return HelperAccess::Permissions;
+    }
+    if facts.permission == PermissionVerdict::Unenrolled {
+        return HelperAccess::EnrollmentRequired;
+    }
+    if facts.exec == ExecState::Noent {
+        return HelperAccess::Missing;
+    }
+    match (facts.live, facts.exec) {
+        (Query::Yes, ExecState::Ok) => HelperAccess::Ready,
+        (Query::Yes, ExecState::Eacces) => probe(ACTIVE_MEMBER_DENIED),
+        (Query::No, ExecState::Ok) => probe(EXEC_WITHOUT_MEMBERSHIP),
+        (Query::No, ExecState::Eacces) => match facts.account {
+            None => probe("account membership unavailable"),
+            Some(Query::Failed) => probe("account group lookup failed"),
+            Some(Query::No) => HelperAccess::EnrollmentRequired,
+            Some(Query::Yes) => HelperAccess::ReloginRequired,
+        },
+        (Query::Failed, _) => probe("live group query failed"),
+        (Query::Yes | Query::No, ExecState::Noent) => HelperAccess::Missing,
+        (_, ExecState::Other) => probe("execution check failed"),
+    }
+}
+
+fn mount_state(canonical: &Path) -> MountState {
+    let Ok(mounts) = std::fs::read_to_string("/proc/self/mounts") else {
+        return MountState::Unknown;
+    };
+    match crate::privilege::mount_for_path(&mounts, canonical) {
+        None => MountState::Unknown,
+        Some(options) if options.split(',').any(|option| option == "noexec") => MountState::NoExec,
+        Some(_) => MountState::Exec,
+    }
+}
+
+fn account_membership(group_gid: Option<nix::unistd::Gid>) -> Query {
+    let Some(group_gid) = group_gid else {
+        return Query::Failed;
+    };
+    let account = match nix::unistd::User::from_uid(nix::unistd::getuid()) {
+        Ok(Some(account)) => account,
+        // An unresolvable account name is a failed lookup, not an answer.
+        Ok(None) | Err(_) => return Query::Failed,
+    };
+    let name = match std::ffi::CString::new(account.name.as_str()) {
+        Ok(name) => name,
+        Err(_) => return Query::Failed,
+    };
+    match nix::unistd::getgrouplist(&name, account.gid) {
+        Ok(gids) => Query::from(gids.contains(&group_gid)),
+        Err(_) => Query::Failed,
+    }
+}
+
+/// Prefixes of every attached network the tunnel must not swallow.
+///
+/// One snapshot per connection: Docker bridges, LANs and other attached
+/// interfaces are excluded from `auto_route` capture so replies can return
+/// through the interface they arrived on. Refreshed on the next connect, not
+/// on interface changes mid-session.
+pub fn connected_subnets(tun_iface: &str) -> std::io::Result<Vec<IpNet>> {
+    let addresses = nix::ifaddrs::getifaddrs()?;
+    connected_subnets_from(addresses, tun_iface)
+}
+
+fn connected_subnets_from(
+    addresses: impl IntoIterator<Item = nix::ifaddrs::InterfaceAddress>,
+    tun_iface: &str,
+) -> std::io::Result<Vec<IpNet>> {
+    use nix::net::if_::InterfaceFlags;
+    use std::net::IpAddr;
+
+    let mut nets: Vec<IpNet> = Vec::new();
+    for ifaddr in addresses {
+        let Some(address) = ifaddr.address else {
+            continue;
+        };
+        if !ifaddr.flags.contains(InterfaceFlags::IFF_UP)
+            || ifaddr
+                .flags
+                .intersects(InterfaceFlags::IFF_LOOPBACK | InterfaceFlags::IFF_POINTOPOINT)
+            || ifaddr.interface_name == tun_iface
+        {
+            continue;
+        }
+        let (addr, family_v4) = match address.as_sockaddr_in() {
+            Some(v4) => (IpAddr::V4(v4.ip()), true),
+            None => match address.as_sockaddr_in6() {
+                Some(v6) => (IpAddr::V6(v6.ip()), false),
+                None => continue,
+            },
+        };
+        let mask = ifaddr.netmask.as_ref().and_then(|mask| {
+            if family_v4 {
+                mask.as_sockaddr_in().map(|m| IpAddr::V4(m.ip()))
+            } else {
+                mask.as_sockaddr_in6().map(|m| IpAddr::V6(m.ip()))
+            }
+        });
+        let Some(mask) = mask else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "interface {} reported no {} netmask",
+                    ifaddr.interface_name,
+                    family_str(addr),
+                ),
+            ));
+        };
+        let net = IpNet::with_netmask(addr, mask)
+            .map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("interface {}: {e}", ifaddr.interface_name),
+                )
+            })?
+            .trunc();
+        // Host routes and whole address spaces are useless as exclusions.
+        let exhaustive = match net {
+            IpNet::V4(n) => n.prefix_len() == 0 || n.prefix_len() == 32,
+            IpNet::V6(n) => n.prefix_len() == 0 || n.prefix_len() == 128,
+        };
+        if exhaustive {
+            continue;
+        }
+        nets.push(net);
+    }
+    nets.sort();
+    nets.dedup();
+    Ok(nets)
+}
+
+fn family_str(addr: std::net::IpAddr) -> &'static str {
+    match addr {
+        std::net::IpAddr::V4(_) => "IPv4",
+        std::net::IpAddr::V6(_) => "IPv6",
+    }
 }
 
 /// Polls `/sys/class/net/<iface>` until the device exists or the timeout elapses.
@@ -360,6 +680,211 @@ mod tests {
     #[tokio::test]
     async fn wait_for_missing_device_times_out() {
         assert!(!wait_for_device("nonexistent-tun-xyz", Duration::from_millis(250)).await);
+    }
+
+    mod connected_subnets {
+        use super::super::*;
+        use nix::ifaddrs::InterfaceAddress;
+        use nix::net::if_::InterfaceFlags;
+        use nix::sys::socket::SockaddrStorage;
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+
+        fn storage_v4(ip: Ipv4Addr) -> SockaddrStorage {
+            SockaddrStorage::from(SocketAddr::V4(SocketAddrV4::new(ip, 0)))
+        }
+
+        fn storage_v6(ip: Ipv6Addr) -> SockaddrStorage {
+            SockaddrStorage::from(SocketAddr::V6(std::net::SocketAddrV6::new(ip, 0, 0, 0)))
+        }
+
+        fn record(
+            name: &str,
+            flags: InterfaceFlags,
+            address: SockaddrStorage,
+            netmask: Option<SockaddrStorage>,
+        ) -> InterfaceAddress {
+            InterfaceAddress {
+                interface_name: name.to_string(),
+                flags,
+                address: Some(address),
+                netmask,
+                broadcast: None,
+                destination: None,
+            }
+        }
+
+        fn v4(name: &str, flags: InterfaceFlags, ip: Ipv4Addr, mask: Ipv4Addr) -> InterfaceAddress {
+            record(name, flags, storage_v4(ip), Some(storage_v4(mask)))
+        }
+
+        fn v6(name: &str, flags: InterfaceFlags, ip: Ipv6Addr, mask: Ipv6Addr) -> InterfaceAddress {
+            record(name, flags, storage_v6(ip), Some(storage_v6(mask)))
+        }
+
+        fn collect(records: Vec<InterfaceAddress>) -> std::io::Result<Vec<IpNet>> {
+            connected_subnets_from(records, "tun0")
+        }
+
+        const UP: InterfaceFlags = InterfaceFlags::IFF_UP;
+
+        #[test]
+        fn collects_sorted_deduplicated_prefixes_of_both_families() {
+            let nets = collect(vec![
+                v4(
+                    "docker0",
+                    UP,
+                    Ipv4Addr::new(172, 17, 0, 1),
+                    Ipv4Addr::new(255, 255, 0, 0),
+                ),
+                v4(
+                    "lan0",
+                    UP,
+                    Ipv4Addr::new(192, 168, 1, 10),
+                    Ipv4Addr::new(255, 255, 255, 0),
+                ),
+                v6(
+                    "lan0",
+                    UP,
+                    Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 0, 1),
+                    Ipv6Addr::new(0xffff, 0xffff, 0, 0, 0, 0, 0, 0),
+                ),
+                v4(
+                    "docker0",
+                    UP,
+                    Ipv4Addr::new(172, 17, 0, 2),
+                    Ipv4Addr::new(255, 255, 0, 0),
+                ),
+            ])
+            .unwrap();
+            let expect: Vec<IpNet> = [
+                "172.17.0.0/16".parse().unwrap(),
+                "192.168.1.0/24".parse().unwrap(),
+                "fd00::/32".parse::<IpNet>().unwrap(),
+            ]
+            .to_vec();
+            assert_eq!(nets, expect);
+        }
+
+        #[test]
+        fn skips_records_without_an_address() {
+            let nets = collect(vec![InterfaceAddress {
+                interface_name: "eth0".to_string(),
+                flags: UP,
+                address: None,
+                netmask: None,
+                broadcast: None,
+                destination: None,
+            }])
+            .unwrap();
+            assert!(nets.is_empty());
+        }
+
+        #[test]
+        fn skips_down_loopback_point_to_point_and_tun_iface() {
+            let nets = collect(vec![
+                v4(
+                    "down0",
+                    InterfaceFlags::empty(),
+                    Ipv4Addr::new(10, 0, 0, 1),
+                    Ipv4Addr::new(255, 0, 0, 0),
+                ),
+                v4(
+                    "lo",
+                    UP | InterfaceFlags::IFF_LOOPBACK,
+                    Ipv4Addr::new(127, 0, 0, 1),
+                    Ipv4Addr::new(255, 0, 0, 0),
+                ),
+                v4(
+                    "ppp0",
+                    UP | InterfaceFlags::IFF_POINTOPOINT,
+                    Ipv4Addr::new(10, 1, 0, 1),
+                    Ipv4Addr::new(255, 255, 255, 252),
+                ),
+                v4(
+                    "tun0",
+                    UP,
+                    Ipv4Addr::new(172, 19, 0, 1),
+                    Ipv4Addr::new(255, 255, 255, 252),
+                ),
+            ])
+            .unwrap();
+            assert!(nets.is_empty());
+        }
+
+        #[test]
+        fn skips_zero_host_and_exhaustive_prefixes() {
+            let nets = collect(vec![
+                v4("a", UP, Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::UNSPECIFIED),
+                v4(
+                    "b",
+                    UP,
+                    Ipv4Addr::new(10, 0, 0, 2),
+                    Ipv4Addr::new(255, 255, 255, 255),
+                ),
+                v6("c", UP, Ipv6Addr::LOCALHOST, Ipv6Addr::UNSPECIFIED),
+                v6(
+                    "d",
+                    UP,
+                    Ipv6Addr::LOCALHOST,
+                    Ipv6Addr::new(
+                        0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff,
+                    ),
+                ),
+            ])
+            .unwrap();
+            assert!(nets.is_empty());
+        }
+
+        #[test]
+        fn retains_bridge_whose_prefix_contains_the_tun_subnet() {
+            let nets = collect(vec![v4(
+                "tunbr",
+                UP,
+                Ipv4Addr::new(172, 19, 0, 1),
+                Ipv4Addr::new(255, 255, 0, 0),
+            )])
+            .unwrap();
+            assert_eq!(nets, vec!["172.19.0.0/16".parse::<IpNet>().unwrap()]);
+        }
+
+        #[test]
+        fn missing_netmask_is_invalid_data() {
+            let err = collect(vec![record(
+                "eth0",
+                UP,
+                storage_v4(Ipv4Addr::new(10, 0, 0, 1)),
+                None,
+            )])
+            .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("eth0"), "{err}");
+        }
+
+        #[test]
+        fn non_contiguous_mask_is_invalid_data() {
+            let err = collect(vec![v4(
+                "eth0",
+                UP,
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(255, 0, 255, 0),
+            )])
+            .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("eth0"), "{err}");
+        }
+
+        #[test]
+        fn cross_family_mask_is_invalid_data() {
+            let err = collect(vec![record(
+                "eth0",
+                UP,
+                storage_v4(Ipv4Addr::new(10, 0, 0, 1)),
+                Some(storage_v6(Ipv6Addr::new(0xffff, 0, 0, 0, 0, 0, 0, 0))),
+            )])
+            .unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("eth0"), "{err}");
+        }
     }
 
     fn t(secs: u64) -> std::time::SystemTime {
@@ -581,5 +1106,258 @@ mod tests {
         let err = run.result.expect_err("a non-zero exit must fail");
         assert!(err.contains("exit status"), "{err}");
         assert!(!run.timed_out);
+    }
+
+    mod helper_access {
+        use super::super::*;
+        use nix::unistd::Gid;
+
+        const ROOT_DENIED: &str =
+            "root execution access denied. Check parent directories and security policy";
+        const ACTIVE_DENIED: &str = "execute permission denied despite active v2ray-rs group membership. Check parent directories and security policy";
+        const MISMATCH: &str = "execution access does not match v2ray-rs group membership";
+
+        fn facts(
+            root: bool,
+            permission: PermissionVerdict,
+            live: Query,
+            account: Option<Query>,
+            exec: ExecState,
+        ) -> HelperFacts {
+            HelperFacts {
+                root,
+                mount: MountState::Exec,
+                permission,
+                live,
+                account,
+                exec,
+            }
+        }
+
+        fn grants(gid: u32) -> Vec<Gid> {
+            vec![Gid::from_raw(gid)]
+        }
+
+        fn gid() -> Gid {
+            Gid::from_raw(4242)
+        }
+
+        #[test]
+        fn active_member_with_successful_execution_is_ready() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::Yes,
+                None,
+                ExecState::Ok,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::Ready);
+        }
+
+        #[test]
+        fn active_member_denied_is_probe_failure() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::Yes,
+                None,
+                ExecState::Eacces,
+            );
+            assert_eq!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(ACTIVE_DENIED.into())
+            );
+        }
+
+        #[test]
+        fn execution_without_live_membership_is_probe_failure() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::No,
+                None,
+                ExecState::Ok,
+            );
+            assert_eq!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(MISMATCH.into())
+            );
+        }
+
+        #[test]
+        fn unenrolled_account_is_enrollment_required() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::No,
+                Some(Query::No),
+                ExecState::Eacces,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::EnrollmentRequired);
+        }
+
+        #[test]
+        fn stale_session_with_account_membership_is_relogin_required() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::No,
+                Some(Query::Yes),
+                ExecState::Eacces,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::ReloginRequired);
+        }
+
+        #[test]
+        fn failed_account_lookup_is_probe_failure() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::No,
+                Some(Query::Failed),
+                ExecState::Eacces,
+            );
+            assert!(matches!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(_)
+            ));
+        }
+
+        #[test]
+        fn noexec_overrides_logout_and_permission_verdicts() {
+            for (permission, live) in [
+                (PermissionVerdict::Correct, Query::Yes),
+                (PermissionVerdict::Incorrect, Query::No),
+                (PermissionVerdict::Unenrolled, Query::No),
+            ] {
+                let mut f = facts(false, permission, live, None, ExecState::Eacces);
+                f.mount = MountState::NoExec;
+                assert_eq!(classify_helper_access(f), HelperAccess::NoExec);
+            }
+        }
+
+        #[test]
+        fn failed_live_group_query_is_probe_failure() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::Failed,
+                None,
+                ExecState::Ok,
+            );
+            assert!(matches!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(_)
+            ));
+        }
+
+        #[test]
+        fn wrong_ownership_or_mode_is_permissions() {
+            let f = facts(
+                false,
+                PermissionVerdict::Incorrect,
+                Query::Yes,
+                None,
+                ExecState::Ok,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::Permissions);
+        }
+
+        #[test]
+        fn absent_group_on_correct_helper_is_enrollment_required() {
+            let f = facts(
+                false,
+                PermissionVerdict::Unenrolled,
+                Query::No,
+                None,
+                ExecState::Ok,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::EnrollmentRequired);
+        }
+
+        #[test]
+        fn root_with_correct_helper_and_execution_is_ready() {
+            let f = facts(
+                true,
+                PermissionVerdict::Correct,
+                Query::No,
+                None,
+                ExecState::Ok,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::Ready);
+        }
+
+        #[test]
+        fn root_execution_denied_is_probe_failure_without_account_lookup() {
+            let f = facts(
+                true,
+                PermissionVerdict::Correct,
+                Query::No,
+                Some(Query::Yes),
+                ExecState::Eacces,
+            );
+            assert_eq!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(ROOT_DENIED.into())
+            );
+        }
+
+        #[test]
+        fn invalid_root_metadata_is_probe_failure() {
+            let f = facts(
+                true,
+                PermissionVerdict::Incorrect,
+                Query::No,
+                None,
+                ExecState::Ok,
+            );
+            assert!(matches!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(_)
+            ));
+        }
+
+        #[test]
+        fn failed_group_lookup_is_probe_failure() {
+            let f = facts(
+                false,
+                PermissionVerdict::GroupQueryFailed,
+                Query::No,
+                None,
+                ExecState::Ok,
+            );
+            assert!(matches!(
+                classify_helper_access(f),
+                HelperAccess::ProbeFailed(_)
+            ));
+        }
+
+        #[test]
+        fn concurrent_disappearance_is_missing() {
+            let f = facts(
+                false,
+                PermissionVerdict::Correct,
+                Query::Yes,
+                None,
+                ExecState::Noent,
+            );
+            assert_eq!(classify_helper_access(f), HelperAccess::Missing);
+            let root = facts(
+                true,
+                PermissionVerdict::Correct,
+                Query::No,
+                None,
+                ExecState::Noent,
+            );
+            assert_eq!(classify_helper_access(root), HelperAccess::Missing);
+        }
+
+        // Supplementary-group shape: membership comes from getgroups(), not
+        // only the primary GID.
+        #[test]
+        fn supplementary_membership_shapes_the_query() {
+            assert!(Query::from(grants(gid().as_raw()).contains(&gid())) == Query::Yes);
+            assert!(Query::from(grants(1).contains(&gid())) == Query::No);
+        }
     }
 }

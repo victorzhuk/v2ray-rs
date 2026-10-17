@@ -165,7 +165,7 @@ The system SHALL acquire an exclusive advisory lock on `runtime_dir/v2ray-rs.loc
 - **THEN** the kernel SHALL release the advisory lock and a subsequent invocation of the same profile SHALL be able to acquire it
 
 ### Requirement: TUN-aware connection start and stop
-The system SHALL make connection start and stop TUN-aware. For xray with TUN enabled, after spawning the backend the system SHALL wait for the TUN device to appear, bounded by a timeout, then invoke the route helper to program the address and routes before reporting `Running`; if the device does not appear or the helper fails, the system SHALL stop the backend and transition to `Error`. For sing-box with TUN enabled, the backend programs its own routes via `auto_route` and the system SHALL NOT run the route helper. Stop SHALL remain SIGTERM-first so the backend can tear down its own routes before any SIGKILL. Every route-helper invocation SHALL be bounded by a timeout and terminated if its caller is cancelled, and its output SHALL reach the process log stream. The TUN recovery marker SHALL be persisted before the route helper first changes routes, naming the backend and the interface the session actually uses.
+The system SHALL make connection start and stop TUN-aware. For xray with TUN enabled, after spawning the backend the system SHALL wait for the TUN device to appear, bounded by a timeout, then invoke the route helper to program the address and routes before reporting `Running`; if the device does not appear or the helper fails, the system SHALL stop the backend and transition to `Error`. For sing-box with TUN enabled, the backend programs its own routes via `auto_route` and the system SHALL NOT run the route helper; the attached-network prefixes sing-box must not capture are merged into the generated config as `route_exclude_address` before the backend is spawned, so no privileged helper is introduced for them and a sing-box TUN start still succeeds without any route helper installed. Stop SHALL remain SIGTERM-first so the backend can tear down its own routes before any SIGKILL. Every route-helper invocation SHALL be bounded by a timeout and terminated if its caller is cancelled, and its output SHALL reach the process log stream. The TUN recovery marker SHALL be persisted before the route helper first changes routes, naming the backend and the interface the session actually uses.
 
 #### Scenario: xray TUN start programs routes
 - **WHEN** the user connects with xray and TUN enabled
@@ -177,7 +177,7 @@ The system SHALL make connection start and stop TUN-aware. For xray with TUN ena
 
 #### Scenario: sing-box TUN start needs no helper
 - **WHEN** the user connects with sing-box and TUN enabled
-- **THEN** the system SHALL spawn sing-box and rely on its `auto_route` to program routes, without invoking the route helper
+- **THEN** the system SHALL spawn sing-box and rely on its `auto_route` to program routes, without invoking the route helper, and SHALL NOT fail the start because the route helper is missing, unenrolled, or unexecutable
 
 #### Scenario: Graceful stop preserves teardown
 - **WHEN** the user disconnects from a TUN session

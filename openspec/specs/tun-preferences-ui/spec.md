@@ -41,7 +41,7 @@ The system SHALL warn the user that enabling TUN routes all system traffic throu
 - **THEN** the UI SHALL display a one-shot warning toast stating that all system traffic will be routed through the active proxy
 
 ### Requirement: Exclusion lists describe their effect per backend
-The excluded-routes and excluded-domains groups SHALL describe what each list does on the active backend. Excluded routes SHALL be described as destinations routed outside the tunnel on both backends. For xray, excluded domains SHALL be described as traffic that still enters the tunnel and is sent directly by xray after it recognizes the domain, so they do not keep traffic off the TUN device; for sing-box, the description SHALL describe domain suffixes that bypass the tunnel. Both groups SHALL state that changes apply on the next connect.
+The excluded-routes and excluded-domains groups SHALL describe what each list does on the active backend. Excluded routes SHALL be described as destinations routed outside the tunnel on both backends, and SHALL state that the host's own attached networks are excluded automatically. For xray, excluded domains SHALL be described as traffic that still enters the tunnel and is sent directly by xray after it recognizes the domain, so they do not keep traffic off the TUN device; for sing-box, the description SHALL describe domain suffixes that bypass the tunnel. Both groups SHALL state that changes apply on the next connect.
 
 #### Scenario: xray domain exclusion wording
 - **WHEN** the active backend is xray and the TUN page is shown
@@ -49,7 +49,7 @@ The excluded-routes and excluded-domains groups SHALL describe what each list do
 
 #### Scenario: Route exclusion wording
 - **WHEN** the active backend is xray or sing-box
-- **THEN** the excluded-routes description SHALL state that the CIDRs are routed outside the tunnel and that changes apply on the next connect
+- **THEN** the excluded-routes description SHALL state that the CIDRs are routed outside the tunnel, that the host's own attached networks are excluded automatically, and that changes apply on the next connect
 
 ### Requirement: DNS hijack mode effect is explained
 The TUN page SHALL explain the DNS hijack modes next to the selector: `hijack` routes DNS queries captured by the tunnel to the backend's resolver, while `native` and `disabled` both leave DNS queries to be carried as ordinary traffic without being answered by the backend's resolver.

@@ -1910,7 +1910,7 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.backend.backend_type = BackendType::V2ray;
 
-        let result = writer.write_config(&[reality_node()], &[], &settings);
+        let result = writer.write_config(&[reality_node()], &[], &settings, &[]);
 
         assert!(matches!(
             result,

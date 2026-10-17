@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use adw::prelude::*;
@@ -16,33 +17,109 @@ type RenderFn = Rc<dyn Fn()>;
 
 pub(crate) const TUN_PAGE_NAME: &str = "tun";
 
-/// Why the route helper still needs a privileged grant, or `None` when it is
-/// ready. The backend holding CAP_NET_ADMIN says nothing about the helper, which
-/// is granted separately and can be missing, stale, or simply never have taken
-/// the capability -- the package hook tolerates `setcap` failing with a warning.
-fn helper_install_reason() -> Option<&'static str> {
-    if v2ray_rs_process::relocation_required() {
-        if !v2ray_rs_process::relocated_helper_path().exists() {
-            return Some("Route helper needs installing before TUN can start");
-        }
-        // The grant adds the user to a system group, which the running session
-        // does not pick up. Say so rather than letting the next connect fail
-        // with a bare permission error.
-        if v2ray_rs_process::helper_needs_relogin() {
-            return Some("Log out and back in to finish enabling TUN");
-        }
-        if v2ray_rs_process::helpers_stale() {
-            return Some("Installed route helper is out of date; grant again");
-        }
-        return None;
-    }
+/// One blocking snapshot of the route-helper facts. Everything here hits the
+/// filesystem or NSS, so it must be collected off the GTK thread.
+struct HelperProbe {
+    helper: PathBuf,
+    access: v2ray_rs_process::HelperAccess,
+    /// `has_net_admin` on the helper, probed only when access is `Ready`.
+    capability: Option<Result<bool, String>>,
+    /// Whether the relocated helper predates the bundled source.
+    stale: bool,
+    /// Whether a grant can install the helper by relocating the bundled copy.
+    missing_installable: bool,
+}
 
-    match v2ray_rs_process::has_net_admin(&v2ray_rs_process::helper_path()) {
-        Ok(true) => None,
-        Ok(false) => Some("Route helper lacks CAP_NET_ADMIN"),
-        // Unreadable capabilities are not proof of absence; leave the row alone
-        // rather than nagging about a helper that may well be fine.
-        Err(_) => None,
+fn probe_helper() -> HelperProbe {
+    let helper = v2ray_rs_process::helper_path();
+    let access = v2ray_rs_process::helper_access(&helper);
+    let ready = access == v2ray_rs_process::HelperAccess::Ready;
+    let capability =
+        ready.then(|| v2ray_rs_process::has_net_admin(&helper).map_err(|err| err.to_string()));
+    let stale = ready && v2ray_rs_process::helpers_stale(&helper);
+    let missing_installable = v2ray_rs_process::relocation_required();
+    HelperProbe {
+        helper,
+        access,
+        capability,
+        stale,
+        missing_installable,
+    }
+}
+
+/// Maps the probed helper facts to `(message, grant_visible)`, or `None` when
+/// the helper is fully ready. The backend holding CAP_NET_ADMIN says nothing
+/// about the helper, which is granted separately and can be missing, stale, or
+/// simply never have taken the capability -- the package hook tolerates
+/// `setcap` failing with a warning.
+fn helper_install_reason(probe: &HelperProbe) -> Option<(String, bool)> {
+    let message = |access: &v2ray_rs_process::HelperAccess| {
+        v2ray_rs_process::ProcessError::from_helper_access(&probe.helper, access.clone())
+            .expect("non-Ready access always maps to an error")
+            .to_string()
+    };
+    match &probe.access {
+        v2ray_rs_process::HelperAccess::Ready => {
+            if probe.stale {
+                return Some((
+                    "Installed route helper is out of date; grant again".to_string(),
+                    true,
+                ));
+            }
+            match &probe.capability {
+                Some(Ok(true)) | None => None,
+                Some(Ok(false)) => Some(("Route helper lacks CAP_NET_ADMIN".to_string(), true)),
+                // Unreadable capabilities are not proof of absence; do not
+                // offer a grant that may be redundant.
+                Some(Err(err)) => Some((format!("Cannot read capabilities: {err}"), false)),
+            }
+        }
+        v2ray_rs_process::HelperAccess::Missing => {
+            if probe.missing_installable {
+                Some((
+                    "Route helper needs installing before TUN can start".to_string(),
+                    true,
+                ))
+            } else {
+                Some((
+                    "Route helper is not installed; install the v2ray-rs distribution package"
+                        .to_string(),
+                    false,
+                ))
+            }
+        }
+        access @ (v2ray_rs_process::HelperAccess::EnrollmentRequired
+        | v2ray_rs_process::HelperAccess::Permissions) => Some((message(access), true)),
+        access @ (v2ray_rs_process::HelperAccess::ReloginRequired
+        | v2ray_rs_process::HelperAccess::NoExec
+        | v2ray_rs_process::HelperAccess::ProbeFailed(_)) => Some((message(access), false)),
+    }
+}
+
+/// Chooses the capability row's message and Grant visibility from the probed
+/// backend and helper facts. The helper is decided even when the backend looks
+/// fixable, so a generic backend grant cannot hide a nonrepairable helper
+/// blocker.
+fn capability_status(
+    backend_caps: Option<&Result<bool, String>>,
+    helper_needed: bool,
+    probe: &HelperProbe,
+) -> (String, bool) {
+    let helper_status = helper_needed
+        .then(|| helper_install_reason(probe))
+        .flatten();
+    if let Some((message, false)) = helper_status {
+        return (message, false);
+    }
+    match backend_caps {
+        None => ("Configure a backend binary first".to_string(), false),
+        Some(Ok(true)) => match helper_status {
+            Some((message, grant)) => (message, grant),
+            None => ("CAP_NET_ADMIN granted".to_string(), false),
+        },
+        Some(Ok(false)) => ("Backend lacks CAP_NET_ADMIN".to_string(), true),
+        // An unreadable verdict is not "definitely missing", so no grant.
+        Some(Err(err)) => (format!("Cannot read capabilities: {err}"), false),
     }
 }
 
@@ -539,40 +616,66 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cap_row = cap_row.clone();
         let grant_button = grant_button.clone();
-        Rc::new(move || {
-            let path = state.borrow().backend.binary_path.clone();
-            match path {
-                None => {
-                    cap_row.set_subtitle("Configure a backend binary first");
-                    grant_button.set_visible(false);
+        let generation = Rc::new(Cell::new(0_u64));
+        let running = Rc::new(Cell::new(false));
+        let pending = Rc::new(Cell::new(false));
+        // The resumable spawn: while a probe is in flight, further requests
+        // only set `pending`, and the in-flight completion re-spawns once.
+        let spawn_refresh = Rc::new(RefCell::new(None::<Rc<dyn Fn()>>));
+        let spawn_refresh_ref = spawn_refresh.clone();
+        let spawn: Rc<dyn Fn()> = Rc::new(move || {
+            if running.get() {
+                pending.set(true);
+                return;
+            }
+            running.set(true);
+            let request = generation.get().wrapping_add(1);
+            generation.set(request);
+            let generation = generation.clone();
+            let running = running.clone();
+            let pending = pending.clone();
+            let cap_row = cap_row.clone();
+            let grant_button = grant_button.clone();
+            let state = state.clone();
+            let spawn_refresh = spawn_refresh_ref.clone();
+            glib::MainContext::default().spawn_local(async move {
+                let helper_needed = state.borrow().backend.backend_type == BackendType::Xray;
+                let backend_path = state.borrow().backend.binary_path.clone();
+                let probed = tokio::task::spawn_blocking(move || {
+                    let backend_caps = backend_path.as_ref().map(|path| {
+                        v2ray_rs_process::has_net_admin(path).map_err(|err| err.to_string())
+                    });
+                    let helper = probe_helper();
+                    (backend_caps, helper)
+                })
+                .await
+                .ok();
+                // An obsolete response: a newer refresh superseded this one.
+                if generation.get() != request {
                     return;
                 }
-                Some(path) => match v2ray_rs_process::has_net_admin(&path) {
-                    Ok(true) => {
-                        cap_row.set_subtitle("CAP_NET_ADMIN granted");
-                        grant_button.set_visible(false);
+                running.set(false);
+                if pending.take() {
+                    if let Some(spawn) = spawn_refresh.borrow().as_ref() {
+                        spawn();
                     }
-                    Ok(false) => {
-                        cap_row.set_subtitle("Backend lacks CAP_NET_ADMIN");
-                        grant_button.set_visible(true);
-                        return;
+                    return;
+                }
+                let (message, grant) = match probed {
+                    None => (
+                        "Cannot read TUN capability state: probe task aborted".to_string(),
+                        false,
+                    ),
+                    Some((backend_caps, helper)) => {
+                        capability_status(backend_caps.as_ref(), helper_needed, &helper)
                     }
-                    Err(err) => {
-                        cap_row.set_subtitle(&format!("Cannot read capabilities: {err}"));
-                        grant_button.set_visible(true);
-                        return;
-                    }
-                },
-            }
-
-            // The backend can hold capabilities while the route helper still
-            // cannot, which is every AppImage: the grant has to install a copy
-            // somewhere the kernel honours them.
-            if let Some(reason) = helper_install_reason() {
-                cap_row.set_subtitle(reason);
-                grant_button.set_visible(true);
-            }
-        })
+                };
+                cap_row.set_subtitle(&message);
+                grant_button.set_visible(grant);
+            });
+        });
+        *spawn_refresh.borrow_mut() = Some(spawn.clone());
+        spawn
     };
     refresh_caps();
 
@@ -758,8 +861,9 @@ fn strict_route_applies(backend: BackendType) -> bool {
     matches!(backend, BackendType::SingBox | BackendType::Xray)
 }
 
-const EXCLUDED_ROUTES_DESCRIPTION: &str =
-    "CIDRs routed outside the tunnel; applies on next connect";
+// User-edited exclusions plus the automatic ones merged at config generation.
+const EXCLUDED_ROUTES_DESCRIPTION: &str = "CIDRs routed outside the tunnel; the host's own attached networks are excluded \
+     automatically; applies on next connect";
 
 // xray has no TUN-level domain bypass: matching flows enter the device and are
 // only sent out directly by its routing.
@@ -848,5 +952,172 @@ mod tests {
         let bypass = "Domain suffixes that bypass the tunnel; applies on next connect";
         assert_eq!(excluded_domains_description(BackendType::SingBox), bypass);
         assert_eq!(excluded_domains_description(BackendType::V2ray), bypass);
+    }
+
+    fn probe(
+        access: v2ray_rs_process::HelperAccess,
+        capability: Option<Result<bool, String>>,
+        stale: bool,
+        missing_installable: bool,
+    ) -> HelperProbe {
+        HelperProbe {
+            helper: PathBuf::from("/usr/local/bin/v2ray-rs-netctl"),
+            access,
+            capability,
+            stale,
+            missing_installable,
+        }
+    }
+
+    #[test]
+    fn ready_helper_with_capability_is_silent() {
+        assert!(
+            helper_install_reason(&probe(
+                v2ray_rs_process::HelperAccess::Ready,
+                Some(Ok(true)),
+                false,
+                false,
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn stale_relocated_helper_offers_grant() {
+        let (message, grant) = helper_install_reason(&probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Ok(true)),
+            true,
+            false,
+        ))
+        .expect("stale helper has a reason");
+        assert!(message.contains("out of date"));
+        assert!(grant);
+    }
+
+    #[test]
+    fn missing_helper_capability_offers_grant() {
+        let (message, grant) = helper_install_reason(&probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Ok(false)),
+            false,
+            false,
+        ))
+        .expect("missing capability has a reason");
+        assert!(message.contains("lacks CAP_NET_ADMIN"));
+        assert!(grant);
+    }
+
+    #[test]
+    fn failed_capability_probe_shows_error_without_grant() {
+        let (message, grant) = helper_install_reason(&probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Err("getcap crashed".to_string())),
+            false,
+            false,
+        ))
+        .expect("probe error has a reason");
+        assert!(message.contains("Cannot read capabilities"));
+        assert!(message.contains("getcap crashed"));
+        assert!(!grant);
+    }
+
+    #[test]
+    fn enrollment_and_permissions_offer_grant() {
+        for access in [
+            v2ray_rs_process::HelperAccess::EnrollmentRequired,
+            v2ray_rs_process::HelperAccess::Permissions,
+        ] {
+            let (message, grant) = helper_install_reason(&probe(access, None, false, false))
+                .expect("repairable access has a reason");
+            assert!(grant, "{message}");
+        }
+    }
+
+    #[test]
+    fn relogin_noexec_and_probe_failure_show_error_without_grant() {
+        for access in [
+            v2ray_rs_process::HelperAccess::ReloginRequired,
+            v2ray_rs_process::HelperAccess::NoExec,
+            v2ray_rs_process::HelperAccess::ProbeFailed("mount unreadable".to_string()),
+        ] {
+            let (message, grant) = helper_install_reason(&probe(access, None, false, false))
+                .expect("nonrepairable access has a reason");
+            assert!(!grant, "{message}");
+        }
+    }
+
+    #[test]
+    fn missing_helper_grant_tracks_relocation_source() {
+        let (message, grant) = helper_install_reason(&probe(
+            v2ray_rs_process::HelperAccess::Missing,
+            None,
+            false,
+            true,
+        ))
+        .expect("missing helper has a reason");
+        assert!(message.contains("needs installing"));
+        assert!(grant);
+
+        let (message, grant) = helper_install_reason(&probe(
+            v2ray_rs_process::HelperAccess::Missing,
+            None,
+            false,
+            false,
+        ))
+        .expect("missing helper has a reason");
+        assert!(message.contains("distribution package"));
+        assert!(!grant);
+    }
+
+    #[test]
+    fn nonrepairable_helper_blocker_wins_over_backend_grant() {
+        let helper = probe(
+            v2ray_rs_process::HelperAccess::ReloginRequired,
+            None,
+            false,
+            false,
+        );
+        let backend_missing = Ok::<bool, String>(false);
+        let (message, grant) = capability_status(Some(&backend_missing), true, &helper);
+        assert!(message.contains("log out and back in"));
+        assert!(!grant);
+    }
+
+    #[test]
+    fn helper_skipped_when_backend_does_not_need_it() {
+        let helper = probe(
+            v2ray_rs_process::HelperAccess::ReloginRequired,
+            None,
+            false,
+            false,
+        );
+        let backend_ready = Ok::<bool, String>(true);
+        let (message, grant) = capability_status(Some(&backend_ready), false, &helper);
+        assert_eq!(message, "CAP_NET_ADMIN granted");
+        assert!(!grant);
+    }
+
+    #[test]
+    fn backend_decisions_unchanged_by_ready_helper() {
+        let helper = probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Ok(true)),
+            false,
+            false,
+        );
+        let backend_missing = Ok::<bool, String>(false);
+        let (message, grant) = capability_status(Some(&backend_missing), true, &helper);
+        assert_eq!(message, "Backend lacks CAP_NET_ADMIN");
+        assert!(grant);
+
+        let (message, grant) = capability_status(None, true, &helper);
+        assert_eq!(message, "Configure a backend binary first");
+        assert!(!grant);
+
+        let backend_probe = Err::<bool, String>("getcap not installed".to_string());
+        let (message, grant) = capability_status(Some(&backend_probe), true, &helper);
+        assert!(message.contains("Cannot read capabilities"));
+        assert!(!grant);
     }
 }

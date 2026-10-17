@@ -95,15 +95,22 @@ impl ConnectionHandle {
 }
 
 pub(super) fn spawn(request: ConnectionRequest, sender: relm4::Sender<AppMsg>) -> ConnectionHandle {
-    spawn_with(request, sender, |mgr| mgr)
+    spawn_with(
+        request,
+        sender,
+        |mgr| mgr,
+        v2ray_rs_process::connected_subnets,
+    )
 }
 
 /// `spawn` with a hook over every candidate's manager, applied after the
-/// production builder chain.
+/// production builder chain, and a connected-subnet collector so tests can
+/// inject a deterministic snapshot.
 fn spawn_with(
     request: ConnectionRequest,
     sender: relm4::Sender<AppMsg>,
     configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
+    collect: impl FnOnce(&str) -> std::io::Result<Vec<ipnet::IpNet>> + Send + 'static,
 ) -> ConnectionHandle {
     let ConnectionRequest {
         binary_path,
@@ -152,6 +159,44 @@ fn spawn_with(
             })
             .await;
         }
+
+        // Collected once per connection, before any candidate: the snapshot
+        // feeds every config write, including failovers, so a Docker bridge is
+        // excluded from TUN capture for the whole session. A host discovery
+        // failure is terminal — no candidate can produce a correct TUN config
+        // without it.
+        let connected_subnets: Vec<ipnet::IpNet> =
+            if settings.backend.backend_type == BackendType::SingBox && settings.tun.enabled {
+                let iface = settings.tun.interface_name.clone();
+                let collected = tokio::task::spawn_blocking(move || collect(&iface));
+                tokio::pin!(collected);
+                tokio::select! {
+                    biased;
+                    Some(ConnectionCmd::Stop(_)) = cmd_rx.recv() => {
+                        report(ProcessState::Stopped, None);
+                        return;
+                    }
+                    joined = &mut collected => match joined {
+                        Ok(Ok(subnets)) => subnets,
+                        Ok(Err(err)) => {
+                            report(
+                                ProcessState::Error(format!("Collect connected subnets: {err}")),
+                                None,
+                            );
+                            return;
+                        }
+                        Err(err) => {
+                            report(
+                                ProcessState::Error(format!("Collect connected subnets: {err}")),
+                                None,
+                            );
+                            return;
+                        }
+                    },
+                }
+            } else {
+                Vec::new()
+            };
 
         let mut failures = Vec::new();
         // A failed candidate keeps its routing state while the next one starts,
@@ -272,27 +317,31 @@ fn spawn_with(
             }
             let unpinned = unpinned_host(&effective_settings, &nodes);
             let pinned = unpinned.is_none();
-            let config_path =
-                match writer.write_config(&nodes, &effective_rules, &effective_settings) {
-                    Ok(path) => path,
-                    Err(e) => {
-                        record_failure(
-                            &mut failures,
-                            CandidateFailure::new(
-                                &candidate_label,
-                                &format!("config generation failed: {e}"),
-                                &candidate_address,
-                                candidate_port,
-                            ),
-                            position,
-                            total,
-                        );
-                        if repeats_previous(&failures) {
-                            break 'candidates;
-                        }
-                        continue;
+            let config_path = match writer.write_config(
+                &nodes,
+                &effective_rules,
+                &effective_settings,
+                &connected_subnets,
+            ) {
+                Ok(path) => path,
+                Err(e) => {
+                    record_failure(
+                        &mut failures,
+                        CandidateFailure::new(
+                            &candidate_label,
+                            &format!("config generation failed: {e}"),
+                            &candidate_address,
+                            candidate_port,
+                        ),
+                        position,
+                        total,
+                    );
+                    if repeats_previous(&failures) {
+                        break 'candidates;
                     }
-                };
+                    continue;
+                }
+            };
 
             let meta = ConnectionMetadata {
                 node_ref: candidate.node_ref,
@@ -1101,7 +1150,10 @@ async fn halt(tasks: Vec<JoinHandle<()>>) {
 fn grant_fixable(e: &ProcessError) -> bool {
     matches!(
         e,
-        ProcessError::TunCapabilityMissing(_) | ProcessError::TunHelperCapabilityMissing(_)
+        ProcessError::TunCapabilityMissing(_)
+            | ProcessError::TunHelperCapabilityMissing(_)
+            | ProcessError::TunHelperEnrollmentRequired
+            | ProcessError::TunHelperPermissions(_)
     )
 }
 
@@ -1397,6 +1449,10 @@ mod tests {
         connect_with(stub, settings, candidates, |mgr| mgr)
     }
 
+    fn no_subnets(_iface: &str) -> std::io::Result<Vec<ipnet::IpNet>> {
+        Ok(Vec::new())
+    }
+
     fn request(
         stub: &Stub,
         settings: AppSettings,
@@ -1438,7 +1494,7 @@ mod tests {
             health_timing,
             ..request(stub, settings, candidates)
         };
-        let handle = spawn_with(req, tx, |mgr| mgr);
+        let handle = spawn_with(req, tx, |mgr| mgr, no_subnets);
         (handle, rx)
     }
 
@@ -1449,7 +1505,12 @@ mod tests {
         configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
     ) -> (ConnectionHandle, relm4::Receiver<AppMsg>) {
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let handle = spawn_with(request(stub, settings, candidates), tx, configure);
+        let handle = spawn_with(
+            request(stub, settings, candidates),
+            tx,
+            configure,
+            no_subnets,
+        );
         (handle, rx)
     }
 
@@ -1982,7 +2043,7 @@ exec sleep 30"#
                 ],
             )
         };
-        let _handle = spawn_with(req, tx, |mgr| mgr);
+        let _handle = spawn_with(req, tx, |mgr| mgr, no_subnets);
 
         let (terminal, offers, update_started) = drain_with_offers(&rx).await;
         let Some(ProcessState::Error(msg)) = terminal else {
@@ -2064,6 +2125,7 @@ exit 1"#,
         mgr.with_host_probe(v2ray_rs_process::HostProbe {
             getcap: PathBuf::from("/bin/true"),
             helper: PathBuf::from("/bin/true"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         })
     }
 
@@ -2106,7 +2168,7 @@ exit 1"#,
         );
         req.host_has_ipv6 = false;
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, capless_probe);
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
 
         let (terminal, lines) = drain(&rx).await;
         assert_error_terminal(terminal);
@@ -2130,7 +2192,7 @@ exit 1"#,
         let mut req = request(&stub, settings, vec![candidate("203.0.113.2")]);
         req.host_has_ipv6 = true;
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, capless_probe);
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
 
         let (terminal, lines) = drain(&rx).await;
         assert_error_terminal(terminal);
@@ -2142,6 +2204,43 @@ exit 1"#,
         let log = std::fs::read_to_string(stub.paths.logs_dir().join("backend.log"))
             .expect("backend.log readable");
         assert!(!log.contains(STRICT_ROUTE_NOTICE), "{log}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn collect_failure_reports_single_error_without_spawn() {
+        let stub = stub(r#"exit 0"#);
+        let mut settings = singbox_settings();
+        settings.tun.enabled = true;
+        let req = request(&stub, settings, vec![candidate("203.0.113.1")]);
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(
+            req,
+            tx,
+            |mgr| mgr,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "ifaddrs failed",
+                ))
+            },
+        );
+
+        let (terminal, lines) = drain(&rx).await;
+        match terminal {
+            Some(ProcessState::Error(msg)) => {
+                assert!(
+                    msg.starts_with("Collect connected subnets: "),
+                    "unexpected error text: {msg}"
+                );
+                assert!(msg.contains("ifaddrs failed"), "{msg}");
+            }
+            other => panic!("expected collection error terminal, got {other:?}"),
+        }
+        // No candidate started, so nothing was written or spawned.
+        assert!(
+            !lines.iter().any(|line| line.contains("candidate start")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2157,7 +2256,7 @@ exit 1"#,
             vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
         );
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, capless_probe);
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
 
         let (terminal, lines) = drain(&rx).await;
         assert_error_terminal(terminal);
@@ -2183,7 +2282,7 @@ exit 1"#,
             vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
         );
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, capless_probe);
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
 
         let (terminal, lines) = drain(&rx).await;
         assert_error_terminal(terminal);
@@ -2201,6 +2300,8 @@ exit 1"#,
             ProcessError::TunHelperCapabilityMissing(PathBuf::from(
                 "/usr/local/bin/v2ray-rs-netctl",
             )),
+            ProcessError::TunHelperEnrollmentRequired,
+            ProcessError::TunHelperPermissions(PathBuf::from("/usr/local/bin/v2ray-rs-netctl")),
         ];
         assert!(fixable.iter().all(grant_fixable));
 
@@ -2209,6 +2310,11 @@ exit 1"#,
             ProcessError::TunMountUnsupported("/dev/net/tun: required key not available".into()),
             ProcessError::TunHelperMissing,
             ProcessError::TunHelperRelogin,
+            ProcessError::TunHelperNoExec(PathBuf::from("/home/user/.local/bin/v2ray-rs-netctl")),
+            ProcessError::TunHelperAccessProbe {
+                path: PathBuf::from("/usr/local/bin/v2ray-rs-netctl"),
+                detail: "mount inspection failed".into(),
+            },
             ProcessError::BackendTooOld {
                 backend: BackendType::Xray,
                 installed: "25.3.5".into(),
@@ -2232,6 +2338,7 @@ exit 1"#,
         let probe = v2ray_rs_process::HostProbe {
             getcap: PathBuf::from("/bin/true"),
             helper: executable(host.path(), "v2ray-rs-netctl"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         };
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
@@ -2420,6 +2527,7 @@ exit 1"#,
         let probe = v2ray_rs_process::HostProbe {
             getcap,
             helper: executable(host.path(), "v2ray-rs-netctl"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         };
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
@@ -2601,6 +2709,7 @@ exit 1"#,
         let probe = v2ray_rs_process::HostProbe {
             getcap,
             helper: executable(host.path(), "v2ray-rs-netctl"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         };
         let mut settings = tun_settings();
         settings.backend.backend_type = BackendType::Xray;
@@ -2668,7 +2777,7 @@ exit 1"#,
         let mut req = request(&stub, settings, vec![candidate]);
         req.subscriptions = vec![sub];
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let handle = spawn_with(req, tx, |mgr| mgr);
+        let handle = spawn_with(req, tx, |mgr| mgr, no_subnets);
 
         loop {
             let (state, _) = next_state(&rx).await;
@@ -2797,7 +2906,7 @@ exit 1"#,
             ],
         );
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, capless_probe);
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
 
         let (terminal, _) = drain(&rx).await;
         assert_error_terminal(terminal);
@@ -2985,6 +3094,7 @@ exit 1"#,
         let probe = v2ray_rs_process::HostProbe {
             getcap,
             helper: executable(host.path(), "v2ray-rs-netctl"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         };
         let mut settings = xray_tun_settings();
         settings.tun.interface_name = iface.into();
@@ -3015,7 +3125,12 @@ exit 1"#,
             })
             .to_vec();
         let (tx, rx) = relm4::channel::<AppMsg>();
-        let _handle = spawn_with(req, tx, move |mgr| mgr.with_host_probe(probe.clone()));
+        let _handle = spawn_with(
+            req,
+            tx,
+            move |mgr| mgr.with_host_probe(probe.clone()),
+            no_subnets,
+        );
 
         let (terminal, _, _) = drain_within(&rx, Duration::from_secs(60)).await;
         assert_error_terminal(terminal);
@@ -3305,6 +3420,7 @@ exit 1"#,
         let probe = v2ray_rs_process::HostProbe {
             getcap,
             helper: executable(host.path(), "v2ray-rs-netctl"),
+            helper_access: Some(v2ray_rs_process::HelperAccess::Ready),
         };
         let (_listener, mut settings) = ready_singbox_settings();
         settings.tun.enabled = true;

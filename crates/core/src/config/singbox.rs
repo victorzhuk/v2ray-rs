@@ -774,6 +774,90 @@ fn build_route(
     }
 }
 
+/// Merges connected-network prefixes into the TUN inbound's
+/// `route_exclude_address`, after user validation of saved settings.
+///
+/// Explicit entries and their order are preserved verbatim, redundant ones
+/// included; automatic prefixes are appended sorted, deduplicated, and only
+/// for address families the TUN actually carries. `settings.tun.exclude_routes`
+/// itself is never touched. A whole-address-space prefix is refused through
+/// the same error a user-entered `/0` gets.
+pub(crate) fn apply_connected_subnets(
+    config: &mut Value,
+    tun: &TunConfig,
+    connected_subnets: &[ipnet::IpNet],
+) -> Result<(), ConfigError> {
+    let explicit: Vec<String> = config["inbounds"]
+        .as_array()
+        .and_then(|inbounds| {
+            inbounds
+                .iter()
+                .find(|inbound| inbound["type"] == "tun")
+                .and_then(|tun_inbound| {
+                    tun_inbound["route_exclude_address"]
+                        .as_array()
+                        .map(|routes| {
+                            routes
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .map(str::to_string)
+                                .collect()
+                        })
+                })
+        })
+        .unwrap_or_default();
+
+    let active_families: Vec<bool> = tun
+        .addresses()
+        .iter()
+        .filter_map(|cidr| cidr.parse::<ipnet::IpNet>().ok())
+        .map(|net| matches!(net, ipnet::IpNet::V4(_)))
+        .collect();
+    let v4_active = active_families.contains(&true);
+    let v6_active = active_families.contains(&false);
+
+    let mut automatic: Vec<ipnet::IpNet> = connected_subnets
+        .iter()
+        .filter(|net| match net {
+            ipnet::IpNet::V4(_) => v4_active,
+            ipnet::IpNet::V6(_) => v6_active,
+        })
+        .copied()
+        .collect();
+    automatic.sort();
+    automatic.dedup();
+    for net in &automatic {
+        if net.prefix_len() == 0 {
+            return Err(ConfigError::InvalidTun(
+                crate::models::ValidationError::ExcludeRouteCoversAll(net.to_string()),
+            ));
+        }
+    }
+
+    let explicit_nets: Vec<Option<ipnet::IpNet>> =
+        explicit.iter().map(|route| route.parse().ok()).collect();
+    let mut combined = explicit;
+    combined.extend(
+        automatic
+            .into_iter()
+            .filter(|net| {
+                !explicit_nets
+                    .iter()
+                    .any(|candidate| candidate.as_ref() == Some(net))
+            })
+            .map(|net| net.to_string()),
+    );
+
+    if !combined.is_empty()
+        && let Some(tun_inbound) = config["inbounds"]
+            .as_array_mut()
+            .and_then(|inbounds| inbounds.iter_mut().find(|inbound| inbound["type"] == "tun"))
+    {
+        tun_inbound["route_exclude_address"] = json!(combined);
+    }
+    Ok(())
+}
+
 /// Rewrites `route.rule_set` entries from `remote` to `local` wherever a
 /// cached `.srs` file exists, so a run with fully cached geodata never needs
 /// network access to start. `rule_sets_dir` must be absolute — sing-box
@@ -906,6 +990,155 @@ mod tests {
     use super::*;
     use crate::config::test_fixtures::fixtures::*;
     use crate::models::*;
+
+    mod connected_subnets_merge {
+        use super::*;
+        use crate::models::ValidationError;
+        use ipnet::IpNet;
+
+        fn merged_config(extra: impl FnOnce(&mut AppSettings)) -> (Value, AppSettings) {
+            let mut settings = default_settings();
+            settings.tun.enabled = true;
+            extra(&mut settings);
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+            (config, settings)
+        }
+
+        fn nets<const N: usize>(cidrs: [&str; N]) -> Vec<IpNet> {
+            cidrs.iter().map(|c| c.parse().unwrap()).collect()
+        }
+
+        fn merged_routes(config: &Value) -> Vec<String> {
+            config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["type"] == "tun")
+                .unwrap()["route_exclude_address"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect()
+        }
+
+        #[test]
+        fn explicit_order_preserved_and_automatic_duplicates_suppressed() {
+            let (mut config, settings) = merged_config(|s| {
+                s.tun.exclude_routes = vec!["192.168.1.0/24".into(), "10.0.0.0/8".into()];
+            });
+            apply_connected_subnets(
+                &mut config,
+                &settings.tun,
+                &nets(["172.17.0.0/16", "10.0.0.0/8"]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                merged_routes(&config),
+                ["192.168.1.0/24", "10.0.0.0/8", "172.17.0.0/16"]
+            );
+            // Saved settings are never touched by the merge.
+            assert_eq!(settings.tun.exclude_routes.len(), 2);
+        }
+
+        #[test]
+        fn automatic_entries_sorted_and_canonical() {
+            let (mut config, settings) = merged_config(|_| ());
+            apply_connected_subnets(
+                &mut config,
+                &settings.tun,
+                &nets(["172.17.0.0/16", "10.1.0.0/16", "10.0.0.0/16"]),
+            )
+            .unwrap();
+
+            assert_eq!(
+                merged_routes(&config),
+                ["10.0.0.0/16", "10.1.0.0/16", "172.17.0.0/16"]
+            );
+        }
+
+        #[test]
+        fn families_absent_from_tun_addresses_omitted() {
+            let (mut config, settings) = merged_config(|_| ());
+            apply_connected_subnets(
+                &mut config,
+                &settings.tun,
+                &nets(["172.17.0.0/16", "fd00::/8"]),
+            )
+            .unwrap();
+
+            assert_eq!(merged_routes(&config), ["172.17.0.0/16"]);
+        }
+
+        #[test]
+        fn redundant_explicit_entries_preserved() {
+            let (mut config, settings) = merged_config(|s| {
+                s.tun.exclude_routes = vec!["172.17.0.0/16".into(), "172.17.0.0/16".into()];
+            });
+            apply_connected_subnets(&mut config, &settings.tun, &[]).unwrap();
+
+            assert_eq!(merged_routes(&config), ["172.17.0.0/16", "172.17.0.0/16"]);
+        }
+
+        #[test]
+        fn empty_combined_list_omits_field() {
+            let (config, settings) = merged_config(|_| ());
+            let tun = config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["type"] == "tun")
+                .unwrap();
+            assert!(tun.get("route_exclude_address").is_none());
+            let _ = settings;
+        }
+
+        #[test]
+        fn automatic_zero_prefix_rejected() {
+            let (mut config, settings) = merged_config(|_| ());
+            let err = apply_connected_subnets(&mut config, &settings.tun, &nets(["0.0.0.0/0"]))
+                .unwrap_err();
+            assert!(matches!(
+                &err,
+                ConfigError::InvalidTun(ValidationError::ExcludeRouteCoversAll(s))
+                    if s == "0.0.0.0/0"
+            ));
+        }
+
+        #[test]
+        fn large_lists_accepted_without_truncation() {
+            let explicit: Vec<String> = (0..256).map(|i| format!("10.{i}.0.0/24")).collect();
+            let (mut config, settings) = merged_config(|s| {
+                s.tun.exclude_routes = explicit;
+            });
+            let automatic: Vec<IpNet> = (0..2)
+                .flat_map(|a| (0..256).map(move |b| format!("172.{a}.{b}.0/24")))
+                .map(|c| c.parse().unwrap())
+                .collect();
+            apply_connected_subnets(&mut config, &settings.tun, &automatic).unwrap();
+
+            assert_eq!(merged_routes(&config).len(), 768);
+        }
+
+        #[test]
+        fn inactive_family_zero_prefix_not_rejected_but_active_one_is() {
+            let (mut config, settings) = merged_config(|_| ());
+            // IPv6 is inactive for the default TUN address set, so an IPv6 /0
+            // is filtered out before the safety check and the merged list
+            // stays empty: the field must remain omitted.
+            apply_connected_subnets(&mut config, &settings.tun, &nets(["::/0"])).unwrap();
+            let tun = config["inbounds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|i| i["type"] == "tun")
+                .unwrap();
+            assert!(tun.get("route_exclude_address").is_none());
+        }
+    }
 
     #[test]
     fn test_singbox_error_on_empty() {

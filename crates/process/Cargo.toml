@@ -7,13 +7,17 @@ edition.workspace = true
 v2ray-rs-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
-nix.workspace = true
+nix = { workspace = true, features = ["net"] }
+ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
 
 [features]
 test-utils = []
+privileged-tests = []
 
 [dev-dependencies]
+v2ray-rs-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
+uuid.workspace = true

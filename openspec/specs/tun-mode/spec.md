@@ -38,7 +38,7 @@ The system SHALL offer TUN mode only when the selected backend is sing-box or xr
 - **THEN** the start SHALL continue and the process log SHALL contain a warning that the version could not be read and the minimum-version check was skipped
 
 ### Requirement: TUN requires elevated capabilities granted once
-The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN connection starts, and SHALL detect this by reading the binary's file capabilities. For xray, the system SHALL additionally require, before spawning the backend, that the route helper resolves to an existing file this process can execute and that it holds `CAP_NET_ADMIN`. When the application runs with effective user ID 0, capability checks SHALL be skipped. Reading file capabilities SHALL be bounded by a timeout; a timeout or a missing capability-reading tool SHALL fail the start with an error naming the cause. When the backend binary resides on a filesystem that does not honor file capabilities, the start SHALL fail with an error naming the path and the manual `setcap` command. A failure of any of these checks SHALL end the connection attempt without trying further candidates.
+The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN connection starts, and SHALL detect this by reading the binary's file capabilities. For xray, the system SHALL additionally require, before spawning the backend, that the exact stored route helper path is ready and that it holds `CAP_NET_ADMIN`. Readiness SHALL be decided by one shared classifier over that stored path — never a fresh path resolution — producing exactly one of: ready, missing, enrollment required, re-login required, wrong ownership or mode, a `noexec` mount, or a failed access probe. Failed mount, group, or execution lookups SHALL be reported as a failed probe and SHALL NOT be reported as a need to log out. Only the account being enrolled in `v2ray-rs` while the running session does not yet hold that group SHALL ask the user to log out and back in, and that one genuine case remains, because route-helper access is group-only. The connection preflight and the TUN preferences page SHALL use the same classifier and the same resolved path, so their verdicts cannot disagree. Every non-ready classification SHALL map to a host-level error and SHALL end the connection attempt without trying further candidates. When the application runs with effective user ID 0, capability checks SHALL be skipped. Reading file capabilities SHALL be bounded by a timeout; a timeout or a missing capability-reading tool SHALL fail the start with an error naming the cause. When the backend binary resides on a filesystem that does not honor file capabilities, the start SHALL fail with an error naming the path and the manual `setcap` command. A failure of any of these checks SHALL end the connection attempt without trying further candidates.
 
 #### Scenario: Missing capabilities block TUN start
 - **WHEN** TUN is enabled but the backend binary lacks `CAP_NET_ADMIN`
@@ -49,8 +49,28 @@ The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN
 - **THEN** the system SHALL NOT spawn the backend and SHALL surface the "Grant TUN privileges" action
 
 #### Scenario: Route helper not executable yet
-- **WHEN** xray TUN is enabled and the relocated route helper exists but this process cannot execute it
+- **WHEN** xray TUN is enabled, the stored route helper exists with correct `root:v2ray-rs` `0750` ownership and mode, the invoking account is in `v2ray-rs`, and the running session does not hold that group yet
 - **THEN** the system SHALL NOT spawn the backend and SHALL tell the user to log out and back in to finish enabling TUN
+
+#### Scenario: Wrong helper ownership or mode is not a logout
+- **WHEN** the stored route helper exists but is not owned by `root:v2ray-rs` with mode `0750`
+- **THEN** the start SHALL fail without spawning, with an error naming the required ownership and mode and pointing at the grant action, and SHALL NOT ask the user to log out
+
+#### Scenario: Account not enrolled in the helper group
+- **WHEN** the stored route helper has correct ownership and mode and the dedicated group exists, but the invoking account is not a member of it
+- **THEN** the start SHALL fail without spawning, with an error naming the required group membership and the grant action
+
+#### Scenario: Helper on a noexec filesystem
+- **WHEN** the stored route helper resides on a filesystem mounted `noexec`
+- **THEN** the start SHALL fail without spawning, with an error naming the path and the filesystem, and SHALL NOT ask the user to log out or to re-grant
+
+#### Scenario: Helper access cannot be probed
+- **WHEN** the mount options covering the helper cannot be read, the helper group cannot be resolved, or the execution check fails with an unexpected error
+- **THEN** the start SHALL fail without spawning with an error stating that route-helper access could not be verified and the underlying detail, and SHALL NOT ask the user to log out
+
+#### Scenario: Startup and preferences agree
+- **WHEN** the stored route helper is classified by the connection preflight and the TUN preferences page reads the same helper
+- **THEN** both SHALL report the same classification and the same resolved path, and neither SHALL re-resolve a different helper
 
 #### Scenario: Route helper missing
 - **WHEN** xray TUN is enabled and no route helper can be found
@@ -70,7 +90,31 @@ The system SHALL require the backend binary to hold `CAP_NET_ADMIN` before a TUN
 
 #### Scenario: One-time grant via pkexec
 - **WHEN** the user invokes "Grant TUN privileges"
-- **THEN** the system SHALL run a single `pkexec` elevation that applies `cap_net_admin,cap_net_bind_service,cap_net_raw+ep` to the backend binary and `cap_net_admin+ep` to the route helper, sets root ownership and the setuid bit on the `v2ray-rs-run` wrapper when it is present, then re-detect capabilities
+- **THEN** the system SHALL run a single `pkexec` elevation that applies `cap_net_admin,cap_net_bind_service,cap_net_raw+ep` to the backend binary and `cap_net_admin+ep` to the route helper, enrolls the invoking account in the `v2ray-rs` group, sets `root:v2ray-rs` ownership before mode `0750` on the route helper and mode `4750` on the `v2ray-rs-run` wrapper when it is present, applies every ownership change before every mode change and every capability change, and then verifies the installed result by identity rather than trusting the exit status
+
+#### Scenario: Grant refuses unsafe mutation targets
+- **WHEN** an existing mutation target is a symlink or not a regular file, is not root-owned, or is writable by non-root accounts, or one of its parent directories is not a protected root-owned directory, or its recorded `device:inode` identity changed between the pre-elevation check and the elevated script
+- **THEN** the grant SHALL refuse before any mutation, naming the path and the reason and pointing at installing the distribution package or asking an administrator, and SHALL NOT promote a user-owned or user-writable file through ownership changes
+
+#### Scenario: Grant refuses a root caller
+- **WHEN** the application runs with real or effective user ID 0 and a grant is invoked
+- **THEN** the grant SHALL refuse to enroll uid 0 before planning or elevating, telling the user to run the application as a non-root account
+
+#### Scenario: Group-only access is preserved, ACLs untouched
+- **WHEN** the helper or the wrapper carries access ACL entries
+- **THEN** the grant SHALL preserve existing entries, SHALL refuse a mode change that would activate dormant named entries, SHALL refuse when the access ACL cannot be verified, and SHALL NOT add or remove any ACL entry
+
+#### Scenario: Grant verifies the installed result
+- **WHEN** the elevation exits successfully
+- **THEN** the system SHALL verify the installed helper's identity, regular-file status, `root:v2ray-rs` ownership, mode `0750`, capability, and the account's enrollment, the wrapper's `root:v2ray-rs` ownership and mode `4750` when present, and the backend's unchanged identity and capability, and SHALL report the grant as unverified rather than successful when any check fails
+
+#### Scenario: Relocated helper is verified by its new identity
+- **WHEN** a relocating grant installs a fresh copy of the route helper
+- **THEN** the elevated script SHALL emit exactly one `helper-identity=<device>:<inode>` record, the system SHALL verify the installed copy against that identity rather than the replaced inode, and SHALL fail verification on missing, malformed, additional, or mismatched output
+
+#### Scenario: Genuine enrollment needs one log-out
+- **WHEN** a grant enrolls the account in the `v2ray-rs` group
+- **THEN** the system SHALL state that one log-out and log-in is required before the running session can execute the helper, and SHALL NOT report the current session as ready
 
 #### Scenario: Capabilities lost after upgrade
 - **WHEN** the backend binary is replaced (e.g. a package upgrade) and loses its capabilities
@@ -232,7 +276,7 @@ The system SHALL start TUN connections on a host whose kernel has no IPv6 suppor
 - **THEN** Connect SHALL fail without spawning a backend or trying any candidate, and the user SHALL see an error naming disabled kernel IPv6 and the IPv6 tunnel address setting
 
 ### Requirement: xray TUN connections pass excluded routes to the route helper
-For an xray TUN connection, the system SHALL pass every entry of the effective `tun.exclude_routes` to the route helper as an exclusion, built from the same effective settings the config was generated from. The generated xray routing rule sending those CIDRs to `direct` SHALL remain. sing-box connections SHALL keep expressing exclusions through `route_exclude_address` and SHALL NOT invoke the helper for them. Each excluded route SHALL be refused by settings validation when its prefix length is 0, and more than 256 excluded routes SHALL be refused, so the TUN preferences reject such an entry before it is saved and config generation fails with an error naming the value instead of the helper refusing it at connect.
+For an xray TUN connection, the system SHALL pass every entry of the effective `tun.exclude_routes` to the route helper as an exclusion, built from the same effective settings the config was generated from. The generated xray routing rule sending those CIDRs to `direct` SHALL remain. sing-box connections SHALL keep expressing exclusions through `route_exclude_address` and SHALL NOT invoke the helper for them. Each excluded route SHALL be refused by settings validation when its prefix length is 0, and more than 256 excluded routes SHALL be refused, so the TUN preferences reject such an entry before it is saved and config generation fails with an error naming the value instead of the helper refusing it at connect. This limit applies to saved settings only; the automatic connected-network entries described below SHALL NOT count toward it.
 
 #### Scenario: Excluded routes reach the helper
 - **WHEN** an xray TUN connection starts with `exclude_routes` `["10.15.12.100/32", "91.230.107.224/32"]`
@@ -249,3 +293,50 @@ For an xray TUN connection, the system SHALL pass every entry of the effective `
 #### Scenario: Too many exclusions are refused
 - **WHEN** settings carry 257 excluded routes
 - **THEN** settings validation SHALL fail
+
+### Requirement: sing-box TUN excludes the host's own attached networks
+For a sing-box TUN connection, the system SHALL collect, without privileges, the prefixes of the interfaces directly attached to the host and merge them into the generated `tun` inbound's `route_exclude_address`, after validating saved settings, so return traffic for an attached network — a Docker bridge, a LAN — is not captured by `auto_route`. Collection SHALL accept IPv4 and IPv6 records of interfaces that are up, SHALL skip loopback and point-to-point interfaces, the configured TUN interface, and the `/0`, `/32`, and `/128` prefixes, SHALL require a same-family contiguous netmask and fail with the interface named when one is missing or invalid, and SHALL return the prefixes sorted and deduplicated. The system SHALL NOT exclude ranges the host is not attached to, such as blanket private address space. Explicit user entries SHALL keep their order and their content, including redundancy; automatic prefixes SHALL be appended, skipping any that duplicate an explicit entry and any whose address family the TUN does not carry. `settings.tun.exclude_routes` SHALL NOT be modified. The snapshot SHALL be taken once per connection before any candidate starts and reused across candidates and crash respawns, and again on a disconnected config regeneration; it is not a route monitor, so a network created after the snapshot is excluded only on the next connect. A collection failure SHALL end the connection with one error naming the failure before any config write, recovery marker, or backend spawn, and no other node SHALL be attempted; a failed regeneration SHALL keep the previously generated file. sing-box SHALL continue to program its own routes and SHALL NOT invoke the privileged route helper, so a sing-box TUN start still requires no route helper.
+
+#### Scenario: Attached bridge prefix is excluded
+- **WHEN** a sing-box TUN connection starts on a host where `docker0` is up with prefix `172.17.0.0/16`
+- **THEN** the generated `route_exclude_address` SHALL contain `172.17.0.0/16` alongside any explicit exclusions, and the connection SHALL NOT invoke the route helper
+
+#### Scenario: Loopback, point-to-point, and TUN prefixes are skipped
+- **WHEN** the host has a loopback address, a point-to-point interface address, and an address on the configured TUN interface
+- **THEN** none of those prefixes SHALL appear in the generated `route_exclude_address`
+
+#### Scenario: Down interfaces are skipped and host routes dropped
+- **WHEN** an interface is down, or a record's prefix is `/0`, `/32`, or `/128`
+- **THEN** that record SHALL contribute no exclusion entry
+
+#### Scenario: Invalid mask fails the collection
+- **WHEN** an eligible interface record has no netmask, or one of the wrong family, or a non-contiguous one
+- **THEN** the collection SHALL fail naming the interface and the cause
+
+#### Scenario: Explicit entries keep order and redundancy
+- **WHEN** `exclude_routes` holds explicit entries and the snapshot overlaps one of them
+- **THEN** every explicit entry SHALL remain in its original order, duplicates included, and only the overlapping automatic entry SHALL be dropped
+
+#### Scenario: Inactive address family is not excluded
+- **WHEN** the TUN carries no IPv6 address and the snapshot contains IPv6 prefixes
+- **THEN** no IPv6 prefix SHALL be added to `route_exclude_address`
+
+#### Scenario: Saved exclusions are not rewritten
+- **WHEN** automatic entries are merged into a generated config
+- **THEN** `settings.tun.exclude_routes` SHALL still hold exactly the entries the user configured
+
+#### Scenario: One snapshot serves every candidate
+- **WHEN** a sing-box TUN connection fails over to another candidate or respawns after a crash
+- **THEN** every candidate's generated config SHALL carry the same snapshot, collected once before the first candidate
+
+#### Scenario: Stop during collection
+- **WHEN** the user requests Stop while the connected-network snapshot is still being collected
+- **THEN** no candidate SHALL start and the connection SHALL report `Stopped`
+
+#### Scenario: Collection failure ends the attempt
+- **WHEN** collecting the connected-network prefixes fails
+- **THEN** the connection SHALL report one error beginning with the collection failure, and no config file, recovery marker, or backend process SHALL be created, and no further node SHALL be attempted
+
+#### Scenario: Regeneration failure keeps the previous config
+- **WHEN** a config regeneration with TUN enabled on sing-box cannot collect the connected-network prefixes
+- **THEN** the previously generated config file SHALL be kept, and the failure SHALL be reported in the log and as a notification

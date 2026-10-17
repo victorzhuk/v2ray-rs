@@ -505,8 +505,31 @@ impl App {
             manual_nodes,
         ));
 
+        let connected_subnets: Vec<ipnet::IpNet> = if self.settings.backend.backend_type
+            == BackendType::SingBox
+            && effective_settings.tun.enabled
+        {
+            match v2ray_rs_process::connected_subnets(&effective_settings.tun.interface_name) {
+                Ok(subnets) => subnets,
+                Err(err) => {
+                    let message =
+                        format!("Failed to regenerate config: Collect connected subnets: {err}");
+                    log::error!("{message}");
+                    self.show_toast(&message);
+                    return;
+                }
+            }
+        } else {
+            Vec::new()
+        };
+
         let writer = ConfigWriter::new(&self.settings, &self.paths);
-        match writer.write_config(&nodes, &effective_rules, &effective_settings) {
+        match writer.write_config(
+            &nodes,
+            &effective_rules,
+            &effective_settings,
+            &connected_subnets,
+        ) {
             Ok(path) => log::info!("Regenerated config at {:?}", path),
             Err(e) => {
                 log::error!("Failed to regenerate config: {}", e);

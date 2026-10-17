@@ -506,7 +506,7 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.backend.backend_type = BackendType::Xray;
 
-        let result = writer.write_config(&[insecure_trojan(false)], &[], &settings);
+        let result = writer.write_config(&[insecure_trojan(false)], &[], &settings, &[]);
 
         assert!(matches!(
             result,

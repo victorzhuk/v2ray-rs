@@ -607,7 +607,7 @@ fn local_ruleset_config_passes_sing_box_check() {
 
     let writer = ConfigWriter::new(&settings, &paths);
     let path = writer
-        .write_config(&[ss_node()], &rules, &settings)
+        .write_config(&[ss_node()], &rules, &settings, &[])
         .unwrap();
     let json = std::fs::read_to_string(&path).unwrap();
     let config: serde_json::Value = serde_json::from_str(&json).unwrap();

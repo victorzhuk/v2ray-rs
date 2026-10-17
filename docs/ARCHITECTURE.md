@@ -74,6 +74,12 @@ serialises the result to JSON, and delegates to `atomic_write()` in
 `crates/core/src/fs.rs`: write to a `NamedTempFile` in the same directory,
 `sync_all`, then `persist` (rename). The generated file gets 0o600.
 
+`write_config()` takes a `connected_subnets: &[ipnet::IpNet]` snapshot as its
+fourth argument. Settings validation runs first and is unchanged, then — for
+sing-box only, and only when `tun.enabled` — `apply_connected_subnets()` merges
+the snapshot into the generated `tun` inbound's `route_exclude_address`. Other
+backends and TUN-off ignore it; every other caller passes `&[]`.
+
 `RoutingManager` wraps rule CRUD with auto-persist. `GeodataManager` handles
 geodata downloads and metadata: `.dat` whole-file for v2ray/xray, per-tag `.srs`
 rule-sets for sing-box. `GeodataIndexManager` builds a searchable tag index (proto
@@ -130,7 +136,11 @@ a stop releases it.
 a single `pkexec` elevation (one shell invocation, paths passed as positional
 args to avoid injection). `tun.rs` holds `TunRuntime` and the xray-specific
 helpers: `wait_for_device()` polls `/sys/class/net/<iface>`, then invokes
-`netctl xray-up`. sing-box programs its own routes via `auto_route`. Each
+`netctl xray-up`. sing-box programs its own routes via `auto_route`. `tun.rs` also
+holds `connected_subnets()`, one unprivileged `getifaddrs()` snapshot of the
+host's directly attached prefixes, and `helper_access()`, the single classifier
+that decides whether the stored route helper is usable — both described under
+"Privileged / TUN model" below. Each
 call's bound is a named constant: the device wait uses `DEVICE_TIMEOUT`, the
 `netctl xray-up`/`xray-down` calls and the startup `recover` pass use
 `HELPER_TIMEOUT` — all 10s (`recover_tun_session` reuses `HELPER_TIMEOUT`; there
@@ -258,15 +268,120 @@ TUN mode requires two non-GUI binaries to hold elevated capabilities:
 | `v2ray-rs-netctl` | `setcap`, `0750 root:v2ray-rs` | `cap_net_admin+ep` |
 | `v2ray-rs-run` | `chown root:v2ray-rs` + `chmod 4750` | SUID (drops to bypass user) |
 
-All three are granted in one `pkexec` elevation: a shell script with all paths
-passed as positional parameters (`$1`..`$5`) so a user-controlled path with
-shell metacharacters cannot inject commands.
+All three are granted in one `pkexec` elevation: a shell script with every path,
+capability string, group name, account name, and recorded identity passed as
+quoted positional parameters (eleven for `InPlace`, ten for `Relocate`) so a
+user-controlled value with shell metacharacters cannot inject commands.
 
 `privilege::file_caps_supported()` reads `/proc/self/mounts` and refuses to
 grant on a `nosuid` mount, surfacing the manual `setcap` command instead.
 
+### Attached networks are excluded from sing-box capture
+
+`sing-box`'s `auto_route` captures everything that does not match a more
+specific host route, which swallows return traffic for directly attached
+networks — a Docker bridge on `172.17.0.0/16` whose replies must arrive on
+that bridge. `process::tun::connected_subnets()` therefore collects one
+unprivileged snapshot of the host's directly attached prefixes with a single
+`getifaddrs()`: `IFF_UP` records only, loopback, point-to-point interfaces and
+the configured TUN interface excluded by name, `/0`, `/32` and `/128` prefixes
+skipped, missing or non-contiguous masks an `InvalidData` error naming the
+interface. The result is sorted and deduplicated.
+
+The connection task collects it once, through `spawn_blocking`, before the
+candidate loop and after lifecycle locking, queued-stop handling, and orphan
+cleanup, and reuses the one snapshot across every candidate and crash respawn.
+A Stop that arrives during collection is honored before any candidate starts.
+A collection or join failure ends the connection in one terminal
+`ProcessState::Error` starting with `Collect connected subnets: `, before any
+config write, marker, or backend spawn, and no other node is attempted.
+`App::regenerate_config_with` repeats the same gate and, on failure, keeps the
+previously generated file and reports
+`Failed to regenerate config: Collect connected subnets: {err}`.
+
+`core::config::singbox::apply_connected_subnets()` merges that snapshot into
+`route_exclude_address` after user-settings validation: explicit entries keep
+their order and any redundancy they carry, automatic prefixes are appended
+sorted and deduplicated and skipped where they duplicate an explicit entry,
+and only address families present in `tun.addresses()` are added. A `/0`
+automatic prefix is refused through the same `ExcludeRouteCoversAll` error a
+typed `/0` gets. `settings.tun.exclude_routes` is never modified — the
+snapshot exists only in the generated file — and the 256-entry limit continues
+to apply to explicit saved settings alone.
+
+Two limits are load-bearing. The snapshot is taken at connect time and at a
+disconnected regeneration, so a bridge created mid-session is excluded only on
+the next connect; nothing monitors routes or interfaces. And only prefixes the
+host is directly attached to are excluded, never blanket RFC1918 ranges: a
+destination outside every attached prefix stays captured by `auto_route`.
+
+sing-box keeps programming its own routes. No privileged helper call is added,
+and a sing-box TUN start still runs without the route helper installed.
+
+### Route-helper readiness is classified once
+
+`tun::helper_access(path)` is the single classifier over the exact stored
+`TunRuntime.helper_path` — the path the launch path would execute, never a
+fresh resolution. It returns `Ready`, `Missing`, `EnrollmentRequired`,
+`ReloginRequired`, `Permissions`, `NoExec`, or `ProbeFailed(detail)`, and
+`ProcessError::from_helper_access()` maps every non-`Ready` state onto a
+host-level error. `ProcessManager` and the TUN preferences page both consume it,
+so startup and the preferences page can no longer disagree about the same
+file. Only xray is gated: sing-box skips the helper gates entirely.
+
+The states follow from the collected facts — mount state, ownership and mode
+verdict, live primary-plus-supplementary membership, account membership from
+`getgrouplist()`, and `access(X_OK)` — with failed lookups staying errors
+rather than becoming negative answers. `ReloginRequired` is reserved for a
+genuine stale session: the account is in `v2ray-rs` but the running process
+does not hold the group yet. Because access is group-only, one log-out and
+log-in after enrollment is still required, and only that case asks for it.
+Wrong owner, mode, or group is `Permissions`; an absent dedicated group is
+`EnrollmentRequired`; a `noexec` mount is `NoExec`; unreadable mount data or an
+unexpected execution error is `ProbeFailed`, never a logout instruction.
+
+### Grant refuses unsafe targets and verifies its own result
+
+`privilege::grant()` refuses a root caller (`RootEnrollment`) before planning or
+elevating, since enrolling uid 0 in the helper group grants nothing. Before
+elevation, and again inside the elevated script before the first mutation, each
+mutation target — the backend in both plans, plus the helper and optional
+`v2ray-rs-run` wrapper — must be a non-symlink regular file, root-owned, free of
+group/other write bits, and unchanged in its recorded decimal `device:inode`
+identity; every canonical parent through `/` must be a root-owned,
+non-group/other-writable directory. A user-owned or writable target is refused
+with `UnsafeGrantTarget` rather than promoted through `chown`, because a
+previously opened writable descriptor would survive that change.
+
+The elevated script re-resolves the invoking account name and requires the same
+nonzero UID recorded before the prompt, ensures the dedicated group (only a
+`getent` missing-key status 2 may create it), enrolls with `usermod -aG`, then
+sets `root:v2ray-rs` ownership before `0750` on the helper, `4750` on the
+wrapper, and the capability sets last, because `chown` clears both file
+capabilities and the setuid bit.
+
+Access is group-only and no ACL is added. Operator-configured ACLs are
+preserved, but a mode repair can enlarge an existing group mask and activate
+dormant named entries, so `getfacl -a -c -n -E` is read (bounded, `LC_ALL=C`)
+before elevation and repeated under it. Malformed output, a missing `getfacl`,
+or a target group mask of `r-x` broader than the current one refuses before any
+mutation; existing entries are never stripped.
+
+After a successful elevation the result is verified by identity rather than by
+exit status: the installed helper must be a regular file whose identity,
+ownership, and `0750` mode match, with `cap_net_admin` present and the account
+enrolled; an optional wrapper must match `root:v2ray-rs` `4750`; the backend
+keeps its identity and capability. A relocating plan installs a fresh inode, so
+its script prints one `helper-identity=<device>:<inode>` record that stdout
+must contain and nothing else, and the installed helper is checked against that
+new identity rather than the replaced one. Both a ready helper and a genuine
+`ReloginRequired` mean provisioning succeeded — the running session is never
+required to have acquired the group.
+
 The xray start sequence in `ProcessManager`:
-1. `has_net_admin(binary)` — fail early if capability is missing.
+1. `helper_access(stored helper_path)` — refuse a missing, unenrolled, mis-owned,
+   `noexec`, or unprobeable helper, and `has_net_admin(binary)` — fail early if
+   the capability is missing.
 2. Spawn backend process.
 3. `wait_for_device(iface, 10s)` — poll `/sys/class/net/<iface>`.
 4. `netctl xray-up` — program address and split routes.
@@ -406,21 +521,33 @@ Constraints on the relocating elevation:
   package hook creates. The invoker's *primary* group is deliberately not used:
   where a distribution shares one across accounts (gid 100 `users`), that would
   hand every local user a `cap_net_admin` binary. The elevation adds the invoker
-  to the group, so the first grant needs a re-login — `tun::helper_needs_relogin()`
-  detects that and the preferences page says so.
+  to the group, so the first grant needs a re-login. That stale-session case is
+  `HelperAccess::ReloginRequired`, and both startup and the preferences page
+  read it from the same classifier rather than treating every execution denial
+  as one.
 - The grant rewrites the destination unconditionally, so re-granting is the
-  universal repair. `tun::helpers_stale()` compares size and mtime against the
+  universal repair. `tun::helpers_stale(installed)` compares the size and mtime
+  of the given installed helper against the
   bundled copy: the destination's mtime is the time of the last grant, so a
   newer source is exactly the "needs re-granting" condition. It is pure metadata
   because the preferences page polls it on every settings change, on the GTK
   thread — an earlier version spawned `netctl --version` there with no timeout.
-- After the elevation, `grant()` confirms the destination is a regular file
-  carrying `cap_net_admin`. A `getcap` that cannot be run is not treated as
+- After the elevation, `grant()` confirms the newly installed helper by
+  identity, ownership, mode, capability, and enrollment; a relocated copy is a
+  fresh inode, so it is matched against the `helper-identity` record the
+  elevated script prints rather than the replaced inode. A `getcap` that cannot
+  be run is not treated as
   failure: it may simply be absent from the user's `PATH` while the elevation's
   `setcap` worked fine.
 - `preflight_targets()` checks the *destination* directory's mount, not the
   bundled copy's — the latter is known `nosuid`, which is the whole reason for
   relocating.
+- A relocating plan also carries the backend's identity and the invoking UID,
+  plus the destination helper's prior `device:inode` or the literal `absent`,
+  all re-checked under elevation before the destination is created. Missing
+  destination directories are created only below a validated protected parent,
+  never adopting an attacker-owned one. Membership is enrolled with
+  `usermod -aG` unconditionally. The wrapper is not relocated.
 
 `v2ray-rs-run` is deliberately **not** relocated and not shipped in the
 AppImage. It drops to the `v2ray-rs-bypass` system user
@@ -432,7 +559,11 @@ Two residual risks are accepted rather than fixed: a same-user process that
 overwrites the `.AppImage` before a grant (indistinguishable from the existing
 risk of running any downloaded AppImage and then authenticating a root prompt —
 only bundle signature verification would address it), and the TOCTOU window
-between the Rust-side source validation and the root-side `cp`.
+between the Rust-side validation of the streamed payload source and the
+elevation reading it — the source is the caller's to read, not a root-owned
+file, and it carries no recorded identity. The mutation targets it does guard —
+helper, wrapper, backend, destination, and their parent directories — are
+checked twice, before elevation and again inside it.
 
 ## On-disk layout
 
