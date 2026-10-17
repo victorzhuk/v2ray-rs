@@ -139,7 +139,7 @@ pub enum ProxyNodeValidationError {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct VlessConfig {
     pub address: String,
     pub port: u16,
@@ -156,7 +156,22 @@ pub struct VlessConfig {
     pub remark: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+impl std::fmt::Debug for VlessConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VlessConfig")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("uuid", &"***")
+            .field("encryption", &self.encryption)
+            .field("flow", &self.flow)
+            .field("transport", &self.transport)
+            .field("tls", &self.tls)
+            .field("remark", &self.remark)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct VmessConfig {
     pub address: String,
     pub port: u16,
@@ -171,6 +186,21 @@ pub struct VmessConfig {
     pub tls: Option<TlsSettings>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remark: Option<String>,
+}
+
+impl std::fmt::Debug for VmessConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VmessConfig")
+            .field("address", &self.address)
+            .field("port", &self.port)
+            .field("uuid", &"***")
+            .field("alter_id", &self.alter_id)
+            .field("security", &self.security)
+            .field("transport", &self.transport)
+            .field("tls", &self.tls)
+            .field("remark", &self.remark)
+            .finish()
+    }
 }
 
 fn default_vmess_security() -> String {
@@ -527,6 +557,26 @@ mod tests {
                 protocol: "vmess",
                 field: "port",
             })
+        );
+    }
+
+    #[test]
+    fn test_debug_redacts_vless_uuid() {
+        let debug = format!("{:?}", sample_vless());
+        assert!(debug.contains("***"), "missing redaction: {debug}");
+        assert!(
+            !debug.contains("550e8400-e29b-41d4-a716-446655440000"),
+            "uuid leaked: {debug}"
+        );
+    }
+
+    #[test]
+    fn test_debug_redacts_vmess_uuid() {
+        let debug = format!("{:?}", sample_vmess());
+        assert!(debug.contains("***"), "missing redaction: {debug}");
+        assert!(
+            !debug.contains("123e4567-e89b-12d3-a456-426614174000"),
+            "uuid leaked: {debug}"
         );
     }
 

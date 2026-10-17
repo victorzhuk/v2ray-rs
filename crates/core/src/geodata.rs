@@ -199,18 +199,94 @@ pub fn check_and_download(
 }
 
 #[cfg(feature = "geodata-fetch")]
-use std::io::Write;
+use std::io::{Read, Write};
 
 #[cfg(feature = "geodata-fetch")]
-pub fn download_geodata(manager: &GeodataManager) -> Result<GeodataMetadata, GeodataError> {
-    manager.ensure_dir()?;
-    let client = reqwest::blocking::Client::builder()
+const MAX_REDIRECTS: usize = 5;
+
+#[cfg(feature = "geodata-fetch")]
+fn build_client() -> Result<reqwest::blocking::Client, GeodataError> {
+    reqwest::blocking::Client::builder()
         .timeout(GEODATA_DOWNLOAD_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::custom(
+            |attempt| match redirect_verdict(
+                attempt.previous().iter().any(|url| url.scheme() == "https"),
+                attempt.url().scheme(),
+                attempt.previous().len(),
+            ) {
+                Ok(()) => attempt.follow(),
+                Err(_) => attempt.stop(),
+            },
+        ))
         .build()
         .map_err(|e| GeodataError::Download {
             url: String::new(),
             reason: e.to_string(),
-        })?;
+        })
+}
+
+#[cfg(feature = "geodata-fetch")]
+fn redirect_verdict(
+    origin_https: bool,
+    next_scheme: &str,
+    hops: usize,
+) -> Result<(), &'static str> {
+    if origin_https && next_scheme == "http" {
+        return Err("refusing redirect from https to http");
+    }
+    if !matches!(next_scheme, "http" | "https") {
+        return Err("refusing redirect to unsupported scheme");
+    }
+    if hops >= MAX_REDIRECTS {
+        return Err("too many redirects");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "geodata-fetch")]
+fn copy_up_to<R: Read, W: Write + ?Sized>(
+    reader: &mut R,
+    writer: &mut W,
+    max: u64,
+) -> std::io::Result<u64> {
+    std::io::copy(&mut reader.take(max.saturating_add(1)), writer)
+}
+
+#[cfg(feature = "geodata-fetch")]
+fn persist_response(
+    mut response: reqwest::blocking::Response,
+    dir: &Path,
+    url: &str,
+) -> Result<tempfile::NamedTempFile, GeodataError> {
+    if let Some(len) = response.content_length()
+        && len > MAX_GEODATA_SIZE
+    {
+        return Err(GeodataError::Download {
+            url: url.to_string(),
+            reason: format!("response too large (max {MAX_GEODATA_SIZE})"),
+        });
+    }
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).map_err(GeodataError::Io)?;
+    let copied = copy_up_to(&mut response, tmp.as_file_mut(), MAX_GEODATA_SIZE).map_err(|e| {
+        GeodataError::Download {
+            url: url.to_string(),
+            reason: e.to_string(),
+        }
+    })?;
+    if copied > MAX_GEODATA_SIZE {
+        return Err(GeodataError::Download {
+            url: url.to_string(),
+            reason: format!("response too large (max {MAX_GEODATA_SIZE})"),
+        });
+    }
+    tmp.as_file().sync_all().map_err(GeodataError::Io)?;
+    Ok(tmp)
+}
+
+#[cfg(feature = "geodata-fetch")]
+pub fn download_geodata(manager: &GeodataManager) -> Result<GeodataMetadata, GeodataError> {
+    manager.ensure_dir()?;
+    let client = build_client()?;
 
     for dl in GeodataManager::download_urls() {
         let target = manager.geodata_dir().join(&dl.filename);
@@ -229,31 +305,13 @@ pub fn download_geodata(manager: &GeodataManager) -> Result<GeodataMetadata, Geo
             });
         }
 
-        let bytes = response.bytes().map_err(|e| GeodataError::Download {
-            url: dl.url.clone(),
-            reason: e.to_string(),
-        })?;
-
-        if bytes.len() as u64 > MAX_GEODATA_SIZE {
-            return Err(GeodataError::Download {
-                url: dl.url,
-                reason: format!(
-                    "response too large: {} bytes (max {MAX_GEODATA_SIZE})",
-                    bytes.len()
-                ),
-            });
-        }
-
         let dir = target.parent().ok_or_else(|| {
             GeodataError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "download target path has no parent",
             ))
         })?;
-        let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
+        let tmp = persist_response(response, dir, &dl.url)?;
         tmp.persist(&target)
             .map_err(|e| GeodataError::Io(e.error))?;
     }
@@ -279,13 +337,7 @@ pub fn download_singbox_rule_sets(
     let _ = std::fs::remove_file(manager.geodata_dir().join("geoip.db"));
     let _ = std::fs::remove_file(manager.geodata_dir().join("geosite.db"));
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(GEODATA_DOWNLOAD_TIMEOUT)
-        .build()
-        .map_err(|e| GeodataError::Download {
-            url: String::new(),
-            reason: e.to_string(),
-        })?;
+    let client = build_client()?;
 
     for tag in tags {
         if manager.has_rule_set(tag) {
@@ -311,25 +363,7 @@ pub fn download_singbox_rule_sets(
             });
         }
 
-        let bytes = response.bytes().map_err(|e| GeodataError::Download {
-            url: url.clone(),
-            reason: e.to_string(),
-        })?;
-
-        if bytes.len() as u64 > MAX_GEODATA_SIZE {
-            return Err(GeodataError::Download {
-                url,
-                reason: format!(
-                    "response too large: {} bytes (max {MAX_GEODATA_SIZE})",
-                    bytes.len()
-                ),
-            });
-        }
-
-        let mut tmp = tempfile::NamedTempFile::new_in(manager.rule_sets_dir())?;
-        tmp.write_all(&bytes)?;
-        tmp.flush()?;
-        tmp.as_file().sync_all()?;
+        let tmp = persist_response(response, &manager.rule_sets_dir(), &url)?;
         tmp.persist(manager.rule_set_path(tag))
             .map_err(|e| GeodataError::Io(e.error))?;
     }
@@ -530,5 +564,35 @@ mod tests {
         let (_tmp, manager) = test_manager();
         let result = manager.reindex(BackendType::V2ray);
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "geodata-fetch")]
+    #[test]
+    fn copy_up_to_aborts_at_cap() {
+        let mut reader = std::io::Cursor::new(vec![0u8; 512]);
+        let mut sink = Vec::new();
+        let copied = copy_up_to(&mut reader, &mut sink, 100).unwrap();
+        assert_eq!(copied, 101);
+        assert_eq!(sink.len(), 101);
+    }
+
+    #[cfg(feature = "geodata-fetch")]
+    #[test]
+    fn copy_up_to_passes_small_body() {
+        let mut reader = std::io::Cursor::new(vec![0u8; 50]);
+        let mut sink = Vec::new();
+        let copied = copy_up_to(&mut reader, &mut sink, 100).unwrap();
+        assert_eq!(copied, 50);
+        assert_eq!(sink.len(), 50);
+    }
+
+    #[cfg(feature = "geodata-fetch")]
+    #[test]
+    fn redirect_verdict_refuses_downgrade_and_caps_hops() {
+        assert!(redirect_verdict(true, "http", 0).is_err());
+        assert!(redirect_verdict(false, "http", 0).is_ok());
+        assert!(redirect_verdict(true, "https", 4).is_ok());
+        assert!(redirect_verdict(true, "https", MAX_REDIRECTS).is_err());
+        assert!(redirect_verdict(true, "ftp", 0).is_err());
     }
 }
