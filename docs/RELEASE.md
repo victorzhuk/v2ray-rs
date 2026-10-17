@@ -46,6 +46,10 @@ functions.
 2. `cargo check` to regenerate `Cargo.lock`.
 3. Commit as `chore(release): bump version to X.Y.Z`.
 4. `git tag vX.Y.Z && git push --tags`.
+   CI's advisory-audit job reads `Cargo.lock` against the RustSec database and
+   fails the build whenever a resolved dependency carries a vulnerability
+   advisory. A deferred advisory needs a recorded exception naming an owner and
+   a review date.
 
 The tag push runs `helpers` → `tarball` → `appimage` → `release` → `aur`. The
 AUR job runs last on purpose: `updpkgsums` for `v2ray-rs-bin` downloads the

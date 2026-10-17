@@ -59,3 +59,16 @@ jobs:
       - name: Test
         run: |
           su builder -c 'export PATH="$CARGO_HOME/bin:$PATH" HOME=/github/home CARGO_TERM_COLOR=always; cd "$GITHUB_WORKSPACE" && cargo test --workspace --all-targets'
+
+  audit:
+    name: Advisory audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      # Policy: fail the build only on vulnerability advisories in the resolved
+      # Cargo.lock. Unmaintained/yanked-crate warnings are reported without failing.
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ github.token }}
