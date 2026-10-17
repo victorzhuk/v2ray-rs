@@ -1940,6 +1940,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -3584,7 +3585,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-core"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "chrono",
  "directories",
@@ -3606,7 +3607,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-netctl"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "clap",
  "futures",
@@ -3617,8 +3618,9 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-process"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
+ "ipnet",
  "log",
  "nix 0.31.1",
  "serde",
@@ -3626,19 +3628,20 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "uuid",
  "v2ray-rs-core",
 ]
 
 [[package]]
 name = "v2ray-rs-run"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "v2ray-rs-subscription"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "base64",
  "chrono",
@@ -3664,7 +3667,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-tray"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "chrono",
  "ksni",
@@ -3680,7 +3683,7 @@ dependencies = [
 
 [[package]]
 name = "v2ray-rs-ui"
-version = "0.20.0"
+version = "0.20.1"
 dependencies = [
  "base64",
  "chrono",

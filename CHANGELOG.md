@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.1] - 2026-10-17
+
+### Fixed
+- sing-box TUN mode now excludes the host's directly attached interface networks from the tunnel route, so Docker bridge and LAN return traffic is no longer captured.
+- xray TUN setup now reports the real helper blocker instead of always asking for a re-login, and the preferences page shows the same readiness state the startup path enforces.
+- TUN privilege grant now refuses unsafe helper/backend/wrapper targets and verifies the installed result instead of reporting success from the exit status alone.
+
 ## [0.20.0] - 2026-10-12
 
 ### Added
@@ -791,6 +798,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
 [Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...HEAD
+[0.20.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.1...v0.20.0
 [0.19.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.0...v0.19.1
 [0.19.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.18.0...v0.19.0
