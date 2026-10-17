@@ -1550,6 +1550,12 @@ mod tests {
 
     #[test]
     fn unsafe_target_refuses_real_files_owned_by_the_caller() {
+        // The test asserts the non-root verdict "target is not root-owned".
+        // Running as root the temporary file really is root-owned, so the
+        // ownership check cannot be exercised at all.
+        if !crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw()) {
+            return;
+        }
         let dir = tempfile::TempDir::new().unwrap();
         let file = dir.path().join("helper");
         std::fs::write(&file, b"bin").unwrap();

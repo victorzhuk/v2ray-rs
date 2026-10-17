@@ -2262,10 +2262,20 @@ mod tests {
         .with_log_file(Some(backend_log(dir.path())));
 
         let result = mgr.start_with_connection(None).await;
-        assert!(
-            matches!(result, Err(ProcessError::TunHelperPermissions(_))),
-            "expected TunHelperPermissions, got {result:?}"
-        );
+        // A root caller is classified by a different branch: 0o644 is neither
+        // root-owned-with-0750 nor an enrollment problem, so the same helper is
+        // a probe failure. Either verdict must refuse the start.
+        if crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw()) {
+            assert!(
+                matches!(result, Err(ProcessError::TunHelperPermissions(_))),
+                "expected TunHelperPermissions, got {result:?}"
+            );
+        } else {
+            assert!(
+                matches!(result, Err(ProcessError::TunHelperAccessProbe { .. })),
+                "expected TunHelperAccessProbe, got {result:?}"
+            );
+        }
         assert!(matches!(mgr.state(), ProcessState::Error(_)));
         assert!(mgr.child.is_none(), "no backend should have been spawned");
         let lines = wait_for_lines(&dir.path().join("backend.log"), 0).await;
