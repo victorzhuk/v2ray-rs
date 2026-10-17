@@ -1,8 +1,9 @@
 use std::fmt;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -30,6 +31,8 @@ pub enum BackendError {
         expected: BackendType,
         detected: BackendType,
     },
+    #[error("version probe for {path} timed out after {seconds}s")]
+    ProbeTimeout { path: PathBuf, seconds: u64 },
 }
 
 #[derive(Debug, Clone)]
@@ -93,16 +96,62 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+/// Upper bound on a single `version` probe. A hung binary must not stall
+/// backend discovery in the UI.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Runs a command to completion, killing and reaping it if it exceeds
+/// `VERSION_PROBE_TIMEOUT`. Returns a `TimedOut` I/O error on timeout.
+fn run_with_probe_timeout(command: &mut Command) -> std::io::Result<std::process::Output> {
+    command.process_group(0);
+    let deadline = Instant::now() + VERSION_PROBE_TIMEOUT;
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait()? {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                timed_out = true;
+                // The child runs in its own group so descendants holding the
+                // output pipe (a spawned `sleep`, wrappers) die with it.
+                let pgid = nix::unistd::Pid::from_raw(child.id() as i32);
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::SIGKILL);
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(25)),
+        }
+    }
+    let output = child.wait_with_output()?;
+    if timed_out {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "version probe timed out",
+        ));
+    }
+    Ok(output)
+}
+
 fn detect_version(path: &Path) -> Result<String, BackendError> {
     const MAX_RETRIES: u32 = 5;
     let output = {
         let mut last_busy_error = None;
         let mut command_result = None;
         for attempt in 0..MAX_RETRIES {
-            match Command::new(path).arg("version").output() {
+            let mut command = Command::new(path);
+            command.arg("version");
+            match run_with_probe_timeout(&mut command) {
                 Ok(output) => {
                     command_result = Some(output);
                     break;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(BackendError::ProbeTimeout {
+                        path: path.to_path_buf(),
+                        seconds: VERSION_PROBE_TIMEOUT.as_secs(),
+                    });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy => {
                     last_busy_error = Some(err);
@@ -376,6 +425,21 @@ mod tests {
     #[test]
     fn test_auto_select_no_panic() {
         let _ = auto_select();
+    }
+
+    #[test]
+    fn test_detect_version_times_out_hung_binary() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("hung-backend");
+        fs::write(&script, "#!/bin/sh\nsleep 120\n").unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let result = detect_version(&script);
+        let elapsed = started.elapsed();
+
+        assert!(matches!(result, Err(BackendError::ProbeTimeout { .. })));
+        assert!(elapsed < VERSION_PROBE_TIMEOUT + Duration::from_secs(3));
     }
 
     #[test]

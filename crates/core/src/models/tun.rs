@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use super::validation::{
     ValidationError, validate_domain_pattern, validate_exclude_route, validate_ip_cidr,
-    validate_tun_interface_name,
+    validate_tun_address_family, validate_tun_interface_name,
 };
 
 /// Upper bound on `exclude_routes`. The route helper enforces the same cap
@@ -101,9 +101,12 @@ impl TunConfig {
             return Err(ValidationError::InvalidTunMtu(self.mtu));
         }
         validate_ip_cidr(&self.address_v4)?;
+        validate_tun_address_family(&self.address_v4, "address_v4", false)?;
         if let Some(v6) = &self.address_v6 {
             validate_ip_cidr(v6)?;
+            validate_tun_address_family(v6, "address_v6", true)?;
         }
+
         if self.exclude_routes.len() > MAX_EXCLUDE_ROUTES {
             return Err(ValidationError::TooManyExcludedRoutes(
                 self.exclude_routes.len(),
@@ -335,6 +338,43 @@ mod tests {
             bad_exclude.validate(),
             Err(ValidationError::InvalidIpCidr(_))
         ));
+    }
+
+    #[test]
+    fn test_validate_rejects_wrong_family_addresses() {
+        let v6_in_v4 = TunConfig {
+            address_v4: "fd00::1/126".to_string(),
+            ..TunConfig::default()
+        };
+        assert!(matches!(
+            v6_in_v4.validate(),
+            Err(ValidationError::InvalidTunAddressFamily {
+                field: "address_v4",
+                ..
+            })
+        ));
+
+        let v4_in_v6 = TunConfig {
+            address_v6: Some("192.168.1.1/24".to_string()),
+            ..TunConfig::default()
+        };
+        assert!(matches!(
+            v4_in_v6.validate(),
+            Err(ValidationError::InvalidTunAddressFamily {
+                field: "address_v6",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn test_validate_accepts_mixed_family_pair() {
+        let mixed = TunConfig {
+            address_v4: "172.19.0.1/30".to_string(),
+            address_v6: Some("fd00::1/126".to_string()),
+            ..TunConfig::default()
+        };
+        assert!(mixed.validate().is_ok());
     }
 
     #[test]

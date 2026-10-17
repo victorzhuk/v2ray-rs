@@ -39,6 +39,12 @@ pub enum ValidationError {
     TooManyExcludedRoutes(usize),
     #[error("excluded route covers every address: {0}")]
     ExcludeRouteCoversAll(String),
+    #[error("invalid tun address family: {field} must be an {expected} CIDR: {value}")]
+    InvalidTunAddressFamily {
+        field: &'static str,
+        expected: &'static str,
+        value: String,
+    },
     #[error("invalid process name: {0}")]
     InvalidProcessName(String),
 }
@@ -70,6 +76,32 @@ pub fn validate_ip_cidr(cidr: &str) -> Result<(), ValidationError> {
     cidr.parse::<IpNet>()
         .map(|_| ())
         .map_err(|_| ValidationError::InvalidIpCidr(cidr.to_string()))
+}
+
+/// Validates that a TUN interface address belongs to the expected family:
+/// `address_v4` must be IPv4 and `address_v6` must be IPv6. The caller has
+/// already validated the CIDR syntax.
+pub fn validate_tun_address_family(
+    cidr: &str,
+    field: &'static str,
+    v6: bool,
+) -> Result<(), ValidationError> {
+    let net: IpNet = cidr
+        .parse()
+        .map_err(|_| ValidationError::InvalidIpCidr(cidr.to_string()))?;
+    let matches_family = match net {
+        IpNet::V4(_) => !v6,
+        IpNet::V6(_) => v6,
+    };
+    if matches_family {
+        Ok(())
+    } else {
+        Err(ValidationError::InvalidTunAddressFamily {
+            field,
+            expected: if v6 { "IPv6" } else { "IPv4" },
+            value: cidr.to_string(),
+        })
+    }
 }
 
 /// Validates a TUN route exclusion: a CIDR with a non-zero prefix, since a
