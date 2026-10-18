@@ -129,6 +129,7 @@ jobs:
     runs-on: ubuntu-latest
     container: debian:trixie
     steps:
+      - uses: actions/checkout@v6
       - name: Install build dependencies
         run: |
           apt-get update
@@ -172,6 +173,57 @@ jobs:
             --plugin gtk \
             --output appimage
           sha256sum -b v2ray-rs-x86_64.AppImage >v2ray-rs-x86_64.AppImage.sha256
+      - name: Generate installer
+        run: |
+          scripts/gen-installer-appimage.sh "${GITHUB_REF_NAME#v}" \
+            v2ray-rs-x86_64.AppImage install-appimage.sh
+      - name: Assert bundled libraries
+        run: |
+          # The AppImage is contracted to bundle the GTK4 stack it depends on.
+          # libfribidi, libharfbuzz, libfontconfig, libX11, and libwayland-client
+          # are deliberately on the AppImage excludelist and must NOT be asserted.
+          missing=""
+          for lib in libgtk-4.so.1 libadwaita-1.so.0 libpango-1.0.so.0; do
+            find AppDir/usr/lib -name "$lib*" | grep -q . || missing="$missing $lib"
+          done
+          if [ ! -e AppDir/usr/bin/v2ray-rs-netctl ]; then
+            missing="$missing v2ray-rs-netctl"
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::AppImage bundle incomplete, missing:$missing"
+            exit 1
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: appimage
+          path: |
+            v2ray-rs-x86_64.AppImage
+            v2ray-rs-x86_64.AppImage.sha256
+            install-appimage.sh
+          if-no-files-found: error
+
+  appimage-smoke:
+    name: AppImage smoke
+    needs: appimage
+    runs-on: ubuntu-latest
+    # ubuntu:24.04 carries GTK 4.14, below the 4.18 build floor, so nothing
+    # from the build environment can mask a missing bundle entry here.
+    container: ubuntu:24.04
+    steps:
+      - name: Install runtime dependencies
+        run: |
+          apt-get update
+          # Only the base runtime stack the user-facing docs require, never
+          # build deps: a broken bundle must fail against this container.
+          apt-get install -y --no-install-recommends \
+            libgtk-4-1 libadwaita-1-0 xvfb xauth libfuse2t64 fuse3
+      - uses: actions/download-artifact@v4
+        with:
+          name: appimage
+      - name: Verify checksum
+        run: |
+          sha256sum -c v2ray-rs-x86_64.AppImage.sha256
+          chmod +x v2ray-rs-x86_64.AppImage
       - name: Smoke test
         env:
           APPIMAGE_EXTRACT_AND_RUN: '1'
@@ -189,17 +241,10 @@ jobs:
             echo "::error::AppImage exited with $status under Xvfb"
             exit 1
           fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: appimage
-          path: |
-            v2ray-rs-x86_64.AppImage
-            v2ray-rs-x86_64.AppImage.sha256
-          if-no-files-found: error
 
   release:
     name: Publish release
-    needs: [tarball, appimage]
+    needs: [tarball, appimage, appimage-smoke]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
