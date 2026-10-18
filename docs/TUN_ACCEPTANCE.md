@@ -282,6 +282,19 @@ and `TEST_ARGS` defaults to `-- --test-threads=$(TEST_THREADS)`. The explicit
 records visible on passing runs. Without it, cargo captures the test output and
 the markers never reach the operator.
 
+The wrapper was dry-expanded during planning with `make -n`, a dry run that
+prints the commands without executing them. That expansion resolves to the
+process crate, the privileged test binary, one test worker, and the preserved
+passthrough test arguments:
+
+```text
+timeout 5m cargo test -p v2ray-rs-process --locked -j 2 --features privileged-tests --test singbox_routing -- --test-threads=1 --nocapture
+```
+
+Do not execute builds or privileged scenarios while producing or reviewing this
+document. The recorded expansion validates the command; it is not evidence that
+the product passes.
+
 Actor: the test binary, re-executed inside an unprivileged user and network
 namespace. Initial state: each scenario creates its own namespaces and tears
 them down again, and binds its own fixed fixture addresses. No scenario inherits
@@ -349,7 +362,9 @@ Observed reference behavior. On a host whose `/usr/bin/sing-box` is newer than
 the pinned 1.13.x line, the four positive rows pass and print their evidence
 markers, and the positive control fails with the incomplete-reproduction
 diagnostic quoted above. This paragraph explains the cause of that failure. It
-does not soften the verdict.
+does not soften the verdict. This observation is not acceptance evidence and is
+not a substitute for a pinned-snapshot row. The reproduction claim rests only
+on the pinned 1.13.0 and 1.13.14 snapshots.
 
 On any host whose backend is not the pinned 1.13.x line, the
 `positive_control_without_automatic_exclusions` row is recorded as FAIL. It
@@ -361,9 +376,14 @@ An explained failure is still a failure for the purposes of this runbook.
 
 Fixed fixtures for the manual rows:
 
+- Manual row 4 requires a real DNS resolver that answers `tun-accept.test`
+  with the declared records below. A synthetic UDP echo is not a substitute for
+  a valid DNS response.
 - The prepared resolver answers `tun-accept.test` with A `192.0.2.80` and AAAA
   `2001:db8::80`. `192.0.2.0/24` and `2001:db8::/32` are documentation-only
   addresses. They are not public services.
+- Do not reuse the harness's `udp53_bridge` exchange as evidence for manual row
+  4. That fixture is a DNS-shaped probe on port 53, not a resolver transaction.
 - A fresh nonce is recorded before each TCP request. The responder must return
   that exact nonce verbatim.
 - Capture only the relevant connection tuple. A busy bridge produces other
@@ -537,7 +557,7 @@ accompanied by any mutation, is not a pass.
 | Scenario | Fixture and action | Required observation |
 |---|---|---|
 | Packaged precedence | Launch the packaged GUI while a stale relocated helper exists. | Preferences and startup select the packaged helper and agree on status. |
-| InPlace enrollment | Safe root-owned files, tester unenrolled, capabilities missing. Invoke the real Grant. Repeat the group-absent and group-present variants. | Helper identity retained, mode `0750 root:v2ray-rs`, capability exactly `cap_net_admin+ep`. Optional wrapper identity retained, mode `4750 root:v2ray-rs`. Backend identity retained, capability set `cap_net_admin,cap_net_bind_service,cap_net_raw+ep`. |
+| InPlace enrollment | Safe root-owned files, tester unenrolled, capabilities missing. Invoke the real Grant. Repeat the group-absent and group-present variants. | Helper identity retained, mode `0750 root:v2ray-rs`, effective set containing the single name `cap_net_admin`. Optional wrapper identity retained, mode `4750 root:v2ray-rs`. Backend identity retained, effective set containing the three names `cap_net_admin`, `cap_net_bind_service`, `cap_net_raw`. The required observation is those capability names. `setcap` applies them with `+ep` and `getcap` renders the same set as `cap_net_admin,cap_net_bind_service,cap_net_raw=ep`; compare the names, not the printed string. |
 | Genuine logout | Observe the old tester desktop after grant, then perform a complete logout and login. | The old GUI reports logout without a Grant loop. The fresh session has live membership and performs actual xray startup and helper route programming. |
 | FUSE relocation | Real mounted AppImage, protected external backend, absent destination. Repeat with a safe existing destination. | Source bytes unchanged. The installed helper carries the source digest, has a verified new identity, correct metadata and capability, and correct enrollment. Selection moves to `/usr/local/lib/v2ray-rs/v2ray-rs-netctl`. |
 | Replacement evidence | Retain the old relocation inode through a protected hard link. | The new target differs from the retained old inode. Do not rely on an inode number that may be reused. |
@@ -703,6 +723,14 @@ Rules:
 - BLOCKED means a prerequisite or OS-level trigger was missing, with the reason
   recorded.
 - NOT RUN means the scenario was never attempted. Do not merge it into BLOCKED.
+
+When a scenario exposes a product defect:
+
+- Preserve the evidence and record the finding.
+- Do not repair the product as part of this procedure. Do not expand this
+  documentation task into a privilege-policy change.
+- A corrected cause starts a new clean-snapshot campaign under `## Retry
+  policy`.
 
 ## Bounds
 
