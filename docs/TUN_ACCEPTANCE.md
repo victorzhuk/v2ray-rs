@@ -282,6 +282,16 @@ and `TEST_ARGS` defaults to `-- --test-threads=$(TEST_THREADS)`. The explicit
 records visible on passing runs. Without it, cargo captures the test output and
 the markers never reach the operator.
 
+Actor: the test binary, re-executed inside an unprivileged user and network
+namespace. Initial state: each scenario creates its own namespaces and tears
+them down again, and binds its own fixed fixture addresses. No scenario inherits
+state from another.
+
+These rows exercise in-process configuration generation and route selection
+through the crate's public API and a real backend. They do not exercise the GUI.
+The packaged-GUI rows in `## Manual routing scenarios` are the boundary-complete
+counterpart for IPv4 bridge, published service, DNS, and overlapping prefix.
+
 Five scenarios and their required evidence:
 
 | Scenario | Required evidence |
@@ -291,6 +301,20 @@ Five scenarios and their required evidence:
 | `non_connected_private_destination_is_captured` | `route_10.0.0.5=tun0` (TUN selection) and `tcp_10_0_0_5=ok` (packet delivered through the tunnel to a controlled endpoint) |
 | `tun_subnet_inside_attached_bridge_stays_on_tun` | `exclude_contains_172.19.0.0/16=yes`, `route_172.19.0.2=tun0`, `route_172.19.0.100=brwide0` |
 | `directly_attached_dns_bypasses_tun` | `route_172.17.0.2=docker0` and `udp53_bridge=ok` |
+
+Positive control per row, so that no row rests on an unnamed control:
+
+| Scenario | Control it rests on |
+|---|---|
+| `attached_bridge_is_not_captured` | The recorded nonce echo and its connection tuple. A bridge selection without a matching nonce reply proves nothing. |
+| `positive_control_without_automatic_exclusions` | It is itself the suite-wide negative control. Its failure invalidates the reproduction claim. |
+| `non_connected_private_destination_is_captured` | The recorded nonce echo and its connection tuple, as the harness asserts them. |
+| `tun_subnet_inside_attached_bridge_stays_on_tun` | The recorded nonce echo and its connection tuple, as the harness asserts them. |
+| `directly_attached_dns_bypasses_tun` | Its own assertion on the observed route device, `route_172.17.0.2=docker0`, because no nonce exchange is involved. |
+
+Manual rows 5 and 6 rest on their own assertions on the observed route device,
+not on a nonce echo. The markers named in their bullets are the observable
+outcome.
 
 Backend matrix: use separate VM snapshots for sing-box 1.13.0 and sing-box
 1.13.14, both installed at `/usr/bin/sing-box`. Before each run record the binary
@@ -324,8 +348,14 @@ backend version, and logs, and report the reproduction as incomplete.
 Observed reference behavior. On a host whose `/usr/bin/sing-box` is newer than
 the pinned 1.13.x line, the four positive rows pass and print their evidence
 markers, and the positive control fails with the incomplete-reproduction
-diagnostic quoted above. That is the expected shape on such a host, not a
-regression. Run the control on the pinned snapshots for the reproduction claim.
+diagnostic quoted above. This paragraph explains the cause of that failure. It
+does not soften the verdict.
+
+On any host whose backend is not the pinned 1.13.x line, the
+`positive_control_without_automatic_exclusions` row is recorded as FAIL. It
+stays non-PASS in the evidence table, and a non-PASS row prevents acceptance.
+The reproduction claim rests only on the pinned 1.13.0 and 1.13.14 snapshots.
+An explained failure is still a failure for the purposes of this runbook.
 
 ## Manual routing scenarios
 
@@ -394,16 +424,35 @@ row.
 
 ### 5. Non-connected private destination
 
-Use the existing harness row `non_connected_private_destination_is_captured` for
-`10.0.0.5`. Label it Direct-outbound delivery after TUN capture. Do not label it
+- Actor: `tun-tester` for the harness command, as the documented account owner
+  of the source tree the command builds.
+- Fixture: the existing harness fixture for
+  `non_connected_private_destination_is_captured`, targeting `10.0.0.5`.
+- Action: run the harness command from `## Automated routing harness` on the
+  pinned snapshot. No GUI is started for this row.
+- Assertion: the harness prints `route_10.0.0.5=tun0` and `tcp_10_0_0_5=ok`.
+  Both markers must appear in the captured output.
+- Reset: none. The harness tears down its own namespaces.
+
+Label this Direct-outbound delivery after TUN capture. Do not label it
 remote-proxy acceptance.
 
 ### 6. Overlapping prefix
 
-Use the existing harness row `tun_subnet_inside_attached_bridge_stays_on_tun` for
-`172.19.0.0/16` with the TUN `/30`. Require both observed route devices. Never
-request container connectivity at a TUN endpoint address; that address belongs to
-the tunnel, not the container.
+- Actor: `tun-tester` for the harness command, as the documented account owner
+  of the source tree the command builds.
+- Fixture: the existing harness fixture for
+  `tun_subnet_inside_attached_bridge_stays_on_tun`, with `172.19.0.0/16` and
+  the TUN `/30`.
+- Action: run the harness command from `## Automated routing harness` on the
+  pinned snapshot. No GUI is started for this row.
+- Assertion: the harness prints `exclude_contains_172.19.0.0/16=yes`,
+  `route_172.19.0.2=tun0`, and `route_172.19.0.100=brwide0`. Both observed
+  route devices are required.
+- Reset: none. The harness tears down its own namespaces.
+
+Never request container connectivity at a TUN endpoint address; that address
+belongs to the tunnel, not the container.
 
 ### 7. TUN IPv6 enabled
 
@@ -471,6 +520,20 @@ Keep packaged, adversarial InPlace, and actual FUSE AppImage snapshots separate.
 Restore before each independent row. A successful `grant` followed by an old
 session and then a full logout and login is one row, not three.
 
+The table lists the source constant spellings for the expected capability sets.
+Assert the requirement in capability words as well, independently of those
+constants: the helper may hold only `cap_net_admin`, and the backend
+additionally needs `cap_net_bind_service` and `cap_net_raw`, holding nothing
+else. Check the observed `getcap` names against the capability words, not only
+against the constant string. A wrong constant is then detectable instead of
+self-confirming.
+
+The exact refusal message text in this table is evidence detail, not the pass
+criterion. Every refusal row is graded on the outcome: the refusal happens
+before elevation, and no enrollment, ownership, mode, or capability change
+occurs on any target. A refusal carrying a different message, or a refusal
+accompanied by any mutation, is not a pass.
+
 | Scenario | Fixture and action | Required observation |
 |---|---|---|
 | Packaged precedence | Launch the packaged GUI while a stale relocated helper exists. | Preferences and startup select the packaged helper and agree on status. |
@@ -480,15 +543,15 @@ session and then a full logout and login is one row, not three.
 | Replacement evidence | Retain the old relocation inode through a protected hard link. | The new target differs from the retained old inode. Do not rely on an inode number that may be reused. |
 | Outsider denial | A fresh authorized tester and an independent unenrolled outsider execute identical absolute helper and wrapper paths. | The tester programs actual routes. The outsider receives a kernel execution denial. The packaged wrapper runs `id -u` as the bypass user for the tester only. |
 | Safe ACL | Named outsider entry `---`, mask `r-x`, then grant. | The named entry stays unchanged and the outsider stays denied. Record intended group-mask changes separately. |
-| Dormant ACL | Named `r-x` entry masked by `r--`. Repeat the mask reduction during the polkit dialog. | Refusal with `mode change would broaden named ACL access`, and no enrollment or privilege change. |
-| Unsafe targets | Separate backend fixtures: user-owned, non-root-writable, symlinked, unsafe canonical parent. | Refusal before elevation, without adopting ownership. |
-| Identity race | Replace the backend, helper, wrapper, or existing relocated destination with a different inode during the polkit dialog. Test absent and present destination transitions separately. | Refusal with `target identity changed`, compared against a post-intervention baseline. Pre-create destination directories before testing zero mutations. |
-| Account race | Change the captured name-to-uid mapping during the polkit dialog, preserving an independent administrator session. | Refusal with `invoking account changed` before enrollment or target privilege mutation. |
-| Root refusal | Root GUI, valid helper metadata, missing backend capability, then Grant. | Exact refusal `cannot grant TUN group membership to uid 0. Run the application as a non-root account`, no polkit prompt, no mutation. Mark BLOCKED if desktop policy prohibits a root GUI. |
+| Dormant ACL | Named `r-x` entry masked by `r--`. Repeat the mask reduction during the polkit dialog. | Refusal with `mode change would broaden named ACL access`, and no enrollment or privilege change. Outcome: refusal before elevation, with no enrollment, ownership, mode, or capability change on any target. |
+| Unsafe targets | Separate backend fixtures: user-owned, non-root-writable, symlinked, unsafe canonical parent. | Refusal before elevation, without adopting ownership. Outcome: no enrollment, ownership, mode, or capability change on any target. |
+| Identity race | Replace the backend, helper, wrapper, or existing relocated destination with a different inode during the polkit dialog. Test absent and present destination transitions separately. | Refusal with `target identity changed`, compared against a post-intervention baseline. Outcome: refusal before elevation, with no enrollment, ownership, mode, or capability change on any target. Pre-create destination directories before testing zero mutations. |
+| Account race | Change the captured name-to-uid mapping during the polkit dialog, preserving an independent administrator session. | Refusal with `invoking account changed` before enrollment or target privilege mutation. Outcome: no ownership, mode, or capability change on any target, and no enrollment. |
+| Root refusal | Root GUI, valid helper metadata, missing backend capability, then Grant. | Refusal `cannot grant TUN group membership to uid 0. Run the application as a non-root account`, no polkit prompt, no mutation. Outcome: no enrollment, ownership, mode, or capability change on any target. Mark BLOCKED if desktop policy prohibits a root GUI. |
 | Noexec | File-level `noexec` mount over the helper, GUI still executable, no `nosuid` relocation. | Preferences and startup report NoExec, with no Grant and no false logout. |
-| ACL tool unavailable | Hide the real `getfacl` before an InPlace grant. Repeat the hiding during the polkit dialog. | Refusal with `cannot verify access ACL` and no privilege change. This check does not apply to the relocation replacement-inode path. |
-| Capability probe unavailable | Hide the real `getcap`, then separately make it non-executable. | The actual probe error appears, with no Grant loop and no false logout. |
-| Invoker unresolved | Keep the tester GUI alive, remove only its account record, preserve home and the admin session, then Grant. | Refusal with `cannot resolve the invoking account` before polkit. Recover through snapshot restoration. |
+| ACL tool unavailable | Hide the real `getfacl` before an InPlace grant. Repeat the hiding during the polkit dialog. | Refusal with `cannot verify access ACL` and no privilege change. Outcome: refusal before elevation, with no enrollment, ownership, mode, or capability change on any target. This check does not apply to the relocation replacement-inode path. |
+| Capability probe unavailable | Hide the real `getcap`, then separately make it non-executable. | The actual probe error appears, with no Grant loop and no false logout. Outcome: no elevation, and no enrollment, ownership, mode, or capability change on any target. |
+| Invoker unresolved | Keep the tester GUI alive, remove only its account record, preserve home and the admin session, then Grant. | Refusal with `cannot resolve the invoking account` before polkit. Outcome: no elevation, and no enrollment, ownership, mode, or capability change on any target. Recover through snapshot restoration. |
 
 ### Authorized route proof
 
@@ -618,9 +681,24 @@ One table per campaign. Statuses: PASS, FAIL, BLOCKED, NOT RUN.
 
 Rules:
 
+- Before any execution, copy the required row set from `## Required matrix`
+  into this evidence table, with every scenario named. The table is
+  pre-declared, not filled in after the fact.
+- A campaign cannot be graded at all when any required row is missing from the
+  results. An empty table or a partial table is incomplete. It is never passing.
+  Zero non-PASS rows inside an incomplete table is not acceptance.
+- One evidence path per assertion, not one per row. A row with three assertions
+  carries three evidence paths. A single path that cannot be opened does not
+  discharge an assertion.
+- A row is satisfied only by its own named action at its own named boundary.
+  Supporting evidence from another row may corroborate it, never discharge it.
 - A required non-PASS row prevents product acceptance.
-- Documentation completion means the procedure is written, source-checked, and
-  reviewed. It does not require available VM infrastructure.
+- Two separate verdicts. Documentation completion means the procedure is written,
+  source-checked, and reviewed. It does not require available VM infrastructure.
+  Runtime acceptance is a separate verdict and this table records only that one.
+- When no authorized VM is available, the runtime verdict is NOT RUN, with every
+  required row recorded as NOT RUN. Record it explicitly. Never leave the runtime
+  verdict blank and never infer it from documentation completion.
 - Never label an unexecuted scenario PASS because its instructions are complete.
 - BLOCKED means a prerequisite or OS-level trigger was missing, with the reason
   recorded.
