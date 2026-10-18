@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.3] - 2026-10-18
+
+### Added
+- `install-appimage.sh`, a user-local installer for the AppImage: it installs
+  the image to `~/.local/bin/v2ray-rs.AppImage`, extracts the desktop entry
+  and icons from the image and repoints `Exec=` at the installed path, and
+  supports `--uninstall`, `--version TAG`, and `--no-modify-path`. It never
+  runs `sudo` and does not create the `v2ray-rs` group or the `v2ray-rs-bypass`
+  user, so TUN mode still needs the in-app grant plus group membership.
+
+### Fixed
+- The AppImage release check now runs on a host below the GTK build floor with
+  only the GTK runtime libraries installed, and asserts that the bundle carries
+  the GTK and Pango libraries it is contracted to bundle. It previously ran
+  inside the build container, whose own build dependencies satisfied any
+  missing library, so the check could not fail and shipped a bundle whose
+  completeness it never tested.
+- The AppImage is no longer described as self-contained. It relies on the
+  host's base font and rendering stack, which the AppImage excludelist
+  deliberately omits because bundling it is documented to break the image on
+  some distributions.
+
 ## [0.20.2] - 2026-10-18
 
 ### Fixed
@@ -842,6 +864,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
 [Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...HEAD
+[0.20.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...v0.20.1
 [0.20.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.19.1...v0.20.0
