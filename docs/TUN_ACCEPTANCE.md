@@ -506,6 +506,18 @@ Constraints for this command:
   tester desktop. Never from a developer host.
 - Any existing application on that profile must be closed first, or the launch
   activates the outside process instead of starting a new one.
+- This launch is not a privilege drop. `nsenter --net` changes only the network
+  namespace, so the child keeps the administrator's UID, supplementary groups,
+  securebits, and capability bounding set. `runuser` is itself a root-only tool
+  and never prompts for a password. Treat the launched GUI and any process it
+  spawns as root-equivalent for trust purposes, and do not describe evidence from
+  this row as collected by an unprivileged account.
+- `NoNewPrivs` must be unset and the target must not be traced, or the kernel
+  ignores file capabilities at `execve` regardless of what `getcap` prints. The
+  mount must not be `nosuid` for the same reason.
+- Do not attach a controlling terminal to the invoking shell for this command.
+  The launch forwards the administrator's stdio, and a shared terminal widens the
+  `TIOCSTI` injection surface that `runuser` warns about.
 - Verify the actual GUI and backend UIDs, groups, and network namespace before
   treating a route change as authorized evidence:
 
