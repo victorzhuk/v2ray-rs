@@ -9,6 +9,7 @@
 | `install.sh` | `tarball` job | `scripts/install.sh` with the version and digest substituted |
 | `v2ray-rs-x86_64.AppImage` | `appimage` job | bundles GTK 4.18, libadwaita, and `v2ray-rs-netctl` |
 | `v2ray-rs-x86_64.AppImage.sha256` | `appimage` job | |
+| `install-appimage.sh` | `appimage` job | `scripts/install-appimage.sh` with the version substituted; installs the AppImage into a user prefix |
 | `PKGBUILD`, `PKGBUILD-bin` | `release` job | copies of the two Arch recipes |
 
 ## Linkage
@@ -71,13 +72,32 @@ docker run --rm -it debian:trixie sh -c '
   ~/.local/bin/v2ray-rs --help &&
   ~/.local/bin/v2ray-rs-netctl --version'
 
-# The AppImage is self-contained on a host below the GTK floor
+# The AppImage runs on a host below the GTK build floor, given the GTK runtime
 docker run --rm -v "$PWD:/w" -w /w -e APPIMAGE_EXTRACT_AND_RUN=1 \
-  ubuntu:24.04 ./v2ray-rs-x86_64.AppImage --help
+  ubuntu:24.04 sh -c '
+  apt-get update -qq &&
+  apt-get install -y -qq libgtk-4-1 libadwaita-1-0 xvfb xauth &&
+  ./v2ray-rs-x86_64.AppImage --help &&
+  status=0
+  xvfb-run --auto-servernum timeout 20 ./v2ray-rs-x86_64.AppImage \
+    --profile development || status=$?
+  [ "$status" -eq 0 ] || [ "$status" -eq 124 ]'
 ```
 
-Re-running `install.sh` must be idempotent, and `install.sh --uninstall` must
-leave no files behind under the prefix.
+`ubuntu:24.04` carries GTK 4.14, below the 4.18 build floor, so nothing from
+the build environment can mask a missing bundle entry. The two `apt-get`
+packages are the supported minimum, not a workaround: a host carrying none of
+the GTK stack is not a supported configuration, and the check would fail there.
+
+What the check proves is narrow. `--help` exits before GTK initialisation, so
+it proves the bundled loader resolves every library the bundle provides, and
+nothing more. Only the `xvfb-run` step opens a window, exercising the pixbuf
+loaders, GSettings schemas and the icon theme, which is where GTK4 bundling
+actually breaks. Exit 124 is `timeout` expiring on a healthy long-running
+window; any other nonzero status fails the check.
+
+Re-running either installer must be idempotent, and `--uninstall` on either one
+must leave no files behind under the prefix.
 
 ## AppImage payload
 
@@ -87,6 +107,26 @@ creates, so a setuid-root copy shipped in an AppImage could not work. The
 bundled `netctl` is inert where it sits — the squashfs is `nosuid` — and exists
 only as the source the privileged grant copies to `/usr/local/lib/v2ray-rs/`.
 See the TUN section of `docs/ARCHITECTURE.md`.
+
+The AppImage is not self-contained. It bundles GTK 4.18, libadwaita 1.7 and the
+GTK and Pango module trees, so it runs on hosts below the GTK build floor, but
+it relies on the host for the base font and rendering stack the AppImage
+excludelist deliberately leaves out: GLib, Pango, fontconfig, harfbuzz, fribidi,
+and the X11 and Wayland client libraries. Upstream excludes them because
+bundling them is documented to break AppImages on some distributions — symbol
+conflicts against a system X11, interaction with Mesa, and font rendering
+stalls. The exclusion is a deliberate upstream decision, not an oversight.
+
+The image also does not carry FUSE, a desktop session, or a proxy backend. It
+needs FUSE to mount, with `APPIMAGE_EXTRACT_AND_RUN=1` as a slower fallback that
+extracts and runs in place, an X11 or Wayland session to draw in, and one of
+v2ray, xray or sing-box installed on the host.
+
+`install-appimage.sh` installs the image into a user prefix. It extracts the
+desktop entry and the icons out of the squashfs and rewrites `Exec=` to the
+installed path, because the baked `Exec=v2ray-rs` only resolves when `$PREFIX/bin`
+is on `$PATH` and it is not, from a desktop launcher. `$PREFIX/share/locale`
+stays empty on purpose: the image carries its own gettext catalogs.
 
 ## The AUR packages
 
