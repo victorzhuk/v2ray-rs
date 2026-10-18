@@ -68,8 +68,8 @@ sh install.sh --uninstall                       # remove it again
 
 ### AppImage
 
-Self-contained, bundles GTK 4.18 and libadwaita — use it when your distribution
-ships something older.
+Bundles GTK 4.18, libadwaita 1.7 and the GTK/Pango module trees — use it when
+your distribution ships something older.
 
 ```bash
 curl -fsSLO https://github.com/victorzhuk/v2ray-rs/releases/latest/download/v2ray-rs-x86_64.AppImage
@@ -77,14 +77,46 @@ chmod +x v2ray-rs-x86_64.AppImage
 ./v2ray-rs-x86_64.AppImage
 ```
 
-TUN mode works, with one extra step. An AppImage is mounted `nosuid`, so the
-route helper cannot hold `cap_net_admin` where it sits — **Grant TUN
-privileges** in the TUN preferences installs it to `/usr/local/lib/v2ray-rs/`
-during the same `pkexec` prompt and grants it there. Re-run the grant after
-updating the AppImage; the app prompts when it notices a stale helper.
+Or let the installer do it:
+
+```bash
+curl -fsSL https://github.com/victorzhuk/v2ray-rs/releases/latest/download/install-appimage.sh | sh
+```
+
+```bash
+sh install-appimage.sh --version v0.20.3   # pin a release
+sh install-appimage.sh --uninstall         # remove it again
+sh install-appimage.sh -v                  # verbose
+sh install-appimage.sh -q                  # quiet
+sh install-appimage.sh --no-modify-path    # leave shell rc files alone
+```
+
+It installs under `$HOME/.local` by default, same as the tarball installer:
+
+| Path | Contents |
+| --- | --- |
+| `bin/v2ray-rs.AppImage` | the image itself, suffix kept so its runtime detects itself |
+| `share/applications/` | desktop entry, `Exec=` rewritten to the installed path |
+| `share/icons/hicolor/` | app and symbolic icons |
+| `env`, `env.fish` | shell snippets adding `bin/` to `PATH` |
+
+The image is not self-contained. It relies on the host for the base font and
+rendering stack its excludelist deliberately drops — GLib, Pango, fontconfig,
+harfbuzz, fribidi, and the X11 and Wayland client libraries — plus FUSE (or set
+`APPIMAGE_EXTRACT_AND_RUN=1` as a slower fallback), a desktop session to draw
+in, and a backend binary, which the image does not bundle.
+
+The script never runs `sudo`, and it does not create the `v2ray-rs` group or the
+`v2ray-rs-bypass` user, so TUN mode still needs **Grant TUN privileges** in the
+TUN preferences plus membership of the `v2ray-rs` group. An AppImage is mounted
+`nosuid`, so the route helper cannot hold `cap_net_admin` where it sits — the
+grant installs it to `/usr/local/lib/v2ray-rs/` during the same `pkexec` prompt
+and grants it there. Re-run the grant after updating the AppImage; the app
+prompts when it notices a stale helper.
 
 *Run with bypass* is unavailable from an AppImage: it needs the
-`v2ray-rs-bypass` system user, which only a distribution package creates.
+`v2ray-rs-bypass` system user and the setuid wrapper, neither of which the
+AppImage carries.
 
 ### Arch Linux (AUR)
 
