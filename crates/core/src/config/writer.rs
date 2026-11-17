@@ -54,7 +54,7 @@ impl ConfigWriter {
         settings: &AppSettings,
         connected_subnets: &[ipnet::IpNet],
     ) -> Result<PathBuf, ConfigError> {
-        validate_runtime_inputs(nodes, settings)?;
+        validate_runtime_inputs(nodes, rules, settings)?;
 
         let backend = settings.backend.backend_type;
         let generator = generator_for(backend);
@@ -128,9 +128,18 @@ fn apply_singbox_cache_file(
     config["experimental"]["cache_file"] = cache_file;
 }
 
-fn validate_runtime_inputs(nodes: &[ProxyNode], settings: &AppSettings) -> Result<(), ConfigError> {
+fn validate_runtime_inputs(
+    nodes: &[ProxyNode],
+    rules: &[RoutingRule],
+    settings: &AppSettings,
+) -> Result<(), ConfigError> {
     for node in nodes {
         node.validate()?;
+    }
+
+    for rule in rules {
+        crate::models::validate_rule_match(&rule.match_condition)
+            .map_err(ConfigError::InvalidRule)?;
     }
 
     if settings.dns.enabled {
@@ -477,6 +486,26 @@ mod tests {
 
         let result = writer.write_config(&nodes, &[], &settings, &[]);
         assert!(matches!(result, Err(ConfigError::InvalidProxyNode(_))));
+    }
+
+    #[test]
+    fn test_write_config_rejects_invalid_routing_rule() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let settings = AppSettings::default();
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::Domain {
+                pattern: "bad_domain.com".into(),
+            },
+            action: RuleAction::Direct,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }];
+
+        let result = writer.write_config(&sample_nodes(), &rules, &settings, &[]);
+        assert!(matches!(result, Err(ConfigError::InvalidRule(_))));
     }
 
     #[test]

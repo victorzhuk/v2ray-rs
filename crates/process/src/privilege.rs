@@ -1065,6 +1065,14 @@ EOF\n\
                [ \"$rc\" = 2 ] || refuse \"group lookup failed: $5\"\n\
                groupadd --system \"$5\" || refuse \"group creation failed: $5\"\n\
              fi\n\
+             if [ -n \"$7\" ]; then\n\
+               if getent passwd v2ray-rs-bypass >/dev/null 2>&1; then :\n\
+               else\n\
+                 rc=$?\n\
+                 [ \"$rc\" = 2 ] || refuse \"account lookup failed: v2ray-rs-bypass\"\n\
+                 useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin v2ray-rs-bypass || refuse \"bypass account creation failed\"\n\
+               fi\n\
+             fi\n\
              usermod -aG \"$5\" -- \"$6\" || refuse \"enrollment failed: $6\"\n\
              chown \"root:$5\" \"$4\" || refuse \"ownership change failed: $4\"\n\
              chmod 0750 \"$4\" || refuse \"mode change failed: $4\"\n\
@@ -1441,6 +1449,18 @@ mod tests {
         // the source lives on; any command naming it would fail with EACCES.
         assert!(script.contains("cat > \"$5\""));
         assert!(!script.contains("cp "));
+    }
+
+    #[test]
+    fn inplace_script_provisions_the_bypass_user() {
+        let script = grant_script(&in_place(Some("/usr/bin/v2ray-rs-run")));
+        assert!(script.contains("if [ -n \"$7\" ]"));
+        assert!(script.contains("getent passwd v2ray-rs-bypass"));
+        assert!(script.contains(
+            "useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin v2ray-rs-bypass"
+        ));
+        // The account must exist before the wrapper is made setuid.
+        assert!(script.find("useradd --system").unwrap() < script.find("chmod 4750 \"$7\"").unwrap());
     }
 
     #[test]

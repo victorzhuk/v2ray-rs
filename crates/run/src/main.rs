@@ -1,24 +1,29 @@
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::os::unix::ffi::OsStringExt;
 
 use libc::{c_char, gid_t, uid_t};
 
 const BYPASS_USER: &str = "v2ray-rs-bypass";
 
-const DANGEROUS_ENV: &[&str] = &[
-    "LD_PRELOAD",
-    "LD_LIBRARY_PATH",
-    "LD_AUDIT",
-    "LD_DEBUG",
-    "LD_ORIGIN_PATH",
-    "GCONV_PATH",
-    "HOSTALIASES",
-    "IFS",
-    "TMPDIR",
-    "NLSPATH",
+/// Only session variables a desktop application needs. Everything else is
+/// dropped, including loader, interpreter, and module-injection hooks.
+const ALLOWED_ENV: &[&str] = &[
+    "TERM",
+    "LANG",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "XDG_RUNTIME_DIR",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "XAUTHORITY",
 ];
 
 const SAFE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+struct BypassUser {
+    uid: uid_t,
+    gid: gid_t,
+    home: Option<String>,
+}
 
 fn main() {
     let argv = match read_argv() {
@@ -29,14 +34,14 @@ fn main() {
         Ok(c) => c,
         Err(e) => die(e),
     };
-    let (uid, gid) = match resolve_bypass_user() {
+    let user = match resolve_bypass_user() {
         Ok(v) => v,
         Err(e) => die(e),
     };
-    if let Err(e) = drop_privileges(uid, gid) {
+    if let Err(e) = drop_privileges(user.uid, user.gid) {
         die(e);
     }
-    let sanitized = sanitize_env(&std::env::vars().collect::<Vec<_>>());
+    let sanitized = sanitize_env(&std::env::vars().collect::<Vec<_>>(), &user);
     apply_env(&sanitized);
     exec_command(&command);
 }
@@ -54,23 +59,34 @@ fn command_argv(argv: &[CString]) -> Result<Vec<CString>, &'static str> {
     Ok(argv[1..].to_vec())
 }
 
-fn resolve_bypass_user() -> Result<(uid_t, gid_t), &'static str> {
+fn resolve_bypass_user() -> Result<BypassUser, &'static str> {
     resolve_user(BYPASS_USER)
 }
 
-fn resolve_user(name: &str) -> Result<(uid_t, gid_t), &'static str> {
+fn resolve_user(name: &str) -> Result<BypassUser, &'static str> {
     let name = CString::new(name).map_err(|_| "invalid user name")?;
-    let (uid, gid) = unsafe {
+    let (uid, gid, home) = unsafe {
         let pw = libc::getpwnam(name.as_ptr());
         if pw.is_null() {
             return Err("user not found");
         }
-        ((*pw).pw_uid, (*pw).pw_gid)
+        let home = if (*pw).pw_dir.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr((*pw).pw_dir)
+                .to_string_lossy()
+                .into_owned()
+        };
+        ((*pw).pw_uid, (*pw).pw_gid, home)
     };
     if uid == 0 || gid == 0 {
         return Err("bypass user must not resolve to root");
     }
-    Ok((uid, gid))
+    Ok(BypassUser {
+        uid,
+        gid,
+        home: (!home.is_empty()).then_some(home),
+    })
 }
 
 fn drop_privileges(uid: uid_t, gid: gid_t) -> Result<(), &'static str> {
@@ -84,20 +100,49 @@ fn drop_privileges(uid: uid_t, gid: gid_t) -> Result<(), &'static str> {
         if libc::setresuid(uid, uid, uid) != 0 {
             return Err("setresuid failed");
         }
-        if libc::getuid() != uid || libc::geteuid() != uid || libc::getgid() != gid {
-            return Err("privilege drop verification failed");
+
+        let (mut ruid, mut euid, mut suid) = (0, 0, 0);
+        if libc::getresuid(&mut ruid, &mut euid, &mut suid) != 0 {
+            return Err("getresuid failed");
+        }
+        if ruid != uid || euid != uid || suid != uid {
+            return Err("uid drop verification failed");
+        }
+
+        let (mut rgid, mut egid, mut sgid) = (0, 0, 0);
+        if libc::getresgid(&mut rgid, &mut egid, &mut sgid) != 0 {
+            return Err("getresgid failed");
+        }
+        if rgid != gid || egid != gid || sgid != gid {
+            return Err("gid drop verification failed");
+        }
+
+        if libc::getgroups(0, std::ptr::null_mut()) != 0 {
+            return Err("supplementary groups were not cleared");
         }
     }
     Ok(())
 }
 
-fn sanitize_env(input: &[(String, String)]) -> Vec<(String, String)> {
-    input
+fn sanitize_env(input: &[(String, String)], user: &BypassUser) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = input
         .iter()
-        .filter(|(k, _)| !DANGEROUS_ENV.contains(&k.as_str()) && k != "PATH")
+        .filter(|(k, _)| {
+            k != "PATH"
+                && k != "HOME"
+                && k != "USER"
+                && k != "LOGNAME"
+                && (ALLOWED_ENV.contains(&k.as_str()) || k.starts_with("LC_"))
+        })
         .cloned()
-        .chain([("PATH".to_owned(), SAFE_PATH.to_owned())])
-        .collect()
+        .collect();
+    out.push(("PATH".to_owned(), SAFE_PATH.to_owned()));
+    if let Some(home) = &user.home {
+        out.push(("HOME".to_owned(), home.clone()));
+    }
+    out.push(("USER".to_owned(), BYPASS_USER.to_owned()));
+    out.push(("LOGNAME".to_owned(), BYPASS_USER.to_owned()));
+    out
 }
 
 fn apply_env(sanitized: &[(String, String)]) {
@@ -160,33 +205,81 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_env_removes_dangerous_and_forces_path() {
-        let input: Vec<(String, String)> = DANGEROUS_ENV
-            .iter()
-            .map(|k| ((*k).to_owned(), "/evil".to_owned()))
-            .chain([
-                ("HOME".to_owned(), "/home/u".to_owned()),
-                ("USER".to_owned(), "u".to_owned()),
-                ("PATH".to_owned(), "/attacker/old".to_owned()),
-            ])
-            .collect();
+    fn sanitize_env_keeps_only_session_variables() {
+        let user = BypassUser {
+            uid: 12345,
+            gid: 12345,
+            home: Some("/nonexistent".to_owned()),
+        };
+        let input: Vec<(String, String)> = [
+            ("PYTHONPATH", "/evil"),
+            ("LD_AUDIT", "/evil.so"),
+            ("LD_PRELOAD", "/evil.so"),
+            ("GIO_EXTRA_MODULES", "/evil"),
+            ("GTK_MODULES", "evil"),
+            ("GCONV_PATH", "/evil"),
+            ("BASH_ENV", "/evil.sh"),
+            ("HOSTALIASES", "/evil"),
+            ("PATH", "/attacker/old"),
+            ("HOME", "/home/attacker"),
+            ("USER", "attacker"),
+            ("LOGNAME", "attacker"),
+            ("DISPLAY", ":0"),
+            ("WAYLAND_DISPLAY", "wayland-0"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+            ("XAUTHORITY", "/run/user/1000/.Xauthority"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "C.UTF-8"),
+            ("TERM", "xterm-256color"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
 
-        let out = sanitize_env(&input);
+        let out = sanitize_env(&input, &user);
         let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
 
-        for danger in DANGEROUS_ENV {
-            assert!(!keys.contains(danger), "{danger} should be stripped");
+        for stripped in [
+            "PYTHONPATH",
+            "LD_AUDIT",
+            "LD_PRELOAD",
+            "GIO_EXTRA_MODULES",
+            "GTK_MODULES",
+            "GCONV_PATH",
+            "BASH_ENV",
+            "HOSTALIASES",
+        ] {
+            assert!(!keys.contains(&stripped), "{stripped} should be stripped");
         }
-        assert!(keys.contains(&"HOME"), "HOME should be preserved");
-        assert!(keys.contains(&"USER"), "USER should be preserved");
+        for kept in [
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "XAUTHORITY",
+            "LANG",
+            "LC_ALL",
+            "TERM",
+        ] {
+            assert!(keys.contains(&kept), "{kept} should be preserved");
+        }
 
-        let paths: Vec<&String> = out
-            .iter()
-            .filter(|(k, _)| k == "PATH")
-            .map(|(_, v)| v)
-            .collect();
-        assert_eq!(paths.len(), 1, "exactly one PATH entry");
-        assert_eq!(paths[0], SAFE_PATH);
+        let value = |key: &str| {
+            out.iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.as_str())
+                .unwrap()
+        };
+        assert_eq!(value("PATH"), SAFE_PATH);
+        assert_eq!(value("HOME"), "/nonexistent");
+        assert_eq!(value("USER"), BYPASS_USER);
+        assert_eq!(value("LOGNAME"), BYPASS_USER);
+        assert_eq!(
+            out.iter().filter(|(k, _)| k == "PATH").count(),
+            1,
+            "exactly one PATH entry"
+        );
     }
 
     #[test]

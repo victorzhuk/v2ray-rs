@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use super::settings::BackendType;
+use super::validation::{validate_domain_keyword, validate_domain_pattern, validate_geosite_category};
 
 /// Server tags the auto-split DNS plane attaches derived domain lists to.
 pub const AUTO_SPLIT_REMOTE_TAG: &str = "remote";
@@ -447,6 +448,14 @@ impl DnsConfig {
 
         let mut tags = HashSet::new();
         for server in &self.servers {
+            if server.tag.is_empty() {
+                return Err(DnsValidationError::EmptyServerTag);
+            }
+            if !valid_dns_address(&server.address) {
+                return Err(DnsValidationError::InvalidServerAddress(
+                    server.address.clone(),
+                ));
+            }
             if !tags.insert(&server.tag) {
                 return Err(DnsValidationError::DuplicateServerTag(server.tag.clone()));
             }
@@ -463,6 +472,18 @@ impl DnsConfig {
                 return Err(DnsValidationError::InvalidRuleServerTag(
                     rule.server_tag.clone(),
                 ));
+            }
+            if let Some(reason) = dns_rule_match_error(&rule.match_condition) {
+                return Err(DnsValidationError::InvalidRuleMatch(reason));
+            }
+        }
+
+        for host in &self.hosts {
+            if !valid_host_domain(&host.domain) || host.ip.parse::<IpAddr>().is_err() {
+                return Err(DnsValidationError::InvalidHostOverride(format!(
+                    "{} -> {}",
+                    host.domain, host.ip
+                )));
             }
         }
 
@@ -500,12 +521,69 @@ pub enum DnsValidationError {
     NoServers,
     #[error("duplicate server tag: {0}")]
     DuplicateServerTag(String),
+    #[error("empty DNS server tag")]
+    EmptyServerTag,
+    #[error("invalid DNS server address: {0}")]
+    InvalidServerAddress(String),
+    #[error("invalid DNS rule matcher: {0}")]
+    InvalidRuleMatch(String),
+    #[error("invalid DNS host override: {0}")]
+    InvalidHostOverride(String),
     #[error("invalid client_subnet IP: {0}")]
     InvalidClientSubnet(String),
     #[error("DNS rule references non-existent server tag: {0}")]
     InvalidRuleServerTag(String),
     #[error("invalid FakeIP CIDR for {field}: {value}")]
     InvalidFakeIpCidr { field: String, value: String },
+}
+
+fn valid_dns_address(address: &str) -> bool {
+    if address.parse::<IpAddr>().is_ok() {
+        return true;
+    }
+    valid_host_domain(address)
+}
+
+fn valid_host_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels
+        .iter()
+        .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+fn dns_rule_match_error(m: &DnsRuleMatch) -> Option<String> {
+    match m {
+        DnsRuleMatch::GeoSite { category } => validate_geosite_category(category).err(),
+        DnsRuleMatch::DomainSuffix { suffix } => {
+            if suffix.is_empty()
+                || suffix.starts_with('.')
+                || !suffix
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+            {
+                return Some(format!("invalid domain suffix: {suffix}"));
+            }
+            None
+        }
+        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword).err(),
+        DnsRuleMatch::DomainFull { domain } => validate_domain_pattern(domain).err(),
+    }
+    .map(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1038,6 +1116,65 @@ server_tag = "google"
         assert!(matches!(
             result.unwrap_err(),
             DnsValidationError::DuplicateServerTag(_)
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_server_address() {
+        let cfg = DnsConfig {
+            enabled: true,
+            servers: vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "999.999.999.999".to_string(),
+                port: None,
+                detour: None,
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            cfg.validate().unwrap_err(),
+            DnsValidationError::InvalidServerAddress(_)
+        ));
+    }
+
+    #[test]
+    fn test_validate_rejects_invalid_rules_and_hosts() {
+        let server = DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        };
+        let bad_suffix = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: "bad_domain.com".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_suffix.validate().unwrap_err(),
+            DnsValidationError::InvalidRuleMatch(_)
+        ));
+
+        let bad_host = DnsConfig {
+            enabled: true,
+            servers: vec![server],
+            hosts: vec![HostOverride {
+                domain: "host.example.com".to_string(),
+                ip: "not-an-ip".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_host.validate().unwrap_err(),
+            DnsValidationError::InvalidHostOverride(_)
         ));
     }
 

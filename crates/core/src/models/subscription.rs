@@ -15,12 +15,8 @@ pub struct Subscription {
     pub enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub imported_profile: Option<ImportedProfile>,
-    #[serde(default = "default_true")]
+    #[serde(default)]
     pub use_imported_profile: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,7 +49,7 @@ impl Subscription {
             auto_update_interval_secs: Some(86400),
             enabled: true,
             imported_profile: None,
-            use_imported_profile: true,
+            use_imported_profile: false,
         }
     }
 
@@ -176,13 +172,30 @@ mod tests {
         });
         let sub: Subscription = serde_json::from_value(json).unwrap();
         assert_eq!(sub.imported_profile, None);
+        assert!(!sub.use_imported_profile);
+    }
+
+    #[test]
+    fn new_from_url_defaults_use_imported_profile_false() {
+        let sub = Subscription::new_from_url("Test", "https://example.com/sub");
+        assert!(!sub.use_imported_profile);
+        assert!(sub.imported_profile.is_none());
+    }
+
+    #[test]
+    fn new_from_file_defaults_use_imported_profile_true() {
+        let sub = Subscription::new_from_file("Test", "/tmp/bundle.json");
         assert!(sub.use_imported_profile);
     }
 
     #[test]
-    fn new_from_url_defaults_use_imported_profile_true() {
-        let sub = Subscription::new_from_url("Test", "https://example.com/sub");
-        assert!(sub.use_imported_profile);
-        assert!(sub.imported_profile.is_none());
+    fn explicit_use_imported_profile_survives_round_trip() {
+        for expected in [true, false] {
+            let mut sub = Subscription::new_from_url("Test", "https://example.com/sub");
+            sub.use_imported_profile = expected;
+            let json = serde_json::to_string(&sub).unwrap();
+            let restored: Subscription = serde_json::from_str(&json).unwrap();
+            assert_eq!(restored.use_imported_profile, expected);
+        }
     }
 }

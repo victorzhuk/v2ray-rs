@@ -37,7 +37,9 @@ package() {
     # restricts these to it (netctl 0750 + cap_net_admin, run 4750 setuid), and
     # creates the bypass user. Modes here are the pre-hook defaults.
     install -Dm755 "target/release/v2ray-rs-netctl" "$pkgdir/usr/bin/v2ray-rs-netctl"
-    install -Dm4755 "target/release/v2ray-rs-run" "$pkgdir/usr/bin/v2ray-rs-run"
+    # Archives never carry the setuid bit: the install hook applies root:v2ray-rs
+    # and 4750 after systemd-sysusers has created the group and bypass user.
+    install -Dm755 "target/release/v2ray-rs-run" "$pkgdir/usr/bin/v2ray-rs-run"
     install_icon "assets/v2ray-rs.svg" \
         "crates/ui/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg" \
         "$pkgdir/usr/share/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg"

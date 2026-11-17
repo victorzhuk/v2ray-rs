@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use serde_json::{Value, json};
 
 use crate::config::{ConfigError, ConfigGenerator, common::strip_suffix_wildcard};
+use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
     DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
@@ -728,9 +729,17 @@ fn build_route(
             // ip_is_private instead, so it must not be collected here.
             RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => {}
             RuleMatch::GeoIp { country_code } => {
+                if canonical_rule_set_tag(&format!("geoip-{country_code}")).is_none() {
+                    log::warn!("skipping rule-set with invalid tag: geoip-{country_code}");
+                    continue;
+                }
                 geoip_tags.insert(country_code.to_lowercase());
             }
             RuleMatch::GeoSite { category } => {
+                if canonical_rule_set_tag(&format!("geosite-{category}")).is_none() {
+                    log::warn!("skipping rule-set with invalid tag: geosite-{category}");
+                    continue;
+                }
                 geosite_tags.insert(category.to_lowercase());
             }
             _ => {}
@@ -743,24 +752,33 @@ fn build_route(
     // (the proxy), the only path that works where GitHub is blocked. The field
     // is also deprecated in sing-box 1.14 and removed in 1.16.
     for tag in &geoip_tags {
+        let full_tag = format!("geoip-{tag}");
+        let Some(canonical) = canonical_rule_set_tag(&full_tag) else {
+            continue;
+        };
         rule_sets.push(json!({
             "type": "remote",
-            "tag": format!("geoip-{tag}"),
+            "tag": canonical,
             "format": "binary",
-            "url": format!("{GEOIP_RULESET_URL}/geoip-{tag}.srs"),
+            "url": format!("{GEOIP_RULESET_URL}/{canonical}.srs"),
         }));
     }
     for tag in &geosite_tags {
+        let full_tag = format!("geosite-{tag}");
+        let Some(canonical) = canonical_rule_set_tag(&full_tag) else {
+            continue;
+        };
         rule_sets.push(json!({
             "type": "remote",
-            "tag": format!("geosite-{tag}"),
+            "tag": canonical,
             "format": "binary",
-            "url": format!("{GEOSITE_RULESET_URL}/geosite-{tag}.srs"),
+            "url": format!("{GEOSITE_RULESET_URL}/{canonical}.srs"),
         }));
     }
 
     let user_rules: Vec<Value> = enabled
         .iter()
+        .filter(|rule| rule_set_tags_are_valid(rule))
         .map(|r| build_route_rule(r, first_proxy_tag, via_tags))
         .collect();
     route_rules.extend(user_rules);
@@ -893,6 +911,21 @@ fn stripped_domains(domains: &[String]) -> Vec<String> {
         .iter()
         .map(|d| super::common::strip_suffix_wildcard(d).to_string())
         .collect()
+}
+
+/// Tags that become rule-set references must also be safe as cache filenames
+/// and URL segments; invalid ones are dropped with their routing rule.
+fn rule_set_tags_are_valid(rule: &RoutingRule) -> bool {
+    match &rule.match_condition {
+        RuleMatch::GeoIp { country_code } if country_code.eq_ignore_ascii_case("private") => true,
+        RuleMatch::GeoIp { country_code } => {
+            canonical_rule_set_tag(&format!("geoip-{country_code}")).is_some()
+        }
+        RuleMatch::GeoSite { category } => {
+            canonical_rule_set_tag(&format!("geosite-{category}")).is_some()
+        }
+        _ => true,
+    }
 }
 
 fn build_route_rule(
@@ -1620,6 +1653,32 @@ mod tests {
         assert!(
             rule_sets[0].get("download_detour").is_none(),
             "download_detour must be absent so rule-sets download via the default (proxy) outbound"
+        );
+    }
+
+    #[test]
+    fn test_singbox_skips_rule_sets_with_invalid_tags() {
+        let generator = SingboxGenerator;
+        let rules = vec![RoutingRule {
+            id: uuid::Uuid::new_v4(),
+            match_condition: RuleMatch::GeoSite {
+                category: "bad/tag".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: true,
+            group: None,
+            via_node: None,
+        }];
+
+        let config = generator
+            .generate(&[ss_node()], &rules, &default_settings())
+            .unwrap();
+
+        let route_rules = config["route"]["rules"].as_array().unwrap();
+        assert!(route_rules.is_empty(), "{route_rules:?}");
+        assert_eq!(
+            config["route"]["rule_set"].as_array().map(Vec::len),
+            None
         );
     }
 

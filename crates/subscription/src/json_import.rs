@@ -9,7 +9,8 @@ use v2ray_rs_core::models::{
     DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings,
     H2Settings, HostOverride, ImportedProfile, ProxyNode, RoutingRule, RuleAction, RuleMatch,
     ShadowsocksConfig, SubscriptionNode, TlsSettings, TransportSettings, TrojanConfig, VlessConfig,
-    VmessConfig, WsSettings, XhttpSettings, validate_rule_match,
+    VmessConfig, WsSettings, XhttpSettings, validate_domain_keyword, validate_domain_pattern,
+    validate_geosite_category, validate_rule_match,
 };
 
 use crate::parser::{ImportResult, ParseError};
@@ -162,7 +163,10 @@ fn import_node(element: &Value) -> Result<ProxyNode, String> {
         .map(str::to_string);
     let stream = outbound.get("streamSettings");
     let transport = stream.map(map_transport).transpose()?.unwrap_or_default();
-    let tls = stream.and_then(map_tls);
+    let tls = match stream {
+        Some(stream) => map_tls(stream)?,
+        None => None,
+    };
 
     match protocol {
         "vless" => build_vless(outbound, remark, transport, tls),
@@ -346,12 +350,17 @@ fn map_transport(stream: &Value) -> Result<TransportSettings, String> {
     }
 }
 
-fn map_tls(stream: &Value) -> Option<TlsSettings> {
-    let security = stream.get("security").and_then(Value::as_str)?;
+fn map_tls(stream: &Value) -> Result<Option<TlsSettings>, String> {
+    let Some(security) = stream.get("security").and_then(Value::as_str) else {
+        return Ok(None);
+    };
     match security {
         "tls" => {
             let t = &stream["tlsSettings"];
-            Some(TlsSettings {
+            if t["allowInsecure"].as_bool().unwrap_or(false) {
+                return Err("allowInsecure disables TLS certificate verification".into());
+            }
+            Ok(Some(TlsSettings {
                 server_name: t["serverName"].as_str().map(str::to_string),
                 alpn: t["alpn"]
                     .as_array()
@@ -362,17 +371,17 @@ fn map_tls(stream: &Value) -> Option<TlsSettings> {
                             .collect()
                     })
                     .unwrap_or_default(),
-                verify: !t["allowInsecure"].as_bool().unwrap_or(false),
+                verify: true,
                 fingerprint: t["fingerprint"].as_str().map(str::to_string),
                 reality: false,
                 public_key: None,
                 short_id: None,
                 spider_x: None,
-            })
+            }))
         }
         "reality" => {
             let r = &stream["realitySettings"];
-            Some(TlsSettings {
+            Ok(Some(TlsSettings {
                 server_name: r["serverName"].as_str().map(str::to_string),
                 alpn: Vec::new(),
                 verify: true,
@@ -381,9 +390,9 @@ fn map_tls(stream: &Value) -> Option<TlsSettings> {
                 public_key: r["publicKey"].as_str().map(str::to_string),
                 short_id: r["shortId"].as_str().map(str::to_string),
                 spider_x: r["spiderX"].as_str().map(str::to_string),
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -400,15 +409,87 @@ fn outbound_actions(outbounds: &[Value]) -> HashMap<String, RuleAction> {
         let action = match protocol {
             "freedom" => RuleAction::Direct,
             "blackhole" => RuleAction::Block,
-            // v2ray-rs owns DNS hijack via TunConfig.dns_hijack; a provider's
-            // dns-out tag becomes a plain direct route.
-            "dns" => RuleAction::Direct,
+            // DNS hijack is app-owned; a provider's dns-out tag has no routing
+            // equivalent, so rules targeting it are skipped instead of widened.
             p if !NON_PROXY_PROTOCOLS.contains(&p) => RuleAction::Proxy,
             _ => continue,
         };
         actions.insert(tag.to_string(), action);
     }
     actions
+}
+
+/// Xray rule fields with no single-condition equivalent in the routing model,
+/// or a meaning that would change silently when translated.
+fn unsupported_rule_match(rule: &Value) -> Option<String> {
+    if let Some(kind) = rule.get("type").and_then(Value::as_str)
+        && kind != "field"
+    {
+        return Some(format!("unsupported rule type '{kind}'"));
+    }
+    for key in ["inboundTag", "source", "sourcePort", "user", "attrs"] {
+        if rule.get(key).is_some() {
+            return Some(format!("unsupported matcher '{key}'"));
+        }
+    }
+    if rule
+        .get("domain")
+        .and_then(Value::as_array)
+        .is_some_and(|domains| {
+            domains
+                .iter()
+                .filter_map(Value::as_str)
+                .any(|d| d.starts_with("regexp:"))
+        })
+    {
+        return Some("unsupported 'regexp:' domain matcher".into());
+    }
+    None
+}
+
+/// `tcp,udp` selects every transport, so it adds no condition of its own.
+fn network_is_tautological(spec: &str) -> bool {
+    let mut saw_tcp = false;
+    let mut saw_udp = false;
+    let mut any = false;
+    for part in spec.split(',').map(str::trim) {
+        any = true;
+        match part.to_ascii_lowercase().as_str() {
+            "tcp" => saw_tcp = true,
+            "udp" => saw_udp = true,
+            _ => return false,
+        }
+    }
+    any && saw_tcp && saw_udp
+}
+
+fn rule_axis_count(rule: &Value) -> usize {
+    let has_strings = |key: &str| {
+        rule.get(key)
+            .and_then(Value::as_array)
+            .is_some_and(|items| items.iter().any(Value::is_string))
+    };
+    let mut axes = 0;
+    if has_strings("domain") {
+        axes += 1;
+    }
+    if has_strings("ip") {
+        axes += 1;
+    }
+    if has_strings("protocol") {
+        axes += 1;
+    }
+    if rule.get("port").and_then(port_spec).is_some() {
+        axes += 1;
+    }
+    if rule
+        .get("network")
+        .and_then(Value::as_str)
+        .is_some_and(|spec| !network_is_tautological(spec))
+    {
+        axes += 1;
+    }
+    axes
 }
 
 fn map_routing_rules(routing: &Value, outbounds: &[Value]) -> (Vec<RoutingRule>, Vec<String>) {
@@ -421,6 +502,17 @@ fn map_routing_rules(routing: &Value, outbounds: &[Value]) -> (Vec<RoutingRule>,
     };
 
     for (i, rule) in raw_rules.iter().enumerate() {
+        if let Some(reason) = unsupported_rule_match(rule) {
+            skipped.push(format!("routing rule {i}: {reason}, dropped"));
+            continue;
+        }
+        let axes = rule_axis_count(rule);
+        if axes > 1 {
+            skipped.push(format!(
+                "routing rule {i}: combines {axes} match conditions, dropped"
+            ));
+            continue;
+        }
         let Some(tag) = rule.get("outboundTag").and_then(Value::as_str) else {
             skipped.push(format!("routing rule {i}: missing outboundTag, ignored"));
             continue;
@@ -480,7 +572,9 @@ fn map_routing_rules(routing: &Value, outbounds: &[Value]) -> (Vec<RoutingRule>,
                 action,
             );
         }
-        if let Some(spec) = rule.get("network").and_then(Value::as_str) {
+        if let Some(spec) = rule.get("network").and_then(Value::as_str)
+            && !network_is_tautological(spec)
+        {
             matched_any = true;
             push_rule(
                 &mut rules,
@@ -611,14 +705,23 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
         };
 
         let (protocol, address, port) = parse_dns_server_address(&raw_address);
+        if !valid_dns_address(&address) {
+            skipped.push(format!(
+                "dns server {i}: invalid address '{raw_address}', ignored"
+            ));
+            continue;
+        }
         let tag = format!("provider-{i}");
 
         for d in &domains {
             match dns_domain_rule_match(d) {
-                Some(m) => rules.push(DnsRule {
+                Some(m) if dns_rule_match_valid(&m) => rules.push(DnsRule {
                     match_condition: m,
                     server_tag: tag.clone(),
                 }),
+                Some(_) => skipped.push(format!(
+                    "dns server {i}: invalid domain matcher '{d}', ignored"
+                )),
                 None => skipped.push(format!(
                     "dns server {i}: unsupported domain matcher '{d}', ignored"
                 )),
@@ -644,7 +747,17 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
         .map(|obj| {
             obj.iter()
                 .filter_map(|(domain, ip)| {
-                    ip.as_str().map(|ip| HostOverride {
+                    let Some(ip) = ip.as_str() else {
+                        skipped.push(format!(
+                            "dns host '{domain}': non-string address, ignored"
+                        ));
+                        return None;
+                    };
+                    if !valid_host_domain(domain) || ip.parse::<std::net::IpAddr>().is_err() {
+                        skipped.push(format!("dns host '{domain}': invalid entry, ignored"));
+                        return None;
+                    }
+                    Some(HostOverride {
                         domain: domain.clone(),
                         ip: ip.to_string(),
                     })
@@ -729,4 +842,50 @@ fn parse_dns_server_address(raw: &str) -> (DnsProtocol, String, Option<u16>) {
         return (protocol, host.to_string(), parsed.port());
     }
     (DnsProtocol::Udp, raw.to_string(), None)
+}
+
+fn valid_dns_address(address: &str) -> bool {
+    if address.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    valid_host_domain(address)
+}
+
+fn valid_host_domain(domain: &str) -> bool {
+    if domain.is_empty() || domain.len() > 253 || domain.starts_with('.') || domain.ends_with('.') {
+        return false;
+    }
+    let labels: Vec<&str> = domain.split('.').collect();
+    if labels
+        .iter()
+        .all(|label| !label.is_empty() && label.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    labels.iter().all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+fn valid_domain_suffix(suffix: &str) -> bool {
+    !suffix.is_empty()
+        && !suffix.starts_with('.')
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
+}
+
+fn dns_rule_match_valid(m: &DnsRuleMatch) -> bool {
+    match m {
+        DnsRuleMatch::GeoSite { category } => validate_geosite_category(category).is_ok(),
+        DnsRuleMatch::DomainSuffix { suffix } => valid_domain_suffix(suffix),
+        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword).is_ok(),
+        DnsRuleMatch::DomainFull { domain } => validate_domain_pattern(domain).is_ok(),
+    }
 }

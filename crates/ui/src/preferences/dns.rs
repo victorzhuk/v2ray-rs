@@ -2068,6 +2068,7 @@ mod tests {
     #[test]
     fn effective_dns_rows_names_imported_profile_subscription() {
         let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.use_imported_profile = true;
         sub.imported_profile = Some(ImportedProfile {
             rules: Vec::new(),
             dns: Some(DnsConfig::default()),

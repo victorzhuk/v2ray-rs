@@ -217,18 +217,24 @@ async fn run_probe_session(
     // The per-node pass (egress fetch, then one availability request per
     // service) rides the same session, after the delay collection. The pass
     // is bounded: at most MAX_CONCURRENT_NODE_PROBES futures are in flight.
-    let node_pass = |config: &Value| {
+    let node_pass = |config: &Value, delays: &[Option<u64>]| {
         let ports = egress_inbound_ports(config);
         let timeout = Duration::from_millis(u64::from(cfg.timeout_ms));
         let services: Vec<ServiceCheck> = services.to_vec();
+        let delays = delays.to_vec();
         run_bounded(
             MAX_CONCURRENT_NODE_PROBES,
             (0..len).map(move |i| {
                 let services = services.clone();
                 let port = ports.get(&i).copied();
+                // A failed delay leaves the outbound unusable, so egress is
+                // only observed for nodes that answered the latency probe.
+                let detect_egress = delays.get(i).copied().flatten().is_some();
                 async move {
                     match port {
-                        Some(port) => probe_node_extras(port, &services, timeout).await,
+                        Some(port) => {
+                            probe_node_extras(port, &services, timeout, detect_egress).await
+                        }
                         None => (None, HashMap::new()),
                     }
                 }
@@ -239,7 +245,7 @@ async fn run_probe_session(
     match backend {
         BackendType::SingBox => {
             let results = singbox_delays(api_port, len, &cfg.test_url, cfg.timeout_ms).await;
-            let extras = node_pass(&config).await;
+            let extras = node_pass(&config, &results).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(results, extras, None)
@@ -249,7 +255,7 @@ async fn run_probe_session(
                 query_xray_observatory(api_port)
             })
             .await;
-            let extras = node_pass(&config).await;
+            let extras = node_pass(&config, &obs_result.results).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
@@ -259,7 +265,7 @@ async fn run_probe_session(
                 query_v2ray_observatory(api_port)
             })
             .await;
-            let extras = node_pass(&config).await;
+            let extras = node_pass(&config, &obs_result.results).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
@@ -295,11 +301,16 @@ async fn probe_node_extras(
     port: u16,
     services: &[ServiceCheck],
     timeout: Duration,
+    detect_egress: bool,
 ) -> (Option<EgressSample>, HashMap<String, VerdictRecord>) {
     let Some(client) = node_proxy_client(port, timeout) else {
         return (None, HashMap::new());
     };
-    let egress = fetch_egress(&client, EGRESS_ECHO_URL).await;
+    let egress = if detect_egress {
+        fetch_egress(&client, EGRESS_ECHO_URL).await
+    } else {
+        None
+    };
     let mut verdicts = HashMap::with_capacity(services.len());
     for check in services {
         verdicts.insert(check.id.to_string(), check_service(&client, check).await);
@@ -307,11 +318,13 @@ async fn probe_node_extras(
     (egress, verdicts)
 }
 
-/// Builds an HTTP client that sends all traffic through the node's loopback
-/// proxy inbound on `port`.
+/// Builds an HTTP client that sends all traffic, including HTTPS, through the
+/// node's loopback proxy inbound on `port`. Ambient proxy variables are ignored
+/// so the host environment cannot divert a probe around the node.
 fn node_proxy_client(port: u16, timeout: Duration) -> Option<reqwest::Client> {
-    let proxy = reqwest::Proxy::http(format!("http://127.0.0.1:{port}")).ok()?;
+    let proxy = reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).ok()?;
     reqwest::Client::builder()
+        .no_proxy()
         .proxy(proxy)
         .user_agent(BROWSER_USER_AGENT)
         .redirect(redirect_policy(REDIRECT_CAP))
@@ -706,6 +719,84 @@ mod availability_tests {
                 .await
                 .is_none()
         );
+    }
+
+    /// Accepts one connection, reports its request line, and closes without a
+    /// response. The request line shows whether a probe used the proxy at all.
+    async fn spawn_capture_proxy() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let read = socket.read(&mut buf).await.unwrap_or(0);
+                let line = String::from_utf8_lossy(&buf[..read])
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+                let _ = tx.send(line);
+            }
+        });
+        (port, rx)
+    }
+
+    #[tokio::test]
+    async fn failed_delay_skips_egress_probe() {
+        let (port, rx) = spawn_capture_proxy().await;
+        let (egress, verdicts) =
+            probe_node_extras(port, &[], Duration::from_millis(500), false).await;
+        assert!(egress.is_none());
+        assert!(verdicts.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), rx)
+                .await
+                .is_err(),
+            "a failed delay node must not send an egress request"
+        );
+    }
+
+    #[test]
+    fn node_proxy_client_ignores_ambient_proxy_env() {
+        const CHILD: &str = "V2RAY_RS_PROBE_PROXY_ENV_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "real_delay::availability_tests::node_proxy_client_ignores_ambient_proxy_env",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("HTTP_PROXY", "http://127.0.0.1:9")
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
+                .env("ALL_PROXY", "http://127.0.0.1:9")
+                .env("NO_PROXY", "*")
+                .status()
+                .unwrap();
+            assert!(status.success(), "ambient proxy env leaked a probe");
+            return;
+        }
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (port, rx) = spawn_capture_proxy().await;
+                let client = node_proxy_client(port, Duration::from_millis(500)).unwrap();
+                let _ = client.get("https://egress.invalid/trace").send().await;
+                let line = tokio::time::timeout(Duration::from_secs(2), rx)
+                    .await
+                    .expect("proxy saw no request")
+                    .unwrap();
+                assert!(
+                    line.starts_with("CONNECT egress.invalid:443"),
+                    "HTTPS must tunnel through the node inbound: {line}"
+                );
+            });
     }
 
     #[test]

@@ -183,13 +183,18 @@ pub async fn xray_up(
 
     add_default_route_v4(handle, index).await?;
     add_xray_rules(handle, AddressFamily::Inet).await?;
+    let v6_rules = v6_rules_needed(v6.is_some(), strict, host_has_ipv6());
     if capture_dns {
         add_dns_capture_rules(handle, AddressFamily::Inet).await?;
+    }
+    // Captured even without a tunnel address: a strict session must not let
+    // on-link IPv6 resolvers leak the lookup onto the LAN.
+    if ipv6_dns_capture(v6_rules, capture_dns) {
+        add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
     }
     if let Some(uid) = bypass_uid {
         add_bypass_uid_rule(handle, AddressFamily::Inet, uid).await?;
     }
-    let v6_rules = v6_rules_needed(v6.is_some(), strict, host_has_ipv6());
     if strict {
         add_fallback_route_v4(handle).await?;
         if v6_rules {
@@ -198,9 +203,6 @@ pub async fn xray_up(
     }
     if v6.is_some() {
         add_default_route_v6(handle, index).await?;
-        if capture_dns {
-            add_dns_capture_rules(handle, AddressFamily::Inet6).await?;
-        }
     }
     if v6_rules {
         add_xray_rules(handle, AddressFamily::Inet6).await?;
@@ -246,6 +248,12 @@ fn exclusion_installable(ip: IpAddr, host_has_ipv6: bool) -> bool {
 /// wants them to refuse IPv6, unless the host has no IPv6 to leak.
 fn v6_rules_needed(v6_requested: bool, strict: bool, host_has_ipv6: bool) -> bool {
     v6_requested || (strict && host_has_ipv6)
+}
+
+/// IPv6 port-53 capture follows the IPv6 policy rules, not the presence of a
+/// tunnel address, so strict sessions close the on-link resolver path.
+fn ipv6_dns_capture(v6_rules: bool, capture_dns: bool) -> bool {
+    v6_rules && capture_dns
 }
 
 /// `/proc/sys/net/ipv6` is absent when the kernel boots with `ipv6.disable=1`,
@@ -638,7 +646,8 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        RULE_PREF_EXCLUDE, XRAY_FWMARK, XRAY_RULE_PREFS, exclusion_installable, v6_rules_needed,
+        RULE_PREF_EXCLUDE, XRAY_FWMARK, XRAY_RULE_PREFS, exclusion_installable, ipv6_dns_capture,
+        v6_rules_needed,
     };
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
 
@@ -680,6 +689,21 @@ mod tests {
                 "v6_requested={v6_requested} strict={strict} host_has_ipv6={host_has_ipv6}"
             );
         }
+    }
+
+    #[test]
+    fn strict_ipv4_only_session_captures_ipv6_dns_when_host_supports_it() {
+        let v6_rules = v6_rules_needed(false, true, true);
+        assert!(v6_rules);
+        assert!(ipv6_dns_capture(v6_rules, true));
+    }
+
+    #[test]
+    fn disabled_host_skips_ipv6_dns_capture() {
+        let v6_rules = v6_rules_needed(false, true, false);
+        assert!(!v6_rules);
+        assert!(!ipv6_dns_capture(v6_rules, true));
+        assert!(!ipv6_dns_capture(true, false));
     }
 
     #[test]

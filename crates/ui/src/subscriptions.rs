@@ -1066,11 +1066,19 @@ impl Component for SubscriptionsPage {
             SubscriptionsCmdOutput::AddDone(outcome) => {
                 let summary =
                     format_update_summary(&outcome.subscription.name, "Imported", &outcome.result);
+                let profile_available = outcome.subscription.imported_profile.is_some()
+                    && matches!(outcome.subscription.source, SubscriptionSource::Url { .. });
+                let name = outcome.subscription.name.clone();
                 self.subscriptions.push(outcome.subscription);
                 self.persister
                     .submit(&self.store, &sender, self.subscriptions.clone());
                 let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
                 let _ = sender.output(SubscriptionsOutput::Notice(summary));
+                if profile_available {
+                    let _ = sender.output(SubscriptionsOutput::Notice(format!(
+                        "{name}: an imported routing & DNS profile is available; enable it in the subscription menu"
+                    )));
+                }
             }
             SubscriptionsCmdOutput::RefreshDone(sub, result) => {
                 let id = sub.id;

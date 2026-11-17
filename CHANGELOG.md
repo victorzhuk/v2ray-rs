@@ -8,8 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Remote URL subscriptions now keep a provider's routing and DNS profile inactive until the per-subscription toggle is enabled; local file and pasted JSON imports keep profiles active. Imported profiles are validated before they can affect runtime config generation.
 - Automatic xray TUN routing now requires a versioned ownership journal and a matching kernel reservation. Legacy and ambiguous recovery require explicit operator intervention.
 - TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.
+
+### Security
+- Route HTTP and HTTPS Real Delay and availability probes exclusively through the node's loopback inbound, ignoring ambient proxy variables, and skip egress probes for nodes whose delay test failed.
+- Block subscription redirects to loopback, link-local, private, unique-local, unspecified, and `localhost` targets.
+- Reject imported TLS nodes that disable certificate verification (`allowInsecure`) with visible warnings instead of importing them.
+- Ignore provider DNS outbounds, drop multi-condition or unsupported Xray routing rules whole, and validate imported routing rules, DNS servers, DNS rules, and host overrides.
+- Capture IPv6 port-53 DNS under strict xray TUN even without an IPv6 tunnel address, and require effective UID 0 for `--force-legacy` route recovery.
+- Validate GeoIP and GeoSite rule-set tags before using them in cache paths or download URLs.
+- Redact sensitive transport headers and tokenized DoH/H3 server URLs in the config preview, and preserve the reveal toggle across Refresh.
+- Restrict `v2ray-rs-run` to an explicit session-variable allowlist and verify real, effective, and saved UID/GID plus cleared supplementary groups after the drop.
+- Ship `v2ray-rs-run` without the setuid bit in package archives and apply `root:v2ray-rs` `4750` only in install hooks; create `v2ray-rs-bypass` during privileged setup and skip the wrapper in user-local installs.
 
 ### Fixed
 - Refuse concurrent route collisions without adopting foreign resources into TUN ownership.

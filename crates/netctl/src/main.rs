@@ -100,9 +100,12 @@ fn main() -> ExitCode {
 
 /// Pure, netlink-free checks for the invocation shape, so an invalid call
 /// fails before the mutation lock is taken and stays unit-testable.
-fn validate_invocation(cli: &Cli) -> Result<(), String> {
+fn validate_invocation(cli: &Cli, euid: u32) -> Result<(), String> {
     if cli.journal.is_none() && !cli.force_legacy {
         return Err("an ownership journal is required; legacy state needs explicit --force-legacy operator recovery".into());
+    }
+    if cli.force_legacy && euid != 0 {
+        return Err("--force-legacy requires effective UID 0".into());
     }
     if cli.journal.is_some() && cli.session_id.is_none() {
         return Err("journaled commands require --session-id".into());
@@ -122,9 +125,22 @@ fn validate_invocation(cli: &Cli) -> Result<(), String> {
     Ok(())
 }
 
+/// Reads the effective UID from the kernel's process identity table; the route
+/// helper gains `CAP_NET_ADMIN` without a root effective UID.
+fn effective_uid() -> Result<u32, String> {
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|e| format!("read process identity: {e}"))?;
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .and_then(|euid| euid.parse().ok())
+        .ok_or_else(|| "could not determine effective UID".into())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run(cli: Cli) -> Result<(), String> {
-    validate_invocation(&cli)?;
+    validate_invocation(&cli, effective_uid()?)?;
     let _mutation_lock = ownership::mutation_lock(cli.journal.as_deref())?;
     match cli.command {
         Command::Reserve { iface } => {
@@ -339,14 +355,31 @@ mod tests {
 
     #[test]
     fn invocation_without_journal_or_force_legacy_is_refused() {
-        let err = validate_invocation(&parse(&[])).unwrap_err();
+        let err = validate_invocation(&parse(&[]), 0).unwrap_err();
         assert!(err.contains("--force-legacy"), "{err}");
+    }
+
+    #[test]
+    fn force_legacy_requires_root() {
+        let legacy = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "recover",
+            "--xray",
+            "--iface",
+            "xtun0",
+            "--force-legacy",
+        ])
+        .unwrap();
+        let err = validate_invocation(&legacy, 1000).unwrap_err();
+        assert!(err.contains("--force-legacy"), "{err}");
+        assert!(err.contains("UID 0"), "{err}");
+        assert!(validate_invocation(&legacy, 0).is_ok());
     }
 
     #[test]
     fn journaled_invocation_requires_session_id() {
         let cli = parse(&["--journal", "journal.json", "--ifindex", "3"]);
-        let err = validate_invocation(&cli).unwrap_err();
+        let err = validate_invocation(&cli, 0).unwrap_err();
         assert!(err.contains("--session-id"), "{err}");
     }
 
@@ -360,14 +393,14 @@ mod tests {
             "--force-legacy",
         ])
         .unwrap();
-        let err = validate_invocation(&cli).unwrap_err();
+        let err = validate_invocation(&cli, 0).unwrap_err();
         assert!(err.contains("reserve requires --journal"), "{err}");
     }
 
     #[test]
     fn journaled_xray_up_requires_ifindex() {
         let cli = parse(&["--journal", "journal.json", "--session-id", "sid"]);
-        let err = validate_invocation(&cli).unwrap_err();
+        let err = validate_invocation(&cli, 0).unwrap_err();
         assert!(err.contains("--ifindex"), "{err}");
         let cli = parse(&[
             "--journal",
@@ -377,7 +410,7 @@ mod tests {
             "--ifindex",
             "3",
         ]);
-        assert!(validate_invocation(&cli).is_ok());
+        assert!(validate_invocation(&cli, 0).is_ok());
     }
 
     #[test]
@@ -394,7 +427,7 @@ mod tests {
             "sid",
         ])
         .unwrap();
-        assert!(validate_invocation(&journaled).is_ok());
+        assert!(validate_invocation(&journaled, 0).is_ok());
         let legacy = Cli::try_parse_from([
             "v2ray-rs-netctl",
             "xray-down",
@@ -403,7 +436,7 @@ mod tests {
             "--force-legacy",
         ])
         .unwrap();
-        assert!(validate_invocation(&legacy).is_ok());
+        assert!(validate_invocation(&legacy, 0).is_ok());
     }
 
     #[test]
@@ -452,7 +485,7 @@ mod tests {
             "sid",
         ])
         .unwrap();
-        let err = validate_invocation(&cli).unwrap_err();
+        let err = validate_invocation(&cli, 0).unwrap_err();
         assert!(err.contains("--journal"), "{err}");
     }
 }

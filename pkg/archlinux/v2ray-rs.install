@@ -8,9 +8,10 @@ post_install() {
     getent group v2ray-rs >/dev/null || groupadd --system v2ray-rs
     id v2ray-rs-bypass &>/dev/null || useradd --system --no-create-home --shell /usr/bin/nologin v2ray-rs-bypass
 
-    # chgrp clears the setuid bit and any file capabilities, so re-apply them
-    # afterwards: setuid on the wrapper, cap_net_admin on the route helper.
-    chgrp v2ray-rs /usr/bin/v2ray-rs-netctl /usr/bin/v2ray-rs-run 2>/dev/null || true
+    # chown/chgrp clear the setuid bit and any file capabilities, so re-apply
+    # ownership and modes afterwards: setuid on the wrapper, cap_net_admin on
+    # the route helper. The packaged payload ships both as 0755.
+    chown root:v2ray-rs /usr/bin/v2ray-rs-netctl /usr/bin/v2ray-rs-run 2>/dev/null || true
     chmod 0750 /usr/bin/v2ray-rs-netctl 2>/dev/null || true
     chmod 4750 /usr/bin/v2ray-rs-run 2>/dev/null || true
     setcap 'cap_net_admin+ep' /usr/bin/v2ray-rs-netctl 2>/dev/null || \

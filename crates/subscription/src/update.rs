@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(subscription.nodes.len(), 24);
         assert!(subscription.imported_profile.is_some());
         assert!(result.profile.is_some());
-        assert_eq!(result.profile.unwrap().rules.len(), 6);
+        assert_eq!(result.profile.unwrap().rules.len(), 4);
     }
 
     #[tokio::test]

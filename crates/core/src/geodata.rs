@@ -25,10 +25,30 @@ const GEOSITE_RULESET_URL: &str =
 pub enum GeodataError {
     #[error("download failed: {url}: {reason}")]
     Download { url: String, reason: String },
+    #[error("invalid rule-set tag: {0}")]
+    InvalidRuleSetTag(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("metadata: {0}")]
     Json(#[from] serde_json::Error),
+}
+
+/// Rule-set tags become both cache filenames and URL path segments. Accept
+/// `[a-z0-9][a-z0-9_-]*` after ASCII lowercasing, and return that canonical
+/// form so path and URL never disagree.
+pub fn canonical_rule_set_tag(full_tag: &str) -> Option<String> {
+    if !full_tag.is_ascii() {
+        return None;
+    }
+    let canonical = full_tag.to_ascii_lowercase();
+    let mut chars = canonical.chars();
+    let first = chars.next()?;
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return None;
+    }
+    chars
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+        .then_some(canonical)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,12 +94,15 @@ impl GeodataManager {
         self.geodata_dir.join("rule-sets")
     }
 
-    pub fn rule_set_path(&self, full_tag: &str) -> PathBuf {
-        self.rule_sets_dir().join(format!("{full_tag}.srs"))
+    pub fn rule_set_path(&self, full_tag: &str) -> Result<PathBuf, GeodataError> {
+        let canonical = canonical_rule_set_tag(full_tag)
+            .ok_or_else(|| GeodataError::InvalidRuleSetTag(full_tag.to_string()))?;
+        Ok(self.rule_sets_dir().join(format!("{canonical}.srs")))
     }
 
     pub fn has_rule_set(&self, full_tag: &str) -> bool {
-        self.rule_set_path(full_tag).exists()
+        self.rule_set_path(full_tag)
+            .is_ok_and(|path| path.exists())
     }
 
     pub fn geoip_path(&self) -> PathBuf {
@@ -183,10 +206,11 @@ fn ensure_dir_0700(path: &Path) -> Result<(), GeodataError> {
 
 #[cfg(feature = "geodata-fetch")]
 fn rule_set_url(full_tag: &str) -> Option<String> {
-    if full_tag.starts_with("geoip-") {
-        Some(format!("{GEOIP_RULESET_URL}/{full_tag}.srs"))
-    } else if full_tag.starts_with("geosite-") {
-        Some(format!("{GEOSITE_RULESET_URL}/{full_tag}.srs"))
+    let canonical = canonical_rule_set_tag(full_tag)?;
+    if canonical.starts_with("geoip-") {
+        Some(format!("{GEOIP_RULESET_URL}/{canonical}.srs"))
+    } else if canonical.starts_with("geosite-") {
+        Some(format!("{GEOSITE_RULESET_URL}/{canonical}.srs"))
     } else {
         None
     }
@@ -369,7 +393,7 @@ pub fn download_singbox_rule_sets(
         }
 
         let tmp = persist_response(response, &manager.rule_sets_dir(), &url)?;
-        tmp.persist(manager.rule_set_path(tag))
+        tmp.persist(manager.rule_set_path(tag)?)
             .map_err(|e| GeodataError::Io(e.error))?;
     }
 
@@ -503,8 +527,44 @@ mod tests {
     #[test]
     fn test_rule_set_path() {
         let (_tmp, manager) = test_manager();
-        let path = manager.rule_set_path("geoip-ru");
+        let path = manager.rule_set_path("geoip-ru").unwrap();
         assert!(path.ends_with("rule-sets/geoip-ru.srs"));
+        let canonical = manager.rule_set_path("GEOIP-RU").unwrap();
+        assert_eq!(canonical, path);
+    }
+
+    #[test]
+    fn test_rule_set_path_rejects_traversal_and_invalid_tags() {
+        let (_tmp, manager) = test_manager();
+        for tag in [
+            "../geoip-ru",
+            "geoip/ru",
+            "geoip\\ru",
+            "geoip ru",
+            "geoip-rü",
+            "",
+            "-geoip",
+            "_geosite",
+            ".hidden",
+        ] {
+            assert!(
+                manager.rule_set_path(tag).is_err(),
+                "invalid tag accepted: {tag:?}"
+            );
+            assert!(!manager.has_rule_set(tag), "invalid tag looked up: {tag:?}");
+            assert!(
+                canonical_rule_set_tag(tag).is_none(),
+                "invalid tag canonicalized: {tag:?}"
+            );
+        }
+        assert_eq!(
+            canonical_rule_set_tag("geosite-category-ads-all").as_deref(),
+            Some("geosite-category-ads-all")
+        );
+        assert_eq!(
+            canonical_rule_set_tag("GeoIP_RU").as_deref(),
+            Some("geoip_ru")
+        );
     }
 
     #[test]
@@ -513,7 +573,7 @@ mod tests {
         assert!(!manager.has_rule_set("geoip-ru"));
 
         manager.ensure_dir().unwrap();
-        std::fs::write(manager.rule_set_path("geoip-ru"), b"test").unwrap();
+        std::fs::write(manager.rule_set_path("geoip-ru").unwrap(), b"test").unwrap();
         assert!(manager.has_rule_set("geoip-ru"));
     }
 
@@ -534,6 +594,8 @@ mod tests {
     #[test]
     fn test_rule_set_url_unrecognized_tag() {
         assert!(rule_set_url("bogus-tag").is_none());
+        assert!(rule_set_url("geoip-../evil").is_none());
+        assert!(rule_set_url("geosite-bad/tag").is_none());
     }
 
     #[test]
@@ -551,8 +613,8 @@ mod tests {
 
         use crate::geodata_index::GeodataIndexManager;
 
-        std::fs::write(manager.rule_set_path("geoip-us"), b"fake").unwrap();
-        std::fs::write(manager.rule_set_path("geosite-google"), b"fake").unwrap();
+        std::fs::write(manager.rule_set_path("geoip-us").unwrap(), b"fake").unwrap();
+        std::fs::write(manager.rule_set_path("geosite-google").unwrap(), b"fake").unwrap();
 
         manager.reindex(BackendType::SingBox).unwrap();
 

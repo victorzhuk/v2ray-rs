@@ -738,6 +738,7 @@ mod tests {
 
     fn profile_subscription(dns: DnsConfig) -> Subscription {
         let mut sub = Subscription::new_from_url("Provider", "https://example.com/sub");
+        sub.use_imported_profile = true;
         sub.imported_profile = Some(ImportedProfile {
             rules: Vec::new(),
             dns: Some(dns),

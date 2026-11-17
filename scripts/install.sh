@@ -293,11 +293,19 @@ verify_checksum() {
 }
 
 install_tree() {
-    local _src="$1" _bin _rel
+    local _src="$1" _bin _rel _is_root=0
+
+    [ "$(id -u)" -eq 0 ] && _is_root=1
 
     say "installing to $PREFIX"
     for _bin in $BINS; do
         [ -f "$_src/bin/$_bin" ] || err "archive is missing bin/$_bin"
+        # A user-owned setuid copy is a no-op and a misleading half-install;
+        # leave the wrapper out unless this install can actually own it as root.
+        if [ "$_bin" = "v2ray-rs-run" ] && [ "$_is_root" -eq 0 ]; then
+            say_verbose "  skipping bin/$_bin (setuid install requires root)"
+            continue
+        fi
         ensure install -Dm755 "$_src/bin/$_bin" "$PREFIX/bin/$_bin"
         say "  bin/$_bin"
     done

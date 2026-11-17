@@ -11,15 +11,15 @@ pub(crate) const USER_AGENT: &str = concat!("v2ray-rs/", env!("CARGO_PKG_VERSION
 pub(crate) const REDIRECT_CAP: usize = 10;
 
 /// Decides whether one redirect hop may be followed. Refuses a scheme
-/// downgrade from `https` to `http`, refuses any non-HTTP(S) scheme, and
-/// enforces the hop cap.
+/// downgrade from `https` to `http`, refuses any non-HTTP(S) scheme, private or
+/// local redirect targets, and enforces the hop cap.
 pub(crate) fn redirect_allowed(
     scheme_from: Option<&str>,
     next: &reqwest::Url,
     hops: usize,
     cap: usize,
 ) -> bool {
-    if hops >= cap {
+    if hops >= cap || !redirect_target_is_public(next) {
         return false;
     }
     match next.scheme() {
@@ -29,9 +29,46 @@ pub(crate) fn redirect_allowed(
     }
 }
 
-/// Builds a redirect policy refusing plaintext downgrades and non-HTTP(S)
-/// schemes. Refusals surface as fetch errors naming only the host, never the
-/// credential-bearing URL.
+/// Rejects redirect targets that would reach the local host or a private
+/// network: loopback, link-local, RFC 1918, unique-local, unspecified, and
+/// `localhost` names. DNS names are not resolved here; public names stay
+/// allowed and private literals cannot masquerade as one.
+fn redirect_target_is_public(url: &reqwest::Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
+        return !ip_is_private_or_local(ip);
+    }
+    let host = host.to_ascii_lowercase();
+    host != "localhost" && !host.ends_with(".localhost")
+}
+
+fn ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_private_or_local(std::net::IpAddr::V4(v4));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || v6.is_unicast_link_local()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Builds a redirect policy refusing plaintext downgrades, non-HTTP(S)
+/// schemes, and private or local targets. Refusals surface as fetch errors
+/// naming only the host, never the credential-bearing URL.
 pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
     reqwest::redirect::Policy::custom(move |attempt| {
         let hops = attempt.previous().len();
@@ -42,6 +79,8 @@ pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
             let host = attempt.url().host_str().unwrap_or("unknown host");
             let reason = if hops >= cap {
                 format!("too many redirects (host {host})")
+            } else if !redirect_target_is_public(attempt.url()) {
+                format!("refusing redirect to a private or local target (host {host})")
             } else {
                 format!("refusing insecure or unsupported redirect for host {host}")
             };
@@ -483,5 +522,45 @@ mod tests {
         assert!(!redirect_allowed(Some("https"), &ftp, 0, 5));
         assert!(!redirect_allowed(Some("http"), &file, 0, 5));
         assert!(!redirect_allowed(None, &ftp, 0, 5));
+    }
+
+    #[test]
+    fn private_and_local_redirect_targets_refused() {
+        for target in [
+            "http://127.0.0.1:8080/sub",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.1.2.3/sub",
+            "http://192.168.1.1/sub",
+            "http://172.16.0.1/sub",
+            "http://[::1]/sub",
+            "http://[fe80::1]/sub",
+            "http://[fc00::1]/sub",
+            "http://0.0.0.0/sub",
+            "http://localhost/sub",
+            "http://sub.localhost/sub",
+        ] {
+            let url = reqwest::Url::parse(target).unwrap();
+            assert!(
+                !redirect_allowed(Some("https"), &url, 0, 5),
+                "private redirect target allowed: {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_redirect_targets_allowed() {
+        for target in [
+            "https://example.com/sub",
+            "https://sub.example.org/next",
+            "http://198.51.100.7/sub",
+            "https://[2001:db8::1]/sub",
+            "https://example.com:8443/path?q=1",
+        ] {
+            let url = reqwest::Url::parse(target).unwrap();
+            assert!(
+                redirect_allowed(Some("http"), &url, 0, 5),
+                "public redirect target refused: {target}"
+            );
+        }
     }
 }

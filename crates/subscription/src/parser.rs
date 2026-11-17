@@ -55,7 +55,15 @@ fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
     }
 }
 
-fn parse_url_tls(params: &HashMap<String, String>) -> Option<TlsSettings> {
+fn parse_url_tls(params: &HashMap<String, String>) -> Result<Option<TlsSettings>, ParseError> {
+    if params
+        .get("allowInsecure")
+        .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+    {
+        return Err(ParseError::InvalidFormat(
+            "allowInsecure disables TLS certificate verification".into(),
+        ));
+    }
     match params.get("security").map(|s| s.as_str()) {
         Some("tls") | Some("reality") => {
             let reality = params.get("security").map(|s| s.as_str()) == Some("reality");
@@ -68,7 +76,7 @@ fn parse_url_tls(params: &HashMap<String, String>) -> Option<TlsSettings> {
             let public_key = params.get("pbk").cloned();
             let short_id = params.get("sid").cloned();
             let spider_x = params.get("spx").cloned();
-            Some(TlsSettings {
+            Ok(Some(TlsSettings {
                 server_name,
                 alpn,
                 verify: true,
@@ -77,9 +85,9 @@ fn parse_url_tls(params: &HashMap<String, String>) -> Option<TlsSettings> {
                 public_key,
                 short_id,
                 spider_x,
-            })
+            }))
         }
-        _ => None,
+        _ => Ok(None),
     }
 }
 
@@ -109,7 +117,7 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
         .collect();
 
     let transport = parse_url_transport(&params);
-    let tls = parse_url_tls(&params);
+    let tls = parse_url_tls(&params)?;
 
     let flow = params.get("flow").cloned();
     let encryption = params.get("encryption").cloned();
@@ -194,6 +202,17 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     };
 
     let tls = if json["tls"].as_str() == Some("tls") {
+        let insecure = json["allowInsecure"]
+            .as_bool()
+            .unwrap_or(false)
+            || json["allowInsecure"]
+                .as_str()
+                .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        if insecure {
+            return Err(ParseError::InvalidFormat(
+                "allowInsecure disables TLS certificate verification".into(),
+            ));
+        }
         let server_name = json["sni"]
             .as_str()
             .or_else(|| json["host"].as_str())
@@ -292,7 +311,7 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
         .collect();
 
     let transport = parse_url_transport(&params);
-    let tls = parse_url_tls(&params).or_else(|| {
+    let tls = parse_url_tls(&params)?.or_else(|| {
         if port == 443 {
             Some(TlsSettings {
                 server_name: Some(address.clone()),
@@ -611,6 +630,39 @@ mod tests {
             }
             _ => panic!("expected InvalidFormat error"),
         }
+    }
+
+    #[test]
+    fn test_parse_vless_rejects_allow_insecure() {
+        for flag in ["1", "true", "TRUE"] {
+            let uri = format!(
+                "vless://uuid@host:443?security=tls&allowInsecure={flag}#Insecure"
+            );
+            let err = parse_uri(&uri).expect_err("allowInsecure must be rejected");
+            assert!(
+                err.to_string().contains("allowInsecure"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_trojan_rejects_allow_insecure() {
+        let err = parse_uri("trojan://pass@host:443?security=tls&allowInsecure=1")
+            .expect_err("allowInsecure must be rejected");
+        assert!(err.to_string().contains("allowInsecure"), "{err}");
+    }
+
+    #[test]
+    fn test_allow_insecure_uri_does_not_block_valid_uris() {
+        let uris = vec![
+            "vless://uuid@host:443?security=tls&allowInsecure=1".to_string(),
+            "vless://uuid@host:443".to_string(),
+        ];
+        let result = parse_subscription_uris(&uris);
+        assert_eq!(result.nodes.len(), 1);
+        assert_eq!(result.errors.len(), 1);
+        assert!(result.errors[0].1.to_string().contains("allowInsecure"));
     }
 
     #[test]

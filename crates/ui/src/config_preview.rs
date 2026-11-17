@@ -16,6 +16,7 @@ pub struct ConfigPreviewDialog {
     raw_content: String,
     redacted_content: Option<String>,
     reveal_raw: bool,
+    preserve_reveal_on_load: bool,
     status: Option<String>,
 }
 
@@ -131,6 +132,7 @@ impl Component for ConfigPreviewDialog {
             raw_content: String::new(),
             redacted_content: None,
             reveal_raw: false,
+            preserve_reveal_on_load: false,
             status: None,
         };
 
@@ -147,6 +149,7 @@ impl Component for ConfigPreviewDialog {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
         match msg {
             ConfigPreviewInput::Refresh => {
+                self.preserve_reveal_on_load = true;
                 let path = self.path.clone();
                 sender.oneshot_command(async move {
                     ConfigPreviewCommandOutput::FileRead(tokio::fs::read_to_string(&path).await)
@@ -164,16 +167,18 @@ impl Component for ConfigPreviewDialog {
             ConfigPreviewInput::SetPath(path) => {
                 self.path = path;
                 self.absolute_path = absolute_path_string(&self.path);
+                self.preserve_reveal_on_load = false;
                 sender.input(ConfigPreviewInput::Refresh);
             }
             ConfigPreviewInput::Loaded(result) => {
+                let preserve_reveal = std::mem::take(&mut self.preserve_reveal_on_load);
                 match result {
                     Ok(raw) => {
                         self.status = None;
                         self.raw_content = raw;
                         self.redacted_content =
                             v2ray_rs_core::config::redact_json(&self.raw_content);
-                        self.reveal_raw = false;
+                        self.reveal_raw = reveal_after_load(preserve_reveal, self.reveal_raw);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         self.status = Some(format!(
@@ -230,4 +235,23 @@ fn absolute_path_string(path: &std::path::Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string()
+}
+
+/// A Refresh keeps the user's reveal choice; a path change or first load
+/// starts redacted.
+fn reveal_after_load(preserve: bool, current: bool) -> bool {
+    if preserve { current } else { false }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reveal_after_load;
+
+    #[test]
+    fn refresh_preserves_reveal_state() {
+        assert!(reveal_after_load(true, true));
+        assert!(!reveal_after_load(true, false));
+        assert!(!reveal_after_load(false, true));
+        assert!(!reveal_after_load(false, false));
+    }
 }
