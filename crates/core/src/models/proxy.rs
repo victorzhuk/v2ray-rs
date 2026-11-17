@@ -51,6 +51,14 @@ impl ProxyNode {
         }
     }
 
+    /// True when the node carries TLS settings that disable certificate
+    /// verification. Probes that would silently accept a mismatched
+    /// certificate must skip such nodes.
+    #[must_use]
+    pub fn tls_verify_disabled(&self) -> bool {
+        self.tls().is_some_and(|tls| !tls.verify)
+    }
+
     pub fn validate(&self) -> Result<(), ProxyNodeValidationError> {
         validate_common(self.protocol_name(), self.address(), self.port())?;
 
@@ -94,6 +102,9 @@ fn validate_common(
     port: u16,
 ) -> Result<(), ProxyNodeValidationError> {
     require_non_empty(protocol, "address", address)?;
+    if address.starts_with('[') || address.ends_with(']') {
+        return Err(ProxyNodeValidationError::BracketedAddress { protocol });
+    }
     if port == 0 {
         return Err(ProxyNodeValidationError::InvalidPort {
             protocol,
@@ -137,6 +148,8 @@ pub enum ProxyNodeValidationError {
         protocol: &'static str,
         field: &'static str,
     },
+    #[error("{protocol} node address must be a bare host, not a bracketed IPv6 literal")]
+    BracketedAddress { protocol: &'static str },
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -404,6 +417,23 @@ mod tests {
             }),
             remark: Some("Test Trojan".into()),
         })
+    }
+
+    #[test]
+    fn test_validate_rejects_bracketed_ipv6_address() {
+        let mut node = sample_vless();
+        if let ProxyNode::Vless(cfg) = &mut node {
+            cfg.address = "[2001:db8::1]".into();
+        }
+        assert!(matches!(
+            node.validate().unwrap_err(),
+            ProxyNodeValidationError::BracketedAddress { .. }
+        ));
+
+        if let ProxyNode::Vless(cfg) = &mut node {
+            cfg.address = "2001:db8::1".into();
+        }
+        assert!(node.validate().is_ok());
     }
 
     #[test]

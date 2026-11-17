@@ -60,6 +60,9 @@ fn via_node(
             node_id,
         } => {
             let sub = subscriptions.iter().find(|s| s.id == subscription_id)?;
+            if !sub.enabled {
+                return None;
+            }
             let node = sub.nodes.iter().find(|n| n.id == node_id)?;
             node.enabled.then(|| node.node.clone())
         }
@@ -870,6 +873,23 @@ mod tests {
     #[test]
     fn resolve_via_nodes_clears_references_to_disabled_nodes() {
         let sub = subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), false, None)]);
+        let node_ref = ConnectionNodeRef::Subscription {
+            subscription_id: sub.id,
+            node_id: sub.nodes[0].id,
+        };
+        let mut rules = vec![via_rule(Some(node_ref))];
+
+        let nodes = resolve_via_nodes(&mut rules, &[sub], &[]);
+
+        assert!(nodes.is_empty());
+        assert_eq!(rules[0].via_node, None);
+    }
+
+    #[test]
+    fn resolve_via_nodes_clears_references_inside_disabled_subscriptions() {
+        let mut sub =
+            subscription_with_nodes("Alpha", vec![(vless_node("a.com", "A"), true, None)]);
+        sub.enabled = false;
         let node_ref = ConnectionNodeRef::Subscription {
             subscription_id: sub.id,
             node_id: sub.nodes[0].id,

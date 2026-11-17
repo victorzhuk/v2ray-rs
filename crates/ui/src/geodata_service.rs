@@ -1,8 +1,10 @@
 use crate::failure_streak::FailureStreak;
 use std::time::Duration;
 
+use v2ray_rs_core::geodata::canonical_rule_set_tag;
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, RoutingRule, RoutingRuleSet, RuleMatch, Subscription,
+    AppSettings, BackendType, DnsConfig, DnsRuleMatch, RoutingRule, RoutingRuleSet, RuleMatch,
+    Subscription,
 };
 use v2ray_rs_core::persistence::AppPaths;
 
@@ -27,20 +29,21 @@ impl GeodataRefreshConfig {
             backend_type: settings.backend.backend_type,
             enabled: settings.auto_update_geodata && settings.backend.binary_path.is_some(),
             interval_secs: settings.geodata_update_interval_secs.max(60),
-            singbox_rule_set_tags: singbox_rule_set_tags(rules, subscriptions),
+            singbox_rule_set_tags: singbox_rule_set_tags(rules, subscriptions, settings),
         }
     }
 }
 
 /// Derives the full sing-box rule-set tags (`geoip-ru`, `geosite-google`, ...)
-/// referenced by the enabled global routing rules plus every subscription's
-/// active imported profile, for fetching and indexing only the geodata
-/// actually in use. A profile's rules are otherwise invisible to this scan -
-/// without it, sing-box hits an uncached category at connect time and does a
-/// live, blocking, FATAL-on-failure fetch instead.
+/// referenced by the enabled global routing rules, the active DNS rule set, and
+/// every subscription's active imported profile, for fetching and indexing only
+/// the geodata actually in use. A profile's rules are otherwise invisible to
+/// this scan - without it, sing-box hits an uncached category at connect time
+/// and does a live, blocking, FATAL-on-failure fetch instead.
 pub(crate) fn singbox_rule_set_tags(
     rules: &RoutingRuleSet,
     subscriptions: &[Subscription],
+    settings: &AppSettings,
 ) -> Vec<String> {
     let mut tags: Vec<String> = rules
         .rules()
@@ -48,6 +51,8 @@ pub(crate) fn singbox_rule_set_tags(
         .filter(|r| r.enabled)
         .filter_map(rule_set_tag)
         .collect();
+
+    dns_geosite_tags(&settings.dns, &mut tags);
 
     for sub in subscriptions {
         if !sub.use_imported_profile {
@@ -63,11 +68,27 @@ pub(crate) fn singbox_rule_set_tags(
                 .filter(|r| r.enabled)
                 .filter_map(rule_set_tag),
         );
+        if let Some(dns) = &profile.dns {
+            dns_geosite_tags(dns, &mut tags);
+        }
     }
 
     tags.sort();
     tags.dedup();
     tags
+}
+
+fn dns_geosite_tags(dns: &DnsConfig, tags: &mut Vec<String>) {
+    if !dns.enabled || !dns.use_custom_rules {
+        return;
+    }
+    for rule in &dns.rules {
+        if let DnsRuleMatch::GeoSite { category } = &rule.match_condition
+            && let Some(tag) = canonical_rule_set_tag(&format!("geosite-{category}"))
+        {
+            tags.push(tag);
+        }
+    }
 }
 
 fn rule_set_tag(rule: &RoutingRule) -> Option<String> {
@@ -127,9 +148,26 @@ mod tests {
             )
             .unwrap();
 
-        let tags = singbox_rule_set_tags(&rules, &[]);
+        let tags = singbox_rule_set_tags(&rules, &[], &AppSettings::default());
 
         assert!(tags.is_empty(), "private has no .srs to fetch: {tags:?}");
+    }
+
+    #[test]
+    fn active_custom_dns_geosite_categories_are_prefetched() {
+        let mut settings = AppSettings::default();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.rules = vec![v2ray_rs_core::models::DnsRule {
+            match_condition: v2ray_rs_core::models::DnsRuleMatch::GeoSite {
+                category: "OpenAI".into(),
+            },
+            server_tag: "remote".into(),
+        }];
+
+        let tags = singbox_rule_set_tags(&RoutingRuleSet::default(), &[], &settings);
+
+        assert_eq!(tags, vec!["geosite-openai".to_string()]);
     }
 
     #[test]
@@ -149,7 +187,8 @@ mod tests {
             imported_at: chrono::Utc::now(),
         });
 
-        let tags = singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub]);
+        let tags =
+            singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub], &AppSettings::default());
 
         assert_eq!(tags, vec!["geosite-netflix".to_string()]);
     }
@@ -171,7 +210,8 @@ mod tests {
             imported_at: chrono::Utc::now(),
         });
 
-        let tags = singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub]);
+        let tags =
+            singbox_rule_set_tags(&RoutingRuleSet::default(), &[sub], &AppSettings::default());
 
         assert!(tags.is_empty());
     }
@@ -241,6 +281,7 @@ async fn run_loop(
     toasts: tokio::sync::mpsc::UnboundedSender<String>,
 ) {
     let mut streak = FailureStreak::new();
+    let mut first_pass = true;
     loop {
         let config = config_rx.borrow().clone();
         if !config.enabled {
@@ -251,7 +292,10 @@ async fn run_loop(
         }
 
         let refresh_config = config.clone();
-        let result = tokio::task::spawn_blocking(move || refresh_once(refresh_config)).await;
+        let force_all = !first_pass;
+        first_pass = false;
+        let result =
+            tokio::task::spawn_blocking(move || refresh_once(refresh_config, force_all)).await;
         let outcome: Result<(), String> = match result {
             Ok(Ok(())) => Ok(()),
             Ok(Err(err)) => {
@@ -281,11 +325,11 @@ async fn run_loop(
     }
 }
 
-fn refresh_once(config: GeodataRefreshConfig) -> Result<(), String> {
+fn refresh_once(config: GeodataRefreshConfig, force_all: bool) -> Result<(), String> {
     #[cfg(feature = "geodata-fetch")]
     {
         use v2ray_rs_core::geodata::{
-            GeodataManager, check_and_download, download_singbox_rule_sets,
+            GeodataManager, check_and_download, download_singbox_rule_sets, rule_sets_to_fetch,
         };
         use v2ray_rs_core::geodata_index::GeodataIndexManager;
 
@@ -298,18 +342,14 @@ fn refresh_once(config: GeodataRefreshConfig) -> Result<(), String> {
                 .map_err(|err| err.to_string())?
                 .is_none();
 
-            let missing: Vec<String> = config
-                .singbox_rule_set_tags
-                .iter()
-                .filter(|tag| !manager.has_rule_set(tag))
-                .cloned()
-                .collect();
+            let fetch = rule_sets_to_fetch(&manager, &config.singbox_rule_set_tags, force_all);
 
-            if !missing.is_empty() {
-                download_singbox_rule_sets(&manager, &missing).map_err(|err| err.to_string())?;
+            if !fetch.is_empty() {
+                download_singbox_rule_sets(&manager, &fetch, force_all)
+                    .map_err(|err| err.to_string())?;
             }
 
-            if !missing.is_empty() || index_missing {
+            if !fetch.is_empty() || index_missing {
                 manager
                     .reindex(BackendType::SingBox)
                     .map_err(|err| err.to_string())?;
@@ -344,10 +384,12 @@ pub(crate) fn update_geodata(paths: &AppPaths, backend: BackendType) -> Result<(
     #[cfg(feature = "geodata-fetch")]
     {
         use v2ray_rs_core::geodata::{
-            GeodataManager, download_geodata, download_singbox_rule_sets,
+            GeodataManager, download_geodata, download_singbox_rule_sets, rule_sets_to_fetch,
         };
         use v2ray_rs_core::geodata_index::GeodataIndexManager;
-        use v2ray_rs_core::persistence::{load_routing_rules, load_subscriptions};
+        use v2ray_rs_core::persistence::{
+            load_routing_rules, load_settings_or_default, load_subscriptions,
+        };
 
         let geodata_manager = GeodataManager::new(paths);
         let index_manager = GeodataIndexManager::new(paths);
@@ -355,14 +397,12 @@ pub(crate) fn update_geodata(paths: &AppPaths, backend: BackendType) -> Result<(
         if backend == BackendType::SingBox {
             let rules = load_routing_rules(paths).unwrap_or_default();
             let subscriptions = load_subscriptions(paths).unwrap_or_default();
-            let tags = singbox_rule_set_tags(&rules, &subscriptions);
-            let missing: Vec<String> = tags
-                .into_iter()
-                .filter(|tag| !geodata_manager.has_rule_set(tag))
-                .collect();
+            let settings = load_settings_or_default(paths);
+            let tags = singbox_rule_set_tags(&rules, &subscriptions, &settings);
+            let fetch = rule_sets_to_fetch(&geodata_manager, &tags, true);
 
-            if !missing.is_empty() {
-                download_singbox_rule_sets(&geodata_manager, &missing)
+            if !fetch.is_empty() {
+                download_singbox_rule_sets(&geodata_manager, &fetch, true)
                     .map_err(|e| format!("Download failed: {}", e))?;
             }
 

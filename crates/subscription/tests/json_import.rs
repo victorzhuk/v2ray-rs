@@ -138,6 +138,25 @@ fn unsupported_transport_lands_in_errors_not_nodes() {
     assert!(import.result.errors[0].1.to_string().contains("kcp"));
 }
 
+#[test]
+fn bracketed_ipv6_outbound_is_normalized() {
+    let bundle = serde_json::json!([{
+        "remarks": "V6",
+        "outbounds": [
+            vless_outbound(
+                "proxy",
+                "[2001:db8::1]",
+                serde_json::json!({"network": "tcp"})
+            )
+        ]
+    }]);
+
+    let import = parse_json_subscription(&bundle.to_string()).expect("bundle format detected");
+    assert_eq!(import.result.errors.len(), 0, "{:?}", import.result.errors);
+    assert_eq!(import.result.nodes.len(), 1);
+    assert_eq!(import.result.nodes[0].node.address(), "2001:db8::1");
+}
+
 fn vless_outbound(tag: &str, address: &str, stream: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "tag": tag,
@@ -229,7 +248,10 @@ fn multi_axis_and_dns_outbound_rules_are_dropped_whole() {
     let import = parse_json_subscription(&bundle.to_string()).expect("bundle detected");
     let profile = import.profile.expect("profile extracted");
     assert_eq!(profile.rules.len(), 1, "{:?}", profile.rules);
-    assert_eq!(profile.rules[0].action, v2ray_rs_core::models::RuleAction::Direct);
+    assert_eq!(
+        profile.rules[0].action,
+        v2ray_rs_core::models::RuleAction::Direct
+    );
     assert!(matches!(
         profile.rules[0].match_condition,
         v2ray_rs_core::models::RuleMatch::GeoIp { .. }
@@ -285,7 +307,11 @@ fn invalid_dns_servers_and_hosts_are_dropped_with_warnings() {
     assert_eq!(dns.rules.len(), 0, "{:?}", dns.rules);
     assert_eq!(dns.hosts.len(), 1, "{:?}", dns.hosts);
     assert_eq!(dns.hosts[0].domain, "ok.example.com");
-    for expected in ["invalid address 'bad host'", "invalid entry", "invalid domain matcher"] {
+    for expected in [
+        "invalid address 'bad host'",
+        "invalid entry",
+        "invalid domain matcher",
+    ] {
         assert!(
             profile
                 .skipped

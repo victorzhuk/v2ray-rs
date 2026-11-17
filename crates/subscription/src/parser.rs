@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use thiserror::Error;
 use v2ray_rs_core::models::{
     GrpcSettings, H2Settings, ProxyNode, TlsSettings, TransportSettings, VmessConfig, WsSettings,
+    XhttpSettings,
 };
 
 #[derive(Debug, Error)]
@@ -11,6 +12,35 @@ pub enum ParseError {
     UnsupportedScheme(String),
     #[error("invalid URI format: {0}")]
     InvalidFormat(String),
+}
+
+/// Backends expect a bare IPv6 literal in stored addresses; URI authorities and
+/// JSON profiles may carry the RFC 3986 bracketed form.
+pub(crate) fn normalize_host(host: &str) -> String {
+    if let Some(inner) = host.strip_prefix('[').and_then(|h| h.strip_suffix(']'))
+        && inner.parse::<std::net::Ipv6Addr>().is_ok()
+    {
+        return inner.to_string();
+    }
+    host.to_string()
+}
+
+fn strip_scheme<'a>(uri: &'a str, scheme: &str) -> Result<&'a str, ParseError> {
+    let (actual, rest) = uri
+        .split_once("://")
+        .ok_or_else(|| ParseError::InvalidFormat(format!("missing {scheme}:// prefix")))?;
+    if !actual.eq_ignore_ascii_case(scheme) {
+        return Err(ParseError::InvalidFormat(format!(
+            "missing {scheme}:// prefix"
+        )));
+    }
+    Ok(rest)
+}
+
+fn percent_decode_component(value: &str) -> String {
+    percent_encoding::percent_decode_str(value)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 pub fn parse_uri(uri: &str) -> Result<ProxyNode, ParseError> {
@@ -25,8 +55,9 @@ pub fn parse_uri(uri: &str) -> Result<ProxyNode, ParseError> {
     }
 }
 
-fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
-    match params.get("type").map(|s| s.as_str()) {
+fn parse_url_transport(params: &HashMap<String, String>) -> Result<TransportSettings, ParseError> {
+    let transport = match params.get("type").map(String::as_str) {
+        None | Some("") | Some("tcp") => TransportSettings::Tcp,
         Some("ws") => {
             let path = params.get("path").cloned().unwrap_or_default();
             let host = params.get("host").cloned();
@@ -43,7 +74,7 @@ fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
                 multi_mode: false,
             })
         }
-        Some("h2") => {
+        Some("h2") | Some("http") => {
             let host = params
                 .get("host")
                 .map(|h| vec![h.clone()])
@@ -51,8 +82,22 @@ fn parse_url_transport(params: &HashMap<String, String>) -> TransportSettings {
             let path = params.get("path").cloned().unwrap_or_default();
             TransportSettings::H2(H2Settings { host, path })
         }
-        _ => TransportSettings::Tcp,
-    }
+        Some("xhttp") | Some("splithttp") => TransportSettings::Xhttp(XhttpSettings {
+            path: params.get("path").cloned().unwrap_or_default(),
+            host: params.get("host").cloned(),
+            mode: params
+                .get("mode")
+                .filter(|mode| !mode.is_empty())
+                .cloned()
+                .unwrap_or_else(|| "auto".to_string()),
+        }),
+        Some(other) => {
+            return Err(ParseError::InvalidFormat(format!(
+                "unsupported transport: {other}"
+            )));
+        }
+    };
+    Ok(transport)
 }
 
 fn parse_url_tls(params: &HashMap<String, String>) -> Result<Option<TlsSettings>, ParseError> {
@@ -96,15 +141,15 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
 
     let url = url::Url::parse(uri).map_err(|e| ParseError::InvalidFormat(e.to_string()))?;
 
-    let uuid = url.username().to_owned();
+    let uuid = percent_decode_component(url.username());
     if uuid.is_empty() {
         return Err(ParseError::InvalidFormat("missing UUID".into()));
     }
 
     let address = url
         .host_str()
-        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
-        .to_owned();
+        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))
+        .map(normalize_host)?;
     let port = url
         .port()
         .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
@@ -116,7 +161,7 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    let transport = parse_url_transport(&params);
+    let transport = parse_url_transport(&params)?;
     let tls = parse_url_tls(&params)?;
 
     let flow = params.get("flow").cloned();
@@ -139,13 +184,19 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     use base64::engine::general_purpose::STANDARD;
 
     const MAX_VMESS_PAYLOAD: usize = 64 * 1024; // 64 KB
+    const MAX_VMESS_ENCODED: usize = MAX_VMESS_PAYLOAD.div_ceil(3) * 4;
 
-    let encoded = uri
-        .strip_prefix("vmess://")
-        .ok_or_else(|| ParseError::InvalidFormat("missing vmess:// prefix".into()))?;
+    let encoded = strip_scheme(uri, "vmess")?;
+    let encoded = encoded.trim();
+    if encoded.len() > MAX_VMESS_ENCODED {
+        return Err(ParseError::InvalidFormat(format!(
+            "vmess payload too large: {} encoded bytes",
+            encoded.len()
+        )));
+    }
 
     let decoded = STANDARD
-        .decode(encoded.trim())
+        .decode(encoded)
         .map_err(|e| ParseError::InvalidFormat(format!("base64 decode failed: {e}")))?;
 
     if decoded.len() > MAX_VMESS_PAYLOAD {
@@ -158,22 +209,25 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
     let json: serde_json::Value = serde_json::from_slice(&decoded)
         .map_err(|e| ParseError::InvalidFormat(format!("invalid JSON: {e}")))?;
 
-    let address = json["add"]
-        .as_str()
-        .ok_or_else(|| ParseError::InvalidFormat("missing 'add' field".into()))?
-        .to_owned();
-    let port = json["port"]
+    let address = normalize_host(
+        json["add"]
+            .as_str()
+            .ok_or_else(|| ParseError::InvalidFormat("missing 'add' field".into()))?,
+    );
+    let raw_port = json["port"]
         .as_u64()
         .or_else(|| json["port"].as_str().and_then(|s| s.parse().ok()))
-        .ok_or_else(|| ParseError::InvalidFormat("missing 'port' field".into()))?
-        as u16;
+        .ok_or_else(|| ParseError::InvalidFormat("missing 'port' field".into()))?;
+    let port = u16::try_from(raw_port)
+        .map_err(|_| ParseError::InvalidFormat(format!("port out of range: {raw_port}")))?;
     let uuid = json["id"]
         .as_str()
         .ok_or_else(|| ParseError::InvalidFormat("missing 'id' field".into()))?
         .to_owned();
     let remark = json["ps"].as_str().map(|s| s.to_owned());
 
-    let transport = match json["net"].as_str() {
+    let transport = match json["net"].as_str().filter(|net| !net.is_empty()) {
+        None | Some("tcp") => TransportSettings::Tcp,
         Some("ws") => {
             let path = json["path"].as_str().unwrap_or("").to_owned();
             let host = json["host"].as_str().map(|s| s.to_owned());
@@ -190,7 +244,7 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
                 multi_mode: false,
             })
         }
-        Some("h2") => {
+        Some("h2") | Some("http") => {
             let host = json["host"]
                 .as_str()
                 .map(|h| vec![h.to_owned()])
@@ -198,13 +252,24 @@ fn parse_vmess(uri: &str) -> Result<ProxyNode, ParseError> {
             let path = json["path"].as_str().unwrap_or("").to_owned();
             TransportSettings::H2(H2Settings { host, path })
         }
-        _ => TransportSettings::Tcp,
+        Some("xhttp") | Some("splithttp") => TransportSettings::Xhttp(XhttpSettings {
+            path: json["path"].as_str().unwrap_or("").to_owned(),
+            host: json["host"].as_str().map(|s| s.to_owned()),
+            mode: json["mode"]
+                .as_str()
+                .filter(|mode| !mode.is_empty())
+                .unwrap_or("auto")
+                .to_string(),
+        }),
+        Some(other) => {
+            return Err(ParseError::InvalidFormat(format!(
+                "unsupported transport: {other}"
+            )));
+        }
     };
 
     let tls = if json["tls"].as_str() == Some("tls") {
-        let insecure = json["allowInsecure"]
-            .as_bool()
-            .unwrap_or(false)
+        let insecure = json["allowInsecure"].as_bool().unwrap_or(false)
             || json["allowInsecure"]
                 .as_str()
                 .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
@@ -242,9 +307,7 @@ fn parse_ss(uri: &str) -> Result<ProxyNode, ParseError> {
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
     use v2ray_rs_core::models::ShadowsocksConfig;
 
-    let without_scheme = uri
-        .strip_prefix("ss://")
-        .ok_or_else(|| ParseError::InvalidFormat("missing ss:// prefix".into()))?;
+    let without_scheme = strip_scheme(uri, "ss")?;
 
     let (userinfo_part, host_part) = without_scheme
         .split_once('@')
@@ -268,8 +331,8 @@ fn parse_ss(uri: &str) -> Result<ProxyNode, ParseError> {
         .map_err(|e| ParseError::InvalidFormat(format!("invalid host:port: {e}")))?;
     let address = parsed
         .host_str()
-        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
-        .to_owned();
+        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))
+        .map(normalize_host)?;
     let port = parsed
         .port()
         .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
@@ -290,15 +353,15 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
 
     let url = url::Url::parse(uri).map_err(|e| ParseError::InvalidFormat(e.to_string()))?;
 
-    let password = url.username().to_owned();
+    let password = percent_decode_component(url.username());
     if password.is_empty() {
         return Err(ParseError::InvalidFormat("missing password".into()));
     }
 
     let address = url
         .host_str()
-        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))?
-        .to_owned();
+        .ok_or_else(|| ParseError::InvalidFormat("missing host".into()))
+        .map(normalize_host)?;
     let port = url
         .port()
         .ok_or_else(|| ParseError::InvalidFormat("missing port".into()))?;
@@ -310,17 +373,15 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
         .map(|(k, v)| (k.into_owned(), v.into_owned()))
         .collect();
 
-    let transport = parse_url_transport(&params);
-    let tls = parse_url_tls(&params)?.or_else(|| {
-        if port == 443 {
-            Some(TlsSettings {
-                server_name: Some(address.clone()),
-                ..Default::default()
-            })
-        } else {
-            None
-        }
-    });
+    let transport = parse_url_transport(&params)?;
+    let tls = match params.get("security").map(String::as_str) {
+        Some("none") => None,
+        Some("tls") | Some("reality") => parse_url_tls(&params)?,
+        _ => Some(TlsSettings {
+            server_name: Some(address.clone()),
+            ..Default::default()
+        }),
+    };
 
     Ok(ProxyNode::Trojan(TrojanConfig {
         address,
@@ -635,9 +696,7 @@ mod tests {
     #[test]
     fn test_parse_vless_rejects_allow_insecure() {
         for flag in ["1", "true", "TRUE"] {
-            let uri = format!(
-                "vless://uuid@host:443?security=tls&allowInsecure={flag}#Insecure"
-            );
+            let uri = format!("vless://uuid@host:443?security=tls&allowInsecure={flag}#Insecure");
             let err = parse_uri(&uri).expect_err("allowInsecure must be rejected");
             assert!(
                 err.to_string().contains("allowInsecure"),
@@ -681,6 +740,82 @@ mod tests {
         assert!(matches!(parse_uri(&vmess_uri), Ok(ProxyNode::Vmess(_))));
         assert!(matches!(parse_uri(&ss_uri), Ok(ProxyNode::Shadowsocks(_))));
         assert!(matches!(parse_uri(trojan_uri), Ok(ProxyNode::Trojan(_))));
+    }
+
+    #[test]
+    fn test_parse_vless_ipv6_stores_bare_literal() {
+        let node = parse_uri("vless://uuid@[2001:db8::1]:443?security=tls#v6").unwrap();
+        assert_eq!(node.address(), "2001:db8::1");
+        assert!(node.validate().is_ok());
+    }
+
+    #[test]
+    fn test_parse_vless_xhttp_transport() {
+        let uri = "vless://uuid@example.com:443?type=xhttp&path=%2Fsplit&host=cdn.example.com&mode=packet-up";
+        let ProxyNode::Vless(cfg) = parse_uri(uri).unwrap() else {
+            panic!("expected VLESS")
+        };
+        assert_eq!(
+            cfg.transport,
+            TransportSettings::Xhttp(XhttpSettings {
+                path: "/split".into(),
+                host: Some("cdn.example.com".into()),
+                mode: "packet-up".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_unknown_transport_is_rejected() {
+        for kind in ["httpupgrade", "kcp"] {
+            let uri = format!("vless://uuid@example.com:443?type={kind}");
+            let err = parse_uri(&uri).unwrap_err();
+            assert!(
+                err.to_string().contains("unsupported transport"),
+                "unexpected error for {kind}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_parse_uppercase_vmess_and_ss_schemes() {
+        let vmess_json = r#"{"add":"host","port":"443","id":"uuid"}"#;
+        let vmess_uri = format!(
+            "VMESS://{}",
+            base64::engine::general_purpose::STANDARD.encode(vmess_json)
+        );
+        assert!(matches!(parse_uri(&vmess_uri), Ok(ProxyNode::Vmess(_))));
+
+        let ss_userinfo = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode("method:pass");
+        let ss_uri = format!("SS://{}@host:8388", ss_userinfo);
+        assert!(matches!(parse_uri(&ss_uri), Ok(ProxyNode::Shadowsocks(_))));
+    }
+
+    #[test]
+    fn test_parse_trojan_defaults_tls_and_decodes_password() {
+        let ProxyNode::Trojan(cfg) =
+            parse_uri("trojan://secret%40pass@example.com:8443#node").unwrap()
+        else {
+            panic!("expected Trojan")
+        };
+        assert_eq!(cfg.password, "secret@pass");
+        let tls = cfg.tls.expect("TLS must default on for Trojan");
+        assert!(tls.verify);
+        assert_eq!(tls.server_name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_parse_vmess_rejects_oversized_payload_and_port() {
+        let oversized = format!("vmess://{}", "A".repeat((70 * 1024usize).div_ceil(3) * 4));
+        assert!(parse_uri(&oversized).is_err());
+
+        let bad_port = r#"{"add":"host","port":"70000","id":"uuid"}"#;
+        let uri = format!(
+            "vmess://{}",
+            base64::engine::general_purpose::STANDARD.encode(bad_port)
+        );
+        let err = parse_uri(&uri).unwrap_err();
+        assert!(err.to_string().contains("port out of range"), "{err}");
     }
 
     #[test]

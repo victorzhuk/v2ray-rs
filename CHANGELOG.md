@@ -38,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pin backend and packaging downloads and verify their SHA-256 digests before use.
 - Run containerized release steps under Bash so pinned downloads and the glibc floor check actually execute.
 - Pass the observed TUN device identity to xray route setup as well as teardown.
+- Format custom UDP DNS ports and bare IPv6 literals correctly, emitting `udp://` addresses for xray and v2ray.
+- Validate FakeIP CIDR address families, reserved DNS server tags, and TUN-derived DNS fields even when DNS is disabled.
+- Register `route.rule_set` entries for DNS GeoSite rules, preserve `DomainKeyword` and `DomainFull` in derived DNS rules, and refresh cached sing-box `.srs` files on scheduled and manual updates.
+- Keep an unrestricted DNS server available when TUN excluded domains need their own scoped resolver.
+- Skip unverified TLS nodes in xray Real Delay probes and refuse `via_node` detours into disabled subscriptions.
+- Parse `xhttp` and `splithttp` URI transports, reject unknown transports, normalize bracketed IPv6 hosts, percent-decode VLESS and Trojan credentials, keep Trojan TLS on by default, and bound VMess payloads and ports.
 
 ## [0.20.3] - 2026-10-18
 

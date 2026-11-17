@@ -559,23 +559,25 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             .dns
             .rules
             .iter()
-            .map(|rule| match &rule.match_condition {
-                DnsRuleMatch::GeoSite { category } => json!({
-                    "rule_set": [format!("geosite-{category}")],
-                    "server": rule.server_tag,
+            .filter_map(|rule| match &rule.match_condition {
+                DnsRuleMatch::GeoSite { category } => dns_geosite_tag(category).map(|tag| {
+                    json!({
+                        "rule_set": [tag],
+                        "server": rule.server_tag,
+                    })
                 }),
-                DnsRuleMatch::DomainSuffix { suffix } => json!({
+                DnsRuleMatch::DomainSuffix { suffix } => Some(json!({
                     "domain_suffix": [strip_suffix_wildcard(suffix)],
                     "server": rule.server_tag,
-                }),
-                DnsRuleMatch::DomainKeyword { keyword } => json!({
+                })),
+                DnsRuleMatch::DomainKeyword { keyword } => Some(json!({
                     "domain_keyword": [keyword],
                     "server": rule.server_tag,
-                }),
-                DnsRuleMatch::DomainFull { domain } => json!({
+                })),
+                DnsRuleMatch::DomainFull { domain } => Some(json!({
                     "domain": [domain],
                     "server": rule.server_tag,
-                }),
+                })),
             })
             .collect();
         let mut all = tun_exclusion_rules;
@@ -586,11 +588,17 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         let mut domestic_geosite: Vec<String> = Vec::new();
         let mut remote_domains: Vec<String> = Vec::new();
         let mut domestic_domains: Vec<String> = Vec::new();
+        let mut remote_keywords: Vec<String> = Vec::new();
+        let mut domestic_keywords: Vec<String> = Vec::new();
+        let mut remote_full: Vec<String> = Vec::new();
+        let mut domestic_full: Vec<String> = Vec::new();
 
         for rule in rules.iter().filter(|r| r.enabled) {
             match &rule.match_condition {
                 RuleMatch::GeoSite { category } => {
-                    let tag = format!("geosite-{category}");
+                    let Some(tag) = dns_geosite_tag(category) else {
+                        continue;
+                    };
                     match rule.action {
                         RuleAction::Proxy => remote_geosite.push(tag),
                         RuleAction::Direct => domestic_geosite.push(tag),
@@ -606,6 +614,16 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
                     }
                     RuleAction::Block => {}
                 },
+                RuleMatch::DomainKeyword { keyword } => match rule.action {
+                    RuleAction::Proxy => remote_keywords.push(keyword.clone()),
+                    RuleAction::Direct => domestic_keywords.push(keyword.clone()),
+                    RuleAction::Block => {}
+                },
+                RuleMatch::DomainFull { domain } => match rule.action {
+                    RuleAction::Proxy => remote_full.push(domain.clone()),
+                    RuleAction::Direct => domestic_full.push(domain.clone()),
+                    RuleAction::Block => {}
+                },
                 _ => {}
             }
         }
@@ -613,11 +631,17 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         for (tag, skipped) in [
             (
                 AUTO_SPLIT_REMOTE_TAG,
-                remote_geosite.len() + remote_domains.len(),
+                remote_geosite.len()
+                    + remote_domains.len()
+                    + remote_keywords.len()
+                    + remote_full.len(),
             ),
             (
                 AUTO_SPLIT_DOMESTIC_TAG,
-                domestic_geosite.len() + domestic_domains.len(),
+                domestic_geosite.len()
+                    + domestic_domains.len()
+                    + domestic_keywords.len()
+                    + domestic_full.len(),
             ),
         ] {
             if !settings.dns.has_server_tag(tag)
@@ -636,6 +660,14 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             derived_rules
                 .push(json!({ "domain_suffix": remote_domains, "server": AUTO_SPLIT_REMOTE_TAG }));
         }
+        if settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG) && !remote_keywords.is_empty() {
+            derived_rules.push(
+                json!({ "domain_keyword": remote_keywords, "server": AUTO_SPLIT_REMOTE_TAG }),
+            );
+        }
+        if settings.dns.has_server_tag(AUTO_SPLIT_REMOTE_TAG) && !remote_full.is_empty() {
+            derived_rules.push(json!({ "domain": remote_full, "server": AUTO_SPLIT_REMOTE_TAG }));
+        }
         if settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG) && !domestic_geosite.is_empty() {
             derived_rules
                 .push(json!({ "rule_set": domestic_geosite, "server": AUTO_SPLIT_DOMESTIC_TAG }));
@@ -644,6 +676,15 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             derived_rules.push(
                 json!({ "domain_suffix": domestic_domains, "server": AUTO_SPLIT_DOMESTIC_TAG }),
             );
+        }
+        if settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG) && !domestic_keywords.is_empty() {
+            derived_rules.push(
+                json!({ "domain_keyword": domestic_keywords, "server": AUTO_SPLIT_DOMESTIC_TAG }),
+            );
+        }
+        if settings.dns.has_server_tag(AUTO_SPLIT_DOMESTIC_TAG) && !domestic_full.is_empty() {
+            derived_rules
+                .push(json!({ "domain": domestic_full, "server": AUTO_SPLIT_DOMESTIC_TAG }));
         }
 
         let mut all = tun_exclusion_rules;
@@ -666,6 +707,20 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
     }
 
     dns_config
+}
+
+fn dns_geosite_tag(category: &str) -> Option<String> {
+    canonical_rule_set_tag(&format!("geosite-{category}"))
+}
+
+fn dns_needs_rule_sets(settings: &AppSettings) -> bool {
+    settings.dns.enabled
+        && settings.dns.use_custom_rules
+        && settings
+            .dns
+            .rules
+            .iter()
+            .any(|rule| matches!(&rule.match_condition, DnsRuleMatch::GeoSite { .. }))
 }
 
 fn build_route(
@@ -716,7 +771,7 @@ fn build_route(
         }
     }
 
-    if enabled.is_empty() && route_rules.is_empty() {
+    if enabled.is_empty() && route_rules.is_empty() && !dns_needs_rule_sets(settings) {
         return json!({ "rules": [] });
     }
 
@@ -743,6 +798,21 @@ fn build_route(
                 geosite_tags.insert(category.to_lowercase());
             }
             _ => {}
+        }
+    }
+
+    if settings.dns.enabled && settings.dns.use_custom_rules {
+        for rule in &settings.dns.rules {
+            if let DnsRuleMatch::GeoSite { category } = &rule.match_condition {
+                match dns_geosite_tag(category) {
+                    Some(_) => {
+                        geosite_tags.insert(category.to_lowercase());
+                    }
+                    None => {
+                        log::warn!("skipping rule-set with invalid tag: geosite-{category}");
+                    }
+                }
+            }
         }
     }
 
@@ -1676,10 +1746,7 @@ mod tests {
 
         let route_rules = config["route"]["rules"].as_array().unwrap();
         assert!(route_rules.is_empty(), "{route_rules:?}");
-        assert_eq!(
-            config["route"]["rule_set"].as_array().map(Vec::len),
-            None
-        );
+        assert_eq!(config["route"]["rule_set"].as_array().map(Vec::len), None);
     }
 
     #[test]
@@ -2996,6 +3063,108 @@ mod tests {
         assert!(
             rules.iter().all(|r| r["server"] != "domestic"),
             "domestic rule must not be emitted without a domestic server"
+        );
+    }
+
+    #[test]
+    fn test_singbox_custom_dns_geosite_registers_route_rule_set() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::GeoSite {
+                category: "Google".to_string(),
+            },
+            server_tag: "remote".to_string(),
+        }];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert_eq!(
+            config["dns"]["rules"][0]["rule_set"],
+            json!(["geosite-google"])
+        );
+        let rule_sets = config["route"]["rule_set"].as_array().unwrap();
+        assert!(
+            rule_sets.iter().any(|r| r["tag"] == "geosite-google"),
+            "route.rule_set must define the DNS GeoSite tag: {rule_sets:?}"
+        );
+    }
+
+    #[test]
+    fn test_singbox_auto_derived_dns_preserves_keyword_and_full_matchers() {
+        let rules = vec![
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::DomainKeyword {
+                    keyword: "yandex".to_string(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: uuid::Uuid::new_v4(),
+                match_condition: RuleMatch::DomainFull {
+                    domain: "api.example.com".to_string(),
+                },
+                action: RuleAction::Proxy,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
+
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = false;
+        settings.dns.servers = vec![
+            DnsServerConfig {
+                tag: AUTO_SPLIT_REMOTE_TAG.to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: None,
+            },
+            DnsServerConfig {
+                tag: AUTO_SPLIT_DOMESTIC_TAG.to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "77.88.8.8".to_string(),
+                port: None,
+                detour: None,
+            },
+        ];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &rules, &settings)
+            .unwrap();
+
+        let dns_rules = config["dns"]["rules"].as_array().unwrap();
+        let domestic = dns_rules
+            .iter()
+            .find(|r| r["domain_keyword"] == json!(["yandex"]))
+            .expect("keyword matcher must stay domain_keyword");
+        assert_eq!(domestic["server"], AUTO_SPLIT_DOMESTIC_TAG);
+        let remote = dns_rules
+            .iter()
+            .find(|r| r["domain"] == json!(["api.example.com"]))
+            .expect("full matcher must stay domain");
+        assert_eq!(remote["server"], AUTO_SPLIT_REMOTE_TAG);
+        assert!(
+            dns_rules
+                .iter()
+                .all(|r| r["domain_suffix"] != json!(["yandex"])
+                    && r["domain_suffix"] != json!(["api.example.com"]))
         );
     }
 

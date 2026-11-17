@@ -73,9 +73,7 @@ fn resolve_user(name: &str) -> Result<BypassUser, &'static str> {
         let home = if (*pw).pw_dir.is_null() {
             String::new()
         } else {
-            CStr::from_ptr((*pw).pw_dir)
-                .to_string_lossy()
-                .into_owned()
+            CStr::from_ptr((*pw).pw_dir).to_string_lossy().into_owned()
         };
         ((*pw).pw_uid, (*pw).pw_gid, home)
     };

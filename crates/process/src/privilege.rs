@@ -1460,7 +1460,9 @@ mod tests {
             "useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin v2ray-rs-bypass"
         ));
         // The account must exist before the wrapper is made setuid.
-        assert!(script.find("useradd --system").unwrap() < script.find("chmod 4750 \"$7\"").unwrap());
+        assert!(
+            script.find("useradd --system").unwrap() < script.find("chmod 4750 \"$7\"").unwrap()
+        );
     }
 
     #[test]

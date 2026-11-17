@@ -142,9 +142,7 @@ fn validate_runtime_inputs(
             .map_err(ConfigError::InvalidRule)?;
     }
 
-    if settings.dns.enabled {
-        settings.dns.validate()?;
-    }
+    settings.dns.validate_for_runtime(settings.tun.enabled)?;
 
     if settings.tun.enabled {
         settings.tun.validate()?;
@@ -257,6 +255,47 @@ mod tests {
         let contents = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&contents).unwrap();
         assert_eq!(parsed["outbounds"][0]["type"], "shadowsocks");
+    }
+
+    #[test]
+    fn test_write_config_singbox_dns_geosite_enables_cache_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
+        let mut settings = AppSettings::default();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".into(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".into(),
+            port: None,
+            detour: None,
+        }];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::GeoSite {
+                category: "google".into(),
+            },
+            server_tag: "remote".into(),
+        }];
+
+        let path = writer
+            .write_config(&sample_nodes(), &[], &settings, &[])
+            .unwrap();
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            parsed["dns"]["rules"][0]["rule_set"],
+            serde_json::json!(["geosite-google"])
+        );
+        assert!(
+            parsed["route"]["rule_set"]
+                .as_array()
+                .is_some_and(|sets| sets.iter().any(|s| s["tag"] == "geosite-google")),
+            "DNS GeoSite rule-set is missing from route.rule_set"
+        );
+        assert_eq!(parsed["experimental"]["cache_file"]["enabled"], true);
     }
 
     #[test]

@@ -4,11 +4,17 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use super::settings::BackendType;
-use super::validation::{validate_domain_keyword, validate_domain_pattern, validate_geosite_category};
+use super::validation::{
+    validate_domain_keyword, validate_domain_pattern, validate_geosite_category,
+};
 
 /// Server tags the auto-split DNS plane attaches derived domain lists to.
 pub const AUTO_SPLIT_REMOTE_TAG: &str = "remote";
 pub const AUTO_SPLIT_DOMESTIC_TAG: &str = "domestic";
+
+/// Server tags the generators synthesize themselves; a user server with one of
+/// these tags would collide with a generated entry at backend startup.
+const RESERVED_SERVER_TAGS: &[&str] = &["hosts", "fakeip", "sys-dns-bootstrap", "tun-dns-fallback"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,36 +39,37 @@ impl DnsProtocol {
     pub fn server_address(&self, address: &str, port: Option<u16>) -> String {
         let default_port = self.default_port();
         let port = port.unwrap_or(default_port);
+        let host = format_host(address);
 
         match self {
-            DnsProtocol::Udp => address.to_string(),
-            DnsProtocol::Tcp => format!("tcp://{}:{}", address, port),
+            DnsProtocol::Udp => format!("{host}:{port}"),
+            DnsProtocol::Tcp => format!("tcp://{host}:{port}"),
             DnsProtocol::Doh => {
                 if port == default_port {
-                    format!("https://{}/dns-query", address)
+                    format!("https://{host}/dns-query")
                 } else {
-                    format!("https://{}:{}/dns-query", address, port)
+                    format!("https://{host}:{port}/dns-query")
                 }
             }
             DnsProtocol::Dot => {
                 if port == default_port {
-                    format!("tls://{}", address)
+                    format!("tls://{host}")
                 } else {
-                    format!("tls://{}:{}", address, port)
+                    format!("tls://{host}:{port}")
                 }
             }
             DnsProtocol::Doq => {
                 if port == default_port {
-                    format!("quic://{}", address)
+                    format!("quic://{host}")
                 } else {
-                    format!("quic://{}:{}", address, port)
+                    format!("quic://{host}:{port}")
                 }
             }
             DnsProtocol::H3 => {
                 if port == default_port {
-                    format!("h3://{}/dns-query", address)
+                    format!("h3://{host}/dns-query")
                 } else {
-                    format!("h3://{}:{}/dns-query", address, port)
+                    format!("h3://{host}:{port}/dns-query")
                 }
             }
         }
@@ -451,6 +458,9 @@ impl DnsConfig {
             if server.tag.is_empty() {
                 return Err(DnsValidationError::EmptyServerTag);
             }
+            if RESERVED_SERVER_TAGS.contains(&server.tag.as_str()) {
+                return Err(DnsValidationError::ReservedServerTag(server.tag.clone()));
+            }
             if !valid_dns_address(&server.address) {
                 return Err(DnsValidationError::InvalidServerAddress(
                     server.address.clone(),
@@ -461,11 +471,7 @@ impl DnsConfig {
             }
         }
 
-        if let Some(ref subnet) = self.client_subnet
-            && subnet.parse::<std::net::IpAddr>().is_err()
-        {
-            return Err(DnsValidationError::InvalidClientSubnet(subnet.clone()));
-        }
+        self.validate_client_subnet_and_hosts()?;
 
         for rule in &self.rules {
             if !tags.contains(&rule.server_tag) {
@@ -478,28 +484,56 @@ impl DnsConfig {
             }
         }
 
+        if self.fakeip.enabled {
+            match self.fakeip.inet4_range.parse::<IpNet>() {
+                Ok(net) if net.addr().is_ipv4() => {}
+                _ => {
+                    return Err(DnsValidationError::InvalidFakeIpCidr {
+                        field: "inet4_range".to_string(),
+                        value: self.fakeip.inet4_range.clone(),
+                    });
+                }
+            }
+
+            match self.fakeip.inet6_range.parse::<IpNet>() {
+                Ok(net) if net.addr().is_ipv6() => {}
+                _ => {
+                    return Err(DnsValidationError::InvalidFakeIpCidr {
+                        field: "inet6_range".to_string(),
+                        value: self.fakeip.inet6_range.clone(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// TUN always generates a DNS plane, so TUN-derived fields must be valid
+    /// even when the user DNS section is disabled.
+    pub fn validate_for_runtime(&self, tun_enabled: bool) -> Result<(), DnsValidationError> {
+        if self.enabled {
+            return self.validate();
+        }
+        if tun_enabled {
+            self.validate_client_subnet_and_hosts()?;
+        }
+        Ok(())
+    }
+
+    fn validate_client_subnet_and_hosts(&self) -> Result<(), DnsValidationError> {
+        if let Some(ref subnet) = self.client_subnet
+            && subnet.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(DnsValidationError::InvalidClientSubnet(subnet.clone()));
+        }
+
         for host in &self.hosts {
             if !valid_host_domain(&host.domain) || host.ip.parse::<IpAddr>().is_err() {
                 return Err(DnsValidationError::InvalidHostOverride(format!(
                     "{} -> {}",
                     host.domain, host.ip
                 )));
-            }
-        }
-
-        if self.fakeip.enabled {
-            if self.fakeip.inet4_range.parse::<IpNet>().is_err() {
-                return Err(DnsValidationError::InvalidFakeIpCidr {
-                    field: "inet4_range".to_string(),
-                    value: self.fakeip.inet4_range.clone(),
-                });
-            }
-
-            if self.fakeip.inet6_range.parse::<IpNet>().is_err() {
-                return Err(DnsValidationError::InvalidFakeIpCidr {
-                    field: "inet6_range".to_string(),
-                    value: self.fakeip.inet6_range.clone(),
-                });
             }
         }
 
@@ -523,6 +557,8 @@ pub enum DnsValidationError {
     DuplicateServerTag(String),
     #[error("empty DNS server tag")]
     EmptyServerTag,
+    #[error("DNS server tag is reserved for generated entries: {0}")]
+    ReservedServerTag(String),
     #[error("invalid DNS server address: {0}")]
     InvalidServerAddress(String),
     #[error("invalid DNS rule matcher: {0}")]
@@ -535,6 +571,14 @@ pub enum DnsValidationError {
     InvalidRuleServerTag(String),
     #[error("invalid FakeIP CIDR for {field}: {value}")]
     InvalidFakeIpCidr { field: String, value: String },
+}
+
+fn format_host(address: &str) -> String {
+    if address.contains(':') && !address.starts_with('[') {
+        format!("[{address}]")
+    } else {
+        address.to_string()
+    }
 }
 
 fn valid_dns_address(address: &str) -> bool {
@@ -703,19 +747,40 @@ mod tests {
     #[test]
     fn test_dns_protocol_udp_default_port() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", None);
-        assert_eq!(addr, "8.8.8.8");
+        assert_eq!(addr, "8.8.8.8:53");
     }
 
     #[test]
     fn test_dns_protocol_udp_custom_port() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", Some(5353));
-        assert_eq!(addr, "8.8.8.8");
+        assert_eq!(addr, "8.8.8.8:5353");
     }
 
     #[test]
     fn test_dns_protocol_udp_default_port_explicit() {
         let addr = DnsProtocol::Udp.server_address("8.8.8.8", Some(53));
-        assert_eq!(addr, "8.8.8.8");
+        assert_eq!(addr, "8.8.8.8:53");
+    }
+
+    #[test]
+    fn test_dns_protocol_brackets_bare_ipv6_literals() {
+        let v6 = "2606:4700:4700::1111";
+        assert_eq!(
+            DnsProtocol::Udp.server_address(v6, Some(5353)),
+            "[2606:4700:4700::1111]:5353"
+        );
+        assert_eq!(
+            DnsProtocol::Doh.server_address(v6, None),
+            "https://[2606:4700:4700::1111]/dns-query"
+        );
+        assert_eq!(
+            DnsProtocol::Tcp.server_address(v6, Some(53)),
+            "tcp://[2606:4700:4700::1111]:53"
+        );
+        assert_eq!(
+            DnsProtocol::Dot.server_address(v6, None),
+            "tls://[2606:4700:4700::1111]"
+        );
     }
 
     #[test]
@@ -1176,6 +1241,95 @@ server_tag = "google"
             bad_host.validate().unwrap_err(),
             DnsValidationError::InvalidHostOverride(_)
         ));
+    }
+
+    #[test]
+    fn test_validate_rejects_reserved_server_tags() {
+        for tag in ["hosts", "fakeip", "sys-dns-bootstrap", "tun-dns-fallback"] {
+            let cfg = DnsConfig {
+                enabled: true,
+                servers: vec![DnsServerConfig {
+                    tag: tag.to_string(),
+                    protocol: DnsProtocol::Udp,
+                    address: "1.1.1.1".to_string(),
+                    port: None,
+                    detour: None,
+                }],
+                ..Default::default()
+            };
+            assert!(matches!(
+                cfg.validate().unwrap_err(),
+                DnsValidationError::ReservedServerTag(reserved) if reserved == tag
+            ));
+        }
+    }
+
+    #[test]
+    fn test_validate_fakeip_ranges_must_match_family() {
+        let server = DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        };
+        let wrong_v4 = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "fc00::/18".to_string(),
+                inet6_range: "fc00::/18".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            wrong_v4.validate().unwrap_err(),
+            DnsValidationError::InvalidFakeIpCidr { field, .. } if field == "inet4_range"
+        ));
+
+        let wrong_v6 = DnsConfig {
+            enabled: true,
+            servers: vec![server],
+            fakeip: FakeIpConfig {
+                enabled: true,
+                inet4_range: "198.18.0.0/15".to_string(),
+                inet6_range: "198.18.0.0/15".to_string(),
+            },
+            ..Default::default()
+        };
+        assert!(matches!(
+            wrong_v6.validate().unwrap_err(),
+            DnsValidationError::InvalidFakeIpCidr { field, .. } if field == "inet6_range"
+        ));
+    }
+
+    #[test]
+    fn test_validate_tun_derived_fields_when_dns_disabled() {
+        let bad_subnet = DnsConfig {
+            enabled: false,
+            client_subnet: Some("not-an-ip".to_string()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_subnet.validate_for_runtime(true).unwrap_err(),
+            DnsValidationError::InvalidClientSubnet(_)
+        ));
+        assert!(bad_subnet.validate_for_runtime(false).is_ok());
+
+        let bad_host = DnsConfig {
+            enabled: false,
+            hosts: vec![HostOverride {
+                domain: "host.example.com".to_string(),
+                ip: "not-an-ip".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            bad_host.validate_for_runtime(true).unwrap_err(),
+            DnsValidationError::InvalidHostOverride(_)
+        ));
+        assert!(bad_host.validate_for_runtime(false).is_ok());
     }
 
     #[test]

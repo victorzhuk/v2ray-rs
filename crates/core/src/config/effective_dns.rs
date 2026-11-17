@@ -322,11 +322,6 @@ fn user_dns_entries(
         let mut remote: Vec<String> = Vec::new();
         let mut domestic: Vec<String> = Vec::new();
         collect_routing_domains(rules, &mut remote, &mut domestic);
-        if tun_xray && !settings.tun.exclude_domains.is_empty() {
-            for d in &settings.tun.exclude_domains {
-                domestic.push(format!("domain:{}", strip_suffix_wildcard(d)));
-            }
-        }
         settings
             .dns
             .servers
@@ -344,14 +339,18 @@ fn user_dns_entries(
 
     for server in &settings.dns.servers {
         let transport = server.protocol.effective_for_backend(backend);
-        let address = transport.server_address(
-            &server.address,
-            if transport != server.protocol {
-                None
-            } else {
-                server.port
-            },
-        );
+        let address = if backend == BackendType::SingBox {
+            server.address.clone()
+        } else {
+            transport.server_address(
+                &server.address,
+                if transport != server.protocol {
+                    None
+                } else {
+                    server.port
+                },
+            )
+        };
         let scope = scopes
             .iter()
             .find(|(tag, _)| *tag == server.tag)
@@ -373,9 +372,10 @@ fn user_dns_entries(
         ));
     }
 
-    // Excluded domains are split-horizon names: folded into the server that
-    // resolves outside the tunnel when there is one, OS resolver otherwise.
-    if tun_xray && settings.dns.use_custom_rules && !settings.tun.exclude_domains.is_empty() {
+    // Excluded domains are split-horizon names. A domain-scoped target absorbs
+    // them; an unrestricted target keeps answering everything else, so the
+    // exclusions get their own entry alongside it.
+    if tun_xray && !settings.tun.exclude_domains.is_empty() {
         let exclude: Vec<String> = settings
             .tun
             .exclude_domains
@@ -388,26 +388,54 @@ fn user_dns_entries(
             .iter()
             .find(|s| s.detours_direct())
             .or_else(|| settings.dns.servers.first());
-        let target_addr = target.map(|s| {
-            s.protocol
-                .effective_for_backend(backend)
-                .server_address(&s.address, s.port)
+        let target_entry = target.map(|server| {
+            let transport = server.protocol.effective_for_backend(backend);
+            let address = if backend == BackendType::SingBox {
+                server.address.clone()
+            } else {
+                transport.server_address(&server.address, server.port)
+            };
+            let path = if server.detours_direct() {
+                DnsPath::Direct
+            } else {
+                DnsPath::Proxy
+            };
+            (address, transport, path)
         });
+        let target_addr = target_entry.as_ref().map(|(address, _, _)| address.clone());
         match entries
-            .iter_mut()
-            .find(|e| Some(&e.address) == target_addr.as_ref())
+            .iter()
+            .position(|e| Some(&e.address) == target_addr.as_ref())
         {
-            Some(matched) => match &mut matched.scope {
+            Some(index) => match &mut entries[index].scope {
                 DnsScope::Domains(domains) => domains.extend(exclude),
-                DnsScope::All => {}
+                DnsScope::All => {
+                    let dedicated = entry(
+                        entries[index].address.clone(),
+                        entries[index].transport,
+                        entries[index].path,
+                        entries[index].source,
+                        DnsScope::Domains(exclude),
+                    );
+                    entries.insert(index + 1, dedicated);
+                }
             },
-            None => entries.push(entry(
-                "localhost",
-                None,
-                DnsPath::System,
-                DnsSource::User,
-                DnsScope::Domains(exclude),
-            )),
+            None => match target_entry {
+                Some((address, protocol, path)) => entries.push(entry(
+                    address,
+                    Some(protocol),
+                    path,
+                    DnsSource::User,
+                    DnsScope::Domains(exclude),
+                )),
+                None => entries.push(entry(
+                    "localhost",
+                    None,
+                    DnsPath::System,
+                    DnsSource::User,
+                    DnsScope::Domains(exclude),
+                )),
+            },
         }
     }
 
@@ -595,15 +623,6 @@ fn server_scope_singbox(settings: &AppSettings, rules: &[RoutingRule], tag: &str
             _ => &Vec::new(),
         };
         domains.extend(derived.iter().cloned());
-    }
-
-    // TUN exclusions route to the split-horizon server.
-    if settings.tun.enabled
-        && super::common::split_horizon_server(settings).is_some_and(|s| s.tag == tag)
-    {
-        for d in &settings.tun.exclude_domains {
-            domains.push(strip_suffix_wildcard(d).to_string());
-        }
     }
 
     scope_from(domains)
@@ -859,7 +878,7 @@ mod tests {
         // The unscoped 9.9.9.9 server answers everything else, so xray adds no
         // fallback of its own.
         let last = summary.entries().last().unwrap();
-        assert_eq!(last.address, "9.9.9.9");
+        assert_eq!(last.address, "9.9.9.9:53");
         assert_eq!(last.source, DnsSource::User);
         assert_eq!(last.path, DnsPath::Proxy);
         assert!(!summary.uses_fallback());
@@ -1089,7 +1108,7 @@ mod tests {
         let domestic = summary
             .entries()
             .iter()
-            .find(|e| e.address == "77.88.8.8")
+            .find(|e| e.address == "77.88.8.8:53")
             .unwrap();
         assert_eq!(domestic.scope, DnsScope::Domains(vec!["domain:ru".into()]));
     }
@@ -1149,11 +1168,39 @@ mod tests {
         let domestic = summary
             .entries()
             .iter()
-            .find(|e| e.address == "77.88.8.8")
+            .find(|e| e.address == "77.88.8.8:53")
             .unwrap();
         assert_eq!(
             domestic.scope,
             DnsScope::Domains(vec!["domain:example.ru".into()])
+        );
+    }
+
+    #[test]
+    fn unrestricted_direct_server_keeps_scope_alongside_exclusions() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["corp.example.com".into()];
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![scoped_server("main", DnsProtocol::Udp, "9.9.9.9", "direct")];
+
+        let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
+        let matching: Vec<&EffectiveDnsEntry> = summary
+            .entries()
+            .iter()
+            .filter(|e| e.address == "9.9.9.9:53")
+            .collect();
+
+        assert_eq!(
+            matching.iter().filter(|e| e.scope == DnsScope::All).count(),
+            1,
+            "the unrestricted server must keep answering everything else: {matching:?}"
+        );
+        assert!(
+            matching
+                .iter()
+                .any(|e| e.scope == DnsScope::Domains(vec!["domain:corp.example.com".into()])),
+            "excluded domains need a scoped entry: {matching:?}"
         );
     }
 
@@ -1304,7 +1351,9 @@ mod tests {
             "server={FALLBACK_DNS} path=direct source=bootstrap scope=example.com"
         )));
         assert!(
-            lines.contains(&"server=77.88.8.8 path=direct source=user scope=domain:ru".to_string())
+            lines.contains(
+                &"server=77.88.8.8:53 path=direct source=user scope=domain:ru".to_string()
+            )
         );
         assert!(lines.iter().any(|l| l.contains("source=fallback")));
         assert!(
@@ -1319,6 +1368,9 @@ mod tests {
     /// (`https://1.1.1.1/dns-query`); the host is the common denominator both
     /// sides share for the same logical resolver.
     fn canonical_address(address: &str) -> String {
+        if let Some(rest) = address.strip_prefix("udp://") {
+            return rest.to_string();
+        }
         for scheme in ["https://", "h3://", "tls://", "quic://", "tcp://"] {
             if let Some(rest) = address.strip_prefix(scheme) {
                 return rest.split(['/', ':']).next().unwrap_or(rest).to_string();

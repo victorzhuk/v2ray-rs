@@ -101,8 +101,7 @@ impl GeodataManager {
     }
 
     pub fn has_rule_set(&self, full_tag: &str) -> bool {
-        self.rule_set_path(full_tag)
-            .is_ok_and(|path| path.exists())
+        self.rule_set_path(full_tag).is_ok_and(|path| path.exists())
     }
 
     pub fn geoip_path(&self) -> PathBuf {
@@ -354,13 +353,15 @@ pub fn download_geodata(manager: &GeodataManager) -> Result<GeodataMetadata, Geo
     Ok(metadata)
 }
 
-/// Fetches only the sing-box rule-sets not already cached locally. Individual
-/// `.srs` files are versioned independently upstream and never expire once
-/// downloaded, so "missing" is the only staleness signal we track.
+/// Fetches sing-box rule-sets not already cached locally, or every requested
+/// rule-set when `force` is set. Scheduled and manual refreshes pass `force`,
+/// since a cached `.srs` never expires on its own and would otherwise stay
+/// frozen forever.
 #[cfg(feature = "geodata-fetch")]
 pub fn download_singbox_rule_sets(
     manager: &GeodataManager,
     tags: &[String],
+    force: bool,
 ) -> Result<GeodataMetadata, GeodataError> {
     manager.ensure_dir()?;
     let _ = std::fs::remove_file(manager.geodata_dir().join("geoip.db"));
@@ -368,11 +369,8 @@ pub fn download_singbox_rule_sets(
 
     let client = build_client()?;
 
-    for tag in tags {
-        if manager.has_rule_set(tag) {
-            continue;
-        }
-        let Some(url) = rule_set_url(tag) else {
+    for tag in rule_sets_to_fetch(manager, tags, force) {
+        let Some(url) = rule_set_url(&tag) else {
             log::warn!("unrecognized sing-box rule-set tag, skipping: {tag}");
             continue;
         };
@@ -393,7 +391,7 @@ pub fn download_singbox_rule_sets(
         }
 
         let tmp = persist_response(response, &manager.rule_sets_dir(), &url)?;
-        tmp.persist(manager.rule_set_path(tag)?)
+        tmp.persist(manager.rule_set_path(&tag)?)
             .map_err(|e| GeodataError::Io(e.error))?;
     }
 
@@ -404,6 +402,16 @@ pub fn download_singbox_rule_sets(
     };
     manager.save_metadata(&metadata)?;
     Ok(metadata)
+}
+
+/// Requested tags that a download pass must fetch: only missing ones on
+/// startup, all of them when the caller forces a refresh.
+#[must_use]
+pub fn rule_sets_to_fetch(manager: &GeodataManager, tags: &[String], force: bool) -> Vec<String> {
+    tags.iter()
+        .filter(|tag| force || !manager.has_rule_set(tag))
+        .cloned()
+        .collect()
 }
 
 #[cfg(test)]
@@ -575,6 +583,21 @@ mod tests {
         manager.ensure_dir().unwrap();
         std::fs::write(manager.rule_set_path("geoip-ru").unwrap(), b"test").unwrap();
         assert!(manager.has_rule_set("geoip-ru"));
+    }
+
+    #[test]
+    fn test_rule_sets_to_fetch_respects_force() {
+        let (_tmp, manager) = test_manager();
+        manager.ensure_dir().unwrap();
+        std::fs::write(manager.rule_set_path("geosite-google").unwrap(), b"cached").unwrap();
+
+        let tags = vec!["geosite-google".to_string(), "geosite-openai".to_string()];
+
+        assert_eq!(
+            rule_sets_to_fetch(&manager, &tags, false),
+            vec!["geosite-openai".to_string()]
+        );
+        assert_eq!(rule_sets_to_fetch(&manager, &tags, true), tags);
     }
 
     #[test]

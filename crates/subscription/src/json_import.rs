@@ -193,8 +193,8 @@ fn build_vless(
     let user = &vnext["users"][0];
     let address = vnext["address"]
         .as_str()
-        .ok_or("vless: missing address")?
-        .to_string();
+        .ok_or("vless: missing address")
+        .map(crate::parser::normalize_host)?;
     let port = as_port(&vnext["port"]).ok_or("vless: missing port")?;
     let uuid = user["id"].as_str().unwrap_or_default().to_string();
     let encryption = user["encryption"].as_str().map(str::to_string);
@@ -225,8 +225,8 @@ fn build_vmess(
     let user = &vnext["users"][0];
     let address = vnext["address"]
         .as_str()
-        .ok_or("vmess: missing address")?
-        .to_string();
+        .ok_or("vmess: missing address")
+        .map(crate::parser::normalize_host)?;
     let port = as_port(&vnext["port"]).ok_or("vmess: missing port")?;
     let uuid = user["id"].as_str().unwrap_or_default().to_string();
     let alter_id = user["alterId"].as_u64().unwrap_or(0) as u32;
@@ -257,8 +257,8 @@ fn build_trojan(
     let server = &outbound["settings"]["servers"][0];
     let address = server["address"]
         .as_str()
-        .ok_or("trojan: missing address")?
-        .to_string();
+        .ok_or("trojan: missing address")
+        .map(crate::parser::normalize_host)?;
     let port = as_port(&server["port"]).ok_or("trojan: missing port")?;
     let password = server["password"].as_str().unwrap_or_default().to_string();
 
@@ -276,8 +276,8 @@ fn build_ss(outbound: &Value, remark: Option<String>) -> Result<ProxyNode, Strin
     let server = &outbound["settings"]["servers"][0];
     let address = server["address"]
         .as_str()
-        .ok_or("shadowsocks: missing address")?
-        .to_string();
+        .ok_or("shadowsocks: missing address")
+        .map(crate::parser::normalize_host)?;
     let port = as_port(&server["port"]).ok_or("shadowsocks: missing port")?;
     let method = server["method"].as_str().unwrap_or_default().to_string();
     let password = server["password"].as_str().unwrap_or_default().to_string();
@@ -748,9 +748,7 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
             obj.iter()
                 .filter_map(|(domain, ip)| {
                     let Some(ip) = ip.as_str() else {
-                        skipped.push(format!(
-                            "dns host '{domain}': non-string address, ignored"
-                        ));
+                        skipped.push(format!("dns host '{domain}': non-string address, ignored"));
                         return None;
                     };
                     if !valid_host_domain(domain) || ip.parse::<std::net::IpAddr>().is_err() {
@@ -839,7 +837,7 @@ fn parse_dns_server_address(raw: &str) -> (DnsProtocol, String, Option<u16>) {
             "tcp" => DnsProtocol::Tcp,
             _ => DnsProtocol::Udp,
         };
-        return (protocol, host.to_string(), parsed.port());
+        return (protocol, crate::parser::normalize_host(host), parsed.port());
     }
     (DnsProtocol::Udp, raw.to_string(), None)
 }

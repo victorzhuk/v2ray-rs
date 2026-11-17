@@ -22,7 +22,10 @@ const PING_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_CONCURRENT_PINGS: usize = 50;
 
 pub async fn tcp_ping(addr: &str, port: u16) -> Result<Duration, PingError> {
-    let target = format!("{addr}:{port}");
+    let target = match addr.parse::<std::net::IpAddr>() {
+        Ok(ip) => std::net::SocketAddr::new(ip, port).to_string(),
+        Err(_) => format!("{addr}:{port}"),
+    };
     let start = Instant::now();
     timeout(PING_TIMEOUT, TcpStream::connect(&target))
         .await
@@ -115,6 +118,15 @@ mod tests {
             last_latency_ms: None,
             last_real_delay_ms: None,
         }
+    }
+
+    #[tokio::test]
+    async fn tcp_ping_dials_bare_ipv6_literal() {
+        let Ok(listener) = tokio::net::TcpListener::bind("[::1]:0").await else {
+            return;
+        };
+        let port = listener.local_addr().unwrap().port();
+        tcp_ping("::1", port).await.unwrap();
     }
 
     #[tokio::test]

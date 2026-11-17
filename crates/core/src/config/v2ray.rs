@@ -653,16 +653,6 @@ fn build_routing_rule(
     }
 }
 
-fn udp_port_for_v2ray(server: &DnsServerConfig) -> Option<u16> {
-    if server.protocol == DnsProtocol::Udp {
-        server
-            .port
-            .filter(|&p| p != DnsProtocol::Udp.default_port())
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 fn build_dns(rules: &[RoutingRule], settings: &AppSettings) -> Value {
     build_dns_for_backend(&[], rules, settings, V2rayFamilyBackend::V2ray, false)
@@ -900,7 +890,7 @@ fn build_user_dns_servers(
 
             servers.push(dns_server_entry(
                 dns_server_address_for_backend(server, backend),
-                udp_port_for_v2ray(server),
+                None,
                 (!domains.is_empty()).then_some(domains),
                 direct_detour(server, tun_xray),
             ));
@@ -929,18 +919,6 @@ fn build_user_dns_servers(
             }
         }
 
-        if backend == V2rayFamilyBackend::Xray
-            && settings.tun.enabled
-            && !settings.tun.exclude_domains.is_empty()
-        {
-            for d in &settings.tun.exclude_domains {
-                domestic_domains.push(format!(
-                    "domain:{}",
-                    super::common::strip_suffix_wildcard(d)
-                ));
-            }
-        }
-
         for (tag, derived) in [
             (AUTO_SPLIT_REMOTE_TAG, &remote_domains),
             (AUTO_SPLIT_DOMESTIC_TAG, &domestic_domains),
@@ -961,7 +939,7 @@ fn build_user_dns_servers(
             };
             servers.push(dns_server_entry(
                 dns_server_address_for_backend(server, backend),
-                udp_port_for_v2ray(server),
+                None,
                 domains,
                 direct_detour(server, tun_xray),
             ));
@@ -971,7 +949,6 @@ fn build_user_dns_servers(
     if backend == V2rayFamilyBackend::Xray
         && settings.tun.enabled
         && !settings.tun.exclude_domains.is_empty()
-        && settings.dns.use_custom_rules
     {
         attach_exclude_domains(&mut servers, settings, backend);
     }
@@ -979,9 +956,10 @@ fn build_user_dns_servers(
     servers
 }
 
-/// Excluded domains are split-horizon names, so they are folded into the
-/// server that resolves outside the tunnel when there is one, and the OS
-/// resolver otherwise.
+/// Excluded domains are split-horizon names, so they get a dedicated
+/// domain-scoped server that resolves outside the tunnel. An unrestricted
+/// target server stays untouched: narrowing it to these domains would break
+/// every other query that server answers.
 fn attach_exclude_domains(
     servers: &mut Vec<Value>,
     settings: &AppSettings,
@@ -997,12 +975,13 @@ fn attach_exclude_domains(
         servers.push(json!({
             "address": "localhost",
             "domains": &exclude_domains,
+            "skipFallback": true,
         }));
         return;
     };
     let target_addr = dns_server_address_for_backend(target, backend);
 
-    let Some(entry) = servers.iter_mut().find(|s| {
+    let Some(index) = servers.iter().position(|s| {
         s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
             s.get("address")
                 .and_then(|a| a.as_str())
@@ -1013,16 +992,22 @@ fn attach_exclude_domains(
         return;
     };
 
-    if entry.is_string() {
-        let addr = entry.as_str().unwrap_or_default().to_string();
-        *entry = json!({ "address": addr, "domains": &exclude_domains });
-    } else if let Some(Value::Array(domains)) = entry.get_mut("domains") {
+    if let Some(Value::Array(domains)) = servers[index].get_mut("domains") {
         for d in &exclude_domains {
             domains.push(json!(d));
         }
-    } else {
-        entry["domains"] = json!(&exclude_domains);
+        servers[index]["skipFallback"] = json!(true);
+        return;
     }
+
+    let mut dedicated = servers[index].clone();
+    if dedicated.is_string() {
+        dedicated = json!({ "address": dedicated });
+    }
+    dedicated["address"] = json!(target_addr);
+    dedicated["domains"] = json!(&exclude_domains);
+    dedicated["skipFallback"] = json!(true);
+    servers.insert(index + 1, dedicated);
 }
 
 fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamilyBackend) -> String {
@@ -1045,14 +1030,21 @@ fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamily
         );
     }
 
-    effective_protocol.server_address(
+    let address = effective_protocol.server_address(
         &server.address,
         if effective_protocol != server.protocol {
             None
         } else {
             server.port
         },
-    )
+    );
+    // Xray and v2ray parse a bare `host:port` UDP address as a URL and reject
+    // it; the explicit scheme is what makes the port acceptable.
+    if effective_protocol == DnsProtocol::Udp {
+        format!("udp://{address}")
+    } else {
+        address
+    }
 }
 
 #[cfg(test)]
@@ -1315,7 +1307,7 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let scoped = &servers[0];
-        assert_eq!(scoped["address"], "192.0.2.1");
+        assert_eq!(scoped["address"], "udp://192.0.2.1:53");
         assert_eq!(scoped["skipFallback"], true);
         assert_eq!(
             servers.last().unwrap(),
@@ -1334,7 +1326,7 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 1, "no catch-all needed: {servers:?}");
-        assert_eq!(servers[0], "192.0.2.1");
+        assert_eq!(servers[0], "udp://192.0.2.1:53");
     }
 
     #[test]
@@ -2039,8 +2031,7 @@ mod tests {
         let servers = dns["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].as_str(), Some("https://1.1.1.1/dns-query"));
-        assert_eq!(servers[1]["address"].as_str(), Some("8.8.8.8"));
-        assert_eq!(servers[1]["port"], 5353);
+        assert_eq!(servers[1].as_str(), Some("udp://8.8.8.8:5353"));
     }
 
     #[test]
@@ -2106,7 +2097,7 @@ mod tests {
         let protocols = vec![
             (DnsProtocol::Doh, "https://1.1.1.1/dns-query"),
             (DnsProtocol::Tcp, "tcp://1.1.1.1:53"),
-            (DnsProtocol::Udp, "1.1.1.1"),
+            (DnsProtocol::Udp, "udp://1.1.1.1:53"),
         ];
 
         for (protocol, expected_address) in protocols {
@@ -2271,7 +2262,7 @@ mod tests {
         assert_eq!(remote_domains[0], "geosite:google");
 
         let domestic = &servers[1];
-        assert_eq!(domestic["address"], "223.5.5.5");
+        assert_eq!(domestic["address"], "udp://223.5.5.5:53");
         let domestic_domains = domestic["domains"].as_array().unwrap();
         assert_eq!(domestic_domains.len(), 1);
         assert_eq!(domestic_domains[0], "domain:.cn");
@@ -2670,6 +2661,44 @@ mod tests {
     }
 
     #[test]
+    fn test_unrestricted_direct_server_stays_alongside_excluded_domains() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["corp.example.com".to_string()];
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "main".into(),
+            protocol: DnsProtocol::Udp,
+            address: "1.1.1.1".into(),
+            port: None,
+            detour: Some("direct".into()),
+        }];
+
+        let config =
+            generate_v2ray_family_config(&[ss_node()], &[], &settings, V2rayFamilyBackend::Xray);
+
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let unrestricted = servers
+            .iter()
+            .find(|s| s.get("domains").is_none())
+            .expect("the unrestricted server must survive");
+        assert_eq!(unrestricted["address"], "udp://1.1.1.1:53");
+        assert!(unrestricted.get("skipFallback").is_none());
+
+        let dedicated = servers
+            .iter()
+            .find(|s| {
+                s["domains"]
+                    .as_array()
+                    .is_some_and(|d| d.contains(&json!("domain:corp.example.com")))
+            })
+            .expect("excluded domains need their own server entry");
+        assert_eq!(dedicated["address"], "udp://1.1.1.1:53");
+        assert_eq!(dedicated["skipFallback"], true);
+        assert_eq!(dedicated["tag"], DNS_DIRECT_TAG);
+    }
+
+    #[test]
     fn test_excluded_domains_bind_to_the_direct_detoured_server() {
         let mut settings = default_settings();
         settings.tun.enabled = true;
@@ -2705,7 +2734,7 @@ mod tests {
                     .is_some_and(|d| d.contains(&json!("domain:corp.example")))
             })
             .expect("no server answers the excluded domain");
-        assert_eq!(answering["address"], "77.88.8.8");
+        assert_eq!(answering["address"], "udp://77.88.8.8:53");
         assert_eq!(answering["tag"], DNS_DIRECT_TAG);
         assert!(
             !servers.iter().any(|s| s["address"] == "localhost"),
@@ -3074,7 +3103,7 @@ mod tests {
             .filter(|s| s["tag"] == json!("dns-direct"))
             .collect();
         assert!(
-            tagged.iter().any(|s| s["address"] == "77.88.8.8"),
+            tagged.iter().any(|s| s["address"] == "udp://77.88.8.8:53"),
             "a direct detour must reach the direct outbound"
         );
     }
@@ -3228,7 +3257,7 @@ mod tests {
         assert!(
             servers
                 .iter()
-                .any(|s| s == "127.0.0.1" || s["address"] == "127.0.0.1"),
+                .any(|s| s == "udp://127.0.0.1:53" || s["address"] == "udp://127.0.0.1:53"),
             "flagged server must survive generation: {servers:?}"
         );
     }

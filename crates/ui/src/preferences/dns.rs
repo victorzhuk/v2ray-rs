@@ -2058,7 +2058,7 @@ mod tests {
             "configured servers must replace the fallback rows: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.starts_with("8.8.8.8 [UDP]")
+            rows.iter().any(|row| row.starts_with("8.8.8.8:53 [UDP]")
                 && row.contains("source=user")
                 && row.ends_with("scope=all")),
             "got: {rows:?}"

@@ -180,14 +180,16 @@ impl ProbeConfigGenerator for XrayProbeGenerator {
         timeout_ms: u32,
         egress_ports: &[u16],
     ) -> Value {
+        let emittable = |i: usize| !nodes[i].node.tls_verify_disabled();
         let outbounds: Vec<Value> = nodes
             .iter()
             .enumerate()
+            .filter(|(i, _)| emittable(*i))
             .map(|(i, node)| crate::config::xray::build_xray_outbound(&node.node, &probe_tag(i)))
             .collect();
 
         let (egress_inbounds, egress_rules) =
-            egress_inbounds_and_rules(nodes, egress_ports, |_| true);
+            egress_inbounds_and_rules(nodes, egress_ports, emittable);
 
         let mut inbounds = vec![json!({
             "tag": "api-in",
@@ -491,6 +493,41 @@ mod tests {
         // Valid JSON.
         let s = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&s).unwrap();
+    }
+
+    #[test]
+    fn xray_probe_omits_unverified_tls_nodes_but_keeps_indices() {
+        let mut nodes = mixed_nodes();
+        if let ProxyNode::Vless(cfg) = &mut nodes[0].node {
+            cfg.tls.as_mut().unwrap().verify = false;
+        }
+        if let ProxyNode::Vmess(cfg) = &mut nodes[1].node {
+            cfg.tls = Some(TlsSettings::default());
+        }
+        let refs: Vec<&SubscriptionNode> = nodes.iter().collect();
+
+        let config = XrayProbeGenerator.generate(
+            &refs,
+            19_092,
+            "https://cp.cloudflare.com/generate_204",
+            4000,
+            &[31_001, 31_002, 31_003, 31_004],
+        );
+
+        let tags: Vec<&str> = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|ob| ob["tag"].as_str())
+            .collect();
+        assert_eq!(tags, vec!["probe-1", "probe-2", "probe-3"]);
+
+        let ports = egress_inbound_ports(&config);
+        assert!(
+            !ports.contains_key(&0),
+            "unverified node keeps no egress inbound"
+        );
+        assert_eq!(ports.get(&1), Some(&31_002));
     }
 
     #[test]
