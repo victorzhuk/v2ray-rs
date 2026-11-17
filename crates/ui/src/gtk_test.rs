@@ -12,6 +12,10 @@ type Job = Box<dyn FnOnce() + Send>;
 /// dedicated thread.
 pub(crate) fn run(test: impl FnOnce() + Send + 'static) {
     let Some(jobs) = gtk_thread() else {
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_DISPLAY").is_none(),
+            "required GTK display is unavailable"
+        );
         eprintln!("no display, skipping");
         return;
     };

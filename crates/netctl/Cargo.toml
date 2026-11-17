@@ -9,11 +9,14 @@ name = "v2ray-rs-netctl"
 path = "src/main.rs"
 
 [dependencies]
+v2ray-rs-tun-session.workspace = true
 rtnetlink.workspace = true
 tokio = { workspace = true }
 futures.workspace = true
 clap.workspace = true
+libc.workspace = true
 [dev-dependencies]
+tempfile.workspace = true
 v2ray-rs-core.workspace = true
 
 [features]

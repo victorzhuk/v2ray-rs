@@ -6,7 +6,7 @@ This file provides guidance to coding agents working in this repository.
 
 A Linux desktop GUI wrapper for v2ray/xray/sing-box CLI proxy tools. The app manages subscriptions, generates config files, handles process lifecycle, and provides geo-routing rules — all without implementing any protocol logic. The protocol work is delegated entirely to the system-installed CLI binaries.
 
-UI: Relm4 (GTK4) with libadwaita. Seven crates: core, subscription, process, netctl, tray, ui, run.
+UI: Relm4 (GTK4) with libadwaita. Eight crates: core, subscription, process, netctl, tray, ui, run, tun-session.
 
 ## Commands
 
@@ -22,7 +22,7 @@ cargo test -p v2ray-rs-core -- test_name # run a single test by name
 
 ## Architecture
 
-Rust workspace with seven crates:
+Rust workspace with eight crates:
 
 ### `crates/core` (`v2ray-rs-core`)
 
@@ -39,7 +39,7 @@ Domain models and infrastructure:
   - `dns.rs` — `DnsConfig` (enabled, strategy, servers, rules, fakeip, disable_cache, client_subnet, hosts, use_custom_rules). `DnsServerConfig` (tag, protocol, address, port, detour). `DnsProtocol` enum (UDP/TCP/DoH/DoT/DoQ/H3) with `server_address()` and `default_port()`. `DnsStrategy` (PreferIpv4/PreferIpv6/Ipv4Only/Ipv6Only). `DnsRule`, `FakeIpConfig`, `HostOverride`. `builtin_dns_presets()` returns 8 presets (Cloudflare, Google, AdGuard, Quad9, Ali DNS, Yandex DNS variants). `DnsConfigWire` for backward-compat migration from the old two-field format.
   - `resolve.rs` — `AutoResolveStrategy` enum (ListOrder/LowestLatency/Random/LastSuccessful/GeoAware). `ConnectionMetadata` for active connection details. `LastSuccessMetadata` and `LatencySample`.
 
-- **`persistence.rs`** — XDG-compliant file storage via `directories` crate. Settings in TOML (`~/.config/v2ray-rs/settings.toml`), subscriptions and routing rules in JSON (`~/.local/share/v2ray-rs/`). Also persists `latency_snapshot.json`, a `tun_session.json` TUN-active marker (written at TUN connect, removed on clean stop; its presence at startup triggers a route-recovery pass), and `logs/` under `state_dir` (`$XDG_STATE_HOME/<qualifier>`, falling back to `data_dir/state`), plus custom presets under `data_dir/presets`. Uses atomic writes via `tempfile::NamedTempFile` + persist. Directories created with 0o700 permissions. `AppPaths::new_dev()` isolates dev mode under a `v2ray-rs-dev` qualifier. `AppPaths::from_paths()` is gated on `cfg(any(test, feature = "test-utils"))`.
+- **`persistence/`** — XDG-compliant file storage via `directories` crate. Settings in TOML (`~/.config/v2ray-rs/settings.toml`), subscriptions and routing rules in JSON (`~/.local/share/v2ray-rs/`). Also persists `latency_snapshot.json`, a versioned `tun_session.v1.json` TUN ownership journal (written at TUN connect, removed on clean stop; its presence at startup triggers a route-recovery pass), and `logs/` under `state_dir` (`$XDG_STATE_HOME/<qualifier>`, falling back to `data_dir/state`), plus custom presets under `data_dir/presets`. Uses atomic writes via `tempfile::NamedTempFile` + persist. Directories created with 0o700 permissions. `AppPaths::new_dev()` isolates dev mode under a `v2ray-rs-dev` qualifier. `AppPaths::from_paths()` is gated on `cfg(any(test, feature = "test-utils"))`.
 
 - **`backend.rs`** — Detects installed v2ray/xray/sing-box binaries by checking well-known paths (`/usr/bin/`, `/usr/local/bin/`) and `$PATH` via `which`. Validates executability, extracts version strings. Provides install guidance strings per backend.
 
@@ -47,11 +47,11 @@ Domain models and infrastructure:
 
 - **`routing_manager.rs`** — `RoutingManager` coordinating rule CRUD with persistence and config generation. All mutations (add, edit, delete, reorder, apply_preset) auto-persist. `write_config()` delegates to `ConfigWriter` from `config/`.
 
-- **`resolve.rs`** — `ConnectionPlanner` selects and orders enabled proxy node candidates per `AutoResolveStrategy`. `LatencySnapshot` stores per-node latency keyed by (subscription_id, node_index).
+- **`resolve.rs`** — `ConnectionPlanner` selects and orders enabled proxy node candidates per `AutoResolveStrategy`. `LatencySnapshot` stores per-node latency keyed by `ConnectionNodeRef` — `(subscription_id, node_id)` for subscription nodes.
 
 - **`config/`** — Backend config generation module:
   - `mod.rs` — `ConfigGenerator` trait and `generator_for(backend)` factory.
-  - `writer.rs` — `ConfigWriter` takes `AppSettings` + `AppPaths`, calls the right generator, atomic-writes the output JSON (e.g., `{data_dir}/generated/xray.json`). Respects `settings.backend.config_output_dir` override.
+  - `writer.rs` — `ConfigWriter` takes `AppSettings` + `AppPaths`, calls the right generator, atomic-writes the output JSON (e.g., `{runtime_dir}/generated/xray.json`). Respects `settings.backend.config_output_dir` override.
   - `v2ray.rs`, `xray.rs`, `singbox.rs` — per-backend `ConfigGenerator` implementations.
   - `common.rs` — shared helpers (outbound tag, test fixtures).
 
@@ -87,8 +87,12 @@ Minimal setuid-root wrapper binary (deps: `libc`). It resolves the `v2ray-rs-byp
 
 ### `crates/netctl` (`v2ray-rs-netctl`)
 
-Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `futures`) invoked by the process layer for xray TUN, since xray creates the device but does not program routes on Linux. Subcommands, all idempotent and argument-validated before any netlink call: `xray-up` (link up, assign address, add `0.0.0.0/1` + `128.0.0.0/1` split routes, plus `::/1` + `8000::/1` with `--addr6`; installs a `uidrange` policy rule at priority 8998 when `--bypass-uid` is given; repeatable `--exclude <CIDR>` installs priority-8997 rules sending those prefixes to table `main`, replaced on every `xray-up`), `xray-down` (remove the policy rules, including 8997, and delete the device), and `recover --singbox|--xray` (remove a leftover device and the xray policy rules; for sing-box flush its `auto_route` table/rules). Kept dependency-light on purpose: it is `setcap`'d with `cap_net_admin` and invokable by any local process. Privileged netns tests are gated behind the `privileged-tests` feature.
+Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `futures`) invoked by the process layer for xray TUN, since xray creates the device but does not program routes on Linux. Automatic commands require `--journal` and `--session-id`; `reserve` establishes kernel ownership before xray spawn. Legacy operator cleanup requires explicit `--force-legacy`. Subcommands, all idempotent and argument-validated before any netlink call: `xray-up` (link up, assign address, add a device-bound default route in table 2023 and policy rules at priorities 9000–9002, with IPv6 equivalents when configured; installs a `uidrange` policy rule at priority 8998 when `--bypass-uid` is given; repeatable `--exclude <CIDR>` installs priority-8997 rules sending those prefixes to table `main`, replaced on every `xray-up`), `xray-down` (remove exact journaled resources and the verified device), and `recover --singbox|--xray` (verify xray ownership before exact cleanup; refuse automatic sing-box cleanup without ownership evidence). Kept dependency-light on purpose: it is `setcap`'d with `cap_net_admin` and restricted to the `v2ray-rs` group with `root:v2ray-rs` ownership and mode `0750`. Privileged netns tests are gated behind the `privileged-tests` feature.
 
+
+### `crates/tun-session` (`v2ray-rs-tun-session`)
+
+Shared versioned TUN journal schema and bounded owner-only atomic I/O. Used by core and netctl so the privileged helper does not depend on the full domain crate. Recovery verifies session, boot, network namespace, device identity, and exact recorded route/rule objects. Unknown or legacy ownership requires operator recovery.
 
 ### `crates/tray` (`v2ray-rs-tray`)
 
@@ -110,7 +114,7 @@ GTK4/Relm4 GUI application:
 
 - **`routing.rs`** — Routing rule management with drag-and-drop reordering.
 
-- **`settings.rs`** — App settings editor.
+- **`preferences/`** — App settings editor.
 
 - **`logs.rs`** — Process log viewer.
 

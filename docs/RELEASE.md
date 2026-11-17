@@ -52,8 +52,26 @@ functions.
    advisory. A deferred advisory needs a recorded exception naming an owner and
    a review date.
 
-The tag push runs `helpers` → `tarball` → `appimage` → `release` → `aur`. The
-AUR job runs last on purpose: `updpkgsums` for `v2ray-rs-bin` downloads the
+The tag push runs the reusable quality workflow alongside packaging. Publication
+requires quality checks, the tarball, the AppImage, and its smoke test to pass
+for the tagged revision. The tag must match the workspace version. Quality
+includes required xray and sing-box checks, display-backed tests, and isolated
+routing acceptance. Missing required backends, display, or routing prerequisites
+fail their jobs. Test commands have deadlines and worker limits.
+
+Backend and packaging downloads use fixed release asset IDs or a commit-pinned
+source URL. Every download is verified against a SHA-256 digest before extraction
+or execution. Updating a pin requires verifying the new upstream asset and its
+digest together. A deleted asset fails the build; it never selects a replacement.
+The selected linuxdeploy AppImage includes its AppImage output plugin and
+appimagetool, so the same digest covers those bundled tools. The AppImage runtime
+is separately pinned and verified, then supplied through `LDAI_RUNTIME_FILE`;
+appimagetool must not fetch a replacement runtime during packaging.
+
+The smoke test observes the application window under Xvfb, requests shutdown
+with SIGTERM, and requires a successful exit within its deadline.
+
+The AUR job runs after publication: `updpkgsums` for `v2ray-rs-bin` downloads the
 release tarball, which does not exist until `release` has uploaded it.
 
 `make dist` reproduces the tarball locally, but against this host's glibc — use
@@ -76,12 +94,38 @@ docker run --rm -it debian:trixie sh -c '
 docker run --rm -v "$PWD:/w" -w /w -e APPIMAGE_EXTRACT_AND_RUN=1 \
   ubuntu:24.04 sh -c '
   apt-get update -qq &&
-  apt-get install -y -qq libgtk-4-1 libadwaita-1-0 xvfb xauth &&
+  apt-get install -y -qq libgtk-4-1 libadwaita-1-0 xvfb xauth x11-utils &&
   ./v2ray-rs-x86_64.AppImage --help &&
-  status=0
-  xvfb-run --auto-servernum timeout 20 ./v2ray-rs-x86_64.AppImage \
-    --profile development || status=$?
-  [ "$status" -eq 0 ] || [ "$status" -eq 124 ]'
+  xvfb-run --auto-servernum timeout 35s bash <<'"'"'SMOKE'"'"'
+  set -euo pipefail
+  ./v2ray-rs-x86_64.AppImage --profile development &
+  app_pid=$!
+  trap "kill -KILL $app_pid 2>/dev/null || true" EXIT
+  ready=0
+  for attempt in $(seq 1 40); do
+    kill -0 "$app_pid"
+    if xwininfo -root -tree | grep -q "\"V2Ray Manager\""; then
+      ready=1
+      break
+    fi
+    sleep 0.25
+  done
+  if [ "$ready" -ne 1 ]; then
+    echo "application window did not appear" >&2
+    exit 1
+  fi
+  kill -TERM "$app_pid"
+  for attempt in $(seq 1 40); do
+    if ! kill -0 "$app_pid" 2>/dev/null; then
+      wait "$app_pid"
+      trap - EXIT
+      exit 0
+    fi
+    sleep 0.25
+  done
+  echo "application did not shut down cleanly" >&2
+  exit 1
+SMOKE'
 ```
 
 `ubuntu:24.04` carries GTK 4.14, below the 4.18 build floor, so nothing from
@@ -93,8 +137,11 @@ What the check proves is narrow. `--help` exits before GTK initialisation, so
 it proves the bundled loader resolves every library the bundle provides, and
 nothing more. Only the `xvfb-run` step opens a window, exercising the pixbuf
 loaders, GSettings schemas and the icon theme, which is where GTK4 bundling
-actually breaks. Exit 124 is `timeout` expiring on a healthy long-running
-window; any other nonzero status fails the check.
+actually breaks. The windowed step polls `xwininfo` for the `V2Ray Manager`
+window and requires a clean exit after SIGTERM within its deadline, so a
+bundle that never shows a window or fails to shut down fails the check; the
+same observable gate is the `appimage-smoke` job in
+`.github/workflows/release.yml`.
 
 Re-running either installer must be idempotent, and `--uninstall` on either one
 must leave no files behind under the prefix.

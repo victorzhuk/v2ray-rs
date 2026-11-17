@@ -284,6 +284,7 @@ mod tests {
     fn test_validate_interface_name() {
         let cases = [
             ("tun0", true),
+            (v2ray_rs_tun_session::RESERVATION_NAME, false),
             ("wg-tun_1", true),
             ("a", true),
             ("0123456789abcde", true),   // 15 chars

@@ -9,14 +9,14 @@ use uuid::Uuid;
 
 use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, builtin_service_checks};
 use v2ray_rs_core::models::{
-    AppSettings, BackendType, ConnectionNodeRef, EgressSample, RealDelayCapability,
+    AppSettings, BackendType, ConnectionNodeRef, EgressSample, ProxyNode, RealDelayCapability,
     RealDelaySettings, Subscription, SubscriptionSource, VerdictRecord,
 };
 use v2ray_rs_core::persistence::{AppPaths, PersistenceError};
 use v2ray_rs_core::runtime_snapshot::subscriptions_runtime_state_eq;
 use v2ray_rs_subscription::{
     RealDelayReport, SubscriptionError, SubscriptionImportOutcome, SubscriptionService,
-    UpdateError, UpdateResult, reconcile_nodes,
+    UpdateError, UpdateResult, reconcile_nodes, same_connection,
 };
 
 use crate::failure_streak::FailureStreak;
@@ -129,9 +129,9 @@ pub enum SubscriptionsMsg {
 pub enum SubscriptionsCmdOutput {
     AddDone(SubscriptionImportOutcome),
     RefreshDone(Subscription, UpdateResult),
-    LatencyResult(Uuid, Vec<Uuid>, Vec<Option<u64>>),
-    RealDelayResult(Uuid, u64, Vec<Uuid>, RealDelayReport),
-    AvailabilityResult(Uuid, u64, Vec<Uuid>, RealDelayReport),
+    LatencyResult(Uuid, Vec<ProbeTarget>, Vec<Option<u64>>),
+    RealDelayResult(Uuid, u64, Vec<ProbeTarget>, RealDelayReport),
+    AvailabilityResult(Uuid, u64, Vec<ProbeTarget>, RealDelayReport),
     RefreshFailed(Uuid, SubscriptionError),
     AddFailed(SubscriptionError),
     AutoUpdateDone(AutoUpdateRefreshBatch),
@@ -201,15 +201,30 @@ fn should_start_refresh(refreshing: &HashSet<Uuid>, id: Uuid) -> bool {
     !refreshing.contains(&id)
 }
 
+/// Node id plus the connection captured when its probe launched. Results
+/// measured against a different connection are dropped instead of attached.
+#[derive(Debug)]
+pub(crate) struct ProbeTarget {
+    node_id: Uuid,
+    connection: ProxyNode,
+}
+
+fn probe_targets(nodes: &[v2ray_rs_core::models::SubscriptionNode]) -> Vec<ProbeTarget> {
+    nodes
+        .iter()
+        .map(|node| ProbeTarget {
+            node_id: node.id,
+            connection: node.node.clone(),
+        })
+        .collect()
+}
+
 async fn run_latency_probe(
     nodes: Vec<v2ray_rs_core::models::SubscriptionNode>,
-) -> (Vec<Uuid>, Vec<Option<u64>>) {
-    let mut snapshot_ids = Vec::with_capacity(nodes.len());
-    for node in &nodes {
-        snapshot_ids.push(node.id);
-    }
+) -> (Vec<ProbeTarget>, Vec<Option<u64>>) {
+    let targets = probe_targets(&nodes);
     let results = v2ray_rs_subscription::ping_nodes(&nodes).await;
-    (snapshot_ids, results)
+    (targets, results)
 }
 
 fn report_subscription_persist_error(
@@ -223,27 +238,34 @@ fn report_subscription_persist_error(
 }
 
 /// Maps a probe result index back to the current node list through the
-/// snapshot's node ids. Results for nodes that no longer exist are dropped.
-fn node_by_snapshot_id<'a>(
+/// captured target. Results for nodes that no longer exist or whose
+/// connection changed since the probe launched are dropped.
+fn node_by_probe_target<'a>(
     sub: &'a mut Subscription,
-    snapshot_ids: &[Uuid],
+    targets: &[ProbeTarget],
     idx: usize,
 ) -> Option<&'a mut v2ray_rs_core::models::SubscriptionNode> {
-    let id = *snapshot_ids.get(idx)?;
-    sub.nodes.iter_mut().find(|n| n.id == id)
+    let target = targets.get(idx)?;
+    sub.nodes
+        .iter_mut()
+        .find(|n| n.id == target.node_id && same_connection(&target.connection, &n.node))
 }
 
-fn apply_latency_by_ids(sub: &mut Subscription, snapshot_ids: &[Uuid], results: &[Option<u64>]) {
+fn apply_latency_by_ids(sub: &mut Subscription, targets: &[ProbeTarget], results: &[Option<u64>]) {
     for (idx, latency) in results.iter().enumerate() {
-        if let Some(node) = node_by_snapshot_id(sub, snapshot_ids, idx) {
+        if let Some(node) = node_by_probe_target(sub, targets, idx) {
             node.last_latency_ms = *latency;
         }
     }
 }
 
-fn apply_real_delay_by_ids(sub: &mut Subscription, snapshot_ids: &[Uuid], results: &[Option<u64>]) {
+fn apply_real_delay_by_ids(
+    sub: &mut Subscription,
+    targets: &[ProbeTarget],
+    results: &[Option<u64>],
+) {
     for (idx, delay) in results.iter().enumerate() {
-        if let Some(node) = node_by_snapshot_id(sub, snapshot_ids, idx) {
+        if let Some(node) = node_by_probe_target(sub, targets, idx) {
             node.last_real_delay_ms = *delay;
         }
     }
@@ -267,6 +289,32 @@ fn persist_latency_snapshot<F>(
         .await
         .unwrap_or_else(|join_err| Err(PersistenceError::Io(std::io::Error::other(join_err))));
         SubscriptionsCmdOutput::SnapshotSaved(result)
+    });
+}
+
+/// Drops in-memory egress and verdict state for nodes whose connection changed
+/// in a refresh and queues a snapshot rewrite without their samples.
+fn invalidate_node_samples(
+    sender: &ComponentSender<SubscriptionsPage>,
+    store: &WorkspaceStore,
+    egress_samples: &mut HashMap<(Uuid, Uuid), EgressSample>,
+    verdicts: &mut HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
+    subscription_id: Uuid,
+    node_ids: &[Uuid],
+) {
+    let changed: HashSet<Uuid> = node_ids.iter().copied().collect();
+    egress_samples
+        .retain(|(sub_id, node_id), _| *sub_id != subscription_id || !changed.contains(node_id));
+    verdicts
+        .retain(|(sub_id, node_id), _| *sub_id != subscription_id || !changed.contains(node_id));
+    let node_ids = node_ids.to_vec();
+    persist_latency_snapshot(sender, store, move |snapshot| {
+        for node_id in node_ids {
+            snapshot.remove(ConnectionNodeRef::Subscription {
+                subscription_id,
+                node_id,
+            });
+        }
     });
 }
 
@@ -646,8 +694,8 @@ impl Component for SubscriptionsPage {
                 self.testing_latency.insert(id);
                 let nodes = sub.nodes.clone();
                 sender.oneshot_command(async move {
-                    let (snapshot_ids, results) = run_latency_probe(nodes).await;
-                    SubscriptionsCmdOutput::LatencyResult(id, snapshot_ids, results)
+                    let (targets, results) = run_latency_probe(nodes).await;
+                    SubscriptionsCmdOutput::LatencyResult(id, targets, results)
                 });
             }
             SubscriptionsMsg::SortByLatency(id) => {
@@ -696,7 +744,7 @@ impl Component for SubscriptionsPage {
                 self.real_delay_run_token = self.real_delay_run_token.wrapping_add(1);
                 let run_token = self.real_delay_run_token;
                 self.testing_real_delay.insert(id, run_token);
-                let snapshot_ids: Vec<Uuid> = node_refs.iter().map(|n| n.id).collect();
+                let targets = probe_targets(&node_refs);
                 sender.oneshot_command(async move {
                     let timeout = std::time::Duration::from_millis(
                         u64::from(real_delay_settings.timeout_ms) + 15_000,
@@ -723,7 +771,7 @@ impl Component for SubscriptionsPage {
                             diagnostic: Some("Real Delay probe timed out".to_string()),
                         },
                     };
-                    SubscriptionsCmdOutput::RealDelayResult(id, run_token, snapshot_ids, report)
+                    SubscriptionsCmdOutput::RealDelayResult(id, run_token, targets, report)
                 });
             }
             SubscriptionsMsg::CheckAvailability(id) => {
@@ -757,7 +805,7 @@ impl Component for SubscriptionsPage {
                 self.availability_run_token = self.availability_run_token.wrapping_add(1);
                 let run_token = self.availability_run_token;
                 self.testing_availability.insert(id, run_token);
-                let snapshot_ids: Vec<Uuid> = node_refs.iter().map(|n| n.id).collect();
+                let targets = probe_targets(&node_refs);
                 sender.oneshot_command(async move {
                     // Same per-node pass as Real Delay, plus one request per
                     // service per node through its tunnel.
@@ -789,7 +837,7 @@ impl Component for SubscriptionsPage {
                             diagnostic: Some("Availability probe timed out".to_string()),
                         },
                     };
-                    SubscriptionsCmdOutput::AvailabilityResult(id, run_token, snapshot_ids, report)
+                    SubscriptionsCmdOutput::AvailabilityResult(id, run_token, targets, report)
                 });
             }
             SubscriptionsMsg::ShowAvailability(id) => {
@@ -1033,10 +1081,21 @@ impl Component for SubscriptionsPage {
                     let lost_profile =
                         previous.imported_profile.is_some() && sub.imported_profile.is_none();
                     let merged = merge_refreshed_subscription(&previous, sub);
+                    let changed_node_ids = changed_connection_node_ids(&previous, &merged);
                     let runtime_changed = !previous.runtime_state_eq(&merged);
                     self.subscriptions[pos] = merged;
                     self.persister
                         .submit(&self.store, &sender, self.subscriptions.clone());
+                    if !changed_node_ids.is_empty() {
+                        invalidate_node_samples(
+                            &sender,
+                            &self.store,
+                            &mut self.egress_samples,
+                            &mut self.verdicts,
+                            id,
+                            &changed_node_ids,
+                        );
+                    }
                     let _ = sender.output(SubscriptionsOutput::Notice(format_update_summary(
                         &name, "Updated", &result,
                     )));
@@ -1063,17 +1122,19 @@ impl Component for SubscriptionsPage {
                     result.parse_failures.len()
                 );
             }
-            SubscriptionsCmdOutput::LatencyResult(id, snapshot_ids, results) => {
+            SubscriptionsCmdOutput::LatencyResult(id, targets, results) => {
                 self.testing_latency.remove(&id);
                 let mut latency_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    apply_latency_by_ids(sub, &snapshot_ids, &results);
-                    for (idx, latency) in results.iter().enumerate() {
-                        if let (Some(node_id), Some(value)) =
-                            (snapshot_ids.get(idx).copied(), latency)
-                        {
-                            latency_updates.push((node_id, *value));
+                    apply_latency_by_ids(sub, &targets, &results);
+                    for (idx, target) in targets.iter().enumerate() {
+                        let Some(value) = results.get(idx).copied().flatten() else {
+                            continue;
+                        };
+                        if node_by_probe_target(sub, &targets, idx).is_none() {
+                            continue;
                         }
+                        latency_updates.push((target.node_id, value));
                     }
                 }
                 let now = chrono::Utc::now();
@@ -1090,7 +1151,7 @@ impl Component for SubscriptionsPage {
                     }
                 });
             }
-            SubscriptionsCmdOutput::RealDelayResult(id, run_token, snapshot_ids, report) => {
+            SubscriptionsCmdOutput::RealDelayResult(id, run_token, targets, report) => {
                 if self.testing_real_delay.get(&id).copied() != Some(run_token) {
                     return;
                 }
@@ -1099,17 +1160,18 @@ impl Component for SubscriptionsPage {
                 let mut delay_updates = Vec::new();
                 let mut egress_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    apply_real_delay_by_ids(sub, &snapshot_ids, &report.results);
-                    for idx in 0..snapshot_ids.len() {
-                        let node_id = snapshot_ids[idx];
+                    apply_real_delay_by_ids(sub, &targets, &report.results);
+                    for (idx, target) in targets.iter().enumerate() {
+                        if node_by_probe_target(sub, &targets, idx).is_none() {
+                            continue;
+                        }
                         if let Some(value) = report.results.get(idx).copied().flatten() {
-                            delay_updates.push((node_id, value));
+                            delay_updates.push((target.node_id, value));
                         }
                         if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
-                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
-                                self.egress_samples.insert((id, node.id), sample.clone());
-                            }
-                            egress_updates.push((node_id, sample.clone()));
+                            self.egress_samples
+                                .insert((id, target.node_id), sample.clone());
+                            egress_updates.push((target.node_id, sample.clone()));
                         }
                     }
                 }
@@ -1161,7 +1223,7 @@ impl Component for SubscriptionsPage {
                     let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
                 }
             }
-            SubscriptionsCmdOutput::AvailabilityResult(id, run_token, snapshot_ids, report) => {
+            SubscriptionsCmdOutput::AvailabilityResult(id, run_token, targets, report) => {
                 if self.testing_availability.get(&id).copied() != Some(run_token) {
                     return;
                 }
@@ -1171,25 +1233,25 @@ impl Component for SubscriptionsPage {
                 let mut egress_updates = Vec::new();
                 let mut verdict_updates = Vec::new();
                 if let Some(sub) = self.subscriptions.iter_mut().find(|s| s.id == id) {
-                    apply_real_delay_by_ids(sub, &snapshot_ids, &report.results);
-                    for idx in 0..snapshot_ids.len() {
-                        let node_id = snapshot_ids[idx];
+                    apply_real_delay_by_ids(sub, &targets, &report.results);
+                    for (idx, target) in targets.iter().enumerate() {
+                        if node_by_probe_target(sub, &targets, idx).is_none() {
+                            continue;
+                        }
                         if let Some(value) = report.results.get(idx).copied().flatten() {
-                            delay_updates.push((node_id, value));
+                            delay_updates.push((target.node_id, value));
                         }
                         if let Some(sample) = report.egress.get(idx).and_then(|e| e.as_ref()) {
-                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
-                                self.egress_samples.insert((id, node.id), sample.clone());
-                            }
-                            egress_updates.push((node_id, sample.clone()));
+                            self.egress_samples
+                                .insert((id, target.node_id), sample.clone());
+                            egress_updates.push((target.node_id, sample.clone()));
                         }
                         if let Some(verdict_map) =
                             report.verdicts.get(idx).filter(|v| !v.is_empty())
                         {
-                            if let Some(node) = node_by_snapshot_id(sub, &snapshot_ids, idx) {
-                                self.verdicts.insert((id, node.id), verdict_map.clone());
-                            }
-                            verdict_updates.push((node_id, verdict_map.clone()));
+                            self.verdicts
+                                .insert((id, target.node_id), verdict_map.clone());
+                            verdict_updates.push((target.node_id, verdict_map.clone()));
                         }
                     }
                 }
@@ -1257,18 +1319,34 @@ impl Component for SubscriptionsPage {
                     .retain(|id, _| self.subscriptions.iter().any(|s| s.id == *id));
                 if !results.is_empty() {
                     let previous = self.subscriptions.clone();
+                    let mut changed_samples: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
                     for (_, result) in &results {
                         if let Ok((updated, _)) = result
                             && let Some(existing) =
                                 self.subscriptions.iter_mut().find(|s| s.id == updated.id)
                         {
-                            *existing = merge_refreshed_subscription(existing, updated.clone());
+                            let merged = merge_refreshed_subscription(existing, updated.clone());
+                            let changed_node_ids = changed_connection_node_ids(existing, &merged);
+                            *existing = merged;
+                            if !changed_node_ids.is_empty() {
+                                changed_samples.push((existing.id, changed_node_ids));
+                            }
                         }
                     }
                     let runtime_changed =
                         !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
                     self.persister
                         .submit(&self.store, &sender, self.subscriptions.clone());
+                    for (sub_id, node_ids) in &changed_samples {
+                        invalidate_node_samples(
+                            &sender,
+                            &self.store,
+                            &mut self.egress_samples,
+                            &mut self.verdicts,
+                            *sub_id,
+                            node_ids,
+                        );
+                    }
                     if runtime_changed {
                         let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
                     }
@@ -1422,6 +1500,20 @@ fn merge_refreshed_subscription(current: &Subscription, refreshed: Subscription)
             .or_else(|| current.imported_profile.clone()),
         use_imported_profile: current.use_imported_profile,
     }
+}
+
+/// Node ids whose connection settings changed between the previous state and
+/// the merged refresh; remark-only edits do not count. Reconciled nodes keep
+/// their id, so the ids drive latency snapshot invalidation.
+fn changed_connection_node_ids(current: &Subscription, merged: &Subscription) -> Vec<Uuid> {
+    merged
+        .nodes
+        .iter()
+        .filter_map(|node| {
+            let previous = current.nodes.iter().find(|old| old.id == node.id)?;
+            (!same_connection(&previous.node, &node.node)).then_some(node.id)
+        })
+        .collect()
 }
 
 fn redact_uri(uri: &str) -> String {
@@ -3021,7 +3113,11 @@ mod tests {
             name: "Original subscription".into(),
             source: current.source.clone(),
             nodes: vec![
-                create_test_node("127.0.0.1", 8080, true),
+                {
+                    let mut node = current.nodes[0].clone();
+                    node.enabled = true;
+                    node
+                },
                 create_test_node("127.0.0.2", 8081, true),
             ],
             last_updated: Some(chrono::Utc::now()),
@@ -3153,11 +3249,11 @@ mod tests {
                 create_test_node("10.0.0.3", 1003, true),
             ],
         );
-        let snapshot_ids: Vec<Uuid> = sub.nodes.iter().map(|n| n.id).collect();
+        let targets = probe_targets(&sub.nodes);
         let results = vec![Some(30), None, Some(70)];
 
         sub.nodes.swap(0, 2);
-        apply_latency_by_ids(&mut sub, &snapshot_ids, &results);
+        apply_latency_by_ids(&mut sub, &targets, &results);
 
         let latency = |idx: usize| sub.nodes[idx].last_latency_ms;
         assert_eq!(
@@ -3179,18 +3275,17 @@ mod tests {
                 create_test_node("10.0.0.2", 1002, true),
             ],
         );
-        let removed_id = sub.nodes[1].id;
-        let snapshot_ids = vec![sub.nodes[0].id, removed_id];
+        let targets = probe_targets(&sub.nodes);
         let results = vec![Some(11), Some(22)];
 
         sub.nodes.remove(1);
-        apply_latency_by_ids(&mut sub, &snapshot_ids, &results);
+        apply_latency_by_ids(&mut sub, &targets, &results);
 
         assert_eq!(sub.nodes[0].last_latency_ms, Some(11));
         assert!(
             sub.nodes
                 .iter()
-                .all(|n| n.id == snapshot_ids[0] || n.last_latency_ms.is_none())
+                .all(|n| n.id == targets[0].node_id || n.last_latency_ms.is_none())
         );
     }
 
@@ -3204,14 +3299,100 @@ mod tests {
                 create_test_node("10.0.0.2", 1002, true),
             ],
         );
-        let snapshot_ids: Vec<Uuid> = sub.nodes.iter().map(|n| n.id).collect();
+        let targets = probe_targets(&sub.nodes);
         let results = vec![Some(120), None];
 
         sub.nodes.reverse();
-        apply_real_delay_by_ids(&mut sub, &snapshot_ids, &results);
+        apply_real_delay_by_ids(&mut sub, &targets, &results);
 
         assert_eq!(sub.nodes[1].last_real_delay_ms, Some(120));
         assert_eq!(sub.nodes[0].last_real_delay_ms, None);
+    }
+
+    #[test]
+    fn probe_result_for_changed_connection_is_dropped() {
+        let mut sub = create_test_subscription(
+            "Rotated",
+            true,
+            vec![create_test_node("10.0.0.1", 1001, true)],
+        );
+        let node_id = sub.nodes[0].id;
+        let captured = sub.nodes[0].node.clone();
+
+        // A refresh swapped the credentials behind the same node id.
+        if let ProxyNode::Vless(config) = &mut sub.nodes[0].node {
+            config.uuid = "rotated-credentials".into();
+        }
+
+        let targets = vec![ProbeTarget {
+            node_id,
+            connection: captured,
+        }];
+        apply_latency_by_ids(&mut sub, &targets, &[Some(42)]);
+        apply_real_delay_by_ids(&mut sub, &targets, &[Some(120)]);
+
+        assert_eq!(
+            sub.nodes[0].last_latency_ms, None,
+            "a stale probe result must not attach to a changed connection"
+        );
+        assert_eq!(sub.nodes[0].last_real_delay_ms, None);
+
+        // A remark-only rename is not a connection change, so results apply.
+        let rotated = sub.nodes[0].node.clone();
+        let mut renamed = sub.nodes[0].clone();
+        if let ProxyNode::Vless(config) = &mut renamed.node {
+            config.remark = Some("renamed".into());
+        }
+        sub.nodes[0] = renamed;
+        let remark_targets = vec![ProbeTarget {
+            node_id,
+            connection: rotated,
+        }];
+        apply_latency_by_ids(&mut sub, &remark_targets, &[Some(42)]);
+        assert_eq!(sub.nodes[0].last_latency_ms, Some(42));
+    }
+
+    #[test]
+    fn refresh_merge_reports_changed_connection_for_snapshot_invalidation() {
+        let current = create_test_subscription(
+            "Corp",
+            true,
+            vec![
+                create_test_node("10.0.0.1", 1001, true),
+                create_test_node("10.0.0.2", 1002, true),
+            ],
+        );
+        let changed_id = current.nodes[0].id;
+        let stable_id = current.nodes[1].id;
+
+        let mut changed_node = current.nodes[0].clone();
+        if let ProxyNode::Vless(config) = &mut changed_node.node {
+            config.uuid = "rotated-credentials".into();
+        }
+        let refreshed = Subscription {
+            id: current.id,
+            name: current.name.clone(),
+            source: current.source.clone(),
+            nodes: vec![changed_node, current.nodes[1].clone()],
+            last_updated: Some(chrono::Utc::now()),
+            auto_update_interval_secs: None,
+            enabled: true,
+            imported_profile: None,
+            use_imported_profile: true,
+        };
+
+        let merged = merge_refreshed_subscription(&current, refreshed);
+
+        assert_eq!(
+            merged.nodes[0].id, changed_id,
+            "reconcile must keep the node id"
+        );
+        assert_eq!(
+            changed_connection_node_ids(&current, &merged),
+            vec![changed_id],
+            "the changed connection must be reported for snapshot invalidation"
+        );
+        assert_eq!(merged.nodes[1].id, stable_id);
     }
 
     #[test]

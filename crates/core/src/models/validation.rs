@@ -117,7 +117,7 @@ pub fn validate_exclude_route(cidr: &str) -> Result<(), ValidationError> {
 /// Validates a TUN interface name: non-empty, at most 15 characters (IFNAMSIZ
 /// minus the NUL terminator), restricted to lowercase letters, digits, `_` and `-`.
 pub fn validate_tun_interface_name(name: &str) -> Result<(), ValidationError> {
-    if name.is_empty() || name.len() > 15 {
+    if name.is_empty() || name.len() > 15 || name == v2ray_rs_tun_session::RESERVATION_NAME {
         return Err(ValidationError::InvalidTunInterface(name.to_string()));
     }
     if !name

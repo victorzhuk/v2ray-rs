@@ -18,7 +18,7 @@ pub use privilege::{
 pub use probe::{ProbeError, ProbeRunner};
 pub use state::{ProcessEvent, ProcessState};
 pub use tun::{
-    BYPASS_USER, HELPER_TIMEOUT, HelperAccess, HelperRun, TunRuntime, connected_subnets,
-    helper_access, helper_path, helpers_stale, host_has_ipv6, relocated_helper_path,
-    relocation_required, run_helper, run_path,
+    BYPASS_USER, HELPER_TIMEOUT, HelperAccess, HelperRun, TunJournal, TunRuntime,
+    connected_subnets, helper_access, helper_path, helpers_stale, host_has_ipv6,
+    relocated_helper_path, relocation_required, run_helper, run_path, verify_singbox_stopped,
 };

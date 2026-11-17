@@ -10,11 +10,16 @@ use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::AppProfile;
 
 fn sing_box_available() -> bool {
-    Command::new("sing-box")
+    let available = Command::new("sing-box")
         .arg("version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        available || std::env::var_os("V2RAY_RS_REQUIRE_BACKENDS").is_none(),
+        "required backend sing-box is unavailable"
+    );
+    available
 }
 
 fn ss_node() -> ProxyNode {

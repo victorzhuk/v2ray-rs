@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
 v2ray-rs-core.workspace = true
 v2ray-rs-process.workspace = true
 serde.workspace = true

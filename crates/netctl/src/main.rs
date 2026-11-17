@@ -1,4 +1,5 @@
 mod net;
+mod ownership;
 mod validate;
 
 use std::net::IpAddr;
@@ -7,18 +8,30 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 
 /// Privileged route helper for v2ray-rs TUN mode. Programs and tears down the
-/// xray TUN interface address and split routes, and recovers leftover state
+/// xray TUN interface addresses and policy routes, and recovers leftover state
 /// after an unclean shutdown. Requires CAP_NET_ADMIN.
 #[derive(Parser)]
 #[command(name = "v2ray-rs-netctl", version, about)]
 struct Cli {
+    #[arg(long, global = true, conflicts_with = "force_legacy")]
+    journal: Option<std::path::PathBuf>,
+    /// Bypass ownership checks only for explicit operator recovery of legacy state.
+    #[arg(long, global = true)]
+    force_legacy: bool,
+    #[arg(long, global = true, requires = "journal")]
+    session_id: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    /// Assign the address(es) and add the split routes for an xray TUN device.
+    /// Reserve xray routing state before the backend creates a device.
+    Reserve {
+        #[arg(long)]
+        iface: String,
+    },
+    /// Assign the address(es) and add policy routes for an xray TUN device.
     XrayUp {
         #[arg(long)]
         iface: String,
@@ -48,8 +61,7 @@ enum Command {
         #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
         ifindex: Option<u32>,
     },
-    /// Remove the xray policy rules, flush the tunnel table (IPv4 and IPv6) and
-    /// delete the xray TUN device (no-op if absent).
+    /// Remove journaled xray routing state and the verified TUN device.
     XrayDown {
         #[arg(long)]
         iface: String,
@@ -86,9 +98,43 @@ fn main() -> ExitCode {
     }
 }
 
+/// Pure, netlink-free checks for the invocation shape, so an invalid call
+/// fails before the mutation lock is taken and stays unit-testable.
+fn validate_invocation(cli: &Cli) -> Result<(), String> {
+    if cli.journal.is_none() && !cli.force_legacy {
+        return Err("an ownership journal is required; legacy state needs explicit --force-legacy operator recovery".into());
+    }
+    if cli.journal.is_some() && cli.session_id.is_none() {
+        return Err("journaled commands require --session-id".into());
+    }
+    if cli.session_id.is_some() && cli.journal.is_none() {
+        return Err("session identity requires --journal".into());
+    }
+    if matches!(cli.command, Command::Reserve { .. }) && cli.journal.is_none() {
+        return Err("reserve requires --journal".into());
+    }
+    let Command::XrayUp { ifindex, .. } = &cli.command else {
+        return Ok(());
+    };
+    if cli.journal.is_some() && ifindex.is_none() {
+        return Err("journaled xray-up requires --ifindex".into());
+    }
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn run(cli: Cli) -> Result<(), String> {
+    validate_invocation(&cli)?;
+    let _mutation_lock = ownership::mutation_lock(cli.journal.as_deref())?;
     match cli.command {
+        Command::Reserve { iface } => {
+            validate::validate_iface(&iface)?;
+            let path = cli.journal.as_deref().ok_or("reserve requires --journal")?;
+            let handle = net::connect()?;
+            ownership::Owner::open(path, &iface, cli.session_id.as_deref().unwrap_or_default())?
+                .reserve(&handle)
+                .await
+        }
         Command::XrayUp {
             iface,
             addr,
@@ -106,17 +152,48 @@ async fn run(cli: Cli) -> Result<(), String> {
             if !validate::is_tun_device(&iface) {
                 return Err(format!("refusing xray-up on {iface}: not a TUN device"));
             }
-            if let Some(expected) = ifindex
-                && let Some(live) = validate::read_ifindex(&iface)?
-            {
+            if let Some(expected) = ifindex {
+                let live = validate::read_ifindex(&iface)?.ok_or_else(|| {
+                    format!("refusing xray-up on {iface}: interface is absent, expected ifindex {expected}")
+                })?;
                 validate::check_ifindex(&iface, expected, live)?;
             }
             let v4 = validate::parse_cidr(&addr)?;
             let v6 = addr6.as_deref().map(validate::parse_cidr).transpose()?;
             validate::check_exclusion_count(exclude.len())?;
             let handle = net::connect()?;
-            net::xray_up(&handle, &iface, v4, v6, bypass_uid, capture_dns, strict).await?;
-            net::replace_exclusions(&handle, &exclude).await
+            let owner = if let Some(path) = &cli.journal {
+                let mut owner = ownership::Owner::open(
+                    path,
+                    &iface,
+                    cli.session_id.as_deref().unwrap_or_default(),
+                )?;
+                owner
+                    .attach(
+                        &handle,
+                        ifindex.ok_or("journaled xray-up requires --ifindex")?,
+                    )
+                    .await?;
+                Some(owner)
+            } else {
+                None
+            };
+            let mut context = net::Context { handle, owner };
+            net::xray_up(
+                &mut context,
+                &iface,
+                v4,
+                v6,
+                bypass_uid,
+                capture_dns,
+                strict,
+            )
+            .await?;
+            net::replace_exclusions(&mut context, &exclude).await?;
+            if let Some(owner) = context.owner.as_mut() {
+                owner.active()?;
+            }
+            Ok(())
         }
         Command::XrayDown { iface, ifindex } => {
             validate::validate_iface(&iface)?;
@@ -126,11 +203,29 @@ async fn run(cli: Cli) -> Result<(), String> {
                 validate::check_ifindex(&iface, expected, live)?;
             }
             let handle = net::connect()?;
-            net::xray_down(&handle, &iface).await
+            if let Some(path) = &cli.journal {
+                ownership::Owner::open(path, &iface, cli.session_id.as_deref().unwrap_or_default())?
+                    .cleanup(&handle)
+                    .await
+            } else {
+                net::xray_down(&handle, &iface).await
+            }
         }
         Command::Recover { iface, backend } => {
             validate::validate_iface(&iface)?;
             let handle = net::connect()?;
+            if let Some(path) = &cli.journal {
+                if backend.singbox {
+                    return Err("sing-box ownership cannot be established; explicit operator recovery is required".into());
+                }
+                return ownership::Owner::open(
+                    path,
+                    &iface,
+                    cli.session_id.as_deref().unwrap_or_default(),
+                )?
+                .cleanup(&handle)
+                .await;
+            }
             if backend.singbox {
                 net::recover_singbox(&handle, &iface).await
             } else {
@@ -144,7 +239,7 @@ async fn run(cli: Cli) -> Result<(), String> {
 mod tests {
     use std::net::IpAddr;
 
-    use super::{Cli, Command};
+    use super::{Cli, Command, validate_invocation};
     use clap::Parser;
 
     fn parse(extra: &[&str]) -> Cli {
@@ -240,5 +335,124 @@ mod tests {
         .err()
         .expect("invalid exclusion must be refused");
         assert!(err.to_string().contains("10.0.0.0/33"), "{err}");
+    }
+
+    #[test]
+    fn invocation_without_journal_or_force_legacy_is_refused() {
+        let err = validate_invocation(&parse(&[])).unwrap_err();
+        assert!(err.contains("--force-legacy"), "{err}");
+    }
+
+    #[test]
+    fn journaled_invocation_requires_session_id() {
+        let cli = parse(&["--journal", "journal.json", "--ifindex", "3"]);
+        let err = validate_invocation(&cli).unwrap_err();
+        assert!(err.contains("--session-id"), "{err}");
+    }
+
+    #[test]
+    fn force_legacy_reserve_without_journal_is_refused() {
+        let cli = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "reserve",
+            "--iface",
+            "xtun0",
+            "--force-legacy",
+        ])
+        .unwrap();
+        let err = validate_invocation(&cli).unwrap_err();
+        assert!(err.contains("reserve requires --journal"), "{err}");
+    }
+
+    #[test]
+    fn journaled_xray_up_requires_ifindex() {
+        let cli = parse(&["--journal", "journal.json", "--session-id", "sid"]);
+        let err = validate_invocation(&cli).unwrap_err();
+        assert!(err.contains("--ifindex"), "{err}");
+        let cli = parse(&[
+            "--journal",
+            "journal.json",
+            "--session-id",
+            "sid",
+            "--ifindex",
+            "3",
+        ]);
+        assert!(validate_invocation(&cli).is_ok());
+    }
+
+    #[test]
+    fn journaled_and_legacy_invocations_pass_validation() {
+        let journaled = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "recover",
+            "--xray",
+            "--iface",
+            "xtun0",
+            "--journal",
+            "journal.json",
+            "--session-id",
+            "sid",
+        ])
+        .unwrap();
+        assert!(validate_invocation(&journaled).is_ok());
+        let legacy = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "xray-down",
+            "--iface",
+            "xtun0",
+            "--force-legacy",
+        ])
+        .unwrap();
+        assert!(validate_invocation(&legacy).is_ok());
+    }
+
+    #[test]
+    fn journal_and_force_legacy_conflict_at_clap_level() {
+        assert!(
+            Cli::try_parse_from([
+                "v2ray-rs-netctl",
+                "xray-up",
+                "--iface",
+                "xtun0",
+                "--addr",
+                "172.19.0.1/30",
+                "--journal",
+                "journal.json",
+                "--force-legacy",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn session_id_without_journal_is_refused() {
+        // Top-level flag ordering: clap refuses it via `requires = "journal"`.
+        assert!(
+            Cli::try_parse_from([
+                "v2ray-rs-netctl",
+                "--session-id",
+                "sid",
+                "xray-down",
+                "--iface",
+                "xtun0",
+                "--force-legacy",
+            ])
+            .is_err()
+        );
+
+        // A global flag repeated after the subcommand slips past clap; the
+        // validation boundary refuses that shape instead.
+        let cli = Cli::try_parse_from([
+            "v2ray-rs-netctl",
+            "xray-down",
+            "--iface",
+            "xtun0",
+            "--force-legacy",
+            "--session-id",
+            "sid",
+        ])
+        .unwrap();
+        let err = validate_invocation(&cli).unwrap_err();
+        assert!(err.contains("--journal"), "{err}");
     }
 }

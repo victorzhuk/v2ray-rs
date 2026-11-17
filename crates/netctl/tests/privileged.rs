@@ -77,7 +77,7 @@ fn ip_in_full(ns: &str, args: &[&str]) -> (bool, String) {
 /// Runs the netctl binary inside the given namespace, so its netlink socket
 /// operates on that namespace's network stack rather than the host's.
 fn netctl_in(ns: &str, args: &[&str]) -> bool {
-    let mut full = vec!["netns", "exec", ns, BIN];
+    let mut full = vec!["netns", "exec", ns, BIN, "--force-legacy"];
     full.extend_from_slice(args);
     run("ip", &full)
 }
@@ -93,8 +93,8 @@ fn device_exists() -> bool {
 
 /// Deletes the namespace (and everything in it) on drop, so a panicking
 /// assertion can never leak the namespace or the test device.
-struct NsGuard(&'static str);
-impl Drop for NsGuard {
+struct NsGuard<'a>(&'a str);
+impl Drop for NsGuard<'_> {
     fn drop(&mut self) {
         let _ = run("ip", &["netns", "del", self.0]);
     }
@@ -105,6 +105,10 @@ fn up_down_is_idempotent_in_namespace() {
     let _ = run("ip", &["netns", "del", NS]); // best-effort pre-clean from a prior run
     if !run("ip", &["netns", "add", NS]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS); // from here, any return or panic deletes the namespace
@@ -113,6 +117,10 @@ fn up_down_is_idempotent_in_namespace() {
     // not universally installed; the feature requires `tun` regardless).
     if !ip_in_ns(&["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
 
@@ -241,12 +249,20 @@ fn capture_dns_steers_port_53_into_the_tunnel_table() {
     let _ = run("ip", &["netns", "del", NS_DNS]);
     if !run("ip", &["netns", "add", NS_DNS]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_DNS);
 
     if !ip_in(NS_DNS, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
 
@@ -320,12 +336,20 @@ fn strict_up_installs_fallback_routes_and_v6_rules() {
     let _ = run("ip", &["netns", "del", NS_STRICT]);
     if !run("ip", &["netns", "add", NS_STRICT]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_STRICT);
 
     if !ip_in(NS_STRICT, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
 
@@ -405,6 +429,10 @@ fn down_and_recover_clear_strict_state_both_families() {
     let _ = run("ip", &["netns", "del", NS_CLEAR]);
     if !run("ip", &["netns", "add", NS_CLEAR]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_CLEAR);
@@ -423,6 +451,10 @@ fn down_and_recover_clear_strict_state_both_families() {
 
     if !ip_in(NS_CLEAR, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     assert!(netctl_in(NS_CLEAR, &strict_up));
@@ -469,6 +501,10 @@ fn reup_across_recreated_device_leaves_one_copy() {
     let _ = run("ip", &["netns", "del", NS_REUP]);
     if !run("ip", &["netns", "add", NS_REUP]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_REUP);
@@ -486,6 +522,10 @@ fn reup_across_recreated_device_leaves_one_copy() {
 
     if !ip_in(NS_REUP, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     assert!(netctl_in(NS_REUP, &strict_up));
@@ -531,12 +571,20 @@ fn strict_state_refuses_unmarked_traffic_without_device() {
     let _ = run("ip", &["netns", "del", NS_GONE]);
     if !run("ip", &["netns", "add", NS_GONE]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_GONE);
 
     if !ip_in(NS_GONE, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     assert!(ip_in(
@@ -597,12 +645,20 @@ fn exclusions_route_outside_tunnel_ahead_of_dns_capture() {
     let _ = run("ip", &["netns", "del", NS_EXCL]);
     if !run("ip", &["netns", "add", NS_EXCL]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_EXCL);
 
     if !ip_in(NS_EXCL, &["tuntap", "add", "dev", IFACE, "mode", "tun"]) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     assert!(ip_in(
@@ -680,6 +736,10 @@ fn exclusions_replaced_on_reup_and_cleared_on_teardown() {
     let _ = run("ip", &["netns", "del", NS_EXCL_REUP]);
     if !run("ip", &["netns", "add", NS_EXCL_REUP]) {
         eprintln!("skipping: cannot create a network namespace (needs root + netns support)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
     let _guard = NsGuard(NS_EXCL_REUP);
@@ -689,6 +749,10 @@ fn exclusions_replaced_on_reup_and_cleared_on_teardown() {
         &["tuntap", "add", "dev", IFACE, "mode", "tun"],
     ) {
         eprintln!("skipping: cannot create a tun device (needs /dev/net/tun)");
+        assert!(
+            std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+            "required routing acceptance prerequisite is unavailable"
+        );
         return;
     }
 
@@ -768,4 +832,345 @@ fn exclusions_replaced_on_reup_and_cleared_on_teardown() {
         excl.is_empty(),
         "exclusions leaked after recover --singbox: {excl:?}"
     );
+}
+
+fn owned_command(path: &std::path::Path, identity: &str, args: &[&str]) -> std::process::Output {
+    Command::new(BIN)
+        .arg("--journal")
+        .arg(path)
+        .arg("--session-id")
+        .arg(identity)
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn journaled_ownership_contract() {
+    const CHILD: &str = "V2RAY_RS_OWNERSHIP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            assert!(
+                std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+                "required TUN device is missing"
+            );
+            return;
+        }
+        let namespace = format!("nctl-owned-{}", std::process::id());
+        if !run("ip", &["netns", "add", &namespace]) {
+            assert!(
+                std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+                "required network namespace is unavailable"
+            );
+            return;
+        }
+        let _guard = NsGuard(&namespace);
+        let result = Command::new("timeout")
+            .arg("90s")
+            .args(["ip", "netns", "exec", &namespace])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journaled_ownership_contract",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "V2RAY_RS_OWNERSHIP_PARENT_NS",
+                v2ray_rs_tun_session::Epoch::current()
+                    .unwrap()
+                    .namespace_inode
+                    .to_string(),
+            )
+            .status()
+            .unwrap();
+        assert!(result.success(), "journaled ownership acceptance failed");
+        return;
+    }
+    let parent: u64 = std::env::var("V2RAY_RS_OWNERSHIP_PARENT_NS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(
+        parent,
+        v2ray_rs_tun_session::Epoch::current()
+            .unwrap()
+            .namespace_inode
+    );
+    use v2ray_rs_tun_session::{Ownership, Phase, RESERVATION_NAME, Resource, Session};
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("session.json");
+    let mut session = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    let identity = session.ownership.as_ref().unwrap().session_id.to_string();
+    v2ray_rs_tun_session::write(&path, &session).unwrap();
+    let rules = || {
+        Command::new("ip")
+            .args(["-json", "rule", "show"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let ok = |args: &[&str]| {
+        let result = owned_command(&path, &identity, args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    assert!(run("ip", &["rule", "add", "pref", "9001", "table", "main"]));
+    let baseline = rules();
+    let original = std::fs::read(&path).unwrap();
+    assert!(
+        !owned_command(&path, &identity, &["reserve", "--iface", IFACE])
+            .status
+            .success()
+    );
+    assert_eq!(baseline, rules());
+    assert_eq!(original, std::fs::read(&path).unwrap());
+    assert!(run("ip", &["rule", "del", "pref", "9001", "table", "main"]));
+    ok(&["reserve", "--iface", IFACE]);
+
+    let other_path = root.path().join("other.json");
+    let other = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    let other_id = other.ownership.as_ref().unwrap().session_id.to_string();
+    v2ray_rs_tun_session::write(&other_path, &other).unwrap();
+    assert!(
+        !owned_command(&other_path, &other_id, &["reserve", "--iface", IFACE])
+            .status
+            .success()
+    );
+    assert!(run("ip", &["tuntap", "add", "dev", IFACE, "mode", "tun"]));
+    let index = std::fs::read_to_string(format!("/sys/class/net/{IFACE}/ifindex")).unwrap();
+    let args = [
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--ifindex",
+        index.trim(),
+        "--strict",
+    ];
+    ok(&args);
+    ok(&args);
+    session = v2ray_rs_tun_session::read(&path).unwrap();
+    assert_eq!(session.ownership.as_ref().unwrap().phase, Phase::Active);
+    assert!(!session.ownership.as_ref().unwrap().resources.is_empty());
+
+    assert!(run(
+        "ip",
+        &[
+            "rule",
+            "add",
+            "pref",
+            "8997",
+            "to",
+            "192.0.2.0/24",
+            "table",
+            "main"
+        ]
+    ));
+    session.ownership.as_mut().unwrap().pending = Some(Resource::Rule(Vec::new()));
+    v2ray_rs_tun_session::write(&path, &session).unwrap();
+    let baseline = rules();
+    assert!(
+        !owned_command(&path, &identity, &["recover", "--xray", "--iface", IFACE])
+            .status
+            .success()
+    );
+    assert_eq!(baseline, rules());
+    assert!(
+        v2ray_rs_tun_session::read::<String>(&path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .pending
+            .is_some()
+    );
+    assert!(run(
+        "ip",
+        &[
+            "rule",
+            "del",
+            "pref",
+            "8997",
+            "to",
+            "192.0.2.0/24",
+            "table",
+            "main"
+        ]
+    ));
+    assert!(run(
+        "ip",
+        &["link", "set", "dev", IFACE, "alias", "foreign-fixture"]
+    ));
+    assert!(
+        !owned_command(&path, &identity, &["recover", "--xray", "--iface", IFACE])
+            .status
+            .success()
+    );
+    let alias = session.ownership.as_ref().unwrap().alias();
+    assert!(run("ip", &["link", "set", "dev", IFACE, "alias", &alias]));
+    ok(&["recover", "--xray", "--iface", IFACE]);
+    ok(&["recover", "--xray", "--iface", IFACE]);
+    assert_eq!(
+        v2ray_rs_tun_session::read::<String>(&path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .phase,
+        Phase::Complete
+    );
+    assert!(!run("ip", &["link", "show", IFACE]));
+    assert!(!run("ip", &["link", "show", RESERVATION_NAME]));
+
+    let replacement = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    v2ray_rs_tun_session::write(&path, &replacement).unwrap();
+    assert!(
+        !owned_command(&path, &identity, &["reserve", "--iface", IFACE])
+            .status
+            .success()
+    );
+    let replacement_id = replacement
+        .ownership
+        .as_ref()
+        .unwrap()
+        .session_id
+        .to_string();
+    assert!(
+        owned_command(&path, &replacement_id, &["reserve", "--iface", IFACE])
+            .status
+            .success()
+    );
+    assert!(run("ip", &["link", "del", RESERVATION_NAME]));
+    assert!(
+        !owned_command(
+            &path,
+            &replacement_id,
+            &["recover", "--xray", "--iface", IFACE]
+        )
+        .status
+        .success()
+    );
+}
+
+#[test]
+fn journal_reservation_cli_without_tun() {
+    const CHILD: &str = "V2RAY_RS_RESERVATION_CLI_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let status = Command::new("timeout")
+            .args(["60s", "unshare", "-rn", "--"])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journal_reservation_cli_without_tun",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "V2RAY_RS_RESERVATION_PARENT_NS",
+                v2ray_rs_tun_session::Epoch::current()
+                    .unwrap()
+                    .namespace_inode
+                    .to_string(),
+            )
+            .status()
+            .unwrap();
+        assert!(status.success(), "private namespace CLI acceptance failed");
+        return;
+    }
+    use v2ray_rs_tun_session::{Epoch, Ownership, Phase, RESERVATION_NAME, Session};
+    let parent: u64 = std::env::var("V2RAY_RS_RESERVATION_PARENT_NS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(parent, Epoch::current().unwrap().namespace_inode);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("journal.json");
+    let session = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    let identity = session.ownership.as_ref().unwrap().session_id.to_string();
+    v2ray_rs_tun_session::write(&path, &session).unwrap();
+    let reserve = ["reserve", "--iface", IFACE];
+    let recover = ["recover", "--xray", "--iface", IFACE];
+    let success = |identity: &str, args: &[&str]| {
+        let result = owned_command(&path, identity, args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    assert!(run("ip", &["rule", "add", "pref", "9001", "table", "main"]));
+    let original = std::fs::read(&path).unwrap();
+    let failure = owned_command(&path, &identity, &reserve);
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("already in use"));
+    assert_eq!(std::fs::read(&path).unwrap(), original);
+    assert!(run("ip", &["rule", "del", "pref", "9001", "table", "main"]));
+    success(&identity, &reserve);
+    success(&identity, &reserve);
+    assert_eq!(
+        v2ray_rs_tun_session::read::<String>(&path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .phase,
+        Phase::Reserved
+    );
+
+    let other_path = dir.path().join("other.json");
+    let mut other = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    let other_id = other.ownership.as_ref().unwrap().session_id.to_string();
+    v2ray_rs_tun_session::write(&other_path, &other).unwrap();
+    assert!(
+        !owned_command(&other_path, &other_id, &reserve)
+            .status
+            .success()
+    );
+    success(&identity, &recover);
+    success(&identity, &recover);
+    assert!(!run("ip", &["link", "show", RESERVATION_NAME]));
+
+    v2ray_rs_tun_session::write(&path, &other).unwrap();
+    success(&other_id, &reserve);
+    let current = std::fs::read(&path).unwrap();
+    let failure = owned_command(&path, &identity, &recover);
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("session identity changed"));
+    assert_eq!(std::fs::read(&path).unwrap(), current);
+    other = v2ray_rs_tun_session::read(&path).unwrap();
+    other.ownership.as_mut().unwrap().epoch.namespace_inode += 1;
+    v2ray_rs_tun_session::write(&path, &other).unwrap();
+    let invalid = std::fs::read(&path).unwrap();
+    assert!(!owned_command(&path, &other_id, &recover).status.success());
+    assert_eq!(std::fs::read(&path).unwrap(), invalid);
+    other.ownership.as_mut().unwrap().epoch = Epoch::current().unwrap();
+    v2ray_rs_tun_session::write(&path, &other).unwrap();
+    assert!(run("ip", &["link", "del", RESERVATION_NAME]));
+    let failure = owned_command(&path, &other_id, &recover);
+    assert!(!failure.status.success());
+    assert!(String::from_utf8_lossy(&failure.stderr).contains("reservation is missing"));
 }

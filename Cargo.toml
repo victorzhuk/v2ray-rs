@@ -52,3 +52,5 @@ tonic = "0.12"
 http = "1"
 rtnetlink = "0.21"
 futures = "0.3"
+
+v2ray-rs-tun-session = { path = "crates/tun-session" }

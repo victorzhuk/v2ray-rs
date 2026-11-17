@@ -97,8 +97,10 @@ pub enum ProcessError {
     TunMountUnsupported(String),
     #[error("TUN device {0} did not appear")]
     TunDeviceTimeout(String),
-    #[error("TUN route helper failed: {0}")]
+    #[error("TUN routing operation failed: {0}")]
     TunHelper(String),
+    #[error("TUN recovery journal: {0}")]
+    TunJournal(String),
     #[error("route helper v2ray-rs-netctl not found")]
     TunHelperMissing,
     #[error("log out and back in to finish enabling TUN")]
@@ -154,6 +156,7 @@ impl ProcessError {
                 | ProcessError::TunHelperPermissions(_)
                 | ProcessError::TunHelperNoExec(_)
                 | ProcessError::TunHelperAccessProbe { .. }
+                | ProcessError::TunJournal(_)
                 | ProcessError::BackendTooOld { .. }
         )
     }
@@ -541,6 +544,27 @@ impl ProcessManager {
             }
         }
 
+        if let Some(rt) = self.tun.as_mut()
+            && let Some(journal) = rt.journal.as_mut()
+        {
+            let identity = match v2ray_rs_core::persistence::renew_completed_tun_session(
+                &journal.path,
+                &journal.session_id,
+            ) {
+                Ok(identity) => identity,
+                Err(e) => {
+                    // A journal-identity failure blocks every candidate node,
+                    // so it must not feed the per-candidate failover loop.
+                    let error = ProcessError::TunJournal(e.to_string());
+                    return self.fail_with(connection.as_ref(), error);
+                }
+            };
+            if identity != journal.session_id {
+                journal.session_id = identity;
+                rt.device_ifindex = None;
+            }
+        }
+
         if connection.is_some() {
             self.current_connection = connection.clone();
         }
@@ -722,6 +746,32 @@ impl ProcessManager {
     // the teardown.
     async fn launch(&mut self) -> Result<(), ProcessError> {
         self.write_session_record().await;
+        if let Some(rt) = &self.tun
+            && rt.needs_helper()
+            && let Some(journal) = &rt.journal
+        {
+            let args = vec![
+                "reserve".into(),
+                "--iface".into(),
+                rt.iface.clone(),
+                "--journal".into(),
+                journal.path.to_string_lossy().into_owned(),
+                "--session-id".into(),
+                journal.session_id.clone(),
+            ];
+            let run = tun::run_helper(&rt.helper_path, &args, tun::HELPER_TIMEOUT).await;
+            self.log_helper("reserve", &run);
+            if let Err(error) = run.result {
+                return Err(ProcessError::TunHelper(error));
+            }
+        }
+        if let Some(rt) = &self.tun
+            && rt.backend == v2ray_rs_core::models::BackendType::SingBox
+            && let Some(journal) = &rt.journal
+        {
+            v2ray_rs_core::persistence::record_singbox_launch(&journal.path, &journal.session_id)
+                .map_err(|e| ProcessError::TunHelper(e.to_string()))?;
+        }
         let mut child = self.try_spawn().await?;
 
         if let Some(pid) = child.id()
@@ -737,7 +787,7 @@ impl ProcessManager {
 
         // xray creates the device but does not program routes on Linux: wait for
         // the device, then drive the privileged helper. sing-box self-routes.
-        if let Some(rt) = self.tun.clone()
+        if let Some(mut rt) = self.tun.clone()
             && rt.needs_helper()
         {
             let Some(ifindex) = tun::wait_for_device(&rt.iface, tun::DEVICE_TIMEOUT).await else {
@@ -745,6 +795,7 @@ impl ProcessManager {
                     .await;
                 return Err(ProcessError::TunDeviceTimeout(rt.iface.clone()));
             };
+            rt.device_ifindex = Some(ifindex);
             // Pin teardown to the exact device the backend created, so a name
             // reuse after a crash cannot redirect xray-down at another tunnel.
             if let Some(rt) = self.tun.as_mut() {
@@ -1104,6 +1155,16 @@ impl ProcessManager {
             self.log_helper("xray-down", &run);
             return run.result;
         }
+        if let Some(rt) = &self.tun
+            && rt.backend == v2ray_rs_core::models::BackendType::SingBox
+            && let Some(journal) = &rt.journal
+        {
+            tokio::time::timeout(tun::HELPER_TIMEOUT, tun::verify_singbox_stopped(&rt.iface))
+                .await
+                .map_err(|_| "sing-box cleanup verification timed out".to_string())??;
+            v2ray_rs_core::persistence::complete_tun_session(&journal.path, &journal.session_id)
+                .map_err(|e| e.to_string())?;
+        }
         Ok(())
     }
 
@@ -1276,6 +1337,46 @@ mod tests {
         "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n";
     fn backend_log(dir: &std::path::Path) -> Arc<RotatingFileWriter> {
         Arc::new(RotatingFileWriter::open(dir.join("backend.log"), DEFAULT_MAX_BYTES).unwrap())
+    }
+
+    #[tokio::test]
+    async fn explicit_tun_start_renews_completed_runtime_identity() {
+        use v2ray_rs_core::persistence::{TunOwnership, TunPhase, TunSession};
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = v2ray_rs_core::persistence::AppPaths::for_profile_in(
+            v2ray_rs_core::profile::AppProfile::Test,
+            dir.path(),
+        );
+        let mut session = TunSession {
+            backend: BackendType::Xray,
+            iface: "lo".into(),
+            ownership: Some(TunOwnership::new().unwrap()),
+        };
+        session.ownership.as_mut().unwrap().phase = TunPhase::Complete;
+        v2ray_rs_core::persistence::save_tun_session(&paths, &session).unwrap();
+        let journal_path = paths.tun_session_path();
+        let old = session.ownership.unwrap().session_id.to_string();
+        let (helper, _) = stub_helper(dir.path(), "echo cap_net_admin=ep\n");
+        let probe = helper.clone();
+        let mut rt = xray_on_lo(helper);
+        rt.device_ifindex = Some(999);
+        rt.journal = Some(tun::TunJournal {
+            path: journal_path,
+            session_id: old.clone(),
+        });
+        let mut mgr =
+            manager_for(&dir, &format!("{VERSION_STUB}exit 1\n")).with_backend(BackendType::Xray);
+        mgr.tun = Some(rt);
+        mgr.host_probe = Some(HostProbe {
+            getcap: probe.clone(),
+            helper: probe,
+            helper_access: Some(tun::HelperAccess::Ready),
+        });
+        // No backend is spawned: configuration rejection isolates the start boundary.
+        let _ = mgr.start().await;
+        let runtime = mgr.tun.as_ref().unwrap();
+        assert_ne!(runtime.journal.as_ref().unwrap().session_id, old);
+        assert!(runtime.device_ifindex.is_none());
     }
 
     #[tokio::test]
@@ -1842,6 +1943,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xray_setup_receives_observed_device_identity() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let args_path = dir.path().join("helper-args");
+        let (helper, _) = stub_helper(
+            dir.path(),
+            &format!("printf '%s\\n' \"$@\" > {}\n", args_path.display()),
+        );
+        let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"));
+        mgr.tun = Some(xray_on_lo(helper));
+        mgr.launch().await.unwrap();
+        let args = std::fs::read_to_string(&args_path).unwrap();
+        let expected = format!("--ifindex\n{}\n", tun::read_device_ifindex("lo").unwrap());
+        mgr.shutdown().await;
+        assert!(args.contains(&expected), "{args}");
+    }
+
+    #[tokio::test]
     async fn exit_record_marks_start_failed_on_xray_up_failure() {
         let dir = tempfile::TempDir::new().unwrap();
         let mut mgr = manager_for(&dir, &format!("{VERSION_STUB}exec sleep 30\n"))
@@ -1978,6 +2096,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         }
     }
 
@@ -2177,6 +2296,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn crash_respawn_keeps_journal_identity() {
+        use v2ray_rs_core::persistence::{TunOwnership, TunPhase, TunSession};
+        let dir = tempfile::TempDir::new().unwrap();
+        let paths = v2ray_rs_core::persistence::AppPaths::for_profile_in(
+            v2ray_rs_core::profile::AppProfile::Test,
+            dir.path(),
+        );
+        let mut session = TunSession {
+            backend: BackendType::Xray,
+            iface: "lo".into(),
+            ownership: Some(TunOwnership::new().unwrap()),
+        };
+        session.ownership.as_mut().unwrap().phase = TunPhase::Complete;
+        v2ray_rs_core::persistence::save_tun_session(&paths, &session).unwrap();
+        let original = session.ownership.unwrap().session_id.to_string();
+
+        let script = format!("{VERSION_STUB}{}", crashing_backend(dir.path(), 1));
+        let mut mgr = manager_for(&dir, &script);
+        mgr.restart_delay = Duration::from_millis(50);
+        let (helper, _) = stub_helper(dir.path(), "echo cap_net_admin=ep\n");
+        let probe = helper.clone();
+        let mut rt = xray_on_lo(helper);
+        rt.journal = Some(tun::TunJournal {
+            path: paths.tun_session_path(),
+            session_id: original.clone(),
+        });
+        mgr.tun = Some(rt);
+        mgr.host_probe = Some(HostProbe {
+            getcap: probe.clone(),
+            helper: probe,
+            helper_access: Some(tun::HelperAccess::Ready),
+        });
+
+        // An explicit start renews a completed journal identity...
+        mgr.start().await.unwrap();
+        let journal = mgr.tun.as_ref().unwrap().journal.as_ref().unwrap();
+        assert_ne!(journal.session_id, original);
+        let renewed = journal.session_id.clone();
+
+        // ...while a crash respawn must keep it.
+        mgr.wait_and_handle_exit().await.unwrap();
+        assert_eq!(mgr.state(), ProcessState::Running);
+        assert_eq!(
+            mgr.tun
+                .as_ref()
+                .unwrap()
+                .journal
+                .as_ref()
+                .unwrap()
+                .session_id,
+            renewed
+        );
+        mgr.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn tun_start_refuses_without_capability() {
         // Root skips the capability probe by design, so there is no gate to hit.
         if !crate::privilege::caps_check_needed(nix::unistd::geteuid().as_raw()) {
@@ -2205,6 +2380,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         }));
 
         let result = mgr.start_with_connection(None).await;
@@ -2243,6 +2419,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         }))
         .with_backend(BackendType::Xray)
         .with_log_file(Some(backend_log(dir.path())));
@@ -2332,6 +2509,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         }))
         .with_backend(BackendType::SingBox);
 
@@ -2481,6 +2659,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         });
 
         let mut rx = mgr.subscribe();
@@ -2522,6 +2701,7 @@ mod tests {
             strict: true,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         });
 
         let err = mgr.stop().await.unwrap_err();
@@ -2747,6 +2927,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))
@@ -2789,6 +2970,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         };
         let mut mgr = ProcessManager::new(binary, config, dir.path().join("backend.pid"), None)
             .with_tun(Some(rt))
@@ -2911,6 +3093,10 @@ mod tests {
             ),
             (ProcessError::TunDeviceTimeout("tun-test".into()), false),
             (ProcessError::TunHelper("helper exited 1".into()), false),
+            (
+                ProcessError::TunJournal("TUN journal identity changed".into()),
+                true,
+            ),
             (ProcessError::TunHelperMissing, true),
             (ProcessError::TunHelperRelogin, true),
             (

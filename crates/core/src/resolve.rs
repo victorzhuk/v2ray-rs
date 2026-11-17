@@ -232,6 +232,11 @@ impl LatencySnapshot {
         self.samples.retain(|node_ref, _| valid.contains(node_ref));
     }
 
+    /// Drops the sample recorded for `node_ref`, if any.
+    pub fn remove(&mut self, node_ref: ConnectionNodeRef) {
+        self.samples.remove(&node_ref);
+    }
+
     pub fn is_empty(&self) -> bool {
         self.samples.is_empty()
     }
@@ -676,6 +681,20 @@ mod tests {
         let sample = snapshot.get(node_ref).unwrap();
         assert_eq!(sample.latency_ms, Some(42));
         assert_eq!(sample.real_delay_ms, Some(412));
+    }
+
+    #[test]
+    fn snapshot_remove_drops_the_recorded_sample() {
+        let mut snapshot = LatencySnapshot::new();
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        snapshot.upsert(node_ref, 42, Utc::now());
+
+        snapshot.remove(node_ref);
+
+        assert!(snapshot.get(node_ref).is_none());
+        assert!(snapshot.is_empty());
     }
 
     #[test]

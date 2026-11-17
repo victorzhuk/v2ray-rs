@@ -9,11 +9,16 @@ use v2ray_rs_core::models::{
 };
 
 fn xray_available() -> bool {
-    Command::new("xray")
+    let available = Command::new("xray")
         .arg("version")
         .output()
         .map(|o| o.status.success())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    assert!(
+        available || std::env::var_os("V2RAY_RS_REQUIRE_BACKENDS").is_none(),
+        "required backend xray is unavailable"
+    );
+    available
 }
 
 fn ss_node() -> ProxyNode {

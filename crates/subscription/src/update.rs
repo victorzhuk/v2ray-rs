@@ -51,6 +51,22 @@ fn node_key(node: &ProxyNode) -> NodeKey {
     (node.address().to_owned(), node.port(), discriminant(node))
 }
 
+/// Connection equality that ignores the display remark, so a provider renaming
+/// a node does not count as a connection change.
+pub fn same_connection(left: &ProxyNode, right: &ProxyNode) -> bool {
+    fn without_remark(node: &ProxyNode) -> ProxyNode {
+        let mut node = node.clone();
+        match &mut node {
+            ProxyNode::Vless(c) => c.remark = None,
+            ProxyNode::Vmess(c) => c.remark = None,
+            ProxyNode::Shadowsocks(c) => c.remark = None,
+            ProxyNode::Trojan(c) => c.remark = None,
+        }
+        node
+    }
+    without_remark(left) == without_remark(right)
+}
+
 pub fn reconcile_with_counts(
     old_nodes: &[SubscriptionNode],
     new_parsed: Vec<ProxyNode>,
@@ -65,20 +81,58 @@ pub fn reconcile_with_counts(
     let mut matched_old = vec![false; old_nodes.len()];
     let mut result = Vec::new();
 
-    for new_node in new_parsed {
-        let key = node_key(&new_node);
-        let matched = index
+    let mut matches = vec![None; new_parsed.len()];
+    for (position, new_node) in new_parsed.iter().enumerate() {
+        let key = node_key(new_node);
+        if let Some(idx) = index
             .get(&key)
-            .and_then(|indices| indices.iter().copied().find(|&idx| !matched_old[idx]));
-
-        if let Some(idx) = matched {
+            .into_iter()
+            .flatten()
+            .copied()
+            .find(|&idx| !matched_old[idx] && same_connection(&old_nodes[idx].node, new_node))
+        {
+            matches[position] = Some(idx);
             matched_old[idx] = true;
+        }
+    }
+    let mut remaining_counts = HashMap::new();
+    for (position, node) in new_parsed.iter().enumerate() {
+        if matches[position].is_none() {
+            *remaining_counts.entry(node_key(node)).or_insert(0usize) += 1;
+        }
+    }
+    for (position, new_node) in new_parsed.iter().enumerate() {
+        if matches[position].is_some() {
+            continue;
+        }
+        let key = node_key(new_node);
+        if remaining_counts.get(&key) != Some(&1) {
+            continue;
+        }
+        let mut old = index
+            .get(&key)
+            .into_iter()
+            .flatten()
+            .copied()
+            .filter(|&idx| !matched_old[idx]);
+        if let Some(idx) = old.next()
+            && old.next().is_none()
+        {
+            matches[position] = Some(idx);
+            matched_old[idx] = true;
+        }
+    }
+    for (new_node, matched) in new_parsed.into_iter().zip(matches) {
+        if let Some(idx) = matched {
             unchanged += 1;
             let old = &old_nodes[idx];
-            let mut subscription_node = SubscriptionNode::with_id(old.id, new_node, old.enabled);
-            subscription_node.last_latency_ms = old.last_latency_ms;
-            subscription_node.last_real_delay_ms = old.last_real_delay_ms;
-            result.push(subscription_node);
+            let same = same_connection(&old.node, &new_node);
+            let mut node = SubscriptionNode::with_id(old.id, new_node, old.enabled);
+            if same {
+                node.last_latency_ms = old.last_latency_ms;
+                node.last_real_delay_ms = old.last_real_delay_ms;
+            }
+            result.push(node);
         } else {
             added += 1;
             result.push(SubscriptionNode::new(new_node));
@@ -149,7 +203,12 @@ pub async fn update_subscription(
         SubscriptionSource::Url { url } => {
             fetch_with_retry(client, url, DEFAULT_MAX_RETRIES).await?
         }
-        SubscriptionSource::File { path } => fetch_from_file(path)?,
+        SubscriptionSource::File { path } => {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || fetch_from_file(&path))
+                .await
+                .map_err(|e| FetchError::FileError(std::io::Error::other(e.to_string())))??
+        }
     };
 
     let profile;
@@ -357,6 +416,39 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].last_latency_ms, Some(38));
         assert_eq!(result[0].last_real_delay_ms, Some(412));
+    }
+
+    #[test]
+    fn reordered_endpoint_duplicates_keep_preferences() {
+        let first = vless_node("example.com", 443);
+        let mut second = first.clone();
+        if let ProxyNode::Vless(c) = &mut second {
+            c.uuid = "second".into();
+        }
+        let old = vec![
+            SubscriptionNode::with_id(Uuid::new_v4(), first.clone(), false),
+            SubscriptionNode::with_id(Uuid::new_v4(), second.clone(), true),
+        ];
+        let result = reconcile_nodes(&old, vec![second, first]);
+        assert_eq!(result[0].id, old[1].id);
+        assert_eq!(result[1].id, old[0].id);
+        assert!(result[0].enabled);
+        assert!(!result[1].enabled);
+    }
+
+    #[test]
+    fn changed_connection_invalidates_measurements() {
+        let mut old = SubscriptionNode::new(vless_node("example.com", 443));
+        old.last_real_delay_ms = Some(100);
+        old.last_latency_ms = Some(20);
+        let mut changed = old.node.clone();
+        if let ProxyNode::Vless(c) = &mut changed {
+            c.uuid = "changed".into();
+        }
+        let result = reconcile_nodes(&[old.clone()], vec![changed]);
+        assert_eq!(result[0].id, old.id);
+        assert_eq!(result[0].last_real_delay_ms, None);
+        assert_eq!(result[0].last_latency_ms, None);
     }
 
     #[test]

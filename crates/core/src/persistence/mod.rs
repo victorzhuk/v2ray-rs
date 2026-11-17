@@ -28,7 +28,12 @@ pub use subscriptions::{
     add_subscription, get_subscription, load_subscriptions, remove_subscription,
     save_subscriptions, update_subscription,
 };
-pub use tun_session::{TunSession, clear_tun_session, load_tun_session, save_tun_session};
+pub use tun_session::{
+    SINGBOX_ROUTE_TABLE, TunEpoch, TunOwnership, TunPhase, TunSession, clear_tun_session,
+    complete_tun_session, load_tun_session, load_tun_session_result, prepare_tun_session,
+    record_singbox_launch, renew_completed_tun_session, retirable_tun_session, save_tun_session,
+    tun_session_pending,
+};
 
 #[derive(Error, Debug)]
 pub enum PersistenceError {
@@ -236,6 +241,10 @@ impl AppPaths {
     }
 
     pub fn tun_session_path(&self) -> PathBuf {
+        self.state_dir.join("tun_session.v1.json")
+    }
+
+    pub fn legacy_tun_session_path(&self) -> PathBuf {
         self.state_dir.join("tun_session.json")
     }
 

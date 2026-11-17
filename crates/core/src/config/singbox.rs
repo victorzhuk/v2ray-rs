@@ -200,6 +200,7 @@ fn build_tun_inbound(tun: &TunConfig) -> Value {
         "address": tun.addresses(),
         "mtu": tun.mtu,
         "auto_route": true,
+        "iproute2_table_index": v2ray_rs_tun_session::SINGBOX_ROUTE_TABLE,
         "strict_route": tun.strict_route,
         "stack": tun.stack,
     });

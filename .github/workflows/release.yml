@@ -18,7 +18,16 @@ env:
   # env value, so raising the floor means editing both job containers and this.
   GLIBC_MAX: '2.41'
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
+  quality:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   helpers:
     name: Static helpers
     runs-on: ubuntu-latest
@@ -97,6 +106,10 @@ jobs:
         id: meta
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::release tag does not match workspace version"
+            exit 1
+          fi
           echo "version=$version" >>"$GITHUB_OUTPUT"
       - name: Stage and pack
         run: |
@@ -144,11 +157,21 @@ jobs:
           name: tarball
       - name: Fetch linuxdeploy
         run: |
-          base=https://github.com/linuxdeploy/linuxdeploy
-          curl -fsSLo /usr/local/bin/linuxdeploy \
-            "$base/releases/download/continuous/linuxdeploy-x86_64.AppImage"
-          curl -fsSLo /usr/local/bin/linuxdeploy-plugin-gtk \
-            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/master/linuxdeploy-plugin-gtk.sh
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/linuxdeploy/linuxdeploy/releases/assets/699514588 \
+            -o /usr/local/bin/linuxdeploy
+          echo 'df908b19f1ed1cdafa79508d415aa12d6c56ce4d56d4149aa8c09286718706e5  /usr/local/bin/linuxdeploy' | sha256sum -c -
+          curl --fail --location --retry 3 --max-time 120 \
+            https://raw.githubusercontent.com/linuxdeploy/linuxdeploy-plugin-gtk/7a3fbc31a9e5075073ff8790f26effbac5f84453/linuxdeploy-plugin-gtk.sh \
+            -o /usr/local/bin/linuxdeploy-plugin-gtk
+          echo 'b0f4cbc684a0103a9651f0955b635eaea0096b3a66c0f5a2c2aa337960375171  /usr/local/bin/linuxdeploy-plugin-gtk' | sha256sum -c -
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/AppImage/type2-runtime/releases/assets/657374641 \
+            -o /usr/local/lib/appimage-runtime
+          echo '617aa77314d57c8b8e4fae9c3f0b35af7b30d5529cb69e98f64f92510ed98a46  /usr/local/lib/appimage-runtime' | sha256sum -c -
           chmod +x /usr/local/bin/linuxdeploy /usr/local/bin/linuxdeploy-plugin-gtk
       - name: Stage AppDir
         run: |
@@ -162,6 +185,7 @@ jobs:
       - name: Build AppImage
         env:
           DEPLOY_GTK_VERSION: '4'
+          LDAI_RUNTIME_FILE: /usr/local/lib/appimage-runtime
           # linuxdeploy is itself an AppImage and cannot mount FUSE in a container.
           APPIMAGE_EXTRACT_AND_RUN: '1'
           OUTPUT: v2ray-rs-x86_64.AppImage
@@ -216,7 +240,7 @@ jobs:
           # Only the base runtime stack the user-facing docs require, never
           # build deps: a broken bundle must fail against this container.
           apt-get install -y --no-install-recommends \
-            libgtk-4-1 libadwaita-1-0 xvfb xauth libfuse2t64 fuse3
+            libgtk-4-1 libadwaita-1-0 xvfb xauth x11-utils libfuse2t64 fuse3
       - uses: actions/download-artifact@v4
         with:
           name: appimage
@@ -231,20 +255,40 @@ jobs:
           # --help exits before GTK init, but the loader has already resolved
           # every bundled library by then, so this is the link check.
           ./v2ray-rs-x86_64.AppImage --help
-          # Only a real window exercises pixbuf loaders, GSettings schemas, and
-          # the icon theme, which is where GTK4 bundling actually breaks.
-          status=0
-          xvfb-run --auto-servernum timeout 20 ./v2ray-rs-x86_64.AppImage \
-            --profile development || status=$?
-          # 124 is timeout expiring on a healthy long-running window.
-          if [ "$status" -ne 0 ] && [ "$status" -ne 124 ]; then
-            echo "::error::AppImage exited with $status under Xvfb"
+          xvfb-run --auto-servernum timeout 35s bash <<'SMOKE'
+          set -euo pipefail
+          ./v2ray-rs-x86_64.AppImage --profile development &
+          app_pid=$!
+          trap 'kill -KILL "$app_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 40); do
+            kill -0 "$app_pid"
+            if xwininfo -root -tree | grep -q '"V2Ray Manager"'; then
+              ready=1
+              break
+            fi
+            sleep 0.25
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::application window did not appear"
             exit 1
           fi
+          kill -TERM "$app_pid"
+          for attempt in $(seq 1 40); do
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+              wait "$app_pid"
+              trap - EXIT
+              exit 0
+            fi
+            sleep 0.25
+          done
+          echo "::error::application did not shut down cleanly"
+          exit 1
+          SMOKE
 
   release:
     name: Publish release
-    needs: [tarball, appimage, appimage-smoke]
+    needs: [quality, tarball, appimage, appimage-smoke]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:

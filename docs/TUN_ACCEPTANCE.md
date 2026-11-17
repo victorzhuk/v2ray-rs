@@ -668,12 +668,49 @@ References:
   mixed-UID GUI cases. If the OS cannot produce them deterministically, the row
   is BLOCKED.
 
+## Ownership journal acceptance
+
+These rows extend the matrix below. Run full TUN scenarios only in the disposable
+VM. The journal-only namespace checks are supporting evidence and do not replace
+the packaged device, grant, or downgrade scenarios.
+
+Automatic helper requests now carry `--journal FILE --session-id UUID`. Obtain
+both values from the actual recorded session. `reserve` must finish before xray
+starts. `xray-up` also carries the observed `--ifindex`. The explicit
+`--force-legacy` mode retains broad operator cleanup and must never discharge an
+automatic ownership scenario.
+
+Required additional rows:
+
+| Scenario | Required assertions |
+| --- | --- |
+| Reservation | The helper creates a dummy reservation, records its index, explicitly sets its session alias, and verifies that alias before route mutation. |
+| Competing profile | Another profile is refused without changes to the first session's journal, rules, routes, or device. |
+| Foreign or duplicate object | Setup or cleanup refuses an unexpected complete rule/route object, including an identical duplicate, before deletion. |
+| Device replacement | Reused names, indices, or changed aliases refuse teardown and retain the journal. |
+| Interrupted tagging | An untagged reservation is not adopted automatically. |
+| Interrupted route mutation | Intent survives; an unacknowledged live object prevents automatic cleanup. |
+| Partial cleanup | A retry deletes only remaining acknowledged objects and verifies absence before completion. |
+| Stale request | An old UUID cannot follow a journal path that now names another session. |
+| Epoch mismatch | A boot or network namespace mismatch cannot authorize mutations of the current network. |
+| Legacy or malformed journal | Original bytes remain intact, a new session is refused, and no destructive helper call is issued automatically. A legacy marker is retired only by the operator: verified cleanup with `netctl recover --xray --iface <iface> --force-legacy` (or `--singbox` when the marker names sing-box), then manual removal of the legacy file; the versioned journal is never renamed to the legacy name. |
+| Sing-box clean stop | Inspection verifies device, table 2022, and selecting-rule absence without deleting anything before the journal is retired. |
+| Sing-box interrupted launch | An Applying journal without verifiable completion remains pending for operator recovery. |
+| Rollback | Networking is verified clean before downgrade; the versioned journal is never renamed to masquerade as a legacy marker. |
+
+Supporting automated checks are `journaled_route_mutations_in_private_namespace`,
+`journal_reservation_cli_without_tun`, and
+`cleanup_verification_preserves_foreign_state`. The full device scenario is
+`journaled_ownership_contract`. Every child must use a fresh namespace; helper
+unit and CLI scenarios verify that its namespace differs from the parent.
+
 ## Required matrix
 
 These dimensions are independent. Do not multiply every grant fault by every
 backend version.
 
-- For each of sing-box 1.13.0 and 1.13.14, all five harness scenarios.
+- For each of sing-box 1.13.0 and 1.13.14, all five routing harness scenarios.
+- Once per kernel fixture, the read-only cleanup inspection scenario and the ownership rows above.
 - For each sing-box version, manual IPv4 bridge, published TCP, real DNS, and
   overlapping-prefix evidence through the packaged GUI.
 - For each sing-box version, the applicable manual routing checks with TUN IPv6

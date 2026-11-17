@@ -27,6 +27,12 @@ pub const RELOCATE_DIR: &str = "/usr/local/lib/v2ray-rs";
 /// Name of the dedicated unprivileged system user used for xray TUN bypass.
 pub const BYPASS_USER: &str = "v2ray-rs-bypass";
 
+#[derive(Debug, Clone)]
+pub struct TunJournal {
+    pub path: PathBuf,
+    pub session_id: String,
+}
+
 /// Everything the process manager needs to drive TUN mode for a connection.
 #[derive(Debug, Clone)]
 pub struct TunRuntime {
@@ -49,6 +55,7 @@ pub struct TunRuntime {
     /// Kernel ifindex captured when the device appeared. Passed to the helper
     /// so teardown refuses a link that reused the name after the backend died.
     pub device_ifindex: Option<u32>,
+    pub journal: Option<TunJournal>,
 }
 
 impl TunRuntime {
@@ -550,6 +557,85 @@ pub fn host_has_ipv6() -> bool {
     Path::new("/proc/sys/net/ipv6").exists()
 }
 
+/// Verifies absence without changing another application's routes or devices.
+pub async fn verify_singbox_stopped(iface: &str) -> Result<(), String> {
+    use futures::TryStreamExt;
+    use rtnetlink::packet_route::route::RouteAttribute;
+    use rtnetlink::packet_route::rule::RuleAttribute;
+    const TABLE: u32 = v2ray_rs_core::persistence::SINGBOX_ROUTE_TABLE;
+    let (connection, handle, _) = rtnetlink::new_connection().map_err(|e| e.to_string())?;
+    let mut tasks = tokio::task::JoinSet::new();
+    tasks.spawn(connection);
+    let result = async {
+        let mut links = handle.link().get().match_name(iface.to_owned()).execute();
+        match links.try_next().await {
+            Ok(Some(_)) => {
+                return Err(
+                    "sing-box TUN device remains. Explicit operator recovery is required".into(),
+                );
+            }
+            Ok(None) => {}
+            Err(rtnetlink::Error::NetlinkError(error))
+                if error.code.is_some_and(|c| c.get() == -19) => {}
+            Err(error) => return Err(format!("verify TUN device absence: {error}")),
+        }
+        for family in [rtnetlink::IpVersion::V4, rtnetlink::IpVersion::V6] {
+            if family == rtnetlink::IpVersion::V6 && !host_has_ipv6() {
+                continue;
+            }
+            let mut rules = handle.rule().get(family).execute();
+            while let Some(rule) = rules.try_next().await.map_err(|e| e.to_string())? {
+                let table = rule
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        RuleAttribute::Table(t) => Some(*t),
+                        _ => None,
+                    })
+                    .unwrap_or(rule.header.table as u32);
+                if table == TABLE {
+                    return Err(
+                        "sing-box routing rules remain. Explicit operator recovery is required"
+                            .into(),
+                    );
+                }
+            }
+        }
+        let queries = [
+            rtnetlink::RouteMessageBuilder::<std::net::Ipv4Addr>::new().build(),
+            rtnetlink::RouteMessageBuilder::<std::net::Ipv6Addr>::new().build(),
+        ];
+        for query in queries {
+            if query.header.address_family == rtnetlink::packet_route::AddressFamily::Inet6
+                && !host_has_ipv6()
+            {
+                continue;
+            }
+            let mut routes = handle.route().get(query).execute();
+            while let Some(route) = routes.try_next().await.map_err(|e| e.to_string())? {
+                let table = route
+                    .attributes
+                    .iter()
+                    .find_map(|a| match a {
+                        RouteAttribute::Table(t) => Some(*t),
+                        _ => None,
+                    })
+                    .unwrap_or(route.header.table as u32);
+                if table == TABLE {
+                    return Err(
+                        "sing-box routes remain. Explicit operator recovery is required".into(),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+    result
+}
+
 /// Captured output and outcome of one route helper invocation.
 pub struct HelperRun {
     pub output: Vec<String>,
@@ -557,7 +643,7 @@ pub struct HelperRun {
     pub timed_out: bool,
 }
 
-/// Runs `netctl xray-up` to assign the address and split routes.
+/// Runs `netctl xray-up` to assign the address and policy routes.
 pub(crate) async fn xray_up(rt: &TunRuntime) -> HelperRun {
     run_helper(&rt.helper_path, &xray_up_args(rt), HELPER_TIMEOUT).await
 }
@@ -588,6 +674,14 @@ pub(crate) fn xray_up_args(rt: &TunRuntime) -> Vec<String> {
     for cidr in &rt.exclude_routes {
         args.extend(["--exclude".to_string(), cidr.clone()]);
     }
+    if let Some(journal) = &rt.journal {
+        args.extend([
+            "--journal".to_string(),
+            journal.path.to_string_lossy().into_owned(),
+            "--session-id".to_string(),
+            journal.session_id.clone(),
+        ]);
+    }
     args
 }
 
@@ -605,6 +699,14 @@ pub(crate) fn xray_down_args(rt: &TunRuntime) -> Vec<String> {
     ];
     if let Some(idx) = rt.device_ifindex {
         args.extend(["--ifindex".to_string(), idx.to_string()]);
+    }
+    if let Some(journal) = &rt.journal {
+        args.extend([
+            "--journal".to_string(),
+            journal.path.to_string_lossy().into_owned(),
+            "--session-id".to_string(),
+            journal.session_id.clone(),
+        ]);
     }
     args
 }
@@ -1003,6 +1105,7 @@ mod tests {
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         };
         assert!(mk(BackendType::Xray).needs_helper());
         assert!(!mk(BackendType::SingBox).needs_helper());
@@ -1020,6 +1123,7 @@ mod tests {
             strict,
             exclude_routes: vec!["10.15.12.100/32".into()],
             device_ifindex: None,
+            journal: None,
         }
     }
 
@@ -1053,6 +1157,7 @@ mod tests {
             capture_dns: false,
             exclude_routes: Vec::new(),
             device_ifindex: Some(31),
+            journal: None,
             ..xray_rt(false)
         };
         assert_eq!(

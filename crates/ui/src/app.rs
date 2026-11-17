@@ -331,7 +331,10 @@ impl App {
     }
 
     fn tun_marker_present(&self) -> bool {
-        self.paths.tun_session_path().exists()
+        v2ray_rs_core::persistence::tun_session_pending(&self.paths).unwrap_or_else(|error| {
+            log::warn!("inspect TUN recovery journal: {error}");
+            true
+        })
     }
 
     /// Releases TUN routes left installed by a session that ended without a
@@ -520,7 +523,14 @@ impl App {
             return;
         };
 
-        let rules = self.store.load_routing_rules().unwrap_or_default();
+        let rules = match regeneration_rules(&self.store) {
+            Ok(rules) => rules,
+            Err(message) => {
+                log::error!("{message}");
+                self.show_toast(&message);
+                return;
+            }
+        };
         let enabled_rules: Vec<_> = rules.enabled_rules().cloned().collect();
         let (mut effective_rules, effective_settings) = resolve_effective_config(
             &candidate.node_ref,
@@ -1455,11 +1465,15 @@ impl SimpleComponent for App {
                     self.process_handle = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
-                    // Clear the TUN recovery marker only on a clean stop. On
-                    // Error the routes stay installed as a kill switch while a
-                    // retry follows; the release pass clears it on give-up.
+                    // Retire the TUN journal only on a clean stop, and only
+                    // when it holds no kernel state. On Error the routes stay
+                    // installed as a kill switch while a retry follows; the
+                    // release pass clears it on give-up. A journal left by a
+                    // failed recovery keeps its file here: it is the only
+                    // evidence of leaked kernel state, and deleting it would
+                    // permanently block later TUN starts.
                     if matches!(state, ProcessState::Stopped) {
-                        let _ = v2ray_rs_core::persistence::clear_tun_session(&self.paths);
+                        let _ = retire_stopped_tun_journal(&self.paths);
                     }
                 }
                 if connection.is_some() {
@@ -3155,6 +3169,7 @@ mod tests {
             &v2ray_rs_core::persistence::TunSession {
                 backend: v2ray_rs_core::models::BackendType::Xray,
                 iface: "tun9".into(),
+                ownership: Some(v2ray_rs_core::persistence::TunOwnership::new().unwrap()),
             },
         )
         .unwrap();
@@ -3176,15 +3191,136 @@ mod tests {
         let args = tmp.path().join("args");
         let helper = stub_helper(&tmp, &format!("echo \"$@\" > {}", args.display()));
 
+        let identity = v2ray_rs_core::persistence::load_tun_session(&paths)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .session_id;
         assert!(recover_tun_session(&paths, &helper).await.is_ok());
 
         let recorded = std::fs::read_to_string(&args).unwrap();
-        assert_eq!(recorded.trim_end(), "recover --xray --iface tun9");
+        assert_eq!(
+            recorded.trim_end(),
+            format!(
+                "recover --xray --iface tun9 --journal {} --session-id {}",
+                paths.tun_session_path().display(),
+                identity
+            )
+        );
         assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
     }
 
     #[tokio::test]
-    async fn recover_clears_marker_when_helper_fails() {
+    async fn singbox_recovery_never_invokes_destructive_helper() {
+        use v2ray_rs_core::persistence::{TunPhase, load_tun_session, save_tun_session};
+        for phase in [
+            TunPhase::Prepared,
+            TunPhase::Reserved,
+            TunPhase::Applying,
+            TunPhase::Active,
+            TunPhase::Cleaning,
+            TunPhase::Complete,
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            let paths = paths_with_marker(&tmp);
+            let mut session = load_tun_session(&paths).unwrap();
+            session.backend = BackendType::SingBox;
+            session.ownership.as_mut().unwrap().phase = phase;
+            save_tun_session(&paths, &session).unwrap();
+            let called = tmp.path().join("called");
+            let helper = stub_helper(&tmp, &format!("touch {}", called.display()));
+            // An unstarted sing-box record (Prepared, nothing reserved) and a
+            // finished record hold no kernel state and retire without the
+            // helper; every unfinished phase is refused and kept for operator
+            // recovery.
+            let retained = !matches!(phase, TunPhase::Prepared | TunPhase::Complete);
+            let result = recover_tun_session(&paths, &helper).await;
+            assert_eq!(result.is_err(), retained, "{phase:?}");
+            assert_eq!(paths.tun_session_path().exists(), retained, "{phase:?}");
+            assert!(!called.exists());
+        }
+    }
+
+    #[test]
+    fn clean_stop_retires_only_a_finished_empty_journal() {
+        use v2ray_rs_core::persistence::{TunPhase, load_tun_session, save_tun_session};
+
+        // A failed recovery leaves a pending, unfinished journal behind; a
+        // clean stop of an unrelated session must keep it.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let mut session = load_tun_session(&paths).unwrap();
+        session.ownership.as_mut().unwrap().phase = TunPhase::Applying;
+        save_tun_session(&paths, &session).unwrap();
+        retire_stopped_tun_journal(&paths).unwrap();
+        assert!(paths.tun_session_path().exists());
+
+        // A finished journal with no recorded resources is safe to discard.
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let mut session = load_tun_session(&paths).unwrap();
+        session.ownership.as_mut().unwrap().phase = TunPhase::Complete;
+        save_tun_session(&paths, &session).unwrap();
+        retire_stopped_tun_journal(&paths).unwrap();
+        assert!(!paths.tun_session_path().exists());
+    }
+
+    #[tokio::test]
+    async fn foreign_epoch_finished_journal_is_retired_on_recovery() {
+        use v2ray_rs_core::persistence::{TunPhase, load_tun_session, save_tun_session};
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let mut session = load_tun_session(&paths).unwrap();
+        let ownership = session.ownership.as_mut().unwrap();
+        ownership.phase = TunPhase::Complete;
+        ownership.epoch.namespace_inode += 1;
+        save_tun_session(&paths, &session).unwrap();
+
+        assert!(
+            recover_tun_session(&paths, &stub_helper(&tmp, "exit 0"))
+                .await
+                .is_ok()
+        );
+        assert!(load_tun_session(&paths).is_none());
+    }
+
+    #[tokio::test]
+    async fn foreign_epoch_unfinished_journal_is_refused_and_retained() {
+        use v2ray_rs_core::persistence::{
+            TunPhase, TunSession, load_tun_session, save_tun_session,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let mut session: TunSession = load_tun_session(&paths).unwrap();
+        let ownership = session.ownership.as_mut().unwrap();
+        ownership.phase = TunPhase::Applying;
+        ownership.epoch.namespace_inode += 1;
+        save_tun_session(&paths, &session).unwrap();
+        let helper = stub_helper(&tmp, "exit 0");
+
+        let failure = recover_tun_session(&paths, &helper).await.unwrap_err();
+
+        assert_eq!(failure.journal_file.as_deref(), Some("tun_session.v1.json"));
+        assert_eq!(load_tun_session(&paths), Some(session));
+    }
+
+    #[tokio::test]
+    async fn legacy_recovery_is_refused_without_invoking_the_helper() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let mut session = v2ray_rs_core::persistence::load_tun_session(&paths).unwrap();
+        session.ownership = None;
+        v2ray_rs_core::persistence::save_tun_session(&paths, &session).unwrap();
+        let called = tmp.path().join("called");
+        let helper = stub_helper(&tmp, &format!("touch {}", called.display()));
+        let failure = recover_tun_session(&paths, &helper).await.unwrap_err();
+        assert_eq!(failure.journal_file.as_deref(), Some("tun_session.v1.json"));
+        assert!(!called.exists());
+        assert!(paths.tun_session_path().exists());
+    }
+
+    #[tokio::test]
+    async fn recover_retains_marker_when_helper_fails() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths_with_marker(&tmp);
         let helper = stub_helper(&tmp, "exit 1");
@@ -3192,7 +3328,7 @@ mod tests {
         let failure = recover_tun_session(&paths, &helper).await.unwrap_err();
 
         assert!(!failure.timed_out);
-        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_some());
     }
 
     #[tokio::test]
@@ -3210,7 +3346,7 @@ mod tests {
             log.contains(" helper recover exited with exit status: 1"),
             "{log}"
         );
-        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_some());
     }
 
     #[tokio::test]
@@ -3230,11 +3366,9 @@ mod tests {
         let session = TunSession {
             backend: BackendType::SingBox,
             iface: "tun0".into(),
+            ownership: None,
         };
-        assert_eq!(
-            recovery_hint(&session),
-            "v2ray-rs-netctl recover --singbox --iface tun0"
-        );
+        assert_eq!(recovery_hint(&session), "singbox interface tun0");
     }
 
     #[test]
@@ -3242,11 +3376,9 @@ mod tests {
         let session = TunSession {
             backend: BackendType::Xray,
             iface: "tun9".into(),
+            ownership: None,
         };
-        assert_eq!(
-            recovery_hint(&session),
-            "v2ray-rs-netctl recover --xray --iface tun9"
-        );
+        assert_eq!(recovery_hint(&session), "xray interface tun9");
     }
 
     #[test]
@@ -3254,22 +3386,34 @@ mod tests {
         let session = TunSession {
             backend: BackendType::Xray,
             iface: "tun9".into(),
+            ownership: None,
         };
         let failed = RecoveryFailure {
-            session: session.clone(),
+            session: Some(session.clone()),
             timed_out: false,
+            journal_file: None,
         };
         let timed_out = RecoveryFailure {
-            session,
+            session: Some(session.clone()),
             timed_out: true,
+            journal_file: None,
+        };
+        let unverifiable = RecoveryFailure {
+            session: Some(session),
+            timed_out: false,
+            journal_file: Some("tun_session.v1.json".into()),
         };
         assert_eq!(
             failed.toast(),
-            "TUN route recovery failed: run v2ray-rs-netctl recover --xray --iface tun9"
+            "TUN route recovery failed for xray interface tun9. Inspect logs before operator recovery"
         );
         assert_eq!(
             timed_out.toast(),
-            "TUN route recovery timed out: run v2ray-rs-netctl recover --xray --iface tun9"
+            "TUN route recovery timed out for xray interface tun9. Inspect logs before operator recovery"
+        );
+        assert_eq!(
+            unverifiable.toast(),
+            "TUN route recovery failed for xray interface tun9. Inspect logs before operator recovery. Remove tun_session.v1.json only after verified cleanup"
         );
     }
 
@@ -3709,6 +3853,24 @@ mod tests {
     }
 
     #[test]
+    fn regeneration_rules_reports_a_corrupt_routing_rules_file() {
+        let (_tmp, paths) = test_instance_paths();
+        paths.ensure_dirs().unwrap();
+        std::fs::write(paths.routing_rules_path(), "{not json").unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+
+        let error = regeneration_rules(&store).unwrap_err();
+        assert!(
+            error.starts_with("Failed to load routing rules: "),
+            "{error}"
+        );
+
+        // Positive control: without the corrupt file the default set loads.
+        std::fs::remove_file(paths.routing_rules_path()).unwrap();
+        assert!(regeneration_rules(&store).is_ok());
+    }
+
+    #[test]
     fn reset_refuses_production_without_confirm() {
         let (_tmp, paths) = test_instance_paths();
         let err =
@@ -3808,25 +3970,36 @@ fn record_unclean_previous_run(paths: &AppPaths) -> bool {
 }
 
 struct RecoveryFailure {
-    session: TunSession,
+    session: Option<TunSession>,
     timed_out: bool,
+    /// Journal file the operator must remove once kernel cleanup is verified.
+    journal_file: Option<String>,
 }
 
 impl RecoveryFailure {
     fn toast(&self) -> String {
-        let hint = recovery_hint(&self.session);
-        if self.timed_out {
-            format!("TUN route recovery timed out: run {hint}")
+        let Some(session) = &self.session else {
+            return "TUN journal cannot be read. Explicit operator recovery is required".into();
+        };
+        let hint = recovery_hint(session);
+        let base = if self.timed_out {
+            format!(
+                "TUN route recovery timed out for {hint}. Inspect logs before operator recovery"
+            )
         } else {
-            format!("TUN route recovery failed: run {hint}")
+            format!("TUN route recovery failed for {hint}. Inspect logs before operator recovery")
+        };
+        match &self.journal_file {
+            Some(file) => format!("{base}. Remove {file} only after verified cleanup"),
+            None => base,
         }
     }
 }
 
 fn recovery_hint(session: &TunSession) -> String {
     format!(
-        "v2ray-rs-netctl recover {} --iface {}",
-        recover_flag(session.backend),
+        "{} interface {}",
+        recover_flag(session.backend).trim_start_matches("--"),
         session.iface
     )
 }
@@ -3838,23 +4011,119 @@ fn recover_flag(backend: BackendType) -> &'static str {
     }
 }
 
+/// Name of the journal file the loaded record lives in:
+/// `load_tun_session_result` prefers the versioned file, so its presence
+/// identifies the loaded path.
+fn unverifiable_journal_file(paths: &AppPaths) -> String {
+    let path = if paths.tun_session_path().exists() {
+        paths.tun_session_path()
+    } else {
+        paths.legacy_tun_session_path()
+    };
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string_lossy().into_owned())
+}
+
+/// Retires the journal after a clean stop only when it is safe to discard:
+/// ownership proven, phase Complete, and no kernel resources recorded. A
+/// journal left by a failed recovery has unfinished work in it and must
+/// survive — it is the only evidence of leaked kernel state, and deleting it
+/// would permanently block later TUN starts. An absent journal, a load
+/// error, missing ownership, and every unfinished phase keep the file.
+fn retire_stopped_tun_journal(
+    paths: &AppPaths,
+) -> Result<(), v2ray_rs_core::persistence::PersistenceError> {
+    let Some(session) = v2ray_rs_core::persistence::load_tun_session_result(paths)? else {
+        return Ok(());
+    };
+    let retirable = session.ownership.as_ref().is_some_and(|ownership| {
+        ownership.phase == v2ray_rs_core::persistence::TunPhase::Complete
+            && ownership.resources.is_empty()
+            && ownership.pending.is_none()
+    });
+    if retirable {
+        v2ray_rs_core::persistence::clear_tun_session(paths)
+    } else {
+        Ok(())
+    }
+}
+
+/// Routing-rules load guard for config regeneration: the caller reports this
+/// message and skips the config write, so a corrupt rules file can never
+/// produce a regenerated config from partial rules.
+fn regeneration_rules(store: &WorkspaceStore) -> Result<RoutingRuleSet, String> {
+    store
+        .load_routing_rules()
+        .map_err(|err| format!("Failed to load routing rules: {err}"))
+}
+
 /// If a TUN session marker is present, run the route helper's recovery pass
-/// and clear the marker. Runs at startup after an unclean shutdown and
-/// whenever a TUN session ends without a clean stop. The marker is cleared
-/// even when the helper fails or hangs, so a broken helper cannot wedge
-/// every later launch.
+/// and clear the marker only after successful recovery. Failed cleanup remains
+/// pending across launches without preventing the desktop from opening.
 async fn recover_tun_session(
     paths: &AppPaths,
     helper: &std::path::Path,
 ) -> Result<(), RecoveryFailure> {
-    let Some(session) = v2ray_rs_core::persistence::load_tun_session(paths) else {
+    let session = v2ray_rs_core::persistence::load_tun_session_result(paths).map_err(|error| {
+        log::warn!("read TUN recovery journal: {error}");
+        RecoveryFailure {
+            session: None,
+            timed_out: false,
+            journal_file: None,
+        }
+    })?;
+    let Some(session) = session else {
         return Ok(());
     };
+    let ownership = session.ownership.as_ref();
+    // Retire a journal that records no kernel state before the epoch gate: a
+    // finished record from a previous boot must not refuse every later launch
+    // forever. Retiring only removes or replaces the journal file; it never
+    // mutates kernel state.
+    if v2ray_rs_core::persistence::retirable_tun_session(&session) {
+        return v2ray_rs_core::persistence::clear_tun_session(paths).map_err(|_| RecoveryFailure {
+            session: Some(session),
+            timed_out: false,
+            journal_file: None,
+        });
+    }
+    if ownership.is_none_or(|ownership| ownership.verify_epoch().is_err()) {
+        let journal_file = unverifiable_journal_file(paths);
+        log::warn!(
+            "TUN ownership cannot be established. Explicit operator recovery is required. \
+             Unverifiable journal: {journal_file}"
+        );
+        return Err(RecoveryFailure {
+            session: Some(session),
+            timed_out: false,
+            journal_file: Some(journal_file),
+        });
+    }
+    if session.backend != BackendType::Xray {
+        log::warn!(
+            "sing-box recovery has no verifiable ownership. Explicit operator recovery is required"
+        );
+        return Err(RecoveryFailure {
+            session: Some(session),
+            timed_out: false,
+            journal_file: None,
+        });
+    }
     let args = [
         "recover".to_string(),
         recover_flag(session.backend).to_string(),
         "--iface".to_string(),
         session.iface.clone(),
+        "--journal".to_string(),
+        paths.tun_session_path().to_string_lossy().into_owned(),
+        "--session-id".to_string(),
+        session
+            .ownership
+            .as_ref()
+            .expect("verified ownership")
+            .session_id
+            .to_string(),
     ];
     let run = v2ray_rs_process::run_helper(helper, &args, v2ray_rs_process::HELPER_TIMEOUT).await;
     let outcome = match &run.result {
@@ -3876,12 +4145,18 @@ async fn recover_tun_session(
         }
         Err(err) => log::warn!("open backend log: {err}"),
     }
-    let _ = v2ray_rs_core::persistence::clear_tun_session(paths);
-    match run.result {
+    let result = run.result.and_then(|()| {
+        v2ray_rs_core::persistence::clear_tun_session(paths).map_err(|err| {
+            log::warn!("clear recovered TUN session marker: {err}");
+            err.to_string()
+        })
+    });
+    match result {
         Ok(()) => Ok(()),
         Err(_) => Err(RecoveryFailure {
-            session,
+            session: Some(session),
             timed_out: run.timed_out,
+            journal_file: None,
         }),
     }
 }

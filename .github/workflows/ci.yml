@@ -6,6 +6,7 @@ on:
   pull_request:
     branches: [master]
   workflow_dispatch:
+  workflow_call:
 
 env:
   CARGO_TERM_COLOR: always
@@ -38,17 +39,30 @@ jobs:
 
   test:
     name: Test
+    timeout-minutes: 20
     runs-on: ubuntu-latest
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl
-      - name: Install sing-box
+        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus
+      - name: Install pinned proxy backends
         run: |
-          ver=1.13.14
-          curl -fsSL "https://github.com/SagerNet/sing-box/releases/download/v${ver}/sing-box-${ver}-linux-amd64.tar.gz" \
-            | tar -xz -C /usr/local/bin --strip-components=1 "sing-box-${ver}-linux-amd64/sing-box"
+          set -euo pipefail
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/SagerNet/sing-box/releases/assets/457461733 \
+            -o sing-box.tar.gz
+          echo 'f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697  sing-box.tar.gz' | sha256sum -c -
+          tar -xzf sing-box.tar.gz -C /usr/local/bin --strip-components=1 sing-box-1.13.14-linux-amd64/sing-box
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/XTLS/Xray-core/releases/assets/726356726 \
+            -o xray.zip
+          echo 'b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82  xray.zip' | sha256sum -c -
+          unzip -p xray.zip xray > /usr/local/bin/xray
+          chmod 0755 /usr/local/bin/xray
           sing-box version
+          xray version
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2
@@ -58,7 +72,60 @@ jobs:
           chown -R builder:builder "$GITHUB_WORKSPACE" /github/home
       - name: Test
         run: |
-          su builder -c 'export PATH="$CARGO_HOME/bin:$PATH" HOME=/github/home CARGO_TERM_COLOR=always; cd "$GITHUB_WORKSPACE" && cargo test --workspace --all-targets'
+          su builder -s /bin/bash <<'TEST'
+          set -e
+          export PATH="$CARGO_HOME/bin:$PATH" HOME=/github/home CARGO_TERM_COLOR=always
+          cd "$GITHUB_WORKSPACE"
+          V2RAY_RS_REQUIRE_BACKENDS=1 V2RAY_RS_REQUIRE_DISPLAY=1 xvfb-run -a dbus-run-session -- make test CARGO_FLAGS="--locked -j 2 --no-fail-fast" TEST_TIMEOUT=10m TEST_THREADS=2
+          TEST
+
+  routing-acceptance:
+    name: Isolated routing acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Prepare routing prerequisites
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler iproute2
+          sudo modprobe tun
+          test -c /dev/net/tun
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/SagerNet/sing-box/releases/assets/457461733 \
+            -o sing-box.tar.gz
+          echo 'f48703461a15476951ac4967cdad339d986f4b8096b4eb3ff0829a500502d697  sing-box.tar.gz' | sha256sum -c -
+          tar -xzf sing-box.tar.gz sing-box-1.13.14-linux-amd64/sing-box
+          sudo install -m 0755 sing-box-1.13.14-linux-amd64/sing-box /usr/bin/sing-box
+      - name: Verify sing-box routing in private namespaces
+        run: make test-process CARGO_FLAGS='--locked -j 2 --features privileged-tests --test singbox_routing' TEST_TIMEOUT=6m TEST_THREADS=1
+      - name: Verify route helper in disposable namespaces
+        run: |
+          timeout 3m cargo test --locked -j 2 -p v2ray-rs-netctl --features privileged-tests --bin v2ray-rs-netctl --test privileged --no-run --message-format=json > routing-artifacts.jsonl
+          python3 - <<'PYTHON'
+          import json
+          import subprocess
+          from pathlib import Path
+          binaries = {entry["target"]["name"]: entry["executable"]
+                      for line in Path("routing-artifacts.jsonl").read_text().splitlines()
+                      if (entry := json.loads(line)).get("reason") == "compiler-artifact"
+                      and entry.get("profile", {}).get("test") and entry.get("executable")}
+          if set(binaries) != {"privileged", "v2ray-rs-netctl"}:
+              raise SystemExit("expected the helper unit and privileged test executables")
+          native = binaries["v2ray-rs-netctl"]
+          listing = subprocess.run([native, "--list"], capture_output=True, text=True, check=True, timeout=10)
+          scenario = "net::tests::journaled_route_mutations_in_private_namespace"
+          if scenario + ": test" not in listing.stdout:
+              raise SystemExit("required journal scenario is missing")
+          subprocess.run(["sudo", "timeout", "2m", native, "--exact", scenario, "--test-threads=1"],
+                         check=True, timeout=130)
+          subprocess.run(["sudo", "env", "V2RAY_RS_REQUIRE_NETNS=1", "timeout", "3m", binaries["privileged"],
+                          "--test-threads=1"], check=True, timeout=190)
+          PYTHON
 
   audit:
     name: Advisory audit
@@ -72,9 +139,13 @@ jobs:
           CARGO_AUDIT_VERSION: v0.22.2
         run: |
           set -euo pipefail
-          curl -fsSL "https://github.com/RustSec/cargo-audit/releases/download/cargo-audit%2F${CARGO_AUDIT_VERSION}/cargo-audit-x86_64-unknown-linux-gnu-${CARGO_AUDIT_VERSION}.tgz" \
-            | tar -xz -C /usr/local/bin --strip-components=1 \
-                "cargo-audit-x86_64-unknown-linux-gnu-${CARGO_AUDIT_VERSION}/cargo-audit"
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/RustSec/cargo-audit/releases/assets/439291614 \
+            -o cargo-audit.tgz
+          echo 'ab28a1bdb54db4d5d8ad5981cf1f959410370b3d28250dbd35f6a44248620e39  cargo-audit.tgz' | sha256sum -c -
+          tar -xzf cargo-audit.tgz -C /usr/local/bin --strip-components=1 \
+            "cargo-audit-x86_64-unknown-linux-gnu-${CARGO_AUDIT_VERSION}/cargo-audit"
           cargo-audit --version
       # Policy: fail the build only on vulnerability advisories in the resolved
       # Cargo.lock. Unmaintained/yanked-crate warnings are reported without failing.

@@ -27,6 +27,9 @@ delegated to the system-installed CLI binary. The app's job is orchestration.
 Privileged helpers (separate binaries, no crate deps on core):
   v2ray-rs-netctl  — route helper (CAP_NET_ADMIN via setcap)
   v2ray-rs-run     — setuid-root process wrapper (drops to bypass user)
+
+Shared journal crate (not a privileged helper): core and netctl
+  → tun-session (versioned ownership journal)
 ```
 
 ## Runtime data flow
@@ -57,7 +60,8 @@ ProcessManager::start()
 ### `core` (`v2ray-rs-core`)
 
 Domain models, persistence, and config generation. Every other crate depends
-on this; it has no in-workspace dependencies.
+on this; its single in-workspace dependency is `v2ray-rs-tun-session`, the
+shared TUN journal schema with its owner-only atomic writer.
 
 Key types: `ProxyNode` (tagged enum: Vless/Vmess/Shadowsocks/Trojan),
 `Subscription`, `RoutingRuleSet`, `AppSettings`, `TunConfig`, `DnsConfig`,
@@ -165,10 +169,22 @@ is its only user.
 
 ### `netctl` (`v2ray-rs-netctl`)
 
-Standalone binary with `CAP_NET_ADMIN` set via `setcap`. No in-workspace crate
-dependencies — deliberately minimal (rtnetlink, tokio current-thread, clap).
+Standalone binary with `CAP_NET_ADMIN` set via `setcap`. It shares the small
+`tun-session` crate with core, without depending on core's config or geodata code.
 
-Three subcommands, all idempotent and input-validated before any netlink call:
+Automatic operations require `--journal FILE --session-id UUID`. The helper checks
+an owner-only regular journal file, schema version, session identity, boot, and
+network namespace before mutation. `reserve --iface IFACE` runs before backend
+spawn. It refuses occupied routing state or interface names, creates the dummy
+link `v2ray-rs-own`, records its index, explicitly sets its session alias, and
+verifies the resulting identity. Creation alone does not preserve the alias on
+the tested kernel. An interruption before tagging requires operator recovery.
+Helper commands are serialized per journal by an owner-only lock file in the
+journal's directory (mode 0600, `flock`); the kernel link preserves the
+reservation between commands and across app exits. `--force-legacy` operator
+commands stay uncoordinated with automatic sessions, as before.
+
+The remaining subcommands retain the following routing policy:
 
 - `xray-up --iface --addr [--addr6] [--ifindex N] [--bypass-uid] [--capture-dns] [--strict] [--exclude CIDR]...`: brings the
   link up, assigns the address, and installs the tunnel default route into table
@@ -205,32 +221,47 @@ Three subcommands, all idempotent and input-validated before any netlink call:
   address is refused rather than sent out the real interface. On a host with
   IPv6 disabled (no `/proc/sys/net/ipv6`) the IPv6 fallback and rules are
   skipped.
-- `xray-down --iface [--ifindex N]`: removes the policy rules, flushes table 2023 for both
-  families, then deletes the device (no-op when all are gone). The flush comes
-  first so a failing device delete cannot leave the fallback blackholing traffic.
-- `recover --iface --singbox|--xray`: cleans up leftover TUN state after an
-  unclean shutdown; for xray it leaves table 2023 and prefs 8997–9002 empty in
-  both families, for sing-box it flushes the `auto_route` table/rules.
+- `xray-down --iface [--ifindex N]` and `recover --xray --iface IFACE` remove only
+  the exact journaled rules and routes, then the verified TUN device and reservation.
+  An unexpected rule, route, duplicate, link index, or alias stops automatic cleanup.
+  Failures retain the journal. A completed journal supports a harmless repeated stop.
+- `recover --singbox` refuses destructive automatic cleanup because the helper did
+  not establish ownership of sing-box's self-managed routes. Sing-box startup
+  remains helper-free. Before a clean stop is reported, the process layer reads
+  netlink state without privileges and verifies that the device, table 2022, and
+  rules selecting it are absent. The generated config sets table 2022 explicitly.
+  Remaining state or failed inspection retains the journal; it is never flushed
+  by this verification.
 
-`xray-up` refuses any `--iface` that is not a TUN device (checked via
-`/sys/class/net/<iface>/tun_flags`), and the device-delete in `xray-down` /
-`recover` only ever deletes a TUN device. That stops a caller from pointing the
-helper at `lo`, a physical NIC, or an unrelated interface — it does **not** make
-the helper session-aware on its own: every TUN device exposes `tun_flags`, so a
-name that another tunnel (openvpn, tailscale, ...) reused would pass that check.
+`xray-up` requires a TUN device and the observed `--ifindex` when a journal is
+supplied. The helper records device identity before assigning its session alias.
+The reservation, observed index, and alias must agree before automatic teardown.
+The session UUID also travels separately from the path, so a delayed stop cannot
+operate on a newer journal that replaced the old file.
 
-The app therefore pins the device identity: `wait_for_device()` captures the
-kernel ifindex when the device appears and stores it on `TunRuntime`, and both
-`xray-up` and that session's `xray-down` pass it as `--ifindex`. When the flag is
-supplied and the live link's ifindex differs — the name was reused by another
-device — the helper refuses before any mutation, naming both indices. The
-authorization boundary remains membership in the `v2ray-rs` group: a group member
-who invokes the helper directly can still name any TUN device, with or without
-`--ifindex`. `recover` is name-scoped by design: it runs at startup, after the
-session that created the device is gone, so no remembered index exists to pin. As
-defence-in-depth, packaging restricts execution of `v2ray-rs-netctl` (0750) and
-`v2ray-rs-run` (4750) to the `v2ray-rs` group, so they are not runnable by every
-local process; the desktop user must be a member of that group for TUN mode.
+Before each route or rule addition, the helper writes intent. After the kernel
+acknowledges it, the helper records the actual returned message and clears intent.
+The stored representation is native netlink bytes, valid only within the recorded
+boot and namespace. Resuming prunes acknowledged objects already absent from the
+kernel; verified completion leaves an empty resource ledger. Automatic deletion compares complete recorded objects,
+including multiplicity. A mutation whose effect cannot be established remains
+pending. Kernel-normalized default-route attributes are handled during addition;
+subsequent ownership checks use the observed object, not a broad priority match.
+
+The authorization boundary remains the `v2ray-rs` group: the helper is
+`root:v2ray-rs` mode `0750`, and the bypass wrapper is mode `4750`. Explicit
+operator commands can use `--force-legacy` without a journal to inspect and
+recover older routing state. That override retains the old broad cleanup behavior
+and must be preceded by identifying the affected resources. Automatic desktop
+recovery never supplies it. Other privileged software can change kernel state;
+unexpected changes make automatic recovery stop.
+
+### `tun-session` (`v2ray-rs-tun-session`)
+
+Shared journal types and bounded, owner-only atomic file I/O. It records the
+schema version, session UUID, boot UUID, namespace device/inode, controller PID
+and start time, device and reservation indices, phase, exact owned resources,
+and any pending addition. It has no protocol, GUI, or netlink dependency.
 
 ### `tray` (`v2ray-rs-tray`)
 
@@ -397,7 +428,7 @@ The xray start sequence in `ProcessManager`:
 2. Spawn backend process.
 3. `wait_for_device(iface, 10s)` — poll `/sys/class/net/<iface>`; the device's
    kernel ifindex is captured and pinned onto `TunRuntime`.
-4. `netctl xray-up --ifindex N` — program address and split routes.
+4. `netctl xray-up --ifindex N` — program addresses, table-2023 default routes, and policy rules.
 
 Stop: SIGTERM lets xray close its TUN fd (kernel drops device-scoped routes),
 then `netctl xray-down --ifindex N` removes the policy rules and the strict
@@ -411,14 +442,32 @@ Releasing the kill-switch when no stop follows is the app's job. When an Error
 is not followed by a reconnect — the retry budget is spent, the Error arrived
 while a stop was in progress, or a Quit is pending — the app runs the
 marker-driven route-recovery pass under the connection lock and clears the
-marker. Disconnect with no live connection but a marker present, and Quit with a
+marker only after successful cleanup. Failed or timed-out recovery remains pending
+across launches. Cleanup errors are reported rather than treated as success. Disconnect with no live connection but a marker present, and Quit with a
 leftover marker, take the same path. Quit while Stopping waits for Stopped, and
 Connect is refused while a release runs.
 
-`tun_session.json` in `state_dir` is written by the connection task from the
-`TunRuntime` right before the backend starts, so a failure or crash mid-start
-still leaves one. A clean stop and the release pass remove it; a crash give-up
-keeps it until then. Its presence at startup triggers the route-recovery pass.
+`tun_session.v1.json` in `state_dir` is prepared before config generation and
+backend start. The process layer reserves xray state before spawn, then records
+setup through the helper. A clean stop and verified recovery remove the journal;
+failures keep it. Sing-box records launch intent before spawning and records
+completion only after its child has stopped and unprivileged inspection verifies
+absence. An unstarted Prepared record or an already verified Complete record can
+be retired without a helper. An interrupted Applying record requires operator
+recovery. A different application process cannot reuse an unfinished
+journal without recovery. The old `tun_session.json` is read for diagnostics but
+is never silently overwritten, converted into an ownership claim, or used for
+automatic destructive cleanup; automatic recovery refuses it. A leftover legacy
+marker is retired only by the operator: verify kernel cleanup with
+`netctl recover --xray --iface <iface> --force-legacy` (or `--singbox` when the
+marker names sing-box), then remove `tun_session.json` manually. The versioned
+`tun_session.v1.json` must never be renamed to the legacy name. Corrupt
+journals are retained.
+
+Downgrading requires verified network cleanup first. Keep an owner-only backup
+of pending journals and do not rename the versioned file to the legacy name.
+Older releases cannot enforce the new ownership contract. A namespace mismatch,
+missing reservation, or unknown mutation outcome requires operator intervention.
 
 The grant flow resolves the helper and SUID wrapper to absolute paths beside the
 running executable before elevating; it never passes a bare/relative name to the
@@ -603,7 +652,8 @@ $XDG_RUNTIME_DIR/v2ray-rs/     (else ~/.local/share/v2ray-rs/runtime/)
 
 $XDG_STATE_HOME/v2ray-rs/      (else ~/.local/share/v2ray-rs/state/)
   instance.json              — InstanceStamp (version, first/last started)
-  tun_session.json           — TUN active marker
+  tun_session.v1.json        — versioned TUN ownership journal
+  tun_session.json           — legacy marker, if present
   latency_snapshot.json      — per-node TCP latency cache
   logs/
     v2ray-rs.log             — app log (rotated: .1–.3 kept at 5 MiB each)
@@ -680,7 +730,8 @@ directory and appended to across runs.
 - **Atomic file writes.** Every persistence write goes through `atomic_write()`
   in `crates/core/src/fs.rs`: `NamedTempFile` in the target directory →
   `sync_all` → `persist` (rename). JSON files serialised via `serde_json`,
-  settings via `toml`.
+  settings via `toml`. Exception: TUN journals go through the
+  `v2ray-rs-tun-session` owner-only atomic writer.
 
 - **Workspace deps.** All external crate versions declared once in the root
   `[workspace.dependencies]` and used with `.workspace = true`. Edition 2024
@@ -698,3 +749,8 @@ directory and appended to across runs.
 - **No protocol logic.** The app generates a JSON config file and hands it to
   the backend via `binary run -c config.json`. Everything else — handshakes,
   encryption, tunnelling — is the backend's problem.
+
+Explicit start renews a verified completed TUN journal and clears the previous
+device index. Crash respawn retains the unfinished session identity. Journaled
+route and rule additions reject EEXIST because a concurrent creator's resource
+cannot establish ownership.

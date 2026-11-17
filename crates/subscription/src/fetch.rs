@@ -51,13 +51,12 @@ pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
 }
 
 const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
-const MAX_ERROR_BODY_SIZE: usize = 4096; // 4 KiB
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("network error: {0}")]
     NetworkError(String),
-    #[error("HTTP {status}: {}", body.replace(['\r', '\n'], " "))]
-    HttpError { status: u16, body: String },
+    #[error("HTTP {status}: subscription request failed")]
+    HttpError { status: u16 },
     #[error("file error: {0}")]
     FileError(#[from] std::io::Error),
     #[error("request timed out")]
@@ -73,7 +72,7 @@ impl FetchError {
         match self {
             Self::Timeout => true,
             Self::NetworkError(_) => true,
-            Self::HttpError { status, .. } => matches!(status, 408 | 429 | 500..=599),
+            Self::HttpError { status } => matches!(status, 408 | 429 | 500..=599),
             Self::InvalidUrl(_) => false,
             Self::RequestBuildError(_) => false,
             Self::FileError(_) => false,
@@ -104,10 +103,8 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
 
     let status = response.status();
     if !status.is_success() {
-        let body = read_error_body(response).await;
         return Err(FetchError::HttpError {
             status: status.as_u16(),
-            body,
         });
     }
 
@@ -134,22 +131,27 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
     String::from_utf8(data).map_err(|e| FetchError::NetworkError(e.to_string()))
 }
 
-async fn read_error_body(mut response: reqwest::Response) -> String {
-    let mut body = Vec::new();
-    while body.len() < MAX_ERROR_BODY_SIZE {
-        match response.chunk().await {
-            Ok(Some(chunk)) => {
-                let take = (MAX_ERROR_BODY_SIZE - body.len()).min(chunk.len());
-                body.extend_from_slice(&chunk[..take]);
-            }
-            Ok(None) | Err(_) => break,
-        }
-    }
-    String::from_utf8_lossy(&body).into_owned()
-}
-
 pub fn fetch_from_file(path: &str) -> Result<String, FetchError> {
-    std::fs::read_to_string(path).map_err(FetchError::FileError)
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(FetchError::FileError(std::io::Error::other(
+            "subscription source must be a regular file",
+        )));
+    }
+    let mut data = String::new();
+    file.take(MAX_SUBSCRIPTION_SIZE + 1)
+        .read_to_string(&mut data)?;
+    if data.len() as u64 > MAX_SUBSCRIPTION_SIZE {
+        return Err(FetchError::FileError(std::io::Error::other(
+            "subscription file exceeds 10 MiB",
+        )));
+    }
+    Ok(data)
 }
 
 pub fn decode_subscription_content(raw: &str) -> Vec<String> {
@@ -219,6 +221,16 @@ mod tests {
 
         let plain_result = decode_subscription_content(input);
         assert_eq!(plain_result, vec!["vmess://a", "vless://b", "ss://c"]);
+    }
+
+    #[test]
+    fn local_import_refuses_oversized_and_special_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(MAX_SUBSCRIPTION_SIZE + 1).unwrap();
+        assert!(fetch_from_file(path.to_str().unwrap()).is_err());
+        assert!(fetch_from_file("/dev/zero").is_err());
     }
 
     #[test]
@@ -313,68 +325,32 @@ mod tests {
 
     #[test]
     fn is_transient_http_408() {
-        assert!(
-            FetchError::HttpError {
-                status: 408,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(FetchError::HttpError { status: 408 }.is_transient());
     }
 
     #[test]
     fn is_transient_http_429() {
-        assert!(
-            FetchError::HttpError {
-                status: 429,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(FetchError::HttpError { status: 429 }.is_transient());
     }
 
     #[test]
     fn is_transient_http_500() {
-        assert!(
-            FetchError::HttpError {
-                status: 500,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(FetchError::HttpError { status: 500 }.is_transient());
     }
 
     #[test]
     fn is_transient_http_503() {
-        assert!(
-            FetchError::HttpError {
-                status: 503,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(FetchError::HttpError { status: 503 }.is_transient());
     }
 
     #[test]
     fn is_transient_http_404() {
-        assert!(
-            !FetchError::HttpError {
-                status: 404,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(!FetchError::HttpError { status: 404 }.is_transient());
     }
 
     #[test]
     fn is_transient_http_401() {
-        assert!(
-            !FetchError::HttpError {
-                status: 401,
-                body: "".into()
-            }
-            .is_transient()
-        );
+        assert!(!FetchError::HttpError { status: 401 }.is_transient());
     }
 
     #[test]
@@ -430,21 +406,46 @@ mod tests {
             "network error must not embed the subscription URL: {msg}"
         );
     }
-    #[test]
-    fn http_error_display_sanitizes_newlines() {
-        let err = FetchError::HttpError {
-            status: 500,
-            body: "boom\r\nline2\nline3".into(),
-        };
+    #[tokio::test]
+    async fn http_error_display_omits_remote_body() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::task::spawn_blocking(move || {
+            let (mut sock, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf);
+            let body = "boom\r\nline2";
+            let response = format!(
+                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(response.as_bytes());
+            let _ = sock.flush();
+        });
+
+        let _ = test_client();
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_millis(500))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let result = fetch_with_client(&client, &format!("http://{addr}/sub")).await;
+        let err = result.expect_err("HTTP 500 must fail");
+        server.await.unwrap();
         let msg = err.to_string();
+        assert_eq!(msg, "HTTP 500: subscription request failed");
+        assert!(
+            !msg.contains("boom"),
+            "display must not embed the remote body: {msg:?}"
+        );
         assert!(
             !msg.contains('\n') && !msg.contains('\r'),
             "display must not embed raw newlines: {msg:?}"
         );
-        assert!(msg.starts_with("HTTP 500: "), "{msg:?}");
-        for piece in ["boom", "line2", "line3"] {
-            assert!(msg.contains(piece), "{msg:?}");
-        }
     }
 
     #[test]
@@ -482,45 +483,5 @@ mod tests {
         assert!(!redirect_allowed(Some("https"), &ftp, 0, 5));
         assert!(!redirect_allowed(Some("http"), &file, 0, 5));
         assert!(!redirect_allowed(None, &ftp, 0, 5));
-    }
-
-    #[tokio::test]
-    async fn fetch_error_body_is_capped_at_4096_bytes() {
-        use std::io::{Read, Write};
-        use std::net::TcpListener;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let server = tokio::task::spawn_blocking(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            let mut buf = [0u8; 4096];
-            let _ = sock.read(&mut buf); // request line + headers
-            let body = "x".repeat(64 * 1024);
-            let response = format!(
-                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            // The client stops reading after the cap and may close the
-            // connection mid-write; a refused write is fine.
-            let _ = sock.write_all(response.as_bytes());
-            let _ = sock.flush();
-        });
-
-        let _ = test_client();
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_millis(500))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let result = fetch_with_client(&client, &format!("http://{addr}/sub")).await;
-        let err = result.expect_err("HTTP 500 must fail");
-        server.await.unwrap();
-        let FetchError::HttpError { status, body } = err else {
-            panic!("expected HttpError, got: {err:?}")
-        };
-        assert_eq!(status, 500);
-        assert_eq!(body.len(), MAX_ERROR_BODY_SIZE);
-        assert!(body.chars().all(|c| c == 'x'));
     }
 }

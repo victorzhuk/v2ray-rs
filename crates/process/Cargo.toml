@@ -5,6 +5,8 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+rtnetlink.workspace = true
+futures.workspace = true
 v2ray-rs-core.workspace = true
 tokio.workspace = true
 thiserror.workspace = true

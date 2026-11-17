@@ -14,7 +14,7 @@ use v2ray_rs_core::models::{
     ManualNode, ProxyNode, RoutingRule, Subscription, resolve_effective_config,
     uses_imported_profile,
 };
-use v2ray_rs_core::persistence::{AppPaths, TunSession, save_tun_session};
+use v2ray_rs_core::persistence::{AppPaths, prepare_tun_session};
 use v2ray_rs_core::resolve::{ConnectionCandidate, resolve_via_nodes};
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_process::{
@@ -341,18 +341,30 @@ fn spawn_with(
             }
             let unpinned = unpinned_host(&effective_settings, &nodes);
             let pinned = unpinned.is_none();
-            let tun = build_tun_runtime(&effective_settings, pinned);
+            let mut tun = build_tun_runtime(&effective_settings, pinned);
             // Written before any config write or kernel touch: startup and
             // terminal-error recovery are gated on this marker, so a session
             // must not start if the recovery pass cannot be recorded.
-            if let Some(rt) = &tun
-                && let Err(err) = save_tun_session(&paths, &tun_session_for(rt))
-            {
-                report(
-                    ProcessState::Error(format!("Failed to record TUN session: {err}")),
-                    None,
-                );
-                return;
+            if let Some(rt) = &mut tun {
+                let session = match prepare_tun_session(&paths, rt.backend, &rt.iface) {
+                    Ok(session) => session,
+                    Err(err) => {
+                        report(
+                            ProcessState::Error(format!("Failed to record TUN session: {err}")),
+                            None,
+                        );
+                        return;
+                    }
+                };
+                rt.journal = Some(v2ray_rs_process::TunJournal {
+                    path: paths.tun_session_path(),
+                    session_id: session
+                        .ownership
+                        .as_ref()
+                        .expect("prepared ownership")
+                        .session_id
+                        .to_string(),
+                });
             }
             let config_path = match writer.write_config(
                 &nodes,
@@ -1063,6 +1075,7 @@ fn build_tun_runtime(settings: &AppSettings, nodes_pinned: bool) -> Option<TunRu
             && nodes_pinned,
         strict: settings.tun.strict_route,
         device_ifindex: None,
+        journal: None,
         exclude_routes: if backend == BackendType::Xray {
             settings.tun.exclude_routes.clone()
         } else {
@@ -1104,13 +1117,6 @@ fn relays(state: &ProcessState) -> bool {
         state,
         ProcessState::Starting | ProcessState::Running | ProcessState::Stopping
     )
-}
-
-fn tun_session_for(rt: &TunRuntime) -> TunSession {
-    TunSession {
-        backend: rt.backend,
-        iface: rt.iface.clone(),
-    }
 }
 
 struct HealthProbe {
@@ -2616,13 +2622,10 @@ exit 1"#,
                 || msg.contains("route helper v2ray-rs-netctl not found"),
             "start should fail at the capability gate: {msg}"
         );
-        assert_eq!(
-            load_tun_session(&stub.paths),
-            Some(TunSession {
-                backend: BackendType::Xray,
-                iface: "v2rstest0".into(),
-            })
-        );
+        let session = load_tun_session(&stub.paths).unwrap();
+        assert_eq!(session.backend, BackendType::Xray);
+        assert_eq!(session.iface, "v2rstest0");
+        assert!(session.ownership.is_some());
         assert_nothing_after_terminal(&rx).await;
     }
 
@@ -3160,6 +3163,7 @@ exit 1"#,
             strict: false,
             exclude_routes: Vec::new(),
             device_ifindex: None,
+            journal: None,
         }));
 
         assert!(probe_allowed(None));

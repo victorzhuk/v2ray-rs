@@ -660,3 +660,48 @@ fn directly_attached_dns_bypasses_tun() {
         &["route_172.17.0.2=docker0", "udp53_bridge=ok"],
     );
 }
+
+#[test]
+fn cleanup_verification_preserves_foreign_state() {
+    if !is_child() {
+        run_namespaced(
+            "cleanup_verification_preserves_foreign_state",
+            &["cleanup_absence=verified"],
+        );
+        return;
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let verify = || runtime.block_on(v2ray_rs_process::verify_singbox_stopped("v2rs-absent"));
+    assert!(verify().is_ok());
+    ip(&["link", "set", "lo", "up"]);
+    let table = v2ray_rs_core::persistence::SINGBOX_ROUTE_TABLE.to_string();
+    ip(&["rule", "add", "pref", "8990", "table", &table]);
+    let rules = || {
+        Command::new("ip")
+            .args(["-json", "rule", "show"])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let before = rules();
+    assert!(verify().is_err());
+    assert_eq!(rules(), before);
+    ip(&["rule", "del", "pref", "8990", "table", &table]);
+    ip(&["route", "add", "192.0.2.0/24", "dev", "lo", "table", &table]);
+    let routes = || {
+        Command::new("ip")
+            .args(["-json", "route", "show", "table", &table])
+            .output()
+            .unwrap()
+            .stdout
+    };
+    let before = routes();
+    assert!(verify().is_err());
+    assert_eq!(routes(), before);
+    ip(&["route", "del", "192.0.2.0/24", "dev", "lo", "table", &table]);
+    assert!(verify().is_ok());
+    evidence("cleanup_absence", "verified");
+}

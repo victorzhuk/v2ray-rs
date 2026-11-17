@@ -3595,6 +3595,7 @@ dependencies = [
  "toml 1.0.0+spec-1.1.0",
  "url",
  "uuid",
+ "v2ray-rs-tun-session",
 ]
 
 [[package]]
@@ -3603,18 +3604,23 @@ version = "0.20.3"
 dependencies = [
  "clap",
  "futures",
+ "libc",
  "rtnetlink",
+ "tempfile",
  "tokio",
  "v2ray-rs-core",
+ "v2ray-rs-tun-session",
 ]
 
 [[package]]
 name = "v2ray-rs-process"
 version = "0.20.3"
 dependencies = [
+ "futures",
  "ipnet",
  "log",
  "nix 0.31.1",
+ "rtnetlink",
  "serde",
  "serde_json",
  "tempfile",
@@ -3640,6 +3646,7 @@ dependencies = [
  "futures-util",
  "http",
  "ipnet",
+ "libc",
  "log",
  "percent-encoding",
  "prost",
@@ -3671,6 +3678,17 @@ dependencies = [
  "uuid",
  "v2ray-rs-core",
  "v2ray-rs-process",
+]
+
+[[package]]
+name = "v2ray-rs-tun-session"
+version = "0.20.3"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]

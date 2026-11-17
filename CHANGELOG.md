@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Automatic xray TUN routing now requires a versioned ownership journal and a matching kernel reservation. Legacy and ambiguous recovery require explicit operator intervention.
+- TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.
+
+### Fixed
+- Refuse concurrent route collisions without adopting foreign resources into TUN ownership.
+- Renew completed TUN session identity on explicit restart.
+- Retain malformed recovery records and refuse cleanup after boot, namespace, device, or session identity changes.
+- Verify sing-box routing state is absent before reporting a clean stop, without deleting unverified resources.
+- Report route cleanup failures and retain pending TUN recovery across launches.
+- Keep subscription identities attached to unchanged connection settings after reordering.
+- Bound local subscription imports and exclude HTTP response bodies from routine errors.
+- Preserve generated configuration when saved routing rules cannot be loaded.
+- Reset cached latency samples when a subscription's connection settings change.
+- Retire a finished TUN journal from a previous boot instead of blocking every later start, and keep an unfinished journal across an unrelated clean stop.
+- Require display-backed CI tests, installed proxy backends, and isolated routing acceptance before release publication.
+- Pin backend and packaging downloads and verify their SHA-256 digests before use.
+- Run containerized release steps under Bash so pinned downloads and the glibc floor check actually execute.
+- Pass the observed TUN device identity to xray route setup as well as teardown.
+
 ## [0.20.3] - 2026-10-18
 
 ### Added
