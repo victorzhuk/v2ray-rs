@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use futures_util::{StreamExt, stream};
+use futures::{StreamExt, stream};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use uuid::Uuid;

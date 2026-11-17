@@ -1,12 +1,12 @@
 use serde_json::{Value, json};
 
-use crate::config::{ConfigError, ConfigGenerator};
+use crate::config::dns_plan::{ResolvedDnsPlan, ResolvedDnsServer};
+use crate::config::{ConfigError, ConfigGenerator, ResolvedNodeSet};
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
-    DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings,
-    H2Settings, LoggingSettings, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
-    TransportSettings, TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
-    XhttpSettings,
+    DnsHijackMode, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, LoggingSettings, ProxyNode,
+    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
+    TunConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
 };
 
 pub struct V2rayGenerator;
@@ -17,21 +17,41 @@ pub(crate) enum V2rayFamilyBackend {
     Xray,
 }
 
-impl ConfigGenerator for V2rayGenerator {
-    fn generate(
+impl V2rayFamilyBackend {
+    fn backend_type(self) -> BackendType {
+        match self {
+            Self::V2ray => BackendType::V2ray,
+            Self::Xray => BackendType::Xray,
+        }
+    }
+}
+
+impl V2rayGenerator {
+    /// Positional-slice entry point retained for callers that already hold a
+    /// resolved candidate list.
+    pub fn generate(
         &self,
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
     ) -> Result<Value, ConfigError> {
-        if nodes.is_empty() {
-            return Err(ConfigError::NoNodes);
-        }
+        ConfigGenerator::generate(self, &ResolvedNodeSet::from_nodes(nodes)?, rules, settings)
+    }
+}
+
+impl ConfigGenerator for V2rayGenerator {
+    fn generate(
+        &self,
+        nodes: &ResolvedNodeSet<'_>,
+        rules: &[RoutingRule],
+        settings: &AppSettings,
+    ) -> Result<Value, ConfigError> {
+        let nodes = nodes.to_vec();
         if let Some(err) = nodes.iter().find_map(v2ray_refusal) {
             return Err(err);
         }
         Ok(generate_v2ray_family_config(
-            nodes,
+            &nodes,
             rules,
             settings,
             V2rayFamilyBackend::V2ray,
@@ -665,10 +685,18 @@ fn build_dns_for_backend(
     backend: V2rayFamilyBackend,
     tun_xray: bool,
 ) -> Value {
+    let node_hosts: Vec<String> = nodes
+        .iter()
+        .map(|node| node.address().to_string())
+        .collect();
+    let host_refs: Vec<&str> = node_hosts.iter().map(String::as_str).collect();
+    let plan = ResolvedDnsPlan::resolve(settings, backend.backend_type(), &host_refs);
+    plan.warn_compat();
+
     let mut dns_config = json!({});
 
     let mut servers = if settings.dns.enabled {
-        build_user_dns_servers(rules, settings, backend, tun_xray)
+        build_user_dns_servers(rules, settings, &plan, backend, tun_xray)
     } else {
         // TUN must never lean on the OS resolver: sniffing destOverride wipes
         // the original IP and IPIfNonMatch feeds geoip rules, so poisoned ISP
@@ -676,7 +704,7 @@ fn build_dns_for_backend(
         vec![json!(FALLBACK_DNS), json!(FALLBACK_DNS_SECONDARY)]
     };
 
-    let bootstrap = bootstrap_dns_servers(nodes, settings, tun_xray);
+    let bootstrap = bootstrap_dns_servers(&plan, tun_xray);
     servers.splice(0..0, bootstrap);
 
     if servers.is_empty() {
@@ -718,16 +746,12 @@ fn build_dns_for_backend(
 /// because UDP/53 is intercepted on others. Only the last carries `finalQuery`,
 /// so the pair is tried in order and nothing falls back past it onto a resolver
 /// that is only reachable through the proxy being resolved.
-fn bootstrap_dns_servers(
-    nodes: &[ProxyNode],
-    settings: &AppSettings,
-    tun_xray: bool,
-) -> Vec<Value> {
+fn bootstrap_dns_servers(plan: &ResolvedDnsPlan, tun_xray: bool) -> Vec<Value> {
     if !tun_xray {
         return Vec::new();
     }
 
-    let domains = bootstrap_domains(nodes, settings);
+    let domains = plan.full_bootstrap_domains();
     if domains.is_empty() {
         return Vec::new();
     }
@@ -747,29 +771,6 @@ fn bootstrap_dns_servers(
             "finalQuery": true,
         }),
     ]
-}
-
-fn bootstrap_domains(nodes: &[ProxyNode], settings: &AppSettings) -> Vec<String> {
-    let mut domains: Vec<String> = Vec::new();
-    for node in nodes {
-        push_bootstrap_domain(&mut domains, node.address());
-    }
-    if settings.dns.enabled {
-        for server in &settings.dns.servers {
-            push_bootstrap_domain(&mut domains, &server.address);
-        }
-    }
-    domains
-}
-
-fn push_bootstrap_domain(domains: &mut Vec<String>, host: &str) {
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return;
-    }
-    let entry = format!("full:{host}");
-    if !domains.contains(&entry) {
-        domains.push(entry);
-    }
 }
 
 /// xray answers a `hosts` hit authoritatively, so an entry holding only
@@ -821,7 +822,7 @@ fn hosts_for_strategy(settings: &AppSettings) -> Option<Value> {
 
 /// xray has no per-server detour field. Only "direct" is expressible, and only
 /// under TUN, where a routing rule can act on the server's tag.
-fn direct_detour(server: &DnsServerConfig, tun_xray: bool) -> bool {
+fn direct_detour(server: &ResolvedDnsServer, tun_xray: bool) -> bool {
     tun_xray && server.detours_direct()
 }
 
@@ -848,31 +849,17 @@ fn dns_server_entry(
     entry
 }
 
-fn warn_flagged_private(server: &DnsServerConfig, backend: V2rayFamilyBackend, tun_xray: bool) {
-    let backend = match backend {
-        V2rayFamilyBackend::V2ray => BackendType::V2ray,
-        V2rayFamilyBackend::Xray => BackendType::Xray,
-    };
-    if server.resolves_via_proxy_private(backend, tun_xray) {
-        log::warn!(
-            "DNS server {} ({}) is private and routed through the proxy; its queries reach the proxy server's network - consider detour 'direct'",
-            server.tag,
-            server.address
-        );
-    }
-}
-
 fn build_user_dns_servers(
     rules: &[RoutingRule],
     settings: &AppSettings,
+    plan: &ResolvedDnsPlan,
     backend: V2rayFamilyBackend,
     tun_xray: bool,
 ) -> Vec<Value> {
     let mut servers: Vec<Value> = Vec::new();
 
     if settings.dns.use_custom_rules {
-        for server in &settings.dns.servers {
-            warn_flagged_private(server, backend, tun_xray);
+        for server in &plan.servers {
             let domains: Vec<String> = settings
                 .dns
                 .rules
@@ -889,7 +876,7 @@ fn build_user_dns_servers(
                 .collect();
 
             servers.push(dns_server_entry(
-                dns_server_address_for_backend(server, backend),
+                server.v2ray_address(),
                 None,
                 (!domains.is_empty()).then_some(domains),
                 direct_detour(server, tun_xray),
@@ -930,15 +917,16 @@ fn build_user_dns_servers(
             }
         }
 
-        for server in &settings.dns.servers {
-            warn_flagged_private(server, backend, tun_xray);
+        for server in &plan.servers {
             let domains = match server.tag.as_str() {
-                "remote" if !remote_domains.is_empty() => Some(remote_domains.clone()),
-                "domestic" if !domestic_domains.is_empty() => Some(domestic_domains.clone()),
+                AUTO_SPLIT_REMOTE_TAG if !remote_domains.is_empty() => Some(remote_domains.clone()),
+                AUTO_SPLIT_DOMESTIC_TAG if !domestic_domains.is_empty() => {
+                    Some(domestic_domains.clone())
+                }
                 _ => None,
             };
             servers.push(dns_server_entry(
-                dns_server_address_for_backend(server, backend),
+                server.v2ray_address(),
                 None,
                 domains,
                 direct_detour(server, tun_xray),
@@ -950,7 +938,7 @@ fn build_user_dns_servers(
         && settings.tun.enabled
         && !settings.tun.exclude_domains.is_empty()
     {
-        attach_exclude_domains(&mut servers, settings, backend);
+        attach_exclude_domains(&mut servers, settings, plan);
     }
 
     servers
@@ -963,7 +951,7 @@ fn build_user_dns_servers(
 fn attach_exclude_domains(
     servers: &mut Vec<Value>,
     settings: &AppSettings,
-    backend: V2rayFamilyBackend,
+    plan: &ResolvedDnsPlan,
 ) {
     let exclude_domains: Vec<String> = settings
         .tun
@@ -971,7 +959,7 @@ fn attach_exclude_domains(
         .iter()
         .map(|d| format!("domain:{}", super::common::strip_suffix_wildcard(d)))
         .collect();
-    let Some(target) = super::common::split_horizon_server(settings) else {
+    let Some(target) = plan.split_horizon_server() else {
         servers.push(json!({
             "address": "localhost",
             "domains": &exclude_domains,
@@ -979,7 +967,7 @@ fn attach_exclude_domains(
         }));
         return;
     };
-    let target_addr = dns_server_address_for_backend(target, backend);
+    let target_addr = target.v2ray_address();
 
     let Some(index) = servers.iter().position(|s| {
         s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
@@ -1010,41 +998,24 @@ fn attach_exclude_domains(
     servers.insert(index + 1, dedicated);
 }
 
+#[cfg(test)]
+use crate::models::DnsServerConfig;
+
+#[cfg(test)]
 fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamilyBackend) -> String {
-    let backend_type = match backend {
-        V2rayFamilyBackend::V2ray => crate::models::BackendType::V2ray,
-        V2rayFamilyBackend::Xray => crate::models::BackendType::Xray,
-    };
-    let effective_protocol = server.protocol.effective_for_backend(backend_type);
-
-    if effective_protocol != server.protocol {
-        let backend_name = match backend {
-            V2rayFamilyBackend::V2ray => "v2ray",
-            V2rayFamilyBackend::Xray => "xray",
-        };
-        log::warn!(
-            "{backend_name} does not support {:?} DNS for '{}' directly; falling back to {:?}",
-            server.protocol,
-            server.tag,
-            effective_protocol
-        );
+    let protocol = server
+        .protocol
+        .effective_for_backend(backend.backend_type());
+    ResolvedDnsServer {
+        tag: server.tag.clone(),
+        address: server.address.clone(),
+        protocol,
+        requested_protocol: server.protocol,
+        port: server.port,
+        detour: server.detour.clone(),
+        resolves_private: false,
     }
-
-    let address = effective_protocol.server_address(
-        &server.address,
-        if effective_protocol != server.protocol {
-            None
-        } else {
-            server.port
-        },
-    );
-    // Xray and v2ray parse a bare `host:port` UDP address as a URL and reject
-    // it; the explicit scheme is what makes the port acceptable.
-    if effective_protocol == DnsProtocol::Udp {
-        format!("udp://{address}")
-    } else {
-        address
-    }
+    .v2ray_address()
 }
 
 #[cfg(test)]
@@ -1902,7 +1873,12 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.backend.backend_type = BackendType::V2ray;
 
-        let result = writer.write_config(&[reality_node()], &[], &settings, &[]);
+        let result = writer.write_config(
+            &ResolvedNodeSet::from_nodes(&[reality_node()]).unwrap(),
+            &[],
+            &settings,
+            &[],
+        );
 
         assert!(matches!(
             result,

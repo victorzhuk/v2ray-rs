@@ -2,7 +2,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use futures_util::{StreamExt, stream};
+use futures::{StreamExt, stream};
 use thiserror::Error;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;

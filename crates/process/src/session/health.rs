@@ -7,7 +7,7 @@ const DNS_WINDOW: Duration = Duration::from_secs(60);
 const DNS_FAILURE_MARKER: &str = "app/dns: failed to retrieve response";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Health {
+pub enum Health {
     Healthy,
     Unhealthy(String),
 }
@@ -15,17 +15,17 @@ pub(crate) enum Health {
 /// Folds probe outcomes into health transitions: `record` reports a change
 /// only, so callers can surface it without repeating themselves.
 #[derive(Debug, Default)]
-pub(crate) struct HealthTracker {
+pub struct HealthTracker {
     failures: u32,
     last_reported: Option<Health>,
 }
 
 impl HealthTracker {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self::default()
     }
 
-    pub(crate) fn record(&mut self, outcome: Result<(), String>) -> Option<Health> {
+    pub fn record(&mut self, outcome: Result<(), String>) -> Option<Health> {
         match outcome {
             Ok(()) => {
                 self.failures = 0;
@@ -46,7 +46,7 @@ impl HealthTracker {
 
     /// Returns nothing on purpose: the caller has already cleared health for
     /// the state that triggered the reset.
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.failures = 0;
         self.last_reported = None;
     }
@@ -61,12 +61,12 @@ impl HealthTracker {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct DnsFailureWindow {
+pub struct DnsFailureWindow {
     failures: VecDeque<Instant>,
 }
 
 impl DnsFailureWindow {
-    pub(crate) fn observe(&mut self, line: &str, now: Instant) {
+    pub fn observe(&mut self, line: &str, now: Instant) {
         if !line.contains(DNS_FAILURE_MARKER) {
             return;
         }
@@ -80,7 +80,7 @@ impl DnsFailureWindow {
         self.failures.push_back(now);
     }
 
-    pub(crate) fn is_failing(&self, now: Instant) -> bool {
+    pub fn is_failing(&self, now: Instant) -> bool {
         let recent = self
             .failures
             .iter()

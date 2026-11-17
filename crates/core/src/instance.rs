@@ -166,6 +166,7 @@ impl InstanceLock {
 
         let file = std_fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&path)?;

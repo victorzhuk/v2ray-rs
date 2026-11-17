@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Default profile paths now use D-Bus application activation: a second launch focuses the running window and exits `0`. Directory overrides and buses without a primary instance keep the exit-`75` lock fallback.
 
 ### Changed
+- Connection supervision now lives in `v2ray-rs-process` and shares one DNS derivation plan with the backend generators; workspace state is served from in-memory snapshots with serialized persistence.
 - Remote URL subscriptions now keep a provider's routing and DNS profile inactive until the per-subscription toggle is enabled; local file and pasted JSON imports keep profiles active. Imported profiles are validated before they can affect runtime config generation.
 - Automatic xray TUN routing now requires a versioned ownership journal and a matching kernel reservation. Legacy and ambiguous recovery require explicit operator intervention.
 - TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.

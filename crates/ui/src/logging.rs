@@ -140,10 +140,6 @@ impl TestLogCapture {
             .collect()
     }
 
-    pub(crate) fn all_lines(&self) -> Vec<String> {
-        self.lines.lock().unwrap().clone()
-    }
-
     /// Polls until `count` captured lines contain `needle`, or 5 s pass.
     pub(crate) fn wait_for(&self, needle: &str, count: usize) -> Vec<String> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);

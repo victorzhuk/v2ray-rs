@@ -80,11 +80,26 @@ pub struct ObservatoryStatus {
 #[derive(Debug, thiserror::Error)]
 pub enum ObservatoryError {
     #[error("gRPC transport error: {0}")]
-    Transport(#[from] tonic::transport::Error),
-    #[error("gRPC status error: {0}")]
-    Status(#[from] tonic::Status),
+    Transport(String),
+    #[error("gRPC status error {code}: {message}")]
+    Status { code: i32, message: String },
     #[error("observatory query timed out after {0:?}")]
     Timeout(Duration),
+}
+
+impl From<tonic::transport::Error> for ObservatoryError {
+    fn from(error: tonic::transport::Error) -> Self {
+        Self::Transport(error.to_string())
+    }
+}
+
+impl From<tonic::Status> for ObservatoryError {
+    fn from(status: tonic::Status) -> Self {
+        Self::Status {
+            code: status.code() as i32,
+            message: status.message().to_string(),
+        }
+    }
 }
 
 // ==========================================
@@ -139,17 +154,13 @@ impl ObservatoryClient {
     }
 
     pub(crate) async fn connect(port: u16, service_path: &str) -> Result<Self, ObservatoryError> {
-        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-            .map_err(ObservatoryError::Transport)?
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))?
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(5));
 
-        let channel = endpoint
-            .connect()
-            .await
-            .map_err(ObservatoryError::Transport)?;
+        let channel = endpoint.connect().await?;
         let mut grpc = Grpc::new(channel);
-        grpc.ready().await.map_err(ObservatoryError::Transport)?;
+        grpc.ready().await?;
 
         let path: PathAndQuery = service_path.parse().map_err(|_| {
             tonic::Status::invalid_argument(format!("Invalid service path: {}", service_path))
@@ -162,16 +173,9 @@ impl ObservatoryClient {
         let codec = ProstCodec::<GetOutboundStatusRequest, GetOutboundStatusResponse>::default();
         let request = Request::new(GetOutboundStatusRequest::default());
 
-        self.grpc
-            .ready()
-            .await
-            .map_err(ObservatoryError::Transport)?;
+        self.grpc.ready().await?;
 
-        let response = self
-            .grpc
-            .unary(request, self.path.clone(), codec)
-            .await
-            .map_err(ObservatoryError::Status)?;
+        let response = self.grpc.unary(request, self.path.clone(), codec).await?;
         let inner = response.into_inner();
 
         Ok(inner

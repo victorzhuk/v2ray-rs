@@ -85,7 +85,7 @@ pub fn show_preferences(
     dialog.add(&network_page);
 
     let routing_page = match routing_result {
-        Ok(_) => build_routing_page(store.paths(), &settings_state, &routing_state, &routing_cb),
+        Ok(_) => build_routing_page(store, &settings_state, &routing_state, &routing_cb),
         Err(err) => build_routing_error_page(store.paths(), err.to_string()),
     };
     dialog.add(&routing_page);

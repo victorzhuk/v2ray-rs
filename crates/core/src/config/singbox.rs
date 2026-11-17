@@ -2,7 +2,8 @@ use std::collections::BTreeSet;
 
 use serde_json::{Value, json};
 
-use crate::config::{ConfigError, ConfigGenerator, common::strip_suffix_wildcard};
+use crate::config::dns_plan::ResolvedDnsPlan;
+use crate::config::{ConfigError, ConfigGenerator, ResolvedNodeSet, common::strip_suffix_wildcard};
 use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
@@ -17,17 +18,27 @@ const GEOSITE_RULESET_URL: &str =
 
 pub struct SingboxGenerator;
 
-impl ConfigGenerator for SingboxGenerator {
-    fn generate(
+impl SingboxGenerator {
+    /// Positional-slice entry point retained for callers that already hold a
+    /// resolved candidate list.
+    pub fn generate(
         &self,
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
     ) -> Result<Value, ConfigError> {
-        if nodes.is_empty() {
-            return Err(ConfigError::NoNodes);
-        }
-        assemble(nodes, rules, settings)
+        ConfigGenerator::generate(self, &ResolvedNodeSet::from_nodes(nodes)?, rules, settings)
+    }
+}
+
+impl ConfigGenerator for SingboxGenerator {
+    fn generate(
+        &self,
+        nodes: &ResolvedNodeSet<'_>,
+        rules: &[RoutingRule],
+        settings: &AppSettings,
+    ) -> Result<Value, ConfigError> {
+        assemble(&nodes.to_vec(), rules, settings)
     }
 }
 
@@ -412,6 +423,8 @@ fn apply_tls(out: &mut Value, tls: Option<&crate::models::TlsSettings>) {
 }
 
 fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &str) -> Value {
+    let plan = ResolvedDnsPlan::resolve(settings, BackendType::SingBox, &[]);
+    plan.warn_compat();
     let mut dns_config = json!({});
 
     dns_config["strategy"] = json!(strategy_str(settings.dns.strategy));
@@ -422,10 +435,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         servers.push(hosts);
     }
 
-    for server_cfg in &settings.dns.servers {
-        let port = server_cfg
-            .port
-            .unwrap_or_else(|| server_cfg.protocol.default_port());
+    for server_cfg in &plan.servers {
+        let port = server_cfg.port_or_default();
 
         let mut server = match server_cfg.protocol {
             DnsProtocol::Udp => json!({
@@ -476,14 +487,6 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
             server["detour"] = json!(first_proxy_tag);
         }
 
-        if server_cfg.resolves_via_proxy_private(BackendType::SingBox, settings.tun.enabled) {
-            log::warn!(
-                "DNS server {} ({}) is private and routed through the proxy; its queries reach the proxy server's network - consider detour 'direct'",
-                server_cfg.tag,
-                server_cfg.address
-            );
-        }
-
         // sing-box rejects a DNS server addressed by hostname at startup
         // ("missing domain resolver for domain server address") unless that
         // server carries its own `domain_resolver` dial field - the route-level
@@ -517,28 +520,21 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
     // can't resolve itself. When none of the configured servers is IP-literal,
     // `default_domain_resolver_tag` falls back to this local-system bootstrap
     // so sing-box has somewhere non-circular to resolve those hostnames.
-    if !settings.dns.servers.is_empty()
-        && !settings
-            .dns
-            .servers
-            .iter()
-            .any(|s| s.address.parse::<std::net::IpAddr>().is_ok())
-    {
+    if !plan.servers.is_empty() && !plan.has_ip_literal_server() {
         servers.push(json!({
             "tag": BOOTSTRAP_RESOLVER_TAG,
             "type": "local",
         }));
     }
 
-    let final_server = settings.dns.servers.first().map(|s| s.tag.clone());
+    let final_server = plan.first_tag().map(str::to_string);
     dns_config["final"] = json!(final_server);
 
     dns_config["servers"] = json!(servers);
 
     let mut tun_exclusion_rules: Vec<Value> = Vec::new();
     if settings.tun.enabled
-        && let Some(direct_tag) =
-            super::common::split_horizon_server(settings).map(|s| s.tag.clone())
+        && let Some(direct_tag) = plan.split_horizon_server().map(|server| server.tag.clone())
     {
         if !settings.tun.exclude_processes.is_empty() {
             tun_exclusion_rules.push(json!({

@@ -526,11 +526,8 @@ where
     I: IntoIterator<Item = F>,
     F: Future<Output = T>,
 {
-    use futures_util::StreamExt;
-    futures_util::stream::iter(items)
-        .buffered(limit)
-        .collect()
-        .await
+    use futures::StreamExt;
+    futures::stream::iter(items).buffered(limit).collect().await
 }
 
 async fn query_singbox_delay(
@@ -1333,11 +1330,8 @@ mod tests {
     #[tokio::test]
     async fn observatory_delays_all_timeout_no_results() {
         // Mock that always fails with a connection error
-        let query_fn = || async move {
-            Err(ObservatoryError::Status(tonic::Status::unavailable(
-                "connection refused",
-            )))
-        };
+        let query_fn =
+            || async move { Err(tonic::Status::unavailable("connection refused").into()) };
 
         let result = observatory_delays_with_query(3, 5000, query_fn).await;
         assert_eq!(result.results, vec![None, None, None]);
@@ -1361,9 +1355,7 @@ mod tests {
             async move {
                 let c = cc.fetch_add(1, Ordering::SeqCst) + 1;
                 if c < 3 {
-                    Err(ObservatoryError::Status(tonic::Status::unavailable(
-                        "connection refused",
-                    )))
+                    Err(tonic::Status::unavailable("connection refused").into())
                 } else {
                     // Eventually return some results
                     Ok(vec![
@@ -1458,11 +1450,8 @@ mod tests {
         use std::time::Instant;
 
         let start = Instant::now();
-        let query_fn = || async move {
-            Err(ObservatoryError::Status(tonic::Status::unavailable(
-                "connection refused",
-            )))
-        };
+        let query_fn =
+            || async move { Err(tonic::Status::unavailable("connection refused").into()) };
 
         // Use a very small timeout (10ms) - should still poll for at least 2 seconds
         let result = observatory_delays_with_query(2, 10, query_fn).await;

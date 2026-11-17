@@ -6,7 +6,7 @@ use ksni::{Handle, Tray, TrayMethods};
 use tempfile::TempDir;
 use tokio::sync::broadcast;
 use v2ray_rs_core::models::ConnectionMetadata;
-use v2ray_rs_process::{ProcessEvent, ProcessState};
+use v2ray_rs_core::state::{ProcessEvent, ProcessState};
 
 use crate::icons;
 use crate::notification::Notifier;

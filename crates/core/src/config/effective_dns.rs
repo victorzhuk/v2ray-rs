@@ -4,6 +4,7 @@
 //! resolver into an ordered list of entries with address, transport, routing
 //! path, provenance and scope.
 
+use crate::config::dns_plan::ResolvedDnsPlan;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol,
     DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
@@ -165,31 +166,29 @@ fn v2ray_family_dns(
         return no_dns_section();
     }
 
+    let plan = ResolvedDnsPlan::resolve(settings, backend, node_hosts);
     let mut entries = Vec::new();
 
-    if tun_xray {
-        let domains = bootstrap_domains(node_hosts, settings);
-        if !domains.is_empty() {
-            let scope = DnsScope::Domains(domains);
-            entries.push(entry(
-                BOOTSTRAP_DNS_UDP,
-                Some(DnsProtocol::Udp),
-                DnsPath::Direct,
-                DnsSource::Bootstrap,
-                scope.clone(),
-            ));
-            entries.push(entry(
-                FALLBACK_DNS,
-                Some(DnsProtocol::Doh),
-                DnsPath::Direct,
-                DnsSource::Bootstrap,
-                scope,
-            ));
-        }
+    if tun_xray && !plan.bootstrap_domains.is_empty() {
+        let scope = DnsScope::Domains(plan.bootstrap_domains.clone());
+        entries.push(entry(
+            BOOTSTRAP_DNS_UDP,
+            Some(DnsProtocol::Udp),
+            DnsPath::Direct,
+            DnsSource::Bootstrap,
+            scope.clone(),
+        ));
+        entries.push(entry(
+            FALLBACK_DNS,
+            Some(DnsProtocol::Doh),
+            DnsPath::Direct,
+            DnsSource::Bootstrap,
+            scope,
+        ));
     }
 
     let user = if settings.dns.enabled {
-        user_dns_entries(backend, settings, rules, tun_xray)
+        user_dns_entries(backend, settings, &plan, rules, tun_xray)
     } else {
         vec![
             entry(
@@ -265,31 +264,10 @@ fn v2ray_family_dns(
     }
 }
 
-fn bootstrap_domains(node_hosts: &[&str], settings: &AppSettings) -> Vec<String> {
-    let mut domains: Vec<String> = Vec::new();
-    for host in node_hosts {
-        push_bootstrap_domain(&mut domains, host);
-    }
-    if settings.dns.enabled {
-        for server in &settings.dns.servers {
-            push_bootstrap_domain(&mut domains, &server.address);
-        }
-    }
-    domains
-}
-
-fn push_bootstrap_domain(domains: &mut Vec<String>, host: &str) {
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return;
-    }
-    if !domains.iter().any(|d| d == host) {
-        domains.push(host.to_string());
-    }
-}
-
 fn user_dns_entries(
     backend: BackendType,
     settings: &AppSettings,
+    plan: &ResolvedDnsPlan,
     rules: &[RoutingRule],
     tun_xray: bool,
 ) -> Vec<EffectiveDnsEntry> {
@@ -337,19 +315,12 @@ fn user_dns_entries(
             .collect()
     };
 
-    for server in &settings.dns.servers {
-        let transport = server.protocol.effective_for_backend(backend);
+    for server in &plan.servers {
+        let transport = server.protocol;
         let address = if backend == BackendType::SingBox {
             server.address.clone()
         } else {
-            transport.server_address(
-                &server.address,
-                if transport != server.protocol {
-                    None
-                } else {
-                    server.port
-                },
-            )
+            server.transport_address()
         };
         let scope = scopes
             .iter()
@@ -382,18 +353,13 @@ fn user_dns_entries(
             .iter()
             .map(|d| format!("domain:{}", strip_suffix_wildcard(d)))
             .collect();
-        let target = settings
-            .dns
-            .servers
-            .iter()
-            .find(|s| s.detours_direct())
-            .or_else(|| settings.dns.servers.first());
+        let target = plan.split_horizon_server();
         let target_entry = target.map(|server| {
-            let transport = server.protocol.effective_for_backend(backend);
+            let transport = server.protocol;
             let address = if backend == BackendType::SingBox {
                 server.address.clone()
             } else {
-                transport.server_address(&server.address, server.port)
+                server.transport_address()
             };
             let path = if server.detours_direct() {
                 DnsPath::Direct
@@ -510,6 +476,7 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
         return no_dns_section();
     }
 
+    let plan = ResolvedDnsPlan::resolve(settings, BackendType::SingBox, &[]);
     let mut entries = Vec::new();
 
     if !settings.dns.enabled {
@@ -522,15 +489,15 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
             DnsScope::All,
         ));
     } else {
-        let final_tag = settings.dns.servers.first().map(|s| s.tag.clone());
-        for server in &settings.dns.servers {
+        let final_tag = plan.first_tag();
+        for server in &plan.servers {
             let path = if server.detour.as_deref().is_none_or(|d| d == "direct") {
                 DnsPath::Direct
             } else {
                 DnsPath::Proxy
             };
             let mut scope = server_scope_singbox(settings, rules, &server.tag);
-            if Some(&server.tag) == final_tag.as_ref() {
+            if Some(server.tag.as_str()) == final_tag {
                 scope = DnsScope::All;
             }
             entries.push(entry(
@@ -542,13 +509,7 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
             ));
         }
 
-        if !settings.dns.servers.is_empty()
-            && !settings
-                .dns
-                .servers
-                .iter()
-                .any(|s| s.address.parse::<std::net::IpAddr>().is_ok())
-        {
+        if !plan.servers.is_empty() && !plan.has_ip_literal_server() {
             entries.push(entry(
                 "local",
                 None,
@@ -696,9 +657,9 @@ impl EffectiveDns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SingboxGenerator;
     use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
     use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
-    use crate::config::{ConfigGenerator, SingboxGenerator};
     use crate::models::{
         ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, HostOverride,
         ImportedProfile, ProxyNode, Subscription,

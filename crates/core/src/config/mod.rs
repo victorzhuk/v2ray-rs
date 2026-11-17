@@ -1,4 +1,5 @@
 mod common;
+pub mod dns_plan;
 pub mod effective_dns;
 mod probe;
 mod redact;
@@ -9,6 +10,7 @@ pub(crate) mod v2ray;
 mod writer;
 pub(crate) mod xray;
 
+pub use dns_plan::{ResolvedDnsPlan, ResolvedDnsServer};
 pub use redact::redact_json;
 
 pub use probe::{
@@ -68,10 +70,46 @@ pub enum ConfigError {
 pub trait ConfigGenerator {
     fn generate(
         &self,
-        nodes: &[ProxyNode],
+        nodes: &ResolvedNodeSet<'_>,
         rules: &[RoutingRule],
         settings: &AppSettings,
     ) -> Result<serde_json::Value, ConfigError>;
+}
+
+/// The typed node set a config generator accepts: one connected node plus every
+/// additional node a routing rule can select as its detour.
+#[derive(Debug, Clone, Copy)]
+pub struct ResolvedNodeSet<'a> {
+    pub primary: &'a ProxyNode,
+    pub detour_nodes: &'a [ProxyNode],
+}
+
+impl<'a> ResolvedNodeSet<'a> {
+    pub fn new(primary: &'a ProxyNode, detour_nodes: &'a [ProxyNode]) -> Self {
+        Self {
+            primary,
+            detour_nodes,
+        }
+    }
+
+    /// Splits a positional node slice in the established order: the connected
+    /// node first, every detour node after it.
+    pub fn from_nodes(nodes: &'a [ProxyNode]) -> Result<Self, ConfigError> {
+        let (primary, detour_nodes) = nodes.split_first().ok_or(ConfigError::NoNodes)?;
+        Ok(Self {
+            primary,
+            detour_nodes,
+        })
+    }
+
+    /// Materializes the positional slice the generator internals still build
+    /// their outbound tags from.
+    pub fn to_vec(&self) -> Vec<ProxyNode> {
+        let mut nodes = Vec::with_capacity(1 + self.detour_nodes.len());
+        nodes.push(self.primary.clone());
+        nodes.extend_from_slice(self.detour_nodes);
+        nodes
+    }
 }
 
 pub fn generator_for(backend: BackendType) -> Box<dyn ConfigGenerator> {

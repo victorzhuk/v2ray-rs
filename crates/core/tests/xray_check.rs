@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
+use v2ray_rs_core::config::XrayGenerator;
 use v2ray_rs_core::models::{
     AppSettings, BackendLogLevel, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig,
     HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings,

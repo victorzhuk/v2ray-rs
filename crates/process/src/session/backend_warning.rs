@@ -2,12 +2,12 @@ use std::collections::HashSet;
 
 use v2ray_rs_core::models::BackendType;
 
-use crate::connection::strip_leading_timestamp;
+use super::strip_leading_timestamp;
 
 const MAX_QUOTE_CHARS: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PatternId {
+pub enum PatternId {
     Deprecated,
     RealityMitm,
 }
@@ -31,14 +31,14 @@ const PATTERNS: &[(BackendType, PatternId, &[&str])] = &[
     ),
 ];
 
-pub(crate) fn match_backend_warning(backend: BackendType, line: &str) -> Option<PatternId> {
+pub fn match_backend_warning(backend: BackendType, line: &str) -> Option<PatternId> {
     PATTERNS
         .iter()
         .find(|(b, _, needles)| *b == backend && needles.iter().all(|n| line.contains(n)))
         .map(|&(_, id, _)| id)
 }
 
-pub(crate) fn warning_toast(line: &str) -> String {
+pub fn warning_toast(line: &str) -> String {
     let quote = strip_leading_timestamp(line.trim());
     if quote.chars().count() > MAX_QUOTE_CHARS {
         let head: String = quote.chars().take(MAX_QUOTE_CHARS - 1).collect();
@@ -53,7 +53,7 @@ pub(crate) fn warning_toast(line: &str) -> String {
 /// future signatures (DNS bootstrap timeout, TLS verification refusal) slot in
 /// without touching the reporting path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct FailureClassification {
+pub struct FailureClassification {
     pub cause: &'static str,
 }
 
@@ -69,7 +69,7 @@ const FAILURE_SIGNATURES: &[(BackendType, &[&str], &str)] = &[(
 /// when nothing matches and the generic report applies. One call over one
 /// candidate's output yields at most one classification, however many times the
 /// backend repeated the signature.
-pub(crate) fn classify_failure(
+pub fn classify_failure(
     backend: BackendType,
     captured_output: &str,
 ) -> Option<FailureClassification> {
@@ -84,20 +84,20 @@ pub(crate) fn classify_failure(
 
 /// Remembers which patterns already toasted, so a warning the backend repeats
 /// for every connection it opens surfaces once per app connection.
-pub(crate) struct BackendWarnings {
+pub struct BackendWarnings {
     backend: BackendType,
     seen: HashSet<PatternId>,
 }
 
 impl BackendWarnings {
-    pub(crate) fn new(backend: BackendType) -> Self {
+    pub fn new(backend: BackendType) -> Self {
         Self {
             backend,
             seen: HashSet::new(),
         }
     }
 
-    pub(crate) fn toast_for(&mut self, line: &str) -> Option<String> {
+    pub fn toast_for(&mut self, line: &str) -> Option<String> {
         let id = match_backend_warning(self.backend, line)?;
         self.seen.insert(id).then(|| warning_toast(line))
     }

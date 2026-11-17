@@ -50,10 +50,15 @@ Domain models and infrastructure:
 - **`resolve.rs`** — `ConnectionPlanner` selects and orders enabled proxy node candidates per `AutoResolveStrategy`. `LatencySnapshot` stores per-node latency keyed by `ConnectionNodeRef` — `(subscription_id, node_id)` for subscription nodes.
 
 - **`config/`** — Backend config generation module:
-  - `mod.rs` — `ConfigGenerator` trait and `generator_for(backend)` factory.
-  - `writer.rs` — `ConfigWriter` takes `AppSettings` + `AppPaths`, calls the right generator, atomic-writes the output JSON (e.g., `{runtime_dir}/generated/xray.json`). Respects `settings.backend.config_output_dir` override.
+  - `mod.rs` — `ConfigGenerator` trait, `ResolvedNodeSet` (primary node plus detour nodes), and `generator_for(backend)` factory.
+  - `dns_plan.rs` — `ResolvedDnsPlan` resolves protocol downgrades, bootstrap domains, hosts, and split-horizon detours once; `v2ray`/`xray`/`sing-box` and Effective DNS lower from it.
+  - `writer.rs` — `ConfigWriter` takes `AppSettings` + `AppPaths` plus a `ResolvedNodeSet`, calls the right generator, atomic-writes the output JSON (e.g., `{runtime_dir}/generated/xray.json`). Respects `settings.backend.config_output_dir` override.
   - `v2ray.rs`, `xray.rs`, `singbox.rs` — per-backend `ConfigGenerator` implementations.
   - `common.rs` — shared helpers (outbound tag, test fixtures).
+
+- **`state.rs`** — Pure `ProcessState`, `ProcessEvent`, and `TransitionError` used by process, tray, and UI without async or OS dependencies.
+
+- **`log_buffer.rs`** — Circular `LogBuffer` (VecDeque, 10K lines max) with `LogLine` (source: Stdout/Stderr, content). Methods: push, last_n, search (case-insensitive).
 
 ### `crates/subscription` (`v2ray-rs-subscription`)
 
@@ -69,9 +74,11 @@ Depends on `v2ray-rs-core`. Handles subscription fetching and URI parsing:
 
 Depends on `v2ray-rs-core`, `tokio`, and `nix`. Async process lifecycle management:
 
-- **`state.rs`** — `ProcessState` enum (Stopped/Starting/Running/Stopping/Error) with validated transitions. `StateManager` wraps state + tokio broadcast channel for event subscribers. `ProcessEvent` enum: StateChanged, LogLine, ProcessExited.
+- **`state.rs`** — `StateManager` wraps the core state types with a tokio broadcast channel for event subscribers; the process and event types are re-exported from `v2ray-rs-core`.
 
-- **`log_buffer.rs`** — Circular `LogBuffer` (VecDeque, 10K lines max) with `LogLine` (source: Stdout/Stderr, content). Methods: push, last_n, search (case-insensitive). Pure sync data structure.
+- **`session/`** — Headless connection supervisor moved out of the UI: candidate failover, DNS pinning and lookups, connected-network snapshots, health monitoring (plain HTTP proxy probe, no TLS client), DNS failure windows, log batching, backend warning and failure classification. It emits `SessionEvent`s and holds no GTK dependency.
+
+- **`log_buffer`** — Re-exported from `v2ray-rs-core` for existing callers.
 
 - **`pid.rs`** — `PidFile` for writing/reading/removing PID files. `check_and_kill_orphaned()` detects stale processes from previous runs using `kill(pid, 0)` signal probe.
 
@@ -108,13 +115,17 @@ System tray integration via ksni (StatusNotifierItem protocol):
 
 GTK4/Relm4 GUI application:
 
-- **`app.rs`** — Main `App` component. `gtk::Paned` (vertical split) between subscriptions and logs pages — no ViewStack/ViewSwitcher. Routing and Settings live in an `adw::PreferencesDialog` opened from a hamburger menu. ToastOverlay wraps content. Connection state and auto-resolve strategy managed via tokio tasks. Status details displayed in a bottom `gtk::ActionBar`.
+- **`app/`** — Main `App` component split into `mod.rs` (state, update loop), `bootstrap.rs` (startup, recovery, tray/icon wiring), `session_bridge.rs` (connect/failover/reconnect policy), `config_regen.rs` (coalesced regeneration), and `dialogs.rs` (quit/disconnect/toast plans). `gtk::Paned` (vertical split) between subscriptions and logs pages — no ViewStack/ViewSwitcher. Routing and Settings live in an `adw::PreferencesDialog` opened from a hamburger menu. ToastOverlay wraps content. Connection state and auto-resolve strategy managed via tokio tasks. Status details displayed in a bottom `gtk::ActionBar`.
 
-- **`subscriptions.rs`** — Subscription management page. Features: add/rename/delete subscriptions, toggle nodes, move up/down reordering (subscriptions and nodes), latency testing (TCP ping), sort by latency. Uses `capture_expanded()` to preserve ExpanderRow state across re-renders.
+- **`connection.rs`** — Thin Relm4 bridge that starts `v2ray_rs_process::session::spawn` and forwards `SessionEvent`s to `AppMsg`.
+
+- **`workspace.rs`** — Authoritative `WorkspaceStore`: in-memory `Arc` snapshots of settings, subscriptions, manual nodes, routing rules, and latency data, with serialized persistence on one background writer thread.
+
+- **`subscriptions/`** — Subscription management page split into `mod.rs` (component and mutations), `rows.rs` (expander/node rendering), `dialogs.rs` (add/rename/delete and forms), and `probes.rs` (latency and real-delay runs). Features: add/rename/delete subscriptions, toggle nodes, move up/down reordering (subscriptions and nodes), latency testing (TCP ping), sort by latency. Uses `capture_expanded()` to preserve ExpanderRow state across re-renders.
 
 - **`routing.rs`** — Routing rule management with drag-and-drop reordering.
 
-- **`preferences/`** — App settings editor.
+- **`preferences/`** — App settings editor. `dns/` is split into `mod.rs` (page state and mutations), `servers.rs`, `rules.rs`, `hosts.rs`, and `effective.rs` (Effective DNS rendering and backend notes).
 
 - **`logs.rs`** — Process log viewer.
 

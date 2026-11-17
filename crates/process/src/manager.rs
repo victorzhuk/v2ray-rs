@@ -13,11 +13,11 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
-use crate::log_buffer::{LogBuffer, LogLine, LogSource};
 use crate::pid::PidFile;
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, HelperRun, TunRuntime};
 use v2ray_rs_core::ansi::strip_ansi;
+use v2ray_rs_core::log_buffer::{LogBuffer, LogLine, LogSource};
 use v2ray_rs_core::models::{BackendType, ConnectionMetadata};
 use v2ray_rs_core::rotating_log::{RotatingFileWriter, local_utc_offset};
 

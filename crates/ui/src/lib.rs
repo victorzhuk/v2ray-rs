@@ -1,5 +1,4 @@
 pub(crate) mod app;
-mod backend_warning;
 mod cli;
 mod config_preview;
 mod connection;
@@ -7,7 +6,6 @@ pub(crate) mod failure_streak;
 mod geodata_service;
 #[cfg(test)]
 mod gtk_test;
-pub(crate) mod health;
 pub mod i18n;
 pub(crate) mod logging;
 mod logs;

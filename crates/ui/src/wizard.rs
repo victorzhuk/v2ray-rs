@@ -34,7 +34,7 @@ pub struct OnboardingWizard {
 #[derive(Debug)]
 pub enum WizardMsg {
     NextPage,
-    ResetSettings(AppSettings),
+    ResetSettings(Box<AppSettings>),
     LoadDetectedBackends,
     DetectedBackendsLoaded(Vec<DetectedBackend>),
     DetectedBackendsFailed(String),
@@ -369,7 +369,7 @@ impl SimpleComponent for OnboardingWizard {
                 self.current_page += 1;
             }
             WizardMsg::ResetSettings(settings) => {
-                self.settings = settings;
+                self.settings = *settings;
                 self.detected_backends.clear();
                 self.selected_backend = None;
                 self.backend_detection_error = None;

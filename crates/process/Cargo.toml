@@ -15,12 +15,15 @@ ipnet.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 log.workspace = true
+chrono.workspace = true
+uuid.workspace = true
 
 [features]
 test-utils = []
 privileged-tests = []
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 v2ray-rs-core = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 uuid.workspace = true

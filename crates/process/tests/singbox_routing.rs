@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use v2ray_rs_core::config::ConfigWriter;
+use v2ray_rs_core::config::{ConfigWriter, ResolvedNodeSet};
 use v2ray_rs_core::models::{
     AppSettings, BackendLogLevel, BackendType, ProxyNode, RoutingRule, RuleAction, RuleMatch,
     ShadowsocksConfig,
@@ -458,7 +458,12 @@ impl Harness {
 
         let writer = ConfigWriter::new(&settings, &paths);
         let config_path = writer
-            .write_config(&[ss_node()], &direct_rules(), &settings, &connected)
+            .write_config(
+                &ResolvedNodeSet::from_nodes(&[ss_node()]).unwrap(),
+                &direct_rules(),
+                &settings,
+                &connected,
+            )
             .unwrap_or_else(|e| prereq(&format!("write_config failed: {e}")));
 
         let singbox_log = paths_dir.path().join("singbox.log");

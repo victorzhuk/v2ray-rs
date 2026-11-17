@@ -14,10 +14,12 @@ use v2ray_rs_core::models::{
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
+use crate::workspace::WorkspaceStore;
+
 use super::{RoutingCallback, emit_routing};
 
 pub(super) fn build_routing_page(
-    paths: &AppPaths,
+    store: &WorkspaceStore,
     settings_state: &Rc<RefCell<AppSettings>>,
     rule_set: &Rc<RefCell<RoutingRuleSet>>,
     on_changed: &RoutingCallback,
@@ -27,7 +29,7 @@ pub(super) fn build_routing_page(
         .icon_name("network-workgroup-symbolic")
         .build();
 
-    let paths = Rc::new(paths.clone());
+    let paths = Rc::new(store.paths().clone());
 
     let toolbar_group = adw::PreferencesGroup::new();
 
@@ -63,6 +65,7 @@ pub(super) fn build_routing_page(
         rule_set: rule_set.clone(),
         on_changed: on_changed.clone(),
         paths: paths.clone(),
+        store: store.clone(),
         added_groups: Rc::new(RefCell::new(Vec::new())),
     };
 
@@ -141,6 +144,7 @@ struct RenderCtx {
     rule_set: Rc<RefCell<RoutingRuleSet>>,
     on_changed: RoutingCallback,
     paths: Rc<AppPaths>,
+    store: WorkspaceStore,
     added_groups: Rc<RefCell<Vec<adw::PreferencesGroup>>>,
 }
 
@@ -406,10 +410,10 @@ fn build_routing_rule_row(
 
 /// Nodes a rule can be pinned to. Useful when one provider tears down idle
 /// streams sooner than another and only some destinations can afford it.
-fn via_node_choices(paths: &AppPaths) -> Vec<(ConnectionNodeRef, String)> {
+fn via_node_choices(store: &WorkspaceStore) -> Vec<(ConnectionNodeRef, String)> {
     let mut choices = Vec::new();
 
-    for sub in persistence::load_subscriptions(paths).unwrap_or_default() {
+    for sub in store.load_subscriptions().unwrap_or_default() {
         for node in sub.nodes.iter().filter(|n| n.enabled) {
             let label = node.node.remark().unwrap_or_else(|| node.node.address());
             choices.push((
@@ -422,7 +426,8 @@ fn via_node_choices(paths: &AppPaths) -> Vec<(ConnectionNodeRef, String)> {
         }
     }
 
-    for manual in persistence::load_manual_nodes_or_default(paths)
+    for manual in store
+        .load_manual_nodes_or_default()
         .iter()
         .filter(|n| n.enabled)
     {
@@ -552,7 +557,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
         .selected(init_action_idx)
         .build();
 
-    let node_choices = via_node_choices(&ctx.paths);
+    let node_choices = via_node_choices(&ctx.store);
     let mut via_labels = vec!["Connected node".to_string()];
     via_labels.extend(node_choices.iter().map(|(_, label)| label.clone()));
     let init_via_idx = existing

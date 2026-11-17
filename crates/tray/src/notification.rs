@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use notify_rust::{Notification, Timeout};
-use v2ray_rs_process::ProcessState;
+use v2ray_rs_core::state::ProcessState;
 
 const NOTIFICATION_TIMEOUT_MS: u32 = 5000;
 

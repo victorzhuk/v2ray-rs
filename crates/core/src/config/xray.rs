@@ -1,7 +1,7 @@
 use serde_json::Value;
 
 use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
-use crate::config::{ConfigError, ConfigGenerator};
+use crate::config::{ConfigError, ConfigGenerator, ResolvedNodeSet};
 use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule, VlessConfig};
 
 pub struct XrayGenerator;
@@ -12,16 +12,27 @@ pub struct XrayGenerator;
 /// looping back into the tunnel. Must match `XRAY_FWMARK` in the netctl crate.
 pub const XRAY_TUN_FWMARK: u32 = 255;
 
-impl ConfigGenerator for XrayGenerator {
-    fn generate(
+impl XrayGenerator {
+    /// Positional-slice entry point retained for callers that already hold a
+    /// resolved candidate list.
+    pub fn generate(
         &self,
         nodes: &[ProxyNode],
         rules: &[RoutingRule],
         settings: &AppSettings,
     ) -> Result<Value, ConfigError> {
-        if nodes.is_empty() {
-            return Err(ConfigError::NoNodes);
-        }
+        ConfigGenerator::generate(self, &ResolvedNodeSet::from_nodes(nodes)?, rules, settings)
+    }
+}
+
+impl ConfigGenerator for XrayGenerator {
+    fn generate(
+        &self,
+        nodes: &ResolvedNodeSet<'_>,
+        rules: &[RoutingRule],
+        settings: &AppSettings,
+    ) -> Result<Value, ConfigError> {
+        let nodes = nodes.to_vec();
         if let Some(node) = nodes.iter().find(|n| disables_tls_verification(n)) {
             return Err(ConfigError::UnsupportedTlsVerification {
                 backend: BackendType::Xray,
@@ -30,9 +41,9 @@ impl ConfigGenerator for XrayGenerator {
         }
 
         let mut config =
-            generate_v2ray_family_config(nodes, rules, settings, V2rayFamilyBackend::Xray);
+            generate_v2ray_family_config(&nodes, rules, settings, V2rayFamilyBackend::Xray);
 
-        patch_xray_outbounds(&mut config, nodes, settings);
+        patch_xray_outbounds(&mut config, &nodes, settings);
 
         if settings.tun.enabled {
             apply_tun_fwmark(&mut config);
@@ -506,7 +517,12 @@ mod tests {
         let mut settings = AppSettings::default();
         settings.backend.backend_type = BackendType::Xray;
 
-        let result = writer.write_config(&[insecure_trojan(false)], &[], &settings, &[]);
+        let result = writer.write_config(
+            &ResolvedNodeSet::from_nodes(&[insecure_trojan(false)]).unwrap(),
+            &[],
+            &settings,
+            &[],
+        );
 
         assert!(matches!(
             result,

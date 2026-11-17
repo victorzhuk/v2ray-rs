@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::process::Command;
 
-use v2ray_rs_core::config::{ConfigGenerator, ConfigWriter, SingboxGenerator};
+use v2ray_rs_core::config::{ConfigWriter, ResolvedNodeSet, SingboxGenerator};
 use v2ray_rs_core::models::{
     AppSettings, BackendLogLevel, BackendType, DnsHijackMode, DnsProtocol, DnsServerConfig,
     FakeIpConfig, HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
@@ -612,7 +612,12 @@ fn local_ruleset_config_passes_sing_box_check() {
 
     let writer = ConfigWriter::new(&settings, &paths);
     let path = writer
-        .write_config(&[ss_node()], &rules, &settings, &[])
+        .write_config(
+            &ResolvedNodeSet::from_nodes(&[ss_node()]).unwrap(),
+            &rules,
+            &settings,
+            &[],
+        )
         .unwrap();
     let json = std::fs::read_to_string(&path).unwrap();
     let config: serde_json::Value = serde_json::from_str(&json).unwrap();

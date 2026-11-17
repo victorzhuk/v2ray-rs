@@ -3,9 +3,9 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-use crate::config::{ConfigError, generator_for};
+use crate::config::{ConfigError, ResolvedNodeSet, generator_for};
 use crate::fs::atomic_write;
-use crate::models::{AppSettings, BackendType, ProxyNode, RoutingRule};
+use crate::models::{AppSettings, BackendType, RoutingRule};
 use crate::persistence::AppPaths;
 
 pub struct ConfigWriter {
@@ -55,7 +55,7 @@ impl ConfigWriter {
 
     pub fn write_config(
         &self,
-        nodes: &[ProxyNode],
+        nodes: &ResolvedNodeSet<'_>,
         rules: &[RoutingRule],
         settings: &AppSettings,
         connected_subnets: &[ipnet::IpNet],
@@ -137,11 +137,11 @@ fn apply_singbox_cache_file(
 }
 
 fn validate_runtime_inputs(
-    nodes: &[ProxyNode],
+    nodes: &ResolvedNodeSet<'_>,
     rules: &[RoutingRule],
     settings: &AppSettings,
 ) -> Result<(), ConfigError> {
-    for node in nodes {
+    for node in std::iter::once(nodes.primary).chain(nodes.detour_nodes) {
         node.validate()?;
     }
 
@@ -165,6 +165,9 @@ fn validate_runtime_inputs(
 
 #[cfg(test)]
 mod tests {
+    fn resolved(nodes: &[ProxyNode]) -> ResolvedNodeSet<'_> {
+        ResolvedNodeSet::from_nodes(nodes).expect("non-empty node set")
+    }
     use super::*;
     use crate::models::*;
     use crate::profile::AppProfile;
@@ -226,7 +229,7 @@ mod tests {
         let settings = AppSettings::default();
 
         let path = writer
-            .write_config(&sample_nodes(), &sample_rules(), &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &sample_rules(), &settings, &[])
             .unwrap();
 
         assert!(path.exists());
@@ -243,7 +246,7 @@ mod tests {
         settings.backend.backend_type = BackendType::V2ray;
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         assert!(path.to_str().unwrap().contains("v2ray.json"));
@@ -260,7 +263,7 @@ mod tests {
         settings.backend.backend_type = BackendType::SingBox;
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         assert!(path.to_str().unwrap().contains("sing-box.json"));
@@ -292,7 +295,7 @@ mod tests {
         }];
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -318,7 +321,7 @@ mod tests {
         settings.backend.backend_type = BackendType::SingBox;
 
         let path = writer
-            .write_config(&sample_nodes(), &sample_rules(), &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &sample_rules(), &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -341,7 +344,7 @@ mod tests {
         settings.dns.fakeip.enabled = true;
 
         let path = writer
-            .write_config(&sample_nodes(), &sample_rules(), &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &sample_rules(), &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -385,7 +388,7 @@ mod tests {
         ];
 
         let path = writer
-            .write_config(&sample_nodes(), &rules, &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &rules, &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -441,7 +444,7 @@ mod tests {
         ];
 
         let path = writer
-            .write_config(&sample_nodes(), &rules, &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &rules, &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -466,7 +469,7 @@ mod tests {
         settings.backend.backend_type = BackendType::SingBox;
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         let parsed: serde_json::Value =
@@ -481,12 +484,12 @@ mod tests {
         let settings = AppSettings::default();
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
         let first_contents = std::fs::read_to_string(&path).unwrap();
 
         let path2 = writer
-            .write_config(&sample_nodes(), &sample_rules(), &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &sample_rules(), &settings, &[])
             .unwrap();
         let second_contents = std::fs::read_to_string(&path2).unwrap();
 
@@ -496,12 +499,10 @@ mod tests {
 
     #[test]
     fn test_write_config_error_on_empty_nodes() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let writer = ConfigWriter::with_dir(dir.path().to_path_buf());
-        let settings = AppSettings::default();
-
-        let result = writer.write_config(&[], &[], &settings, &[]);
-        assert!(result.is_err());
+        assert!(matches!(
+            ResolvedNodeSet::from_nodes(&[]),
+            Err(ConfigError::NoNodes)
+        ));
     }
 
     #[test]
@@ -513,7 +514,7 @@ mod tests {
         settings.tun.enabled = true;
         settings.tun.exclude_routes = (0..257).map(|i| format!("10.{i}.0.0/16")).collect();
 
-        let result = writer.write_config(&sample_nodes(), &[], &settings, &[]);
+        let result = writer.write_config(&resolved(&sample_nodes()), &[], &settings, &[]);
         assert!(matches!(
             result,
             Err(ConfigError::InvalidTun(
@@ -535,7 +536,7 @@ mod tests {
             remark: None,
         })];
 
-        let result = writer.write_config(&nodes, &[], &settings, &[]);
+        let result = writer.write_config(&resolved(&nodes), &[], &settings, &[]);
         assert!(matches!(result, Err(ConfigError::InvalidProxyNode(_))));
     }
 
@@ -555,7 +556,7 @@ mod tests {
             via_node: None,
         }];
 
-        let result = writer.write_config(&sample_nodes(), &rules, &settings, &[]);
+        let result = writer.write_config(&resolved(&sample_nodes()), &rules, &settings, &[]);
         assert!(matches!(result, Err(ConfigError::InvalidRule(_))));
     }
 
@@ -573,7 +574,7 @@ mod tests {
             detour: None,
         }];
 
-        let result = writer.write_config(&sample_nodes(), &[], &settings, &[]);
+        let result = writer.write_config(&resolved(&sample_nodes()), &[], &settings, &[]);
         assert!(result.is_ok());
     }
 
@@ -585,7 +586,7 @@ mod tests {
         let settings = AppSettings::default();
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         assert!(nested.exists());
@@ -606,7 +607,7 @@ mod tests {
         settings.backend.config_output_dir = Some(output.clone());
 
         ConfigWriter::new(&settings, &paths)
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         let mode = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
@@ -617,12 +618,14 @@ mod tests {
     fn test_write_config_rejects_colliding_proxy_ports() {
         let dir = tempfile::TempDir::new().unwrap();
         let writer = ConfigWriter::with_dir(dir.path().join("out"));
-        let mut settings = AppSettings::default();
-        settings.socks_port = 1080;
-        settings.http_port = 1080;
+        let settings = AppSettings {
+            socks_port: 1080,
+            http_port: 1080,
+            ..AppSettings::default()
+        };
 
         let err = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap_err();
         assert!(matches!(err, ConfigError::InvalidSettings(_)));
     }
@@ -666,7 +669,7 @@ mod tests {
         };
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .expect("invalid listen_address should fall back, not fail");
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -687,7 +690,7 @@ mod tests {
         };
 
         let path = writer
-            .write_config(&sample_nodes(), &[], &settings, &[])
+            .write_config(&resolved(&sample_nodes()), &[], &settings, &[])
             .unwrap();
 
         let contents = std::fs::read_to_string(&path).unwrap();
@@ -709,7 +712,9 @@ mod tests {
             let mut settings = AppSettings::default();
             settings.backend.backend_type = backend;
 
-            let path = writer.write_config(&nodes, &rules, &settings, &[]).unwrap();
+            let path = writer
+                .write_config(&resolved(&nodes), &rules, &settings, &[])
+                .unwrap();
             assert!(path.exists());
 
             let contents = std::fs::read_to_string(&path).unwrap();

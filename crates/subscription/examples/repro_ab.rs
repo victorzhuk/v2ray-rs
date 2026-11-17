@@ -4,7 +4,7 @@
 //!
 //! Usage: repro_ab <subscriptions.json> <out_dir> <sub-name=remark-substr> ...
 
-use v2ray_rs_core::config::{ConfigGenerator, XrayGenerator};
+use v2ray_rs_core::config::XrayGenerator;
 use v2ray_rs_core::models::{AppSettings, Subscription};
 
 fn main() {

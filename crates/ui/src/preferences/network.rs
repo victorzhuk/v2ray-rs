@@ -746,10 +746,9 @@ pub(super) fn build_network_page(
             real_delay_url_row.remove_css_class("error");
             if let Some(index) = (0..3).find(|index| {
                 real_delay_preset_url(*index) == Some(settings.real_delay.test_url.as_str())
-            }) {
-                if real_delay_preset_row.selected() != index {
-                    real_delay_preset_row.set_selected(index);
-                }
+            }) && real_delay_preset_row.selected() != index
+            {
+                real_delay_preset_row.set_selected(index);
             }
 
             let detected = detected_state.borrow();

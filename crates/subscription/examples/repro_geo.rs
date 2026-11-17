@@ -2,7 +2,9 @@
 //! generated outbound for each backend, so protocol-specific emission bugs show
 //! up as diffs between the share link and the generated JSON.
 
-use v2ray_rs_core::config::{ConfigGenerator, SingboxGenerator, V2rayGenerator, XrayGenerator};
+use v2ray_rs_core::config::{
+    ConfigGenerator, ResolvedNodeSet, SingboxGenerator, V2rayGenerator, XrayGenerator,
+};
 use v2ray_rs_core::models::{AppSettings, BackendType, ProxyNode};
 use v2ray_rs_subscription::parse_uri;
 
@@ -65,7 +67,8 @@ fn main() {
                 println!("[{name}] VALIDATE ERROR: {e}");
                 continue;
             }
-            match generator.generate(std::slice::from_ref(&node), &[], &settings) {
+            let nodes = ResolvedNodeSet::from_nodes(std::slice::from_ref(&node)).unwrap();
+            match generator.generate(&nodes, &[], &settings) {
                 Ok(cfg) => {
                     let ob = &cfg["outbounds"][0];
                     println!(

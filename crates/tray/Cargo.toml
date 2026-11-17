@@ -6,7 +6,6 @@ rust-version.workspace = true
 
 [dependencies]
 v2ray-rs-core.workspace = true
-v2ray-rs-process.workspace = true
 ksni.workspace = true
 notify-rust.workspace = true
 resvg.workspace = true
