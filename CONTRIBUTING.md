@@ -58,7 +58,7 @@ cargo nextest run
 
 ### Local Development Profiles
 
-By default, `cargo run` uses the `development` profile, which stores all data under `~/.config/v2ray-rs-dev/` and `~/.local/share/v2ray-rs-dev/` — completely isolated from any production install.
+By default, `cargo run` uses the `development` profile, which stores all data under `~/.config/v2ray-rs-dev/`, `~/.local/share/v2ray-rs-dev/`, and `~/.local/state/v2ray-rs-dev/` — completely isolated from any production install. Runtime logs are written under the state directory's `logs/` folder.
 
 ```bash
 # Run with development profile (default for debug builds)
@@ -323,6 +323,9 @@ crates/
 │   │   └── routing_manager.rs
 ├── subscription/      # Subscription fetching/parsing
 ├── process/           # Process lifecycle management
+├── netctl/            # Privileged route helper
+├── run/               # Setuid bypass wrapper
+├── tun-session/       # Shared TUN ownership journal
 ├── tray/              # System tray (StatusNotifierItem)
 └── ui/                # GTK4/Relm4 GUI
 ```

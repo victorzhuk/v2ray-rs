@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Default profile paths now use D-Bus application activation: a second launch focuses the running window and exits `0`. Directory overrides and buses without a primary instance keep the exit-`75` lock fallback.
+
 ### Changed
 - Remote URL subscriptions now keep a provider's routing and DNS profile inactive until the per-subscription toggle is enabled; local file and pasted JSON imports keep profiles active. Imported profiles are validated before they can affect runtime config generation.
 - Automatic xray TUN routing now requires a versioned ownership journal and a matching kernel reservation. Legacy and ambiguous recovery require explicit operator intervention.
@@ -24,6 +27,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ship `v2ray-rs-run` without the setuid bit in package archives and apply `root:v2ray-rs` `4750` only in install hooks; create `v2ray-rs-bypass` during privileged setup and skip the wrapper in user-local installs.
 
 ### Fixed
+- Resolve TUN proxy hostnames lazily per candidate, pre-pin at most eight candidates before strict xray routing, reuse last good pins under parked routes, and cancel lookups and pin probes when Stop arrives.
+- Batch Real Delay and availability probes into groups of at most 64 nodes, reuse one observatory gRPC channel, stop polling once every tag reports, and bound Clash API response bodies.
+- Flush debounced settings on Preferences close and quit, keep editor dialogs open with inline validation, preserve unset DNS ports and exact host overrides, and initialize the wizard from loaded settings without a redundant backend scan.
+- Write `backend.pid` atomically and verify process identity through `/proc` fallbacks when the executable link is inaccessible.
+- Store the geodata autocomplete index under the cache directory and give non-ASCII preset names distinct filenames.
+- Skip the `StatusNotifierWatcher` hide when no host is registered, resync the tray after broadcast lag, and run icon cache updates off the GTK thread.
 - Refuse concurrent route collisions without adopting foreign resources into TUN ownership.
 - Renew completed TUN session identity on explicit restart.
 - Retain malformed recovery records and refuse cleanup after boot, namespace, device, or session identity changes.

@@ -15,7 +15,8 @@ use v2ray_rs_core::models::{
 };
 
 use super::{
-    SettingsCallback, SettingsObservers, clear_preferences_group, emit, subscribe_settings,
+    RoutingObservers, SettingsCallback, SettingsObservers, clear_preferences_group, emit,
+    subscribe_settings,
 };
 
 pub(super) fn build_dns_page(
@@ -23,6 +24,7 @@ pub(super) fn build_dns_page(
     cb: &SettingsCallback,
     settings_observers: &SettingsObservers,
     rules: &Rc<RefCell<RoutingRuleSet>>,
+    routing_observers: &RoutingObservers,
     subscriptions: &[Subscription],
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
@@ -272,7 +274,7 @@ pub(super) fn build_dns_page(
         let rules = rules.clone();
         let effective_group = effective_group.clone();
         let profile_subscriptions = dns_profile_subscription_names(subscriptions);
-        let render_effective = move |settings: &AppSettings| {
+        let render_effective: Rc<dyn Fn(&AppSettings)> = Rc::new(move |settings: &AppSettings| {
             clear_preferences_group(&effective_group);
             let summary = effective_dns(
                 settings.backend.backend_type,
@@ -283,9 +285,21 @@ pub(super) fn build_dns_page(
             for row in effective_dns_rows(&summary, &profile_subscriptions) {
                 effective_group.add(&adw::ActionRow::builder().title(row).build());
             }
-        };
+        });
         render_effective(&state.borrow());
-        subscribe_settings(settings_observers, render_effective);
+        {
+            let render_effective = render_effective.clone();
+            subscribe_settings(settings_observers, move |settings| {
+                render_effective(settings);
+            });
+        }
+        {
+            let render_effective = render_effective.clone();
+            let state = state.clone();
+            routing_observers
+                .borrow_mut()
+                .push(Rc::new(move || render_effective(&state.borrow())));
+        }
     }
 
     page.add(&effective_group);
@@ -1276,9 +1290,13 @@ fn render_dns_hosts(ctx: &DnsRenderCtx) {
             .build();
         let ctx_clone = ctx.clone();
         let domain = host.domain.clone();
+        let ip = host.ip.clone();
         remove_btn.connect_clicked(move |_| {
             if apply_dns_mutation(&ctx_clone, |settings| {
-                settings.dns.hosts.retain(|h| h.domain != domain);
+                settings
+                    .dns
+                    .hosts
+                    .retain(|h| !(h.domain == domain && h.ip == ip));
                 Ok(())
             })
             .is_ok()
@@ -1340,7 +1358,13 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
             srv.port.unwrap_or_default(),
             srv.detour.clone().unwrap_or_default(),
         ),
-        None => (String::new(), 0, String::new(), 0u16, String::new()),
+        None => (
+            String::new(),
+            0,
+            String::new(),
+            DnsProtocol::Udp.default_port(),
+            String::new(),
+        ),
     };
 
     let backend = ctx.state.borrow().backend.backend_type;
@@ -1575,6 +1599,21 @@ fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx)
     {
         let update_validation = update_validation.clone();
         protocol_combo.connect_selected_notify(move |_| update_validation());
+    }
+    {
+        let update_validation = update_validation.clone();
+        port_spin.connect_changed(move |_| update_validation());
+    }
+    {
+        let port_spin = port_spin.clone();
+        let previous_default = Cell::new(index_to_protocol(init_protocol).default_port());
+        protocol_combo.connect_selected_notify(move |row| {
+            let next_default = index_to_protocol(row.selected()).default_port();
+            if port_spin.value() as u16 == previous_default.get() {
+                port_spin.set_value(next_default as f64);
+            }
+            previous_default.set(next_default);
+        });
     }
     {
         let update_validation = update_validation.clone();

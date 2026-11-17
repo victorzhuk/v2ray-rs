@@ -22,8 +22,23 @@ fn process_exists(pid: u32) -> bool {
     )
 }
 
-fn process_binary_path(pid: u32) -> Option<PathBuf> {
-    fs::read_link(format!("/proc/{pid}/exe")).ok()
+enum ExeLookup {
+    Path(PathBuf),
+    PermissionDenied,
+    Missing,
+}
+
+fn process_binary_path(pid: u32) -> ExeLookup {
+    match fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(path) => ExeLookup::Path(path),
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => ExeLookup::PermissionDenied,
+        Err(_) => ExeLookup::Missing,
+    }
+}
+
+fn process_comm(pid: u32) -> Option<String> {
+    let raw = fs::read(format!("/proc/{pid}/comm")).ok()?;
+    Some(String::from_utf8_lossy(&raw).trim_end().to_string())
 }
 
 fn process_config_path(pid: u32) -> Option<PathBuf> {
@@ -68,6 +83,33 @@ pub struct PidOwnershipRecord {
     pub start_time_ticks: u64,
 }
 
+fn atomic_write_0600(path: &Path, payload: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("backend.pid");
+    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        file.write_all(payload)?;
+        file.sync_all()?;
+        fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
 enum PidFileEntry {
     Record(PidOwnershipRecord),
     Legacy,
@@ -97,13 +139,7 @@ impl PidFile {
 
         let payload = serde_json::to_vec_pretty(&record)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        fs::write(&self.path, payload)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
-        }
+        atomic_write_0600(&self.path, &payload)?;
 
         Ok(())
     }
@@ -213,19 +249,59 @@ impl PidFile {
 }
 
 fn process_matches_record(record: &PidOwnershipRecord) -> bool {
-    let Some(actual_binary_path) = process_binary_path(record.pid) else {
-        return false;
-    };
+    let exe = process_binary_path(record.pid);
     let Some(actual_config_path) = process_config_path(record.pid) else {
         return false;
     };
     let Ok(actual_start_time) = process_start_time(record.pid) else {
         return false;
     };
+    let comm = process_comm(record.pid);
 
-    canonicalize_best(&actual_binary_path) == record.binary_path
-        && canonicalize_best(&actual_config_path) == record.config_path
-        && actual_start_time == record.start_time_ticks
+    matches_record_parts(
+        record,
+        exe,
+        actual_start_time,
+        Some(&actual_config_path),
+        comm.as_deref(),
+    )
+}
+
+/// Verifies the recorded identity. `exe` is the `/proc/<pid>/exe` result:
+/// capability-bearing binaries on a `fs.suid_dumpable = 2` host expose it only
+/// to root, so the fallback trusts start ticks plus `comm` plus the exact
+/// config argument instead.
+fn matches_record_parts(
+    record: &PidOwnershipRecord,
+    exe: ExeLookup,
+    actual_start_time: u64,
+    actual_config_path: Option<&Path>,
+    actual_comm: Option<&str>,
+) -> bool {
+    if actual_start_time != record.start_time_ticks {
+        return false;
+    }
+
+    let Some(actual_config_path) = actual_config_path else {
+        return false;
+    };
+    if canonicalize_best(actual_config_path) != record.config_path {
+        return false;
+    }
+
+    match exe {
+        ExeLookup::Path(path) => canonicalize_best(&path) == record.binary_path,
+        ExeLookup::PermissionDenied => actual_comm.is_some_and(|comm| comm_matches(comm, record)),
+        ExeLookup::Missing => false,
+    }
+}
+
+fn comm_matches(comm: &str, record: &PidOwnershipRecord) -> bool {
+    let Some(name) = record.binary_path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let expected = &name.as_bytes()[..name.len().min(15)];
+    comm.as_bytes() == expected
 }
 
 #[cfg(test)]
@@ -281,6 +357,97 @@ mod tests {
         assert_eq!(record.pid, test_pid);
         assert_eq!(record.binary_path, canonicalize_best(fake_binary_path()));
         assert_eq!(record.config_path, canonicalize_best(fake_config_path()));
+
+        let mode = fs::metadata(&pid_file.path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    fn capability_record() -> PidOwnershipRecord {
+        PidOwnershipRecord {
+            pid: 4242,
+            binary_path: PathBuf::from("/usr/bin/xray"),
+            config_path: PathBuf::from("/run/v2ray-rs/generated/xray.json"),
+            start_time_ticks: 987_654,
+        }
+    }
+
+    #[test]
+    fn eacces_exe_fallback_verifies_identity() {
+        let record = capability_record();
+
+        assert!(matches_record_parts(
+            &record,
+            ExeLookup::PermissionDenied,
+            record.start_time_ticks,
+            Some(&record.config_path),
+            Some("xray"),
+        ));
+    }
+
+    #[test]
+    fn eacces_exe_fallback_rejects_mismatched_identity() {
+        let record = capability_record();
+
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::PermissionDenied,
+            record.start_time_ticks + 1,
+            Some(&record.config_path),
+            Some("xray"),
+        ));
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::PermissionDenied,
+            record.start_time_ticks,
+            Some(&record.config_path),
+            Some("sing-box"),
+        ));
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::PermissionDenied,
+            record.start_time_ticks,
+            Some(Path::new("/run/other.json")),
+            Some("xray"),
+        ));
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::PermissionDenied,
+            record.start_time_ticks,
+            Some(&record.config_path),
+            None,
+        ));
+    }
+
+    #[test]
+    fn missing_exe_never_matches_even_with_matching_fields() {
+        let record = capability_record();
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::Missing,
+            record.start_time_ticks,
+            Some(&record.config_path),
+            Some("xray"),
+        ));
+    }
+
+    #[test]
+    fn reused_pid_with_new_start_time_is_not_ours() {
+        let record = capability_record();
+        assert!(!matches_record_parts(
+            &record,
+            ExeLookup::Path(record.binary_path.clone()),
+            record.start_time_ticks + 1,
+            Some(&record.config_path),
+            Some("xray"),
+        ));
+    }
+
+    #[test]
+    fn comm_matches_truncates_long_binary_names_to_fifteen_bytes() {
+        let mut record = capability_record();
+        record.binary_path = PathBuf::from("/usr/bin/a-very-long-backend-name");
+        assert!(comm_matches("a-very-long-bac", &record));
+        assert!(!comm_matches("a-very-long-back", &record));
     }
 
     #[test]

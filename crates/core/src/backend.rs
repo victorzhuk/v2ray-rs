@@ -100,6 +100,31 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
 /// backend discovery in the UI.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Largest slice of probe output kept in memory. The rest is drained and
+/// discarded so a chatty binary cannot fill the pipe and block on write.
+const MAX_PROBE_OUTPUT: usize = 256 * 1024;
+
+fn drain_output(
+    mut reader: impl std::io::Read + Send + 'static,
+) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut collected = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    let room = MAX_PROBE_OUTPUT.saturating_sub(collected.len());
+                    collected.extend_from_slice(&buf[..n.min(room)]);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        collected
+    })
+}
+
 /// Runs a command to completion, killing and reaping it if it exceeds
 /// `VERSION_PROBE_TIMEOUT`. Returns a `TimedOut` I/O error on timeout.
 fn run_with_probe_timeout(command: &mut Command) -> std::io::Result<std::process::Output> {
@@ -109,6 +134,10 @@ fn run_with_probe_timeout(command: &mut Command) -> std::io::Result<std::process
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()?;
+
+    let stdout = child.stdout.take().map(drain_output);
+    let stderr = child.stderr.take().map(drain_output);
+
     let mut timed_out = false;
     loop {
         match child.try_wait()? {
@@ -124,14 +153,22 @@ fn run_with_probe_timeout(command: &mut Command) -> std::io::Result<std::process
             None => std::thread::sleep(Duration::from_millis(25)),
         }
     }
-    let output = child.wait_with_output()?;
+
+    let status = child.wait()?;
+    let stdout = stdout.and_then(|h| h.join().ok()).unwrap_or_default();
+    let stderr = stderr.and_then(|h| h.join().ok()).unwrap_or_default();
+
     if timed_out {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "version probe timed out",
         ));
     }
-    Ok(output)
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
 fn detect_version(path: &Path) -> Result<String, BackendError> {
@@ -352,6 +389,23 @@ pub fn all_install_guidance() -> String {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn test_probe_drains_large_stdout_and_stderr_without_deadlock() {
+        let mut command = Command::new("sh");
+        command.args([
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' x; \
+             head -c 200000 /dev/zero | tr '\\0' y >&2",
+        ]);
+
+        let output = run_with_probe_timeout(&mut command).unwrap();
+
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 200_000);
+        assert!(output.stdout.iter().all(|b| *b == b'x'));
+        assert!(output.stderr.iter().all(|b| *b == b'y'));
+    }
 
     #[test]
     fn test_backend_name() {

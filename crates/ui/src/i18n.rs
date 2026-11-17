@@ -20,14 +20,6 @@ pub fn init(language: Language) {
     textdomain(DOMAIN).ok();
 }
 
-pub fn switch_language(language: Language) {
-    let locale = match language {
-        Language::English => "en_US.UTF-8",
-        Language::Russian => "ru_RU.UTF-8",
-    };
-    setlocale(LocaleCategory::LcAll, locale);
-}
-
 pub fn tr(msgid: &str) -> String {
     gettext(msgid)
 }

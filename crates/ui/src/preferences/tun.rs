@@ -522,39 +522,58 @@ pub(super) fn build_tun_page(
     let wrapper_on_disk = run_bin.is_file()
         || std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
             .any(|dir| dir.join(&run_bin).is_file());
-    // The wrapper drops to this user and exits with "user not found" without it.
-    // Nothing outside a distribution package creates it, so an AppImage never
-    // has one.
-    let bypass_user_exists = nix::unistd::User::from_name(v2ray_rs_process::BYPASS_USER)
-        .ok()
-        .flatten()
-        .is_some();
-    let wrapper_available = wrapper_on_disk && bypass_user_exists;
 
     let run_note = adw::ActionRow::builder()
         .title("Wrapper not available")
         .subtitle(if wrapper_on_disk {
-            "The v2ray-rs-bypass system user is missing; install the distribution package"
+            "Checking the v2ray-rs-bypass system user..."
         } else {
             "Install v2ray-rs-run and grant privileges first"
         })
-        .visible(!wrapper_available)
+        .visible(!wrapper_on_disk)
         .build();
     run_group.add(&run_note);
 
     let run_entry = adw::EntryRow::builder()
         .title("Command (e.g. cloudflared tunnel run)")
-        .sensitive(wrapper_available)
+        .sensitive(false)
         .build();
     let launch_button = gtk::Button::builder()
         .label("Launch")
         .valign(gtk::Align::Center)
-        .sensitive(wrapper_available)
+        .sensitive(false)
         .css_classes(["suggested-action"])
         .build();
     run_entry.add_suffix(&launch_button);
     run_group.add(&run_entry);
     page.add(&run_group);
+
+    if wrapper_on_disk {
+        let run_note = run_note.clone();
+        let run_entry = run_entry.clone();
+        let launch_button = launch_button.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let bypass_user_exists = tokio::task::spawn_blocking(|| {
+                nix::unistd::User::from_name(v2ray_rs_process::BYPASS_USER)
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .await
+            .unwrap_or(false);
+
+            if bypass_user_exists {
+                run_note.set_visible(false);
+                run_entry.set_sensitive(true);
+                launch_button.set_sensitive(true);
+            } else {
+                run_note.set_subtitle(
+                    "The v2ray-rs-bypass system user is missing; install the distribution package",
+                );
+                run_note.set_visible(true);
+            }
+        });
+    }
 
     {
         let toast_cb = toast_cb.clone();
@@ -564,12 +583,29 @@ pub(super) fn build_tun_page(
             if text.is_empty() {
                 return;
             }
+            let args = match glib::shell_parse_argv(&text) {
+                Ok(args) => args,
+                Err(err) => {
+                    toast_cb(&format!("Invalid command: {err}"));
+                    return;
+                }
+            };
+            if args.is_empty() {
+                return;
+            }
             let mut cmd = tokio::process::Command::new(v2ray_rs_process::run_path());
-            cmd.args(text.split_whitespace());
+            cmd.args(&args);
             match cmd.spawn() {
                 Ok(mut child) => {
-                    tokio::spawn(async move {
-                        let _ = child.wait().await;
+                    let toast_wait = toast_cb.clone();
+                    glib::MainContext::default().spawn_local(async move {
+                        match child.wait().await {
+                            Ok(status) if status.success() => {}
+                            Ok(status) => {
+                                toast_wait(&format!("Command exited with {status}"));
+                            }
+                            Err(err) => toast_wait(&format!("Command failed: {err}")),
+                        }
                     });
                     toast_cb("Launched via bypass wrapper.");
                 }
@@ -694,14 +730,20 @@ pub(super) fn build_tun_page(
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
         let warned = Rc::new(Cell::new(false));
+        let guard = Rc::new(Cell::new(false));
         enable_row.connect_active_notify(move |row| {
+            if guard.get() {
+                return;
+            }
             let enabled = row.is_active();
             if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.enabled = enabled;
                 Ok(())
             }) {
                 toast_cb(&format!("Failed to save TUN setting: {err}"));
-                row.set_active(state.borrow().tun.enabled);
+                with_rollback_guard(&guard, || {
+                    row.set_active(state.borrow().tun.enabled);
+                });
                 return;
             }
             if enabled && !warned.replace(true) {
@@ -761,14 +803,20 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
+        let guard = Rc::new(Cell::new(false));
         mtu_row.connect_changed(move |row| {
+            if guard.get() {
+                return;
+            }
             let mtu = row.value() as u16;
             if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.mtu = mtu;
                 Ok(())
             }) {
                 toast_cb(&format!("Failed to save TUN setting: {err}"));
-                row.set_value(state.borrow().tun.mtu as f64);
+                with_rollback_guard(&guard, || {
+                    row.set_value(state.borrow().tun.mtu as f64);
+                });
             }
         });
     }
@@ -776,14 +824,20 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
+        let guard = Rc::new(Cell::new(false));
         stack_row.connect_selected_notify(move |row| {
+            if guard.get() {
+                return;
+            }
             let stack = index_to_stack(row.selected());
             if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.stack = stack;
                 Ok(())
             }) {
                 toast_cb(&format!("Failed to save TUN setting: {err}"));
-                row.set_selected(stack_to_index(state.borrow().tun.stack));
+                with_rollback_guard(&guard, || {
+                    row.set_selected(stack_to_index(state.borrow().tun.stack));
+                });
             }
         });
     }
@@ -791,14 +845,20 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
+        let guard = Rc::new(Cell::new(false));
         strict_row.connect_active_notify(move |row| {
+            if guard.get() {
+                return;
+            }
             let active = row.is_active();
             if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.strict_route = active;
                 Ok(())
             }) {
                 toast_cb(&format!("Failed to save TUN setting: {err}"));
-                row.set_active(state.borrow().tun.strict_route);
+                with_rollback_guard(&guard, || {
+                    row.set_active(state.borrow().tun.strict_route);
+                });
             }
         });
     }
@@ -806,14 +866,20 @@ pub(super) fn build_tun_page(
         let state = state.clone();
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
+        let guard = Rc::new(Cell::new(false));
         hijack_row.connect_selected_notify(move |row| {
+            if guard.get() {
+                return;
+            }
             let mode = index_to_hijack(row.selected());
             if let Err(err) = apply_tun_mutation(&state, &cb, |s| {
                 s.tun.dns_hijack = mode;
                 Ok(())
             }) {
                 toast_cb(&format!("Failed to save TUN setting: {err}"));
-                row.set_selected(hijack_to_index(state.borrow().tun.dns_hijack));
+                with_rollback_guard(&guard, || {
+                    row.set_selected(hijack_to_index(state.borrow().tun.dns_hijack));
+                });
             }
         });
     }
@@ -967,6 +1033,16 @@ fn present_add_dialog(
         });
     }
     dialog.present(crate::active_window().as_ref());
+}
+
+/// Restores a widget after a rejected mutation without letting the restore
+/// re-enter its own change handler.
+fn with_rollback_guard(guard: &Cell<bool>, rollback: impl FnOnce()) {
+    if guard.replace(true) {
+        return;
+    }
+    rollback();
+    guard.set(false);
 }
 
 fn apply_tun_mutation<F>(

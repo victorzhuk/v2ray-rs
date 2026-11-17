@@ -17,7 +17,10 @@ pub use observatory::{
 };
 pub use parser::{ImportResult, ParseError, parse_subscription_uris, parse_uri};
 pub use ping::ping_nodes;
-pub use real_delay::{RealDelayReport, check_node_availability, measure_real_delay};
+pub use real_delay::{
+    MAX_PROBE_BATCH_SIZE, RealDelayReport, check_node_availability, measure_real_delay,
+    probe_batch_count,
+};
 pub use update::{
     ParseFailure, UpdateError, UpdateResult, reconcile_nodes, reconcile_with_counts,
     same_connection,

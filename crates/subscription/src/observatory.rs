@@ -117,52 +117,87 @@ async fn query_observatory(
     port: u16,
     service_path: &str,
 ) -> Result<Vec<ObservatoryStatus>, ObservatoryError> {
-    let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
-        .map_err(ObservatoryError::Transport)?
-        .connect_timeout(Duration::from_secs(2))
-        .timeout(Duration::from_secs(5));
+    let mut client = ObservatoryClient::connect(port, service_path).await?;
+    client.query().await
+}
 
-    let channel = endpoint
-        .connect()
-        .await
-        .map_err(ObservatoryError::Transport)?;
-    let mut grpc = Grpc::new(channel);
+/// A reusable observatory gRPC connection. The channel is established once and
+/// reused for every poll, so a dead backend costs one connect attempt instead of
+/// one per poll interval.
+pub(crate) struct ObservatoryClient {
+    grpc: Grpc<tonic::transport::Channel>,
+    path: PathAndQuery,
+}
 
-    let path: PathAndQuery = service_path.parse().map_err(|_| {
-        tonic::Status::invalid_argument(format!("Invalid service path: {}", service_path))
-    })?;
-    let codec = ProstCodec::<GetOutboundStatusRequest, GetOutboundStatusResponse>::default();
-    let request = Request::new(GetOutboundStatusRequest::default());
+impl ObservatoryClient {
+    pub(crate) async fn connect_xray(port: u16) -> Result<Self, ObservatoryError> {
+        Self::connect(port, XRAY_SERVICE_PATH).await
+    }
 
-    let response = grpc
-        .unary(request, path, codec)
-        .await
-        .map_err(ObservatoryError::Status)?;
-    let inner = response.into_inner();
+    pub(crate) async fn connect_v2ray(port: u16) -> Result<Self, ObservatoryError> {
+        Self::connect(port, V2RAY_SERVICE_PATH).await
+    }
 
-    Ok(inner
-        .status
-        .map(|result| {
-            result
-                .status
-                .into_iter()
-                .map(|s| ObservatoryStatus {
-                    outbound_tag: s.outbound_tag,
-                    delay_ms: if s.alive && s.delay > 0 {
-                        Some(s.delay as u64)
-                    } else {
-                        None
-                    },
-                    alive: s.alive,
-                    last_error: if s.last_error_reason.is_empty() {
-                        None
-                    } else {
-                        Some(s.last_error_reason)
-                    },
-                })
-                .collect()
-        })
-        .unwrap_or_default())
+    pub(crate) async fn connect(port: u16, service_path: &str) -> Result<Self, ObservatoryError> {
+        let endpoint = tonic::transport::Endpoint::from_shared(format!("http://127.0.0.1:{port}"))
+            .map_err(ObservatoryError::Transport)?
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5));
+
+        let channel = endpoint
+            .connect()
+            .await
+            .map_err(ObservatoryError::Transport)?;
+        let mut grpc = Grpc::new(channel);
+        grpc.ready().await.map_err(ObservatoryError::Transport)?;
+
+        let path: PathAndQuery = service_path.parse().map_err(|_| {
+            tonic::Status::invalid_argument(format!("Invalid service path: {}", service_path))
+        })?;
+
+        Ok(Self { grpc, path })
+    }
+
+    pub(crate) async fn query(&mut self) -> Result<Vec<ObservatoryStatus>, ObservatoryError> {
+        let codec = ProstCodec::<GetOutboundStatusRequest, GetOutboundStatusResponse>::default();
+        let request = Request::new(GetOutboundStatusRequest::default());
+
+        self.grpc
+            .ready()
+            .await
+            .map_err(ObservatoryError::Transport)?;
+
+        let response = self
+            .grpc
+            .unary(request, self.path.clone(), codec)
+            .await
+            .map_err(ObservatoryError::Status)?;
+        let inner = response.into_inner();
+
+        Ok(inner
+            .status
+            .map(|result| {
+                result
+                    .status
+                    .into_iter()
+                    .map(|s| ObservatoryStatus {
+                        outbound_tag: s.outbound_tag,
+                        delay_ms: if s.alive && s.delay > 0 {
+                            Some(s.delay as u64)
+                        } else {
+                            None
+                        },
+                        alive: s.alive,
+                        last_error: if s.last_error_reason.is_empty() {
+                            None
+                        } else {
+                            Some(s.last_error_reason)
+                        },
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
 }
 
 // ==========================================

@@ -10,12 +10,16 @@ use crate::persistence::AppPaths;
 
 pub struct ConfigWriter {
     output_dir: PathBuf,
+    /// Whether `output_dir` came from `backend.config_output_dir`. A user-chosen
+    /// directory keeps its existing permissions instead of being tightened.
+    user_output_dir: bool,
     singbox_cache_path: Option<PathBuf>,
     rule_sets_dir: PathBuf,
 }
 
 impl ConfigWriter {
     pub fn new(settings: &AppSettings, paths: &AppPaths) -> Self {
+        let user_output_dir = settings.backend.config_output_dir.is_some();
         let output_dir = settings
             .backend
             .config_output_dir
@@ -24,6 +28,7 @@ impl ConfigWriter {
 
         Self {
             output_dir,
+            user_output_dir,
             singbox_cache_path: Some(paths.cache_dir().join("sing-box-cache.db")),
             rule_sets_dir: paths.geodata_dir().join("rule-sets"),
         }
@@ -35,6 +40,7 @@ impl ConfigWriter {
             singbox_cache_path: Some(dir.join("sing-box-cache.db")),
             rule_sets_dir: dir.join("rule-sets"),
             output_dir: dir,
+            user_output_dir: false,
         }
     }
 
@@ -93,7 +99,9 @@ impl ConfigWriter {
 
         std::fs::create_dir_all(&self.output_dir)?;
         #[cfg(unix)]
-        std::fs::set_permissions(&self.output_dir, std::fs::Permissions::from_mode(0o700))?;
+        if !self.user_output_dir {
+            std::fs::set_permissions(&self.output_dir, std::fs::Permissions::from_mode(0o700))?;
+        }
 
         let path = self.output_path(backend);
         atomic_write(&path, json.as_bytes()).map_err(ConfigError::Io)?;
@@ -141,6 +149,10 @@ fn validate_runtime_inputs(
         crate::models::validate_rule_match(&rule.match_condition)
             .map_err(ConfigError::InvalidRule)?;
     }
+
+    settings
+        .validate_proxy_ports()
+        .map_err(ConfigError::InvalidSettings)?;
 
     settings.dns.validate_for_runtime(settings.tun.enabled)?;
 
@@ -578,6 +590,41 @@ mod tests {
 
         assert!(nested.exists());
         assert!(path.exists());
+    }
+
+    #[test]
+    fn test_write_config_preserves_user_output_dir_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let output = dir.path().join("external");
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let paths = AppPaths::for_profile_in(AppProfile::Test, dir.path());
+        let mut settings = AppSettings::default();
+        settings.backend.config_output_dir = Some(output.clone());
+
+        ConfigWriter::new(&settings, &paths)
+            .write_config(&sample_nodes(), &[], &settings, &[])
+            .unwrap();
+
+        let mode = std::fs::metadata(&output).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "user-chosen directory must keep its mode");
+    }
+
+    #[test]
+    fn test_write_config_rejects_colliding_proxy_ports() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ConfigWriter::with_dir(dir.path().join("out"));
+        let mut settings = AppSettings::default();
+        settings.socks_port = 1080;
+        settings.http_port = 1080;
+
+        let err = writer
+            .write_config(&sample_nodes(), &[], &settings, &[])
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidSettings(_)));
     }
 
     #[test]

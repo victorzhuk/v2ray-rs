@@ -50,13 +50,42 @@ impl Notifier {
     fn send(&self, summary: &str, body: &str) {
         if let Err(e) = Notification::new()
             .appname("V2Ray Manager")
-            .summary(summary)
-            .body(body)
+            .summary(&escape_markup(summary))
+            .body(&escape_markup(body))
             .icon("network-vpn")
             .timeout(Timeout::Milliseconds(NOTIFICATION_TIMEOUT_MS))
             .show()
         {
             log::debug!("desktop notification failed: {e}");
         }
+    }
+}
+
+/// Backend diagnostics can contain `<`, `>` and `&`; a notification server
+/// configured for markup would otherwise interpret them as tags.
+fn escape_markup(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_markup_neutralizes_tags() {
+        assert_eq!(
+            escape_markup("<b>boom</b> & more"),
+            "&lt;b&gt;boom&lt;/b&gt; &amp; more"
+        );
+    }
+
+    #[test]
+    fn disabled_notifier_skips_state_changes() {
+        let notifier = Notifier::new(false);
+        notifier.on_state_change(&ProcessState::Starting, &ProcessState::Running);
+        notifier.notify("summary", "body");
     }
 }

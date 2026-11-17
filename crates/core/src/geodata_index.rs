@@ -45,18 +45,19 @@ impl GeodataIndex {
 
 #[derive(Debug)]
 pub struct GeodataIndexManager {
-    geodata_dir: PathBuf,
+    index_dir: PathBuf,
 }
 
 impl GeodataIndexManager {
     pub fn new(paths: &AppPaths) -> Self {
-        let geodata_dir = paths.geodata_dir();
-        Self { geodata_dir }
+        Self {
+            index_dir: paths.geodata_index_dir(),
+        }
     }
 
-    pub(crate) fn new_from_geodata_dir(geodata_dir: &Path) -> Self {
+    pub(crate) fn new_from_index_dir(index_dir: &Path) -> Self {
         Self {
-            geodata_dir: geodata_dir.to_path_buf(),
+            index_dir: index_dir.to_path_buf(),
         }
     }
 
@@ -66,7 +67,7 @@ impl GeodataIndexManager {
             BackendType::Xray => "xray_index.json",
             BackendType::SingBox => "singbox_index.json",
         };
-        self.geodata_dir.join(filename)
+        self.index_dir.join(filename)
     }
 
     pub fn load_index(
@@ -203,6 +204,22 @@ mod tests {
         let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         let manager = GeodataIndexManager::new(&paths);
         (tmp, manager)
+    }
+
+    #[test]
+    fn test_index_lives_under_cache_dir() {
+        let (_tmp, manager) = test_index_manager();
+        let path = manager.index_path(BackendType::Xray);
+
+        assert_eq!(
+            path,
+            manager.index_dir.join("xray_index.json"),
+            "index path must be rooted at the configured index directory"
+        );
+        assert!(
+            path.to_string_lossy().contains("cache/geodata-index"),
+            "default index directory must be cache_dir/geodata-index: {path:?}"
+        );
     }
 
     #[test]

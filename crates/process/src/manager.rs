@@ -993,8 +993,10 @@ impl ProcessManager {
             cmd.arg("run")
                 .arg("-c")
                 .arg(&config_path)
+                .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped());
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true);
 
             if let Some(dir) = &geodata_dir {
                 cmd.env("V2RAY_LOCATION_ASSET", dir);

@@ -6,9 +6,11 @@ use relm4::prelude::*;
 use v2ray_rs_core::backend::{
     DetectedBackend, all_install_guidance, backend_name, detect_all, validate_custom_path,
 };
-use v2ray_rs_core::models::{AppSettings, BackendConfig, BackendType, SubscriptionSource};
+use v2ray_rs_core::models::{AppSettings, BackendType, SubscriptionSource};
 
-use crate::subscriptions::{SubscriptionSourceInput, subscription_source_from_inputs};
+use crate::subscriptions::{
+    SubscriptionSourceInput, strip_v2raytun_import_prefix, subscription_source_from_inputs,
+};
 
 pub struct OnboardingWizard {
     settings: AppSettings,
@@ -32,6 +34,7 @@ pub struct OnboardingWizard {
 #[derive(Debug)]
 pub enum WizardMsg {
     NextPage,
+    ResetSettings(AppSettings),
     LoadDetectedBackends,
     DetectedBackendsLoaded(Vec<DetectedBackend>),
     DetectedBackendsFailed(String),
@@ -61,7 +64,7 @@ pub enum WizardOutput {
 
 #[relm4::component(pub)]
 impl SimpleComponent for OnboardingWizard {
-    type Init = ();
+    type Init = AppSettings;
     type Input = WizardMsg;
     type Output = WizardOutput;
 
@@ -314,17 +317,22 @@ impl SimpleComponent for OnboardingWizard {
     }
 
     fn init(
-        _init: Self::Init,
+        settings: Self::Init,
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
+        let selected_backend = settings
+            .backend
+            .binary_path
+            .as_ref()
+            .map(|path| (settings.backend.backend_type, path.clone()));
         let mut model = OnboardingWizard {
-            settings: AppSettings::default(),
+            settings,
             detected_backends: Vec::new(),
-            detecting_backends: true,
+            detecting_backends: false,
             backend_detection_error: None,
             backend_list_container: gtk::Box::new(gtk::Orientation::Vertical, 0),
-            selected_backend: None,
+            selected_backend,
             current_page: 0,
             subscription_name: String::new(),
             subscription_url: String::new(),
@@ -336,6 +344,7 @@ impl SimpleComponent for OnboardingWizard {
             validating_custom_backend: false,
             custom_validation_generation: 0,
         };
+        model.detecting_backends = !model.settings.onboarding_complete;
 
         let widgets = view_output!();
         model.backend_list_container = widgets.backend_list_container.clone();
@@ -347,7 +356,9 @@ impl SimpleComponent for OnboardingWizard {
             model.detecting_backends,
             model.backend_detection_error.as_deref(),
         );
-        sender.input(WizardMsg::LoadDetectedBackends);
+        if !model.settings.onboarding_complete {
+            sender.input(WizardMsg::LoadDetectedBackends);
+        }
 
         ComponentParts { model, widgets }
     }
@@ -356,6 +367,14 @@ impl SimpleComponent for OnboardingWizard {
         match msg {
             WizardMsg::NextPage => {
                 self.current_page += 1;
+            }
+            WizardMsg::ResetSettings(settings) => {
+                self.settings = settings;
+                self.detected_backends.clear();
+                self.selected_backend = None;
+                self.backend_detection_error = None;
+                self.current_page = 0;
+                sender.input(WizardMsg::LoadDetectedBackends);
             }
             WizardMsg::LoadDetectedBackends => {
                 self.detecting_backends = true;
@@ -378,11 +397,8 @@ impl SimpleComponent for OnboardingWizard {
                 if self.selected_backend.is_none() {
                     self.selected_backend = auto_selected_backend(&self.detected_backends);
                     if let Some((backend_type, binary_path)) = &self.selected_backend {
-                        self.settings.backend = BackendConfig {
-                            backend_type: *backend_type,
-                            binary_path: Some(binary_path.clone()),
-                            config_output_dir: None,
-                        };
+                        self.settings.backend.backend_type = *backend_type;
+                        self.settings.backend.binary_path = Some(binary_path.clone());
                         self.custom_backend_status = Some(format!(
                             "Using {} at {}",
                             backend_name(*backend_type),
@@ -419,11 +435,8 @@ impl SimpleComponent for OnboardingWizard {
                     backend_name(backend_type),
                     binary_path.display()
                 ));
-                self.settings.backend = BackendConfig {
-                    backend_type,
-                    binary_path: Some(binary_path),
-                    config_output_dir: None,
-                };
+                self.settings.backend.backend_type = backend_type;
+                self.settings.backend.binary_path = Some(binary_path);
             }
             WizardMsg::SubscriptionNameChanged(name) => {
                 self.subscription_name = name;
@@ -486,11 +499,8 @@ impl SimpleComponent for OnboardingWizard {
                         ));
                         self.selected_backend =
                             Some((detected.backend_type, detected.binary_path.clone()));
-                        self.settings.backend = BackendConfig {
-                            backend_type: detected.backend_type,
-                            binary_path: Some(detected.binary_path),
-                            config_output_dir: None,
-                        };
+                        self.settings.backend.backend_type = detected.backend_type;
+                        self.settings.backend.binary_path = Some(detected.binary_path);
                         render_wizard_backend_list(
                             &self.backend_list_container,
                             &self.detected_backends,
@@ -705,7 +715,8 @@ fn complete_subscription(
     if skipped {
         return None;
     }
-    let source = subscription_source_from_inputs(subscription_url, subscription_file_path, "")
+    let subscription_url = strip_v2raytun_import_prefix(subscription_url.trim());
+    let source = subscription_source_from_inputs(&subscription_url, subscription_file_path, "")
         .and_then(|input| match input {
             SubscriptionSourceInput::Url(url) => Some(SubscriptionSource::Url { url }),
             SubscriptionSourceInput::File(path) => Some(SubscriptionSource::File { path }),
@@ -814,6 +825,23 @@ mod tests {
             source,
             SubscriptionSource::File {
                 path: "/tmp/proxies.txt".into()
+            }
+        );
+    }
+
+    #[test]
+    fn complete_strips_v2raytun_import_prefix() {
+        let (_, source) = complete_subscription(
+            false,
+            "v2raytun://import/https://example.com/sub",
+            "",
+            "Imported",
+        )
+        .expect("source");
+        assert_eq!(
+            source,
+            SubscriptionSource::Url {
+                url: "https://example.com/sub".into()
             }
         );
     }

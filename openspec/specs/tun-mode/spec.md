@@ -187,7 +187,7 @@ The system SHALL include a minimal privileged helper binary that programs and re
 - **THEN** the helper SHALL remove any leftover TUN device and its policy rules, flush its dedicated routing table (2023 for xray) including the fallback routes, and for sing-box additionally flush the routing rules and table its `auto_route` uses, leaving system networking clean
 
 ### Requirement: Proxy hostname resolution is bootstrapped
-For TUN connections only, the system SHALL resolve every hostname-addressed proxy node through the operating-system resolver and carry the answers, of both families, into the generated config as static host overrides, so the backend never has to resolve its own server through the tunnel it is building; each generator keeps the addresses its backend can use. Connections without TUN SHALL NOT pin node hostnames. The hostnames of all candidates of a connection attempt, including nodes their routing rules send traffic through, SHALL be resolved once, before the first candidate is started, and never while routing state installed by an earlier candidate of the same attempt is present. Before a candidate starts, the system SHALL test each of its pinned addresses with a TCP connection to the node's port, bounded by a short timeout, and SHALL keep only the addresses that accepted; when none accepted, or when a previously failed candidate's routing state is still installed, it SHALL keep all of them. When a hostname cannot be resolved, the system SHALL use the addresses pinned for that hostname by the most recent session of the running application that reached `Running`, if any. Kernel-side DNS capture SHALL be armed only when the generated config actually carries an override the backend can answer with for every hostname-addressed node, because capturing port 53 while the backend still needs a name resolved sends that lookup into the tunnel. When capture would otherwise be armed but a node is unpinned, the system SHALL notify the user once per connection attempt, write a notice naming the hostname to the process log stream, and record in the session record that DNS capture is off. The TUN runtime SHALL be built from the same effective settings the config was generated from.
+For TUN connections only, the system SHALL resolve hostname-addressed proxy nodes through the OS resolver before tunnel routes block unmarked lookups, carrying both address families into static host overrides while connections without TUN never pin node hostnames. When no fail-closed TUN routing state is installed (`sing-box` TUN or non-strict `xray` TUN), hostnames SHALL be resolved lazily per candidate; before strict `xray` TUN installs routes, pre-pinning SHALL be bounded to at most 8 planned candidates (and their `via_node`s). When dead fail-closed routes from `Error` remain installed, reconnect SHALL skip live OS lookups and TCP pin probes in favor of `last_good_pins`, and `Stop` SHALL cancel in-flight lookups and probes immediately. Kernel DNS capture SHALL be armed only when every hostname-addressed node of the candidate has a usable override, notifying and logging once per attempt when capture stays off, with the TUN runtime built from the same effective settings as the config.
 
 #### Scenario: Hostname node is pinned before the tunnel exists
 - **WHEN** a connection starts with TUN enabled and the selected node is addressed by a hostname
@@ -197,9 +197,21 @@ For TUN connections only, the system SHALL resolve every hostname-addressed prox
 - **WHEN** a connection starts with TUN disabled and the selected node is addressed by a hostname
 - **THEN** the system SHALL NOT resolve it in advance and the generated config SHALL contain no host override for it that the user did not configure
 
+#### Scenario: Lazy per-candidate resolution when no routes stay parked
+- **WHEN** a `sing-box` TUN or non-strict `xray` TUN connection starts across 50 hostname-addressed subscription nodes and candidate 1 succeeds
+- **THEN** only candidate 1 (and any `via_node` it uses) SHALL be resolved through the OS resolver, without disclosing the remaining 49 hostnames
+
 #### Scenario: Failover does not resolve through a parked tunnel
-- **WHEN** an xray TUN candidate fails, its routing state stays installed, and the next candidate is addressed by a hostname
-- **THEN** that hostname SHALL already have been resolved before the first candidate started, and no lookup SHALL be made while the failed candidate's routing state is installed
+- **WHEN** a strict `xray` TUN candidate fails, its routing state stays installed, and failover advances within the bounded lookahead (`<= 8` candidates)
+- **THEN** the next candidate's hostname SHALL already have been resolved before the first candidate installed routes, and no live OS lookup SHALL run while strict routing state is installed
+
+#### Scenario: Reconnect under parked strict routes uses last good pins immediately
+- **WHEN** strict `xray` TUN is parked in `Error` with dead fail-closed routes installed and an automatic reconnect starts
+- **THEN** the reconnect SHALL skip live `os_lookup` and `probe_pins` timeouts and immediately use `last_good_pins`
+
+#### Scenario: Stop cancels in-flight hostname lookup or pin probe
+- **WHEN** the user invokes Disconnect while `os_lookup` or `probe_pins` is awaiting network I/O
+- **THEN** the lookup or probe SHALL abort immediately and the session SHALL transition to `Stopped` without waiting for resolver or TCP probe timeouts
 
 #### Scenario: Unreachable pinned addresses are dropped
 - **WHEN** a hostname resolves to three addresses and only one accepts a TCP connection on the node's port
@@ -361,3 +373,14 @@ The route helper's `--force-legacy` flag SHALL require effective user ID 0. Invo
 #### Scenario: Root operator recovery allowed on force-legacy
 - **WHEN** an operator invokes `v2ray-rs-netctl --force-legacy recover --xray` with effective UID 0
 - **THEN** the helper SHALL execute the legacy cleanup pass
+
+### Requirement: Parked TUN state tears down before incompatible connect and drops failed managers
+Before starting a non-TUN connection or a TUN connection whose backend or interface differs from a parked fail-closed TUN session, the system SHALL tear down the parked TUN routing state and journal first. Once a failover candidate reaches `Running`, any parked failed candidate `ProcessManager`s from earlier attempts SHALL be dropped immediately.
+
+#### Scenario: Switching from strict TUN Error to non-TUN Connect clears routes first
+- **WHEN** strict `xray` TUN is in `Error` with fail-closed routes parked, the user disables TUN, and clicks Connect
+- **THEN** the system SHALL tear down the parked `xray` TUN routes and journal before starting the non-TUN connection
+
+#### Scenario: Cleanup fails before an incompatible connect
+- **WHEN** teardown of the parked session fails or cannot verify ownership
+- **THEN** the system SHALL retain the journal, report the failure, and leave the requested backend unstarted

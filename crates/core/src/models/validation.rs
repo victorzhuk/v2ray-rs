@@ -29,6 +29,10 @@ pub enum ValidationError {
     IndexOutOfBounds(usize),
     #[error("invalid listen address: {0}")]
     InvalidListenAddress(String),
+    #[error("proxy port must be between 1 and 65535: {0}")]
+    InvalidProxyPort(u16),
+    #[error("socks_port and http_port must differ (both {0})")]
+    DuplicateProxyPort(u16),
     #[error("invalid test URL: {0} (must be an http:// or https:// URL)")]
     InvalidTestUrl(String),
     #[error("invalid tun interface name: {0}")]

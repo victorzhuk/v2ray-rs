@@ -54,6 +54,17 @@ impl PathOverrides {
             }),
         }
     }
+
+    /// Whether any directory override is active. Custom directories need the
+    /// per-profile lock because the application ID alone does not distinguish
+    /// them on the session bus.
+    pub fn has_directory_overrides(&self) -> bool {
+        self.config_dir.is_some()
+            || self.data_dir.is_some()
+            || self.cache_dir.is_some()
+            || self.runtime_dir.is_some()
+            || self.state_dir.is_some()
+    }
 }
 
 fn parse_bool(value: &str) -> Option<bool> {
@@ -88,6 +99,19 @@ mod tests {
         fn get(&self, key: &str) -> Option<String> {
             self.vars.get(key).cloned()
         }
+    }
+
+    #[test]
+    fn test_has_directory_overrides() {
+        let env = MockEnv::new();
+        let cli = CliPaths::default();
+        assert!(!PathOverrides::resolve(&cli, &env).has_directory_overrides());
+
+        let cli = CliPaths {
+            config_dir: Some(PathBuf::from("/custom")),
+            ..CliPaths::default()
+        };
+        assert!(PathOverrides::resolve(&cli, &env).has_directory_overrides());
     }
 
     #[test]

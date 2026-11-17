@@ -6,14 +6,23 @@ use crate::models::Preset;
 use super::{AppPaths, PersistenceError, create_dir_with_permissions, read_file};
 
 fn slugify(name: &str) -> String {
-    name.to_lowercase()
+    let slug = name
+        .to_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    if !slug.is_empty() {
+        return slug;
+    }
+
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    format!("preset-{:016x}", hasher.finish())
 }
 
 pub fn save_preset(paths: &AppPaths, preset: &Preset) -> Result<(), PersistenceError> {
@@ -60,6 +69,33 @@ pub fn delete_preset(paths: &AppPaths, name: &str) -> Result<bool, PersistenceEr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_slugify_non_ascii_name_uses_hash_fallback() {
+        let slug = slugify("Блокировка рекламы");
+        assert!(!slug.is_empty());
+        assert!(slug.starts_with("preset-"));
+        let suffix = slug.trim_start_matches("preset-");
+        assert_eq!(suffix.len(), 16);
+        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(slug, slugify("Блокировка рекламы"));
+        assert_ne!(slug, slugify("Другой пресет"));
+    }
+
+    #[test]
+    fn test_save_and_load_cyrillic_preset() {
+        let (_tmp, paths) = super::super::test_paths();
+        let mut preset = crate::models::builtin_presets().remove(0);
+        preset.name = "Русский пресет".to_string();
+        preset.description = "Описание".to_string();
+
+        save_preset(&paths, &preset).unwrap();
+        let loaded = load_custom_presets(&paths).unwrap();
+
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, preset.name);
+        assert!(delete_preset(&paths, &preset.name).unwrap());
+    }
 
     #[test]
     fn test_save_and_load_custom_preset() {

@@ -271,6 +271,19 @@ impl AppSettings {
     pub fn validate_real_delay_url(url: &str) -> Result<(), ValidationError> {
         validate_test_url(url)
     }
+
+    /// Rejects proxy ports the backend cannot bind or would bind twice.
+    pub fn validate_proxy_ports(&self) -> Result<(), ValidationError> {
+        for port in [self.socks_port, self.http_port] {
+            if port == 0 {
+                return Err(ValidationError::InvalidProxyPort(port));
+            }
+        }
+        if self.socks_port == self.http_port {
+            return Err(ValidationError::DuplicateProxyPort(self.socks_port));
+        }
+        Ok(())
+    }
 }
 
 fn deserialize_auto_resolve_strategy<'de, D>(

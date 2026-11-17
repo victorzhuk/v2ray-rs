@@ -114,3 +114,10 @@ Scheduled background refreshes and manual "Update Now" actions for sing-box SHAL
 #### Scenario: Manual Update Now refreshes cached rule-sets
 - **WHEN** `geosite-google.srs` already exists in `cache_dir/geodata/rule-sets/` and the user clicks "Update Now" (or the scheduled update interval fires)
 - **THEN** the refresh pass SHALL fetch the latest `geosite-google.srs` atomically and update the last-refresh timestamp
+
+### Requirement: GeodataIndexManager persists index in cache_dir
+`GeodataIndexManager` SHALL read and write `geodata_index.json` under `paths.geodata_index_dir()` (`cache_dir/geodata-index/`) rather than `data_dir`, migrating or ignoring stale `data_dir/geodata_index.json` copies cleanly.
+
+#### Scenario: Index rebuild writes only under cache_dir
+- **WHEN** `GeodataIndexManager` saves a rebuilt geodata autocomplete index
+- **THEN** `geodata_index.json` SHALL be written under `cache_dir/geodata-index/` and no file SHALL be written under `data_dir`

@@ -439,6 +439,47 @@ fn via_node_choices(paths: &AppPaths) -> Vec<(ConnectionNodeRef, String)> {
     choices
 }
 
+fn rule_match_from_input(type_idx: u32, value: &str) -> Result<RuleMatch, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("A match value is required".to_string());
+    }
+
+    let match_condition = match type_idx {
+        0 => RuleMatch::GeoIp {
+            country_code: value.to_uppercase(),
+        },
+        1 => RuleMatch::GeoSite {
+            category: value.to_lowercase(),
+        },
+        2 => RuleMatch::Domain {
+            pattern: value.to_string(),
+        },
+        3 => RuleMatch::IpCidr {
+            cidr: IpNet::from_str(value).map_err(|e| format!("Invalid IP CIDR: {e}"))?,
+        },
+        4 => RuleMatch::DomainKeyword {
+            keyword: value.to_string(),
+        },
+        5 => RuleMatch::DomainFull {
+            domain: value.to_string(),
+        },
+        6 => RuleMatch::Protocol {
+            name: value.to_string(),
+        },
+        7 => RuleMatch::Port {
+            spec: value.to_string(),
+        },
+        8 => RuleMatch::Network {
+            spec: value.to_string(),
+        },
+        _ => return Err("Unknown rule type".to_string()),
+    };
+
+    validate_rule_match(&match_condition).map_err(|e| e.to_string())?;
+    Ok(match_condition)
+}
+
 fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
     let is_edit = existing.is_some();
 
@@ -558,6 +599,39 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
     content.append(&error_label);
 
     dialog.set_extra_child(Some(&content));
+
+    let update_validity = {
+        let dialog = dialog.clone();
+        let type_combo = type_combo.clone();
+        let value_entry = value_entry.clone();
+        let error_label = error_label.clone();
+        move || {
+            let value = value_entry.text().to_string();
+            let result = rule_match_from_input(type_combo.selected(), &value);
+            match result {
+                Ok(_) => {
+                    value_entry.remove_css_class("error");
+                    error_label.set_visible(false);
+                    dialog.set_response_enabled("save", true);
+                }
+                Err(message) => {
+                    value_entry.add_css_class("error");
+                    error_label.set_text(&message);
+                    error_label.set_visible(!value.trim().is_empty());
+                    dialog.set_response_enabled("save", false);
+                }
+            }
+        }
+    };
+    {
+        let update_validity = update_validity.clone();
+        value_entry.connect_changed(move |_| update_validity());
+    }
+    {
+        let update_validity = update_validity.clone();
+        type_combo.connect_selected_notify(move |_| update_validity());
+    }
+    update_validity();
 
     let type_combo_clone = type_combo.clone();
     let value_entry_clone = value_entry.clone();
@@ -719,48 +793,16 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
         if value.trim().is_empty() {
             return;
         }
-        let value = value.trim().to_string();
-
-        let match_condition = match type_combo.selected() {
-            0 => {
-                let normalized = value.to_uppercase();
-                RuleMatch::GeoIp {
-                    country_code: normalized,
-                }
+        let match_condition = match rule_match_from_input(type_combo.selected(), &value) {
+            Ok(match_condition) => match_condition,
+            Err(message) => {
+                value_entry.add_css_class("error");
+                error_label.set_text(&message);
+                error_label.set_visible(true);
+                log::warn!("invalid rule match: {message}");
+                return;
             }
-            1 => {
-                let normalized = value.to_lowercase();
-                RuleMatch::GeoSite {
-                    category: normalized,
-                }
-            }
-            2 => RuleMatch::Domain { pattern: value },
-            3 => match IpNet::from_str(&value) {
-                Ok(cidr) => RuleMatch::IpCidr { cidr },
-                Err(e) => {
-                    value_entry.add_css_class("error");
-                    error_label.set_text(&format!("Invalid IP CIDR: {e}"));
-                    error_label.set_visible(true);
-                    return;
-                }
-            },
-            4 => RuleMatch::DomainKeyword { keyword: value },
-            5 => RuleMatch::DomainFull { domain: value },
-            6 => RuleMatch::Protocol { name: value },
-            7 => RuleMatch::Port { spec: value },
-            8 => RuleMatch::Network { spec: value },
-            _ => return,
         };
-
-        if let Err(e) = validate_rule_match(&match_condition) {
-            value_entry.add_css_class("error");
-            error_label.set_text(&e.to_string());
-            error_label.set_visible(true);
-            log::warn!("invalid rule match: {e}");
-            return;
-        }
-        value_entry.remove_css_class("error");
-        error_label.set_visible(false);
 
         let action = match action_combo.selected() {
             0 => RuleAction::Proxy,
@@ -1002,6 +1044,27 @@ mod routing_row_tests {
             group: None,
             via_node: None,
         }
+    }
+
+    #[test]
+    fn rule_input_validation_rejects_empty_and_bad_values() {
+        assert!(rule_match_from_input(0, "  ").is_err());
+        assert!(rule_match_from_input(3, "192.0.2.0/24").is_ok());
+        assert!(rule_match_from_input(3, "not-a-cidr").is_err());
+        assert!(rule_match_from_input(1, "not a category").is_err());
+        assert!(rule_match_from_input(99, "value").is_err());
+    }
+
+    #[test]
+    fn rule_input_validation_normalizes_case() {
+        assert!(matches!(
+            rule_match_from_input(0, "ru"),
+            Ok(RuleMatch::GeoIp { country_code }) if country_code == "RU"
+        ));
+        assert!(matches!(
+            rule_match_from_input(1, "GOOGLE"),
+            Ok(RuleMatch::GeoSite { category }) if category == "google"
+        ));
     }
 
     #[test]

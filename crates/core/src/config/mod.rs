@@ -37,6 +37,8 @@ pub enum ConfigError {
     InvalidDns(#[from] DnsValidationError),
     #[error("invalid tun config: {0}")]
     InvalidTun(#[from] ValidationError),
+    #[error("invalid settings: {0}")]
+    InvalidSettings(ValidationError),
     #[error("invalid routing rule: {0}")]
     InvalidRule(ValidationError),
     #[error("dns protocol {protocol:?} is not supported by backend {backend} for server '{tag}'")]

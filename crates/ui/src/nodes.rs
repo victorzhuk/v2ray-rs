@@ -36,6 +36,7 @@ pub enum NodesMsg {
     UpdateNode(Uuid, ProxyNode),
     ImportFromUrl(String),
     ResetStorage,
+    Reload,
     SetActiveNode(Option<Uuid>),
 }
 
@@ -396,6 +397,7 @@ impl TlsRows {
     }
 }
 
+#[derive(Clone)]
 enum NodeForm {
     Vless {
         common: CommonRows,
@@ -560,6 +562,54 @@ impl NodeForm {
                     tls,
                 }
             }
+        }
+    }
+
+    fn validation_error(&self) -> Option<&'static str> {
+        let (common, credential) = match self {
+            Self::Vless { common, uuid, .. } => (common, Some(uuid.text().to_string())),
+            Self::Vmess { common, uuid, .. } => (common, Some(uuid.text().to_string())),
+            Self::Shadowsocks {
+                common,
+                method,
+                password,
+            } => {
+                if method.text().trim().is_empty() {
+                    return Some("A cipher method is required");
+                }
+                (common, Some(password.text().to_string()))
+            }
+            Self::Trojan {
+                common, password, ..
+            } => (common, Some(password.text().to_string())),
+        };
+
+        if common.address().is_empty() {
+            return Some("An address is required");
+        }
+        if credential.is_some_and(|text| text.trim().is_empty()) {
+            return Some("Credentials are required");
+        }
+        None
+    }
+
+    fn validation_entries(&self) -> Vec<adw::EntryRow> {
+        match self {
+            Self::Vless { common, uuid, .. } | Self::Vmess { common, uuid, .. } => {
+                vec![common.address.clone(), uuid.clone()]
+            }
+            Self::Shadowsocks {
+                common,
+                method,
+                password,
+            } => vec![
+                common.address.clone(),
+                method.clone(),
+                password.clone().upcast(),
+            ],
+            Self::Trojan {
+                common, password, ..
+            } => vec![common.address.clone(), password.clone().upcast()],
         }
     }
 
@@ -754,11 +804,20 @@ impl Component for NodesPage {
 
         let mut changed = false;
 
-        if self.load_error.is_some() && !matches!(msg, NodesMsg::ResetStorage) {
+        if self.load_error.is_some() && !matches!(msg, NodesMsg::ResetStorage | NodesMsg::Reload) {
             return;
         }
 
         match msg {
+            NodesMsg::Reload => match self.store.load_manual_nodes() {
+                Ok(nodes) => {
+                    self.nodes = nodes;
+                    self.load_error = None;
+                }
+                Err(err) => {
+                    self.load_error = Some(format!("Manual nodes are read-only: {err}"));
+                }
+            },
             NodesMsg::ToggleNode(id) => {
                 if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
                     self.nodes[pos].enabled = !self.nodes[pos].enabled;
@@ -1080,7 +1139,40 @@ fn show_node_form(edit_id: Option<Uuid>, node: ProxyNode, sender: ComponentSende
         .build();
 
     let form = NodeForm::from_node(&node, &content);
+    let error_label = gtk::Label::builder()
+        .css_classes(["error"])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    content.append(&error_label);
     dialog.set_extra_child(Some(&content));
+
+    {
+        let dialog = dialog.clone();
+        let error_label = error_label.clone();
+        let update_validity = {
+            let dialog = dialog.clone();
+            let error_label = error_label.clone();
+            let form = form.clone();
+            move || match form.validation_error() {
+                Some(message) => {
+                    error_label.set_text(message);
+                    error_label.set_visible(true);
+                    dialog.set_response_enabled("save", false);
+                }
+                None => {
+                    error_label.set_visible(false);
+                    dialog.set_response_enabled("save", true);
+                }
+            }
+        };
+        update_validity();
+        for entry in form.validation_entries() {
+            let update_validity = update_validity.clone();
+            entry.connect_changed(move |_| update_validity());
+        }
+    }
 
     dialog.connect_response(None, move |_, response| {
         if response != "save" {

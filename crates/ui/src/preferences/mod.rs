@@ -26,6 +26,7 @@ pub(crate) type RoutingCallback = Rc<dyn Fn(RoutingRuleSet)>;
 pub(crate) type ToastCallback = Rc<dyn Fn(&str)>;
 pub(crate) type SettingsObserver = Rc<dyn Fn(&AppSettings)>;
 pub(crate) type SettingsObservers = Rc<RefCell<Vec<SettingsObserver>>>;
+pub(crate) type RoutingObservers = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
@@ -57,7 +58,18 @@ pub fn show_preferences(
             }
         })
     };
-    let routing_cb: RoutingCallback = Rc::new(on_routing_changed);
+    let routing_observers: RoutingObservers = Rc::new(RefCell::new(Vec::new()));
+    let routing_cb: RoutingCallback = {
+        let on_routing_changed = Rc::new(on_routing_changed);
+        let routing_observers = routing_observers.clone();
+        Rc::new(move |rules: RoutingRuleSet| {
+            on_routing_changed(rules);
+            let observers: Vec<_> = routing_observers.borrow().iter().cloned().collect();
+            for observer in observers {
+                observer();
+            }
+        })
+    };
     let toast_cb: ToastCallback = Rc::new(on_toast);
 
     let system_page = build_system_page(&settings_state, &settings_cb, &settings_observers);
@@ -84,6 +96,7 @@ pub fn show_preferences(
         &settings_cb,
         &settings_observers,
         &routing_state,
+        &routing_observers,
         &subscriptions,
     );
     dialog.add(&dns_page);

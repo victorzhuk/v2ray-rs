@@ -21,11 +21,13 @@ pub enum TrayAction {
 
 pub struct TrayHandle {
     handle: Handle<AppTray>,
+    listener: tokio::task::JoinHandle<()>,
     notifier: Notifier,
 }
 
 impl TrayHandle {
     pub async fn shutdown(&self) {
+        self.listener.abort();
         self.handle.shutdown().await;
     }
 
@@ -252,11 +254,77 @@ impl AppTray {
     }
 }
 
+/// Applies one tray state update and fires the matching notification.
+async fn apply_state_event(
+    handle: &Handle<AppTray>,
+    notifier: &Notifier,
+    from: ProcessState,
+    to: ProcessState,
+    connection: Option<ConnectionMetadata>,
+) {
+    let state = to.clone();
+    let update_connection = connection.clone();
+    handle
+        .update(move |tray| {
+            tray.process_state = state;
+            tray.connection = update_connection;
+        })
+        .await;
+    let n = notifier.clone();
+    tokio::task::spawn_blocking(move || {
+        n.on_state_change(&from, &to);
+    });
+}
+
+fn spawn_listener(
+    mut event_rx: broadcast::Receiver<ProcessEvent>,
+    handle: Handle<AppTray>,
+    notifier: Notifier,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match event_rx.recv().await {
+                Ok(event) => {
+                    let ProcessEvent::StateChanged {
+                        from,
+                        to,
+                        connection,
+                    } = event
+                    else {
+                        continue;
+                    };
+                    apply_state_event(&handle, &notifier, from, to, connection).await;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    // Broadcast keeps the newest messages; draining now applies
+                    // the retained transitions and ends on the current state.
+                    loop {
+                        match event_rx.try_recv() {
+                            Ok(ProcessEvent::StateChanged {
+                                from,
+                                to,
+                                connection,
+                            }) => {
+                                apply_state_event(&handle, &notifier, from, to, connection).await;
+                            }
+                            Ok(_) => continue,
+                            Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::TryRecvError::Empty) => break,
+                            Err(broadcast::error::TryRecvError::Closed) => return,
+                        }
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
+}
+
 pub struct TrayService;
 
 impl TrayService {
     pub async fn spawn(
-        mut event_rx: broadcast::Receiver<ProcessEvent>,
+        event_rx: broadcast::Receiver<ProcessEvent>,
         notifier: Notifier,
         on_action: impl Fn(TrayAction) + Send + Sync + 'static,
     ) -> Result<TrayHandle, ksni::Error> {
@@ -277,43 +345,17 @@ impl TrayService {
         };
 
         let handle = tray.spawn().await?;
-        let update_handle = handle.clone();
-        let shared_notifier = notifier.clone();
+        let listener = spawn_listener(event_rx, handle.clone(), notifier.clone());
 
-        tokio::spawn(async move {
-            loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        if let ProcessEvent::StateChanged {
-                            from,
-                            to,
-                            connection,
-                        } = event
-                        {
-                            let state = to.clone();
-                            update_handle
-                                .update(move |tray| {
-                                    tray.process_state = state;
-                                    tray.connection = connection;
-                                })
-                                .await;
-                            let n = shared_notifier.clone();
-                            tokio::task::spawn_blocking(move || {
-                                n.on_state_change(&from, &to);
-                            });
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-
-        Ok(TrayHandle { handle, notifier })
+        Ok(TrayHandle {
+            handle,
+            listener,
+            notifier,
+        })
     }
 
     pub async fn spawn_with_data_dir(
-        mut event_rx: broadcast::Receiver<ProcessEvent>,
+        event_rx: broadcast::Receiver<ProcessEvent>,
         notifier: Notifier,
         on_action: impl Fn(TrayAction) + Send + Sync + 'static,
         data_dir: &Path,
@@ -326,7 +368,8 @@ impl TrayService {
             .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        icons::install_icons(data_dir);
+        let install_dir = data_dir.to_path_buf();
+        let _ = tokio::task::spawn_blocking(move || icons::install_icons(&install_dir)).await;
 
         let tray = AppTray {
             process_state: ProcessState::Stopped,
@@ -337,39 +380,13 @@ impl TrayService {
         };
 
         let handle = tray.spawn().await?;
-        let update_handle = handle.clone();
-        let shared_notifier = notifier.clone();
+        let listener = spawn_listener(event_rx, handle.clone(), notifier.clone());
 
-        tokio::spawn(async move {
-            loop {
-                match event_rx.recv().await {
-                    Ok(event) => {
-                        if let ProcessEvent::StateChanged {
-                            from,
-                            to,
-                            connection,
-                        } = event
-                        {
-                            let state = to.clone();
-                            update_handle
-                                .update(move |tray| {
-                                    tray.process_state = state;
-                                    tray.connection = connection;
-                                })
-                                .await;
-                            let n = shared_notifier.clone();
-                            tokio::task::spawn_blocking(move || {
-                                n.on_state_change(&from, &to);
-                            });
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-
-        Ok(TrayHandle { handle, notifier })
+        Ok(TrayHandle {
+            handle,
+            listener,
+            notifier,
+        })
     }
 }
 

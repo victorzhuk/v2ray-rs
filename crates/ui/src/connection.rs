@@ -259,22 +259,34 @@ fn spawn_with(
             sender.emit(AppMsg::ProcessLogLines(generation, vec![warning]));
         }
 
-        // Every hostname is looked up here, before any candidate's tunnel
-        // exists: once its rules are up, a lookup would be captured by the
-        // tunnel it is preparing.
-        let resolved = resolve_pins(
-            pin_hosts(
-                &candidates,
+        // Strict xray TUN installs kill-switch routes before the first start,
+        // so only its first few planned candidates can be looked up live. The
+        // rest fall back to last-good pins or IP literals.
+        let strict_lookahead = settings.tun.enabled
+            && settings.tun.strict_route
+            && !drop_strict_route
+            && settings.backend.backend_type == BackendType::Xray;
+        let mut resolved: HashMap<String, Vec<IpAddr>> = HashMap::new();
+        if strict_lookahead {
+            let planned = candidates.len().min(TUN_PIN_LOOKAHEAD);
+            let hosts = pin_hosts(
+                &candidates[..planned],
                 &subscriptions,
                 &manual_nodes,
                 &enabled_rules,
                 &settings,
-            ),
-            &last_good_pins,
-            PIN_LOOKUP_TIMEOUT,
-            os_lookup,
-        )
-        .await;
+            );
+            let lookups = resolve_pins(hosts, &last_good_pins, PIN_LOOKUP_TIMEOUT, os_lookup);
+            tokio::pin!(lookups);
+            resolved = tokio::select! {
+                biased;
+                Some(ConnectionCmd::Stop(_)) = cmd_rx.recv() => {
+                    report(ProcessState::Stopped, None);
+                    return;
+                }
+                resolved = &mut lookups => resolved,
+            };
+        }
 
         // Once per connection, like the strict-route notice, so a failover
         // cannot repeat it.
@@ -325,16 +337,65 @@ fn spawn_with(
             ));
             let mut applied = Vec::new();
             if pins_enabled(&effective_settings) {
+                let hosts = pin_hosts_for(&nodes, &effective_settings);
+                let missing: Vec<(String, u16)> = hosts
+                    .iter()
+                    .filter(|(host, _)| !resolved.contains_key(host))
+                    .cloned()
+                    .collect();
+
+                if !missing.is_empty() {
+                    // Strict xray routes and parked kill switches both make a
+                    // live lookup a self-capture; use the last good addresses.
+                    if strict_lookahead || !probe_allowed(parked.as_ref()) {
+                        resolved.extend(last_good_resolution(&missing, &last_good_pins));
+                    } else {
+                        let lookups =
+                            resolve_pins(missing, &last_good_pins, PIN_LOOKUP_TIMEOUT, os_lookup);
+                        tokio::pin!(lookups);
+                        let found = tokio::select! {
+                            biased;
+                            Some(ConnectionCmd::Stop(reason)) = cmd_rx.recv() => {
+                                if let Some(mut failed) = parked.take() {
+                                    failed.shutdown_with(reason).await;
+                                }
+                                report(ProcessState::Stopped, None);
+                                return;
+                            }
+                            found = &mut lookups => found,
+                        };
+                        resolved.extend(found);
+                    }
+                }
+
+                let pins: HashMap<String, Vec<IpAddr>> = hosts
+                    .iter()
+                    .filter_map(|(host, _)| {
+                        resolved
+                            .get(host)
+                            .map(|addrs| (host.clone(), addrs.clone()))
+                    })
+                    .collect();
                 // A parked candidate's tunnel is still up, so a probe would
                 // measure its kill switch rather than the node.
-                let probed;
-                let pins = if probe_allowed(parked.as_ref()) {
-                    probed = probe_pins(&nodes, &resolved).await;
-                    &probed
+                let pins = if probe_allowed(parked.as_ref()) && !pins.is_empty() {
+                    let probes = probe_pins(&nodes, &pins);
+                    tokio::pin!(probes);
+                    tokio::select! {
+                        biased;
+                        Some(ConnectionCmd::Stop(reason)) = cmd_rx.recv() => {
+                            if let Some(mut failed) = parked.take() {
+                                failed.shutdown_with(reason).await;
+                            }
+                            report(ProcessState::Stopped, None);
+                            return;
+                        }
+                        pins = &mut probes => pins,
+                    }
                 } else {
-                    &resolved
+                    pins
                 };
-                applied = apply_pins(&mut effective_settings, &nodes, pins);
+                applied = apply_pins(&mut effective_settings, &nodes, &pins);
             }
             if drop_strict_route {
                 effective_settings.tun.strict_route = false;
@@ -342,6 +403,15 @@ fn spawn_with(
             let unpinned = unpinned_host(&effective_settings, &nodes);
             let pinned = unpinned.is_none();
             let mut tun = build_tun_runtime(&effective_settings, pinned);
+            // A parked tunnel belongs to the previous candidate's TUN session.
+            // When the next candidate runs without TUN, that session would
+            // keep capturing traffic for a node the user has left.
+            if tun.is_none()
+                && parked.as_ref().is_some_and(ProcessManager::has_tun_runtime)
+                && let Some(mut stale) = parked.take()
+            {
+                stale.shutdown_with(StopReason::NodeSwitch).await;
+            }
             // Written before any config write or kernel touch: startup and
             // terminal-error recovery are gated on this marker, so a session
             // must not start if the recovery pass cannot be recorded.
@@ -497,6 +567,12 @@ fn spawn_with(
 
             match started {
                 Ok(()) => {
+                    // The new candidate owns the kernel state now; the parked
+                    // manager's tunnel (if any) is stale and must not outlive
+                    // its replacement.
+                    if let Some(mut stale) = parked.take() {
+                        stale.shutdown_with(StopReason::NodeSwitch).await;
+                    }
                     // A Disconnect clicked while the start was in flight sits
                     // queued until here; honor it instead of flashing the UI
                     // back to Connected with a dead handle.
@@ -851,6 +927,29 @@ fn pins_enabled(settings: &AppSettings) -> bool {
     settings.tun.enabled && settings.backend.backend_type != BackendType::V2ray
 }
 
+/// Hostname pins resolved before the first candidate starts. Strict xray TUN
+/// installs fail-closed routes before its first start, so every lookup after
+/// that is captured by the tunnel; only the first
+/// [`TUN_PIN_LOOKAHEAD`] planned candidates are resolved up front.
+const TUN_PIN_LOOKAHEAD: usize = 8;
+
+/// Hostnames to pin for one candidate's node set, under its effective
+/// settings. The first port seen for a hostname wins.
+fn pin_hosts_for(nodes: &[ProxyNode], settings: &AppSettings) -> Vec<(String, u16)> {
+    let mut hosts: Vec<(String, u16)> = Vec::new();
+    for node in nodes {
+        let host = node.address();
+        if host.parse::<std::net::IpAddr>().is_ok()
+            || settings.dns.hosts.iter().any(|h| h.domain == host)
+            || hosts.iter().any(|(known, _)| known == host)
+        {
+            continue;
+        }
+        hosts.push((host.to_string(), node.port()));
+    }
+    hosts
+}
+
 /// Hostnames to pin before any candidate starts: each candidate node and its
 /// via nodes, under that candidate's effective settings. The first port seen
 /// for a hostname wins.
@@ -869,18 +968,35 @@ fn pin_hosts(
             continue;
         }
         let via = resolve_via_nodes(&mut rules, subscriptions, manual_nodes);
-        for node in std::iter::once(&candidate.node).chain(&via) {
-            let host = node.address();
-            if host.parse::<std::net::IpAddr>().is_ok()
-                || effective.dns.hosts.iter().any(|h| h.domain == host)
-                || hosts.iter().any(|(known, _)| known == host)
-            {
-                continue;
+        let nodes: Vec<ProxyNode> = std::iter::once(candidate.node.clone()).chain(via).collect();
+        for (host, port) in pin_hosts_for(&nodes, &effective) {
+            if !hosts.iter().any(|(known, _)| known == &host) {
+                hosts.push((host, port));
             }
-            hosts.push((host.to_string(), node.port()));
         }
     }
     hosts
+}
+
+/// Addresses from the last successful connection, keyed by hostname, for hosts
+/// whose live lookup must not run under installed kill-switch routes.
+fn last_good_resolution(
+    hosts: &[(String, u16)],
+    last_good: &[HostOverride],
+) -> HashMap<String, Vec<IpAddr>> {
+    let mut resolved = HashMap::new();
+    for (host, _) in hosts {
+        let addrs = unique(
+            last_good
+                .iter()
+                .filter(|h| &h.domain == host)
+                .filter_map(|h| h.ip.parse::<IpAddr>().ok()),
+        );
+        if !addrs.is_empty() {
+            resolved.insert(host.clone(), addrs);
+        }
+    }
+    resolved
 }
 
 /// Pins each hostname-addressed node to its resolved addresses in `dns.hosts`.
@@ -3139,6 +3255,39 @@ exit 1"#,
         assert!(
             at("cannot pin failover-b.invalid") < first_start,
             "{lines:#?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_strict_tun_resolves_each_candidate_lazily() {
+        let capture = crate::logging::install_test_capture();
+        let stub = stub(r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; exit 1"#);
+        let mut settings = xray_tun_settings();
+        settings.tun.interface_name = "v2rstest5".into();
+        settings.tun.strict_route = false;
+        let req = request(
+            &stub,
+            settings,
+            // The first candidate fails config generation, so no tunnel is
+            // parked; the second's lookup must happen at its own turn.
+            vec![candidate("[::1]"), candidate("lazy-b.invalid")],
+        );
+        let (tx, rx) = relm4::channel::<AppMsg>();
+        let _handle = spawn_with(req, tx, capless_probe, no_subnets);
+
+        let (terminal, _) = drain(&rx).await;
+        assert_error_terminal(terminal);
+
+        let lines = capture.all_lines();
+        let at = |needle: &str| {
+            lines
+                .iter()
+                .position(|line| line.contains(needle))
+                .unwrap_or_else(|| panic!("no {needle:?} line: {lines:#?}"))
+        };
+        assert!(
+            at("candidate start 2/2 label=lazy-b.invalid") < at("cannot pin lazy-b.invalid"),
+            "candidate 2 must be resolved at its own turn: {lines:#?}"
         );
     }
 

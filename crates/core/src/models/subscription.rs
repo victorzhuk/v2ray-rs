@@ -79,6 +79,8 @@ impl Subscription {
     #[must_use]
     pub fn runtime_state_eq(&self, other: &Self) -> bool {
         self.enabled == other.enabled
+            && self.imported_profile == other.imported_profile
+            && self.use_imported_profile == other.use_imported_profile
             && self.nodes.len() == other.nodes.len()
             && self
                 .nodes
@@ -189,13 +191,12 @@ mod tests {
     }
 
     #[test]
-    fn explicit_use_imported_profile_survives_round_trip() {
-        for expected in [true, false] {
-            let mut sub = Subscription::new_from_url("Test", "https://example.com/sub");
-            sub.use_imported_profile = expected;
-            let json = serde_json::to_string(&sub).unwrap();
-            let restored: Subscription = serde_json::from_str(&json).unwrap();
-            assert_eq!(restored.use_imported_profile, expected);
-        }
+    fn runtime_state_eq_tracks_imported_profile_toggle() {
+        let base = Subscription::new_from_url("Test", "https://example.com/sub");
+        let mut toggled = base.clone();
+        toggled.use_imported_profile = true;
+
+        assert!(!base.runtime_state_eq(&toggled));
+        assert!(base.runtime_state_eq(&base.clone()));
     }
 }

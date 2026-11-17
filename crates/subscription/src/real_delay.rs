@@ -11,15 +11,14 @@
 use std::collections::HashMap;
 use std::net::TcpListener;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use tokio::sync::Mutex;
 
 use crate::fetch::redirect_policy;
-use crate::observatory::{
-    ObservatoryError, ObservatoryStatus, query_v2ray_observatory, query_xray_observatory,
-};
+use crate::observatory::{ObservatoryClient, ObservatoryError, ObservatoryStatus};
 use chrono::Utc;
 use serde_json::Value;
 use std::time::Instant;
@@ -54,6 +53,8 @@ const BROWSER_USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/53
 const REDIRECT_CAP: usize = 5;
 /// Body cap for an availability check reply.
 const AVAILABILITY_BODY_CAP: usize = 2 * 1024 * 1024;
+/// Body cap for a Clash API delay reply.
+const CLASH_API_BODY_CAP: usize = 64 * 1024;
 /// Body cap for the IP-echo reply.
 const EGRESS_BODY_CAP: usize = 64 * 1024;
 
@@ -130,7 +131,64 @@ pub async fn check_node_availability(
     run_probe_session(backend, binary, nodes, cfg, paths, services).await
 }
 
+/// Largest number of nodes one ephemeral probe backend is asked to hold.
+/// Larger subscriptions are split into sequential batches so the generated
+/// config, the backend's outbound table, and its file-descriptor use stay
+/// bounded.
+pub const MAX_PROBE_BATCH_SIZE: usize = 64;
+
+/// Number of sequential backend batches a probe of `node_count` nodes needs.
+/// Callers use it to scale their outer timeout to the number of batches.
+#[must_use]
+pub fn probe_batch_count(node_count: usize) -> usize {
+    node_count.div_ceil(MAX_PROBE_BATCH_SIZE)
+}
+
 async fn run_probe_session(
+    backend: BackendType,
+    binary: &Path,
+    nodes: &[&SubscriptionNode],
+    cfg: &RealDelaySettings,
+    paths: &AppPaths,
+    services: &[ServiceCheck],
+) -> RealDelayReport {
+    if nodes.is_empty() {
+        return RealDelayReport {
+            results: Vec::new(),
+            egress: Vec::new(),
+            verdicts: Vec::new(),
+            diagnostic: None,
+        };
+    }
+
+    // Serialize the whole session so only one ephemeral backend runs at a time,
+    // including the stop that releases its routes and ports.
+    let _guard = REAL_DELAY_LOCK.lock().await;
+
+    let mut results = Vec::with_capacity(nodes.len());
+    let mut egress = Vec::with_capacity(nodes.len());
+    let mut verdicts = Vec::with_capacity(nodes.len());
+    let mut diagnostic = None;
+
+    for batch in nodes.chunks(MAX_PROBE_BATCH_SIZE) {
+        let report = run_probe_batch(backend, binary, batch, cfg, paths, services).await;
+        results.extend(report.results);
+        egress.extend(report.egress);
+        verdicts.extend(report.verdicts);
+        if diagnostic.is_none() {
+            diagnostic = report.diagnostic;
+        }
+    }
+
+    RealDelayReport {
+        results,
+        egress,
+        verdicts,
+        diagnostic,
+    }
+}
+
+async fn run_probe_batch(
     backend: BackendType,
     binary: &Path,
     nodes: &[&SubscriptionNode],
@@ -151,9 +209,6 @@ async fn run_probe_session(
     let Some(generator) = probe_generator_for(backend) else {
         return RealDelayReport::failed(len, format!("Real Delay is not supported by {backend}"));
     };
-
-    // Serialize the whole session so only one ephemeral backend runs at a time.
-    let _guard = REAL_DELAY_LOCK.lock().await;
 
     if let Err(e) = paths.ensure_dirs() {
         return RealDelayReport::failed(len, format!("failed to prepare runtime dir: {e}"));
@@ -251,26 +306,55 @@ async fn run_probe_session(
             finalize_report(results, extras, None)
         }
         BackendType::Xray => {
-            let obs_result = observatory_delays_with_query(len, cfg.timeout_ms, || {
-                query_xray_observatory(api_port)
-            })
-            .await;
+            let obs_result =
+                observatory_delays(BackendType::Xray, api_port, len, cfg.timeout_ms).await;
             let extras = node_pass(&config, &obs_result.results).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
         }
         BackendType::V2ray => {
-            let obs_result = observatory_delays_with_query(len, cfg.timeout_ms, || {
-                query_v2ray_observatory(api_port)
-            })
-            .await;
+            let obs_result =
+                observatory_delays(BackendType::V2ray, api_port, len, cfg.timeout_ms).await;
             let extras = node_pass(&config, &obs_result.results).await;
             let _ = runner.stop().await;
             drop(temp);
             finalize_report(obs_result.results, extras, obs_result.diagnostic)
         }
     }
+}
+
+/// Polls the backend observatory over one reused gRPC channel.
+async fn observatory_delays(
+    backend: BackendType,
+    api_port: u16,
+    count: usize,
+    timeout_ms: u32,
+) -> ObservatoryDelaysResult {
+    let client: Arc<tokio::sync::Mutex<Option<ObservatoryClient>>> = Arc::new(Mutex::new(None));
+    let query = move || {
+        let client = Arc::clone(&client);
+        async move {
+            let mut guard = client.lock().await;
+            if guard.is_none() {
+                let connected = match backend {
+                    BackendType::Xray => ObservatoryClient::connect_xray(api_port).await,
+                    _ => ObservatoryClient::connect_v2ray(api_port).await,
+                };
+                *guard = Some(connected?);
+            }
+            let result = guard
+                .as_mut()
+                .expect("client was just connected")
+                .query()
+                .await;
+            if result.is_err() {
+                *guard = None;
+            }
+            result
+        }
+    };
+    observatory_delays_with_query(count, timeout_ms, query).await
 }
 
 /// Assembles the session report from the delay results and the per-node
@@ -422,7 +506,7 @@ async fn singbox_delays(
     };
     let encoded_url = utf8_percent_encode(test_url, NON_ALPHANUMERIC).to_string();
     // Allow the backend's own per-probe timeout to elapse before we give up.
-    let request_timeout = Duration::from_millis(u64::from(timeout_ms) + 3000);
+    let request_timeout = Duration::from_millis(u64::from(timeout_ms).saturating_add(3000));
 
     let futures = (0..count).map(|i| {
         let client = client.clone();
@@ -454,11 +538,11 @@ async fn query_singbox_delay(
     url: &str,
     timeout: Duration,
 ) -> Option<u64> {
-    let response = client.get(url).timeout(timeout).send().await.ok()?;
+    let mut response = client.get(url).timeout(timeout).send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
-    let text = response.text().await.ok()?;
+    let text = fetch_capped(&mut response, CLASH_API_BODY_CAP).await.ok()?;
     let body: serde_json::Value = serde_json::from_str(&text).ok()?;
     body.get("delay").and_then(serde_json::Value::as_u64)
 }
@@ -489,10 +573,12 @@ where
     Fut: std::future::Future<Output = Result<Vec<ObservatoryStatus>, ObservatoryError>> + Send,
 {
     // Minimum 2-second polling window
-    let deadline = Instant::now() + Duration::from_millis(u64::from(timeout_ms + 1500).max(2000));
+    let deadline = Instant::now()
+        + Duration::from_millis(u64::from(timeout_ms).saturating_add(1500).max(2000));
     let poll_interval = Duration::from_millis(300);
 
     let mut results: Vec<Option<u64>> = vec![None; count];
+    let mut settled = vec![false; count];
     let mut had_grpc_error = false;
 
     loop {
@@ -505,10 +591,13 @@ where
                         && idx < count
                     {
                         results[idx] = status.delay_ms;
+                        settled[idx] = true;
                     }
                 }
-                // Check if all results collected
-                if results.iter().all(|r| r.is_some()) {
+                // A dead node reports "not alive" without a delay, so any
+                // reported status settles it; waiting for delays alone would
+                // poll a dead batch until the deadline.
+                if settled.iter().all(|seen| *seen) {
                     break;
                 }
             }
@@ -943,6 +1032,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn probe_batch_count_rounds_up() {
+        assert_eq!(probe_batch_count(0), 0);
+        assert_eq!(probe_batch_count(1), 1);
+        assert_eq!(probe_batch_count(MAX_PROBE_BATCH_SIZE), 1);
+        assert_eq!(probe_batch_count(MAX_PROBE_BATCH_SIZE + 1), 2);
+        assert_eq!(probe_batch_count(500), 8);
+    }
+
+    #[tokio::test]
     async fn measure_real_delay_empty_nodes() {
         let dir = tempfile::tempdir().unwrap();
         let paths = AppPaths::for_profile_in(v2ray_rs_core::profile::AppProfile::Test, dir.path());
@@ -1318,6 +1416,40 @@ mod tests {
         assert_eq!(result.results, vec![Some(100), Some(200)]);
         assert!(result.diagnostic.is_none());
         assert_eq!(call_count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn observatory_delays_exit_early_when_all_nodes_report_dead() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let query_fn = move || {
+            let cc = cc.clone();
+            async move {
+                cc.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![
+                    ObservatoryStatus {
+                        outbound_tag: "probe-0".to_string(),
+                        delay_ms: None,
+                        alive: false,
+                        last_error: Some("refused".into()),
+                    },
+                    ObservatoryStatus {
+                        outbound_tag: "probe-1".to_string(),
+                        delay_ms: None,
+                        alive: false,
+                        last_error: Some("timeout".into()),
+                    },
+                ])
+            }
+        };
+
+        let start = std::time::Instant::now();
+        let result = observatory_delays_with_query(2, 5000, query_fn).await;
+
+        assert_eq!(result.results, vec![None, None]);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 
     #[tokio::test]

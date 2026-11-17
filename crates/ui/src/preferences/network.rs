@@ -8,7 +8,9 @@ use std::rc::Rc;
 
 use v2ray_rs_core::backend::{DetectedBackend, detect_all, validate_custom_path};
 use v2ray_rs_core::geodata_index::GeodataIndexManager;
-use v2ray_rs_core::models::{AppSettings, AutoResolveStrategy, BackendConfig, BackendType};
+use v2ray_rs_core::models::{
+    AppSettings, AutoResolveStrategy, BackendConfig, BackendType, ValidationError,
+};
 use v2ray_rs_core::persistence::AppPaths;
 
 use super::{
@@ -124,6 +126,14 @@ pub(super) fn build_network_page(
         .build();
     ports_group.add(&http_row);
 
+    let ports_error = gtk::Label::builder()
+        .css_classes(["error"])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    ports_group.add(&ports_error);
+
     let idle_timeout_row = adw::SpinRow::builder()
         .title("Idle connection timeout (seconds)")
         .subtitle(
@@ -160,6 +170,7 @@ pub(super) fn build_network_page(
     let listen_address_row = adw::EntryRow::builder()
         .title("Listen address")
         .text(s.listen_address.as_str())
+        .show_apply_button(true)
         .build();
     let listen_address_status = adw::ActionRow::builder()
         .title("Listen address status")
@@ -527,16 +538,36 @@ pub(super) fn build_network_page(
     {
         let st = state.clone();
         let cb = cb.clone();
+        let http_row = http_row.clone();
+        let ports_error = ports_error.clone();
         socks_row.connect_changed(move |row| {
-            st.borrow_mut().socks_port = row.value() as u16;
+            let socks = row.value() as u16;
+            let http = http_row.value() as u16;
+            if let Some(message) = proxy_ports_error(socks, http) {
+                ports_error.set_text(&message);
+                ports_error.set_visible(true);
+                return;
+            }
+            ports_error.set_visible(false);
+            st.borrow_mut().socks_port = socks;
             emit(&st, &cb);
         });
     }
     {
         let st = state.clone();
         let cb = cb.clone();
+        let socks_row = socks_row.clone();
+        let ports_error = ports_error.clone();
         http_row.connect_changed(move |row| {
-            st.borrow_mut().http_port = row.value() as u16;
+            let socks = socks_row.value() as u16;
+            let http = row.value() as u16;
+            if let Some(message) = proxy_ports_error(socks, http) {
+                ports_error.set_text(&message);
+                ports_error.set_visible(true);
+                return;
+            }
+            ports_error.set_visible(false);
+            st.borrow_mut().http_port = http;
             emit(&st, &cb);
         });
     }
@@ -685,6 +716,7 @@ pub(super) fn build_network_page(
                 return;
             };
             real_delay_url_row.set_text(url);
+            real_delay_url_row.remove_css_class("error");
             st.borrow_mut().real_delay.test_url = url.to_string();
             emit(&st, &cb);
         });
@@ -699,6 +731,8 @@ pub(super) fn build_network_page(
         let invalidate = invalidate_validation.clone();
         let tracked_backend = tracked_backend.clone();
         let custom_type_suppress = custom_type_suppress.clone();
+        let real_delay_url_row = real_delay_url_row.clone();
+        let real_delay_preset_row = real_delay_preset_row.clone();
         subscribe_settings(settings_observers, move |settings| {
             let selection = backend_selection(settings);
             if *tracked_backend.borrow() != selection {
@@ -709,6 +743,14 @@ pub(super) fn build_network_page(
             custom_type_row.set_selected(settings.backend.backend_type.to_index());
             custom_type_suppress.set(false);
             ws_heartbeat_row.set_sensitive(settings.backend.backend_type == BackendType::Xray);
+            real_delay_url_row.remove_css_class("error");
+            if let Some(index) = (0..3).find(|index| {
+                real_delay_preset_url(*index) == Some(settings.real_delay.test_url.as_str())
+            }) {
+                if real_delay_preset_row.selected() != index {
+                    real_delay_preset_row.set_selected(index);
+                }
+            }
 
             let detected = detected_state.borrow();
             set_current_backend_status(&custom_status_row, settings, &detected);
@@ -775,6 +817,19 @@ fn geodata_status_text(index_manager: &GeodataIndexManager, backend_type: Backen
     }
 }
 
+fn proxy_ports_error(socks: u16, http: u16) -> Option<String> {
+    if socks == 0 {
+        return Some(ValidationError::InvalidProxyPort(socks).to_string());
+    }
+    if http == 0 {
+        return Some(ValidationError::InvalidProxyPort(http).to_string());
+    }
+    if socks == http {
+        return Some(ValidationError::DuplicateProxyPort(socks).to_string());
+    }
+    None
+}
+
 fn real_delay_preset_url(index: u32) -> Option<&'static str> {
     match index {
         0 => Some("https://www.gstatic.com/generate_204"),
@@ -787,6 +842,17 @@ fn real_delay_preset_url(index: u32) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_ports_reject_zero_and_equal_ports() {
+        assert!(proxy_ports_error(0, 8080).is_some());
+        assert!(proxy_ports_error(1080, 0).is_some());
+        assert_eq!(
+            proxy_ports_error(1080, 1080),
+            Some("socks_port and http_port must differ (both 1080)".to_string())
+        );
+        assert_eq!(proxy_ports_error(1080, 8080), None);
+    }
 
     /// The guard at the validation completion site is a generation compare;
     /// once the path is edited mid-flight, the in-flight request id must no

@@ -67,6 +67,7 @@ pub struct GeodataDownload {
 #[derive(Debug)]
 pub struct GeodataManager {
     geodata_dir: PathBuf,
+    index_dir: PathBuf,
     metadata_path: PathBuf,
 }
 
@@ -76,6 +77,7 @@ impl GeodataManager {
         let metadata_path = geodata_dir.join("metadata.json");
         Self {
             geodata_dir,
+            index_dir: paths.geodata_index_dir(),
             metadata_path,
         }
     }
@@ -92,6 +94,10 @@ impl GeodataManager {
 
     pub fn rule_sets_dir(&self) -> PathBuf {
         self.geodata_dir.join("rule-sets")
+    }
+
+    pub fn index_dir(&self) -> &Path {
+        &self.index_dir
     }
 
     pub fn rule_set_path(&self, full_tag: &str) -> Result<PathBuf, GeodataError> {
@@ -162,7 +168,7 @@ impl GeodataManager {
     }
 
     pub fn reindex(&self, backend: BackendType) -> Result<(), GeodataError> {
-        let index_manager = GeodataIndexManager::new_from_geodata_dir(&self.geodata_dir);
+        let index_manager = GeodataIndexManager::new_from_index_dir(&self.index_dir);
 
         match backend {
             BackendType::V2ray | BackendType::Xray => {
@@ -641,7 +647,7 @@ mod tests {
 
         manager.reindex(BackendType::SingBox).unwrap();
 
-        let index_manager = GeodataIndexManager::new_from_geodata_dir(manager.geodata_dir());
+        let index_manager = GeodataIndexManager::new_from_index_dir(manager.index_dir());
         let index = index_manager.load_index(BackendType::SingBox).unwrap();
         assert!(index.is_some());
         let index = index.unwrap();

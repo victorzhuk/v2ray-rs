@@ -42,6 +42,8 @@ pub struct SubscriptionsPage {
     egress_samples: HashMap<(Uuid, Uuid), EgressSample>,
     verdicts: HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
     expanded_subs: HashSet<Uuid>,
+    sub_expanders: HashMap<Uuid, adw::ExpanderRow>,
+    node_widgets: HashMap<(Uuid, Uuid), NodeWidgets>,
     active_node: Option<(Uuid, Uuid)>,
     tun_active: bool,
     backend_type: BackendType,
@@ -53,9 +55,20 @@ pub struct SubscriptionsPage {
 
 enum RenderHint {
     Full,
+    NodeState,
     NodeToggle(Uuid, usize),
     SubscriptionToggle(Uuid),
     SubscriptionRename(Uuid),
+}
+
+/// Widgets owned by one rendered subscription node, indexed by its stable
+/// `NodeId` so updates never walk private `AdwExpanderRow` children.
+struct NodeWidgets {
+    row: adw::ActionRow,
+    toggle: gtk::Switch,
+    address: String,
+    latency: gtk::Label,
+    real_delay: gtk::Label,
 }
 
 struct RenderState<'a> {
@@ -435,7 +448,7 @@ impl Component for SubscriptionsPage {
             .selection_mode(gtk::SelectionMode::None)
             .build();
 
-        let model = SubscriptionsPage {
+        let mut model = SubscriptionsPage {
             store: store.clone(),
             service,
             subscriptions,
@@ -455,6 +468,8 @@ impl Component for SubscriptionsPage {
             egress_samples,
             verdicts,
             expanded_subs: HashSet::new(),
+            sub_expanders: HashMap::new(),
+            node_widgets: HashMap::new(),
             active_node: None,
             tun_active: false,
             backend_type: settings.backend.backend_type,
@@ -471,6 +486,8 @@ impl Component for SubscriptionsPage {
             &model.subscriptions,
             &list_container,
             &sender,
+            &mut model.sub_expanders,
+            &mut model.node_widgets,
             RenderState {
                 expanded_subs: &model.expanded_subs,
                 testing_latency: &model.testing_latency,
@@ -716,6 +733,12 @@ impl Component for SubscriptionsPage {
                 }
             }
             SubscriptionsMsg::TestRealDelay(id) => {
+                if self.tun_active {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "Real Delay is unavailable while TUN is active".to_string(),
+                    ));
+                    return;
+                }
                 if self.testing_real_delay.contains_key(&id) {
                     return;
                 }
@@ -746,9 +769,11 @@ impl Component for SubscriptionsPage {
                 self.testing_real_delay.insert(id, run_token);
                 let targets = probe_targets(&node_refs);
                 sender.oneshot_command(async move {
-                    let timeout = std::time::Duration::from_millis(
-                        u64::from(real_delay_settings.timeout_ms) + 15_000,
-                    );
+                    let per_batch = u64::from(real_delay_settings.timeout_ms) + 15_000;
+                    let batches =
+                        v2ray_rs_subscription::probe_batch_count(node_count).max(1) as u64;
+                    let timeout =
+                        std::time::Duration::from_millis(per_batch.saturating_mul(batches));
                     let report = match tokio::time::timeout(timeout, async {
                         let node_ref_ptrs: Vec<&v2ray_rs_core::models::SubscriptionNode> =
                             node_refs.iter().collect();
@@ -775,6 +800,12 @@ impl Component for SubscriptionsPage {
                 });
             }
             SubscriptionsMsg::CheckAvailability(id) => {
+                if self.tun_active {
+                    let _ = sender.output(SubscriptionsOutput::Notice(
+                        "Availability checks are unavailable while TUN is active".to_string(),
+                    ));
+                    return;
+                }
                 if self.testing_availability.contains_key(&id) {
                     return;
                 }
@@ -809,11 +840,13 @@ impl Component for SubscriptionsPage {
                 sender.oneshot_command(async move {
                     // Same per-node pass as Real Delay, plus one request per
                     // service per node through its tunnel.
-                    let timeout = std::time::Duration::from_millis(
-                        u64::from(real_delay_settings.timeout_ms)
-                            + 15_000
-                            + 30_000 * service_count as u64,
-                    );
+                    let per_batch = u64::from(real_delay_settings.timeout_ms)
+                        .saturating_add(15_000)
+                        .saturating_add(30_000 * service_count as u64);
+                    let batches =
+                        v2ray_rs_subscription::probe_batch_count(node_count).max(1) as u64;
+                    let timeout =
+                        std::time::Duration::from_millis(per_batch.saturating_mul(batches));
                     let report = match tokio::time::timeout(timeout, async {
                         let node_ref_ptrs: Vec<&v2ray_rs_core::models::SubscriptionNode> =
                             node_refs.iter().collect();
@@ -976,6 +1009,7 @@ impl Component for SubscriptionsPage {
             } => {
                 let backend_changed = self.backend_type != backend_type;
                 let binary_changed = self.binary_path != binary_path;
+                let real_delay_changed = self.real_delay_settings != real_delay_settings;
                 let changed = self.auto_update_enabled != auto_update_enabled
                     || self.auto_update_interval_secs != auto_update_interval_secs;
                 self.auto_update_enabled = auto_update_enabled;
@@ -983,9 +1017,11 @@ impl Component for SubscriptionsPage {
                 self.backend_type = backend_type;
                 self.binary_path = binary_path;
                 self.real_delay_settings = real_delay_settings;
-                if backend_changed || binary_changed {
+                if backend_changed || binary_changed || real_delay_changed {
                     self.real_delay_run_token = self.real_delay_run_token.wrapping_add(1);
                     self.testing_real_delay.clear();
+                    self.availability_run_token = self.availability_run_token.wrapping_add(1);
+                    self.testing_availability.clear();
                     self.real_delay_capability = backend_type.default_real_delay_capability();
                     render_hint = RenderHint::Full;
                 }
@@ -1017,18 +1053,26 @@ impl Component for SubscriptionsPage {
         emit_active_nodes(&self.subscriptions, &sender);
 
         match render_hint {
+            RenderHint::NodeState => {
+                refresh_node_widgets(
+                    &self.node_widgets,
+                    &self.subscriptions,
+                    &self.egress_samples,
+                );
+                return;
+            }
             RenderHint::NodeToggle(sub_id, idx) => {
-                if update_node_switch(&self.list_container, sub_id, idx, &self.subscriptions) {
+                if update_node_switch(&self.node_widgets, sub_id, idx, &self.subscriptions) {
                     return;
                 }
             }
             RenderHint::SubscriptionToggle(id) => {
-                if update_subscription_toggle(&self.list_container, id, &self.subscriptions) {
+                if update_subscription_toggle(&self.sub_expanders, id, &self.subscriptions) {
                     return;
                 }
             }
             RenderHint::SubscriptionRename(id) => {
-                if update_subscription_title(&self.list_container, id, &self.subscriptions) {
+                if update_subscription_title(&self.sub_expanders, id, &self.subscriptions) {
                     return;
                 }
             }
@@ -1039,6 +1083,8 @@ impl Component for SubscriptionsPage {
             &self.subscriptions,
             &self.list_container,
             &sender,
+            &mut self.sub_expanders,
+            &mut self.node_widgets,
             RenderState {
                 expanded_subs: &self.expanded_subs,
                 testing_latency: &self.testing_latency,
@@ -1062,6 +1108,7 @@ impl Component for SubscriptionsPage {
         sender: ComponentSender<Self>,
         _root: &Self::Root,
     ) {
+        let mut render_hint = RenderHint::Full;
         match msg {
             SubscriptionsCmdOutput::AddDone(outcome) => {
                 let summary =
@@ -1158,6 +1205,7 @@ impl Component for SubscriptionsPage {
                         );
                     }
                 });
+                render_hint = RenderHint::NodeState;
             }
             SubscriptionsCmdOutput::RealDelayResult(id, run_token, targets, report) => {
                 if self.testing_real_delay.get(&id).copied() != Some(run_token) {
@@ -1230,6 +1278,7 @@ impl Component for SubscriptionsPage {
                 if let Some(diagnostic) = report.diagnostic {
                     let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
                 }
+                render_hint = RenderHint::NodeState;
             }
             SubscriptionsCmdOutput::AvailabilityResult(id, run_token, targets, report) => {
                 if self.testing_availability.get(&id).copied() != Some(run_token) {
@@ -1302,6 +1351,7 @@ impl Component for SubscriptionsPage {
                 if let Some(diagnostic) = report.diagnostic {
                     let _ = sender.output(SubscriptionsOutput::Notice(diagnostic));
                 }
+                render_hint = RenderHint::NodeState;
             }
             SubscriptionsCmdOutput::RefreshFailed(id, error) => {
                 self.refreshing.remove(&id);
@@ -1435,10 +1485,20 @@ impl Component for SubscriptionsPage {
         }
         let has_active = self.subscriptions.iter().any(|s| s.has_enabled_nodes());
         let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
+        if matches!(render_hint, RenderHint::NodeState) {
+            refresh_node_widgets(
+                &self.node_widgets,
+                &self.subscriptions,
+                &self.egress_samples,
+            );
+            return;
+        }
         render_list(
             &self.subscriptions,
             &self.list_container,
             &sender,
+            &mut self.sub_expanders,
+            &mut self.node_widgets,
             RenderState {
                 expanded_subs: &self.expanded_subs,
                 testing_latency: &self.testing_latency,
@@ -1631,103 +1691,107 @@ fn subscriptions_eligible_for_latency_test(
         .collect()
 }
 
+fn refresh_node_widgets(
+    node_widgets: &HashMap<(Uuid, Uuid), NodeWidgets>,
+    subscriptions: &[Subscription],
+    egress_samples: &HashMap<(Uuid, Uuid), EgressSample>,
+) {
+    for (&(sub_id, node_id), widgets) in node_widgets {
+        let Some(node) = subscriptions
+            .iter()
+            .find(|sub| sub.id == sub_id)
+            .and_then(|sub| sub.nodes.iter().find(|node| node.id == node_id))
+        else {
+            continue;
+        };
+
+        if widgets.toggle.is_active() != node.enabled {
+            widgets.toggle.set_active(node.enabled);
+        }
+        widgets
+            .row
+            .set_opacity(if node.enabled { 1.0 } else { 0.5 });
+        widgets.row.set_subtitle(&format_node_subtitle(
+            &widgets.address,
+            egress_samples.get(&(sub_id, node_id)),
+        ));
+        update_latency_label(&widgets.latency, node.last_latency_ms);
+        update_real_delay_label(&widgets.real_delay, node.last_real_delay_ms);
+    }
+}
+
+fn update_latency_label(label: &gtk::Label, latency_ms: Option<u64>) {
+    label.remove_css_class("success");
+    label.remove_css_class("warning");
+    label.remove_css_class("error");
+    let Some(ms) = latency_ms else {
+        label.set_visible(false);
+        return;
+    };
+    label.set_label(&format!("{ms}ms"));
+    label.add_css_class(latency_css_class(ms));
+    label.set_visible(true);
+}
+
+fn update_real_delay_label(label: &gtk::Label, latency_ms: Option<u64>) {
+    label.remove_css_class("success");
+    label.remove_css_class("warning");
+    label.remove_css_class("error");
+    let Some(ms) = latency_ms else {
+        label.set_visible(false);
+        return;
+    };
+    label.set_label(&format!("· {ms}ms"));
+    label.add_css_class(latency_css_class(ms));
+    label.set_visible(true);
+}
+
+fn latency_css_class(ms: u64) -> &'static str {
+    const LATENCY_GOOD_MS: u64 = 200;
+    const LATENCY_WARN_MS: u64 = 500;
+    if ms < LATENCY_GOOD_MS {
+        "success"
+    } else if ms < LATENCY_WARN_MS {
+        "warning"
+    } else {
+        "error"
+    }
+}
+
 fn update_node_switch(
-    container: &gtk::ListBox,
+    node_widgets: &HashMap<(Uuid, Uuid), NodeWidgets>,
     sub_id: Uuid,
     node_idx: usize,
     subscriptions: &[Subscription],
 ) -> bool {
-    let sub = match subscriptions.iter().find(|s| s.id == sub_id) {
-        Some(s) => s,
-        None => return false,
+    let Some(sub) = subscriptions.iter().find(|s| s.id == sub_id) else {
+        return false;
     };
-    let node = match sub.nodes.get(node_idx) {
-        Some(n) => n,
-        None => return false,
+    let Some(node) = sub.nodes.get(node_idx) else {
+        return false;
+    };
+    let Some(widgets) = node_widgets.get(&(sub_id, node.id)) else {
+        return false;
     };
 
-    let mut child = container.first_child();
-    while let Some(ref widget) = child {
-        if let Some(expander) = widget.downcast_ref::<adw::ExpanderRow>() {
-            let name = expander.widget_name();
-            if let Ok(id) = Uuid::parse_str(&name)
-                && id == sub_id
-            {
-                let mut current_idx = 0;
-                let mut inner_child = expander.first_child();
-                while let Some(ref inner_widget) = inner_child {
-                    if inner_widget.is::<adw::ActionRow>() {
-                        if current_idx == node_idx {
-                            if let Some(action_row) = inner_widget.downcast_ref::<adw::ActionRow>()
-                            {
-                                let mut descendant = action_row.first_child();
-                                while let Some(ref desc_widget) = descendant {
-                                    if let Some(switch) = desc_widget.downcast_ref::<gtk::Switch>()
-                                    {
-                                        if switch.is_active() != node.enabled {
-                                            switch.set_active(node.enabled);
-                                        }
-                                        action_row.set_opacity(if node.enabled {
-                                            1.0
-                                        } else {
-                                            0.5
-                                        });
-                                        return true;
-                                    }
-                                    if let Some(container) =
-                                        desc_widget.downcast_ref::<gtk::Widget>()
-                                    {
-                                        let mut nested = container.first_child();
-                                        while let Some(ref nested_widget) = nested {
-                                            if let Some(switch) =
-                                                nested_widget.downcast_ref::<gtk::Switch>()
-                                            {
-                                                if switch.is_active() != node.enabled {
-                                                    switch.set_active(node.enabled);
-                                                }
-                                                action_row.set_opacity(if node.enabled {
-                                                    1.0
-                                                } else {
-                                                    0.5
-                                                });
-                                                return true;
-                                            }
-                                            nested = nested_widget.next_sibling();
-                                        }
-                                    }
-                                    descendant = desc_widget.next_sibling();
-                                }
-                            }
-                            return false;
-                        }
-                        current_idx += 1;
-                    }
-                    inner_child = inner_widget.next_sibling();
-                }
-                return false;
-            }
-        }
-        child = widget.next_sibling();
+    if widgets.toggle.is_active() != node.enabled {
+        widgets.toggle.set_active(node.enabled);
     }
-    false
+    widgets
+        .row
+        .set_opacity(if node.enabled { 1.0 } else { 0.5 });
+    true
 }
 
-fn find_expander_by_id(container: &gtk::ListBox, sub_id: Uuid) -> Option<adw::ExpanderRow> {
-    let mut child = container.first_child();
-    while let Some(ref widget) = child {
-        if let Some(expander) = widget.downcast_ref::<adw::ExpanderRow>()
-            && let Ok(id) = Uuid::parse_str(&expander.widget_name())
-            && id == sub_id
-        {
-            return Some(expander.clone());
-        }
-        child = widget.next_sibling();
-    }
-    None
+fn find_expander_by_id(
+    sub_expanders: &HashMap<Uuid, adw::ExpanderRow>,
+    sub_id: Uuid,
+) -> Option<adw::ExpanderRow> {
+    sub_expanders.get(&sub_id).cloned()
 }
 
 fn update_subscription_toggle(
-    container: &gtk::ListBox,
+    sub_expanders: &HashMap<Uuid, adw::ExpanderRow>,
     sub_id: Uuid,
     subscriptions: &[Subscription],
 ) -> bool {
@@ -1735,7 +1799,7 @@ fn update_subscription_toggle(
         Some(s) => s,
         None => return false,
     };
-    let Some(expander) = find_expander_by_id(container, sub_id) else {
+    let Some(expander) = find_expander_by_id(sub_expanders, sub_id) else {
         return false;
     };
 
@@ -1753,7 +1817,7 @@ fn update_subscription_toggle(
 }
 
 fn update_subscription_title(
-    container: &gtk::ListBox,
+    sub_expanders: &HashMap<Uuid, adw::ExpanderRow>,
     sub_id: Uuid,
     subscriptions: &[Subscription],
 ) -> bool {
@@ -1761,7 +1825,7 @@ fn update_subscription_title(
         Some(s) => s,
         None => return false,
     };
-    let Some(expander) = find_expander_by_id(container, sub_id) else {
+    let Some(expander) = find_expander_by_id(sub_expanders, sub_id) else {
         return false;
     };
 
@@ -1788,11 +1852,15 @@ fn render_list(
     subs: &[Subscription],
     container: &gtk::ListBox,
     sender: &ComponentSender<SubscriptionsPage>,
+    sub_expanders: &mut HashMap<Uuid, adw::ExpanderRow>,
+    node_widgets: &mut HashMap<(Uuid, Uuid), NodeWidgets>,
     state: RenderState<'_>,
 ) {
     while let Some(child) = container.first_child() {
         container.remove(&child);
     }
+    sub_expanders.clear();
+    node_widgets.clear();
 
     if subs.is_empty() {
         let empty = adw::StatusPage::builder()
@@ -1810,7 +1878,8 @@ fn render_list(
     }
 
     for (idx, sub) in subs.iter().enumerate() {
-        let expander = build_subscription_group(sub, idx, sender, &state);
+        let expander =
+            build_subscription_group(sub, idx, sender, &state, sub_expanders, node_widgets);
         container.append(&expander);
     }
 }
@@ -1820,25 +1889,32 @@ fn build_subscription_group(
     sub_idx: usize,
     sender: &ComponentSender<SubscriptionsPage>,
     state: &RenderState<'_>,
+    sub_expanders: &mut HashMap<Uuid, adw::ExpanderRow>,
+    node_widgets: &mut HashMap<(Uuid, Uuid), NodeWidgets>,
 ) -> adw::ExpanderRow {
     let expander = build_expander_header(sub, state.expanded_subs.contains(&sub.id), sender);
     attach_drag_handle(&expander, sub_idx, sender, state.locked);
     attach_subscription_toggle(&expander, sub.id, sub.enabled, sender, state.locked);
     let menu = build_subscription_menu(sub, sender, state);
     expander.add_suffix(&menu);
+    sub_expanders.insert(sub.id, expander.clone());
 
     for (idx, node) in sub.nodes.iter().enumerate() {
         let active = state.active_node == Some((sub.id, node.id));
         let egress = state.egress_samples.get(&(sub.id, node.id));
-        expander.add_row(&build_node_row(
-            sub.id,
-            idx,
-            node,
-            sender,
-            state.locked,
-            active,
-            egress,
-        ));
+        let (row, toggle, latency, real_delay, address) =
+            build_node_row(sub.id, idx, node, sender, state.locked, active, egress);
+        expander.add_row(&row);
+        node_widgets.insert(
+            (sub.id, node.id),
+            NodeWidgets {
+                row,
+                toggle,
+                address,
+                latency,
+                real_delay,
+            },
+        );
     }
 
     attach_profile_toggle(&expander, sub, sender, state.locked);
@@ -2175,10 +2251,14 @@ fn build_subscription_menu(
             "Test Real Delay"
         })
         .has_frame(false)
-        .sensitive(!is_testing_real_delay && real_delay_available && btn_sensitive)
+        .sensitive(!is_testing_real_delay && real_delay_available && btn_sensitive && !tun_active)
         .build();
     if let Some(tooltip) = btn_tooltip {
         test_real_delay_btn.set_tooltip_text(Some(&tooltip));
+    } else if tun_active {
+        test_real_delay_btn.set_tooltip_text(Some(
+            "Real Delay is unavailable while TUN is active; Disconnect first",
+        ));
     } else if !real_delay_available {
         test_real_delay_btn.set_tooltip_text(Some(
             "Real Delay is not available (check settings and backend)",
@@ -2272,7 +2352,7 @@ fn build_node_row(
     locked: bool,
     active: bool,
     egress: Option<&EgressSample>,
-) -> adw::ActionRow {
+) -> (adw::ActionRow, gtk::Switch, gtk::Label, gtk::Label, String) {
     let protocol = match &node.node {
         v2ray_rs_core::models::ProxyNode::Vless(_) => "VLESS",
         v2ray_rs_core::models::ProxyNode::Vmess(_) => "VMESS",
@@ -2351,41 +2431,21 @@ fn build_node_row(
         row.add_suffix(&connected);
     }
 
-    if let Some(ms) = node.last_latency_ms {
-        let latency_label = gtk::Label::builder()
-            .label(format!("{ms}ms"))
-            .valign(gtk::Align::Center)
-            .build();
-        latency_label.add_css_class("caption");
-        const LATENCY_GOOD_MS: u64 = 200;
-        const LATENCY_WARN_MS: u64 = 500;
-        if ms < LATENCY_GOOD_MS {
-            latency_label.add_css_class("success");
-        } else if ms < LATENCY_WARN_MS {
-            latency_label.add_css_class("warning");
-        } else {
-            latency_label.add_css_class("error");
-        }
-        row.add_suffix(&latency_label);
-    }
+    let latency_label = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["caption"])
+        .visible(false)
+        .build();
+    update_latency_label(&latency_label, node.last_latency_ms);
+    row.add_suffix(&latency_label);
 
-    if let Some(ms) = node.last_real_delay_ms {
-        let real_label = gtk::Label::builder()
-            .label(format!("· {ms}ms"))
-            .valign(gtk::Align::Center)
-            .build();
-        real_label.add_css_class("caption");
-        const LATENCY_GOOD_MS: u64 = 200;
-        const LATENCY_WARN_MS: u64 = 500;
-        if ms < LATENCY_GOOD_MS {
-            real_label.add_css_class("success");
-        } else if ms < LATENCY_WARN_MS {
-            real_label.add_css_class("warning");
-        } else {
-            real_label.add_css_class("error");
-        }
-        row.add_suffix(&real_label);
-    }
+    let real_label = gtk::Label::builder()
+        .valign(gtk::Align::Center)
+        .css_classes(["caption"])
+        .visible(false)
+        .build();
+    update_real_delay_label(&real_label, node.last_real_delay_ms);
+    row.add_suffix(&real_label);
 
     let move_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -2454,7 +2514,7 @@ fn build_node_row(
     }
     row.add_suffix(&node_toggle);
 
-    row
+    (row, node_toggle, latency_label, real_label, address)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -2632,7 +2692,65 @@ fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
         .build();
     content.append(&paste_scroll);
 
+    let error_label = gtk::Label::builder()
+        .css_classes(["error"])
+        .halign(gtk::Align::Start)
+        .wrap(true)
+        .visible(false)
+        .build();
+    content.append(&error_label);
+
     dialog.set_extra_child(Some(&content));
+
+    {
+        let dialog = dialog.clone();
+        let update_validity = {
+            let dialog = dialog.clone();
+            let error_label = error_label.clone();
+            let name_entry = name_entry.clone();
+            let url_entry = url_entry.clone();
+            let file_entry = file_entry.clone();
+            let paste_buffer = paste_buffer.clone();
+            move || {
+                let (start, end) = paste_buffer.bounds();
+                let pasted = paste_buffer.text(&start, &end, false).to_string();
+                let error = subscription_form_error(
+                    &name_entry.text(),
+                    &url_entry.text(),
+                    &file_entry.text(),
+                    &pasted,
+                );
+                match error {
+                    Some(message) => {
+                        error_label.set_text(&message);
+                        error_label.set_visible(true);
+                        dialog.set_response_enabled("add", false);
+                    }
+                    None => {
+                        error_label.set_visible(false);
+                        dialog.set_response_enabled("add", true);
+                    }
+                }
+            }
+        };
+        {
+            let update_validity = update_validity.clone();
+            name_entry.connect_changed(move |_| update_validity());
+        }
+        {
+            let update_validity = update_validity.clone();
+            url_entry.connect_changed(move |_| update_validity());
+        }
+        {
+            let update_validity = update_validity.clone();
+            file_entry.connect_changed(move |_| update_validity());
+        }
+        {
+            let update_validity = update_validity.clone();
+            paste_buffer.connect_changed(move |_| update_validity());
+        }
+        update_validity();
+    }
 
     dialog.connect_response(None, move |_, response| {
         if response == "add" {
@@ -2660,7 +2778,7 @@ const V2RAYTUN_IMPORT_PREFIX: &str = "v2raytun://import/";
 
 /// Strips a `v2raytun://import/` deep-link prefix and recovers the
 /// underlying subscription URL, which the app encodes URL-then-base64.
-fn strip_v2raytun_import_prefix(input: &str) -> String {
+pub(crate) fn strip_v2raytun_import_prefix(input: &str) -> String {
     let Some(rest) = input.strip_prefix(V2RAYTUN_IMPORT_PREFIX) else {
         return input.to_string();
     };
@@ -2696,6 +2814,28 @@ pub(crate) fn subscription_source_from_inputs(
         (true, false, true) => Some(SubscriptionSourceInput::File(file_path.into())),
         (true, true, false) => Some(SubscriptionSourceInput::Paste(pasted_json.into())),
         _ => None,
+    }
+}
+
+fn subscription_form_error(
+    name: &str,
+    url: &str,
+    file_path: &str,
+    pasted_json: &str,
+) -> Option<String> {
+    if name.trim().is_empty() {
+        return Some("A subscription name is required".to_string());
+    }
+
+    let url = strip_v2raytun_import_prefix(url.trim());
+    if subscription_source_from_inputs(&url, file_path, pasted_json).is_some() {
+        return None;
+    }
+
+    if url.trim().is_empty() && file_path.trim().is_empty() && pasted_json.trim().is_empty() {
+        Some("Provide a URL, a local file path, or pasted JSON".to_string())
+    } else {
+        Some("Provide exactly one subscription source".to_string())
     }
 }
 
@@ -2749,6 +2889,23 @@ fn show_rename_dialog(id: Uuid, current_name: &str, sender: ComponentSender<Subs
     content.append(&group);
 
     dialog.set_extra_child(Some(&content));
+
+    {
+        let dialog = dialog.clone();
+        let name_entry = name_entry.clone();
+        let update_validity = {
+            let dialog = dialog.clone();
+            let name_entry = name_entry.clone();
+            move || {
+                dialog.set_response_enabled("rename", !name_entry.text().trim().is_empty());
+            }
+        };
+        {
+            let update_validity = update_validity.clone();
+            name_entry.connect_changed(move |_| update_validity());
+        }
+        update_validity();
+    }
 
     dialog.connect_response(None, move |_, response| {
         if response == "rename" {
@@ -3422,5 +3579,43 @@ mod tests {
             subscription_persist_notice(&err),
             "Failed to save subscriptions: failed to determine XDG directories"
         );
+    }
+
+    #[test]
+    fn subscription_form_requires_a_name_and_exactly_one_source() {
+        assert_eq!(
+            subscription_form_error("", "https://example.com/sub", "", ""),
+            Some("A subscription name is required".to_string())
+        );
+        assert_eq!(
+            subscription_form_error("Work", "", "", ""),
+            Some("Provide a URL, a local file path, or pasted JSON".to_string())
+        );
+        assert_eq!(
+            subscription_form_error("Work", "https://example.com/sub", "/tmp/sub.json", ""),
+            Some("Provide exactly one subscription source".to_string())
+        );
+        assert_eq!(
+            subscription_form_error("Work", "https://example.com/sub", "", ""),
+            None
+        );
+        assert_eq!(
+            subscription_form_error("Work", "", "/tmp/sub.json", ""),
+            None
+        );
+        assert_eq!(subscription_form_error("Work", "", "", "{}"), None);
+    }
+
+    #[test]
+    fn v2raytun_prefix_is_stripped_before_source_detection() {
+        use base64::Engine as _;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode("https://example.com/sub");
+        let input = format!("{V2RAYTUN_IMPORT_PREFIX}{encoded}");
+        assert_eq!(
+            strip_v2raytun_import_prefix(&input),
+            "https://example.com/sub"
+        );
+        assert_eq!(subscription_form_error("Work", &input, "", ""), None);
     }
 }

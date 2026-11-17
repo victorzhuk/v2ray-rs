@@ -166,7 +166,6 @@ impl InstanceLock {
 
         let file = std_fs::OpenOptions::new()
             .create(true)
-            .truncate(true)
             .read(true)
             .write(true)
             .open(&path)?;
@@ -188,11 +187,9 @@ impl InstanceLock {
 }
 
 fn read_holder_pid(paths: &AppPaths) -> Result<u32, InstanceError> {
-    if let Ok(stamp) = InstanceStamp::load_or_create(paths) {
-        Ok(stamp.last_started_pid)
-    } else {
-        Ok(std::process::id())
-    }
+    let content = std_fs::read_to_string(paths.instance_stamp_path())?;
+    let stamp: InstanceStamp = serde_json::from_str(&content)?;
+    Ok(stamp.last_started_pid)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -419,10 +416,26 @@ mod tests {
         let (_tmp, paths) = test_paths();
         paths.ensure_dirs().unwrap();
 
+        let mut stamp = InstanceStamp::load_or_create(&paths).unwrap();
+        stamp.last_started_pid = 4242;
+        stamp.save_to(&paths.instance_stamp_path()).unwrap();
+
         let _lock1 = InstanceLock::acquire(&paths).unwrap();
 
         let result = InstanceLock::acquire(&paths);
-        assert!(matches!(result, Err(InstanceError::LockHeld { .. })));
+        match result.err() {
+            Some(InstanceError::LockHeld { pid, .. }) => {
+                assert_eq!(pid, 4242, "holder PID must come from instance.json")
+            }
+            Some(other) => panic!("expected LockHeld, got {other:?}"),
+            None => panic!("second acquire unexpectedly succeeded"),
+        }
+
+        let restored = InstanceStamp::load_or_create(&paths).unwrap();
+        assert_eq!(
+            restored.last_started_pid, 4242,
+            "contention must not overwrite the holder stamp"
+        );
     }
 
     #[test]

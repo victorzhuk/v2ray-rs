@@ -211,18 +211,24 @@ pub async fn update_subscription(
         }
     };
 
-    let profile;
-    let import = match parse_json_subscription(&raw_content) {
-        Some(j) => {
-            profile = j.profile;
-            j.result
-        }
-        None => {
-            let uris = crate::fetch::decode_subscription_content(&raw_content);
-            profile = None;
-            parse_subscription_uris(&uris)
-        }
-    };
+    // A 10 MiB subscription can expand into tens of thousands of URIs; both
+    // base64 decoding and URI parsing are CPU-bound and must not stall the
+    // async runtime that other subscriptions share.
+    let (profile, import) =
+        tokio::task::spawn_blocking(move || match parse_json_subscription(&raw_content) {
+            Some(j) => (j.profile, j.result),
+            None => {
+                let uris = crate::fetch::decode_subscription_content(&raw_content);
+                (None, parse_subscription_uris(&uris))
+            }
+        })
+        .await
+        .map_err(|e| UpdateError::InvalidContent {
+            failures: vec![ParseFailure {
+                uri: "<subscription>".to_string(),
+                error: format!("parse task failed: {e}"),
+            }],
+        })?;
 
     let parse_failures: Vec<ParseFailure> = import
         .errors

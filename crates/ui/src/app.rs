@@ -92,8 +92,10 @@ pub struct App {
     geodata_service: GeodataRefreshService,
     pending_exit: bool,
     pending_direct_target: Option<ConnectionNodeRef>,
+    deferred_connect: Option<DeferredConnect>,
     session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
+    pending_settings: Option<AppSettings>,
     auto_reconnect_attempts: u32,
     status_prev: ProcessState,
     connection_origin: ConnectOrigin,
@@ -140,6 +142,23 @@ pub enum ConnectOrigin {
     /// Applies-and-restarts the anchored session: keeps the chosen node and
     /// falls back to the configured strategy when it no longer resolves.
     Restart,
+}
+
+/// A connect request received while the previous session is still tearing
+/// down. Replaying it on `Stopped` keeps a stop and a start from overlapping.
+#[derive(Debug, Clone)]
+enum DeferredConnect {
+    Plan(ConnectOrigin),
+    Node(ConnectionNodeRef, ConnectOrigin),
+}
+
+impl DeferredConnect {
+    fn into_msg(self) -> AppMsg {
+        match self {
+            Self::Plan(origin) => AppMsg::Connect(origin),
+            Self::Node(target, origin) => AppMsg::ConnectToNode(target, origin),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -365,6 +384,7 @@ impl App {
             std::process::exit(1);
         }
         self.cancel_auto_reconnect();
+        self.flush_pending_settings(sender);
         if self.tun_release_in_flight {
             self.pending_exit = true;
             return;
@@ -397,6 +417,44 @@ impl App {
             .map_err(|err| err.to_string())?;
         self.settings = settings;
         Ok(())
+    }
+
+    fn commit_settings(&mut self, settings: AppSettings, sender: &ComponentSender<Self>) {
+        let settings = keep_last_success(settings, &self.settings);
+        if let Err(err) = self.persist_settings(settings) {
+            log::error!("save settings: {err}");
+            self.show_toast(&format!("Failed to save settings: {err}"));
+            return;
+        }
+        update_tray_notification_setting(self.settings.notifications_enabled);
+        self.geodata_service
+            .update(GeodataRefreshConfig::from_settings(
+                &self.paths,
+                &self.settings,
+                &self.store.load_routing_rules().unwrap_or_default(),
+                &self.store.load_subscriptions().unwrap_or_default(),
+            ));
+        self.subscriptions_page
+            .emit(SubscriptionsMsg::SyncSettings {
+                auto_update_enabled: self.settings.auto_update_subscriptions,
+                auto_update_interval_secs: self.settings.subscription_update_interval_secs,
+                backend_type: self.settings.backend.backend_type,
+                binary_path: self.settings.backend.binary_path.clone(),
+                real_delay_settings: self.settings.real_delay.clone(),
+            });
+        self.restart_required = self.check_restart_required();
+        if self.process_handle.is_none() {
+            self.regenerate_config_disconnected(sender);
+        }
+    }
+
+    fn flush_pending_settings(&mut self, sender: &ComponentSender<Self>) {
+        if let Some(id) = self.settings_debounce.take() {
+            id.remove();
+        }
+        if let Some(settings) = self.pending_settings.take() {
+            self.commit_settings(settings, sender);
+        }
     }
 
     fn load_latency_snapshot_or_default(&self) -> LatencySnapshot {
@@ -686,6 +744,7 @@ impl App {
         self.runtime_snapshot = Some(RuntimeConfigSnapshot {
             backend_type: self.settings.backend.backend_type,
             binary_path: self.settings.backend.binary_path.clone(),
+            config_output_dir: self.settings.backend.config_output_dir.clone(),
             socks_port: self.settings.socks_port,
             http_port: self.settings.http_port,
             listen_address: self.settings.listen_address.clone(),
@@ -1065,7 +1124,7 @@ impl SimpleComponent for App {
         let logs_page = LogsPage::builder().launch(()).detach();
 
         let wizard = OnboardingWizard::builder()
-            .launch(())
+            .launch(settings.clone())
             .forward(sender.input_sender(), |msg| match msg {
                 crate::wizard::WizardOutput::Complete {
                     settings,
@@ -1140,8 +1199,10 @@ impl SimpleComponent for App {
             geodata_service,
             pending_exit: false,
             pending_direct_target: None,
+            deferred_connect: None,
             session_target: None,
             settings_debounce: None,
+            pending_settings: None,
             auto_reconnect_attempts: 0,
             status_prev: ProcessState::Stopped,
             connection_origin: ConnectOrigin::User,
@@ -1209,6 +1270,7 @@ impl SimpleComponent for App {
                         binary_path: self.settings.backend.binary_path.clone(),
                         real_delay_settings: self.settings.real_delay.clone(),
                     });
+                self.nodes_page.emit(NodesMsg::Reload);
 
                 if let Some((name, source)) = subscription {
                     let source_input = match source {
@@ -1223,6 +1285,7 @@ impl SimpleComponent for App {
                 if let Some(id) = self.settings_debounce.take() {
                     id.remove();
                 }
+                self.pending_settings = Some(settings.clone());
                 let s = sender.clone();
                 self.settings_debounce = Some(glib::timeout_add_local_once(
                     std::time::Duration::from_millis(300),
@@ -1231,33 +1294,8 @@ impl SimpleComponent for App {
             }
             AppMsg::FlushSettings(settings) => {
                 self.settings_debounce = None;
-                let settings = keep_last_success(settings, &self.settings);
-                if let Err(err) = self.persist_settings(settings) {
-                    log::error!("save settings: {err}");
-                    self.show_toast(&format!("Failed to save settings: {err}"));
-                    return;
-                }
-                crate::i18n::switch_language(self.settings.language);
-                update_tray_notification_setting(self.settings.notifications_enabled);
-                self.geodata_service
-                    .update(GeodataRefreshConfig::from_settings(
-                        &self.paths,
-                        &self.settings,
-                        &self.store.load_routing_rules().unwrap_or_default(),
-                        &self.store.load_subscriptions().unwrap_or_default(),
-                    ));
-                self.subscriptions_page
-                    .emit(SubscriptionsMsg::SyncSettings {
-                        auto_update_enabled: self.settings.auto_update_subscriptions,
-                        auto_update_interval_secs: self.settings.subscription_update_interval_secs,
-                        backend_type: self.settings.backend.backend_type,
-                        binary_path: self.settings.backend.binary_path.clone(),
-                        real_delay_settings: self.settings.real_delay.clone(),
-                    });
-                self.restart_required = self.check_restart_required();
-                if self.process_handle.is_none() {
-                    self.regenerate_config_disconnected(&sender);
-                }
+                self.pending_settings = None;
+                self.commit_settings(settings, &sender);
             }
             AppMsg::ActiveNodesChanged(_has) => {
                 self.refresh_has_active_nodes();
@@ -1308,6 +1346,10 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::Connect(origin) => {
+                if matches!(self.process_state, ProcessState::Stopping) {
+                    self.deferred_connect = Some(DeferredConnect::Plan(origin));
+                    return;
+                }
                 if self.process_handle.is_some() || self.tun_release_in_flight {
                     return;
                 }
@@ -1374,6 +1416,10 @@ impl SimpleComponent for App {
                 self.session_target = None;
             }
             AppMsg::ConnectToNode(target, origin) => {
+                if matches!(self.process_state, ProcessState::Stopping) {
+                    self.deferred_connect = Some(DeferredConnect::Node(target, origin));
+                    return;
+                }
                 if self.tun_release_in_flight {
                     return;
                 }
@@ -1450,6 +1496,10 @@ impl SimpleComponent for App {
             }
             AppMsg::Disconnect => {
                 self.health_failover.cancel();
+                if matches!(self.process_state, ProcessState::Stopping) {
+                    self.pending_direct_target = None;
+                    return;
+                }
                 self.stop_session(&sender);
             }
             AppMsg::ProcessStateConnection(generation, state, connection) => {
@@ -1521,6 +1571,11 @@ impl SimpleComponent for App {
                     self.reconnect_pending = false;
                     self.cancel_auto_reconnect();
                     sender.input(AppMsg::ConnectToNode(target, ConnectOrigin::User));
+                    return;
+                }
+                if stopped && let Some(deferred) = self.deferred_connect.take() {
+                    self.reconnect_pending = false;
+                    sender.input(deferred.into_msg());
                     return;
                 }
                 if stopped && !self.reconnect_pending {
@@ -1651,7 +1706,10 @@ impl SimpleComponent for App {
                 self.update_status_labels();
             }
             AppMsg::CloseRequested => {
-                if self.settings.minimize_to_tray && tray_available() {
+                if self.settings.minimize_to_tray
+                    && tray_available()
+                    && status_notifier_host_registered()
+                {
                     self.window.set_visible(false);
                 } else {
                     self.quit(&sender, false);
@@ -1707,6 +1765,7 @@ impl SimpleComponent for App {
                 self.preferences_dialog = Some(dialog);
             }
             AppMsg::PreferencesClosed => {
+                self.flush_pending_settings(&sender);
                 self.preferences_dialog = None;
             }
             AppMsg::ViewGeneratedConfig => {
@@ -1729,6 +1788,9 @@ impl SimpleComponent for App {
                     self.settings = AppSettings::default();
                     self.settings_load_error = None;
                     self.show_wizard = true;
+                    self.wizard.emit(crate::wizard::WizardMsg::ResetSettings(
+                        self.settings.clone(),
+                    ));
                     self.geodata_service
                         .update(GeodataRefreshConfig::from_settings(
                             &self.paths,
@@ -1751,6 +1813,9 @@ impl SimpleComponent for App {
                     self.settings = AppSettings::default();
                     self.settings_load_error = None;
                     self.show_wizard = true;
+                    self.wizard.emit(crate::wizard::WizardMsg::ResetSettings(
+                        self.settings.clone(),
+                    ));
                 }
                 Err(err) => {
                     self.show_toast(&format!("Failed to reset settings: {err}"));
@@ -2342,6 +2407,7 @@ mod tests {
         RuntimeConfigSnapshot {
             backend_type: backend,
             binary_path: None,
+            config_output_dir: None,
             socks_port: 1080,
             http_port: 1081,
             listen_address: "127.0.0.1".into(),
@@ -2764,6 +2830,19 @@ mod tests {
     fn restart_origin_cancels_like_user() {
         assert!(cancels_auto_reconnect(ConnectOrigin::Restart));
         assert!(!direct_session(session_target_node(), ConnectOrigin::Restart).established);
+    }
+
+    #[test]
+    fn deferred_connect_replays_the_requested_action() {
+        assert!(matches!(
+            DeferredConnect::Plan(ConnectOrigin::User).into_msg(),
+            AppMsg::Connect(ConnectOrigin::User)
+        ));
+        let target = session_target_node();
+        assert!(matches!(
+            DeferredConnect::Node(target.clone(), ConnectOrigin::Restart).into_msg(),
+            AppMsg::ConnectToNode(node, ConnectOrigin::Restart) if node == target
+        ));
     }
 
     #[test]
@@ -3923,6 +4002,47 @@ fn tray_available() -> bool {
         .is_some()
 }
 
+/// Whether the session has a StatusNotifier host that will actually display a
+/// tray icon. Wayland compositors without an AppIndicator host accept the item
+/// registration but never render it, so hiding the window there would strand a
+/// running process with no way back.
+fn status_notifier_host_registered() -> bool {
+    let Ok(connection) =
+        gtk::gio::bus_get_sync(gtk::gio::BusType::Session, None::<&gtk::gio::Cancellable>)
+    else {
+        return false;
+    };
+
+    for name in [
+        "org.kde.StatusNotifierWatcher",
+        "org.freedesktop.StatusNotifierWatcher",
+    ] {
+        let arguments = (
+            "org.kde.StatusNotifierWatcher",
+            "IsStatusNotifierHostRegistered",
+        );
+        let reply = connection.call_sync(
+            Some(name),
+            "/StatusNotifierWatcher",
+            "org.freedesktop.DBus.Properties",
+            "Get",
+            Some(&arguments.to_variant()),
+            Some(glib::VariantTy::new("(v)").expect("valid variant type")),
+            gtk::gio::DBusCallFlags::NONE,
+            1_000,
+            None::<&gtk::gio::Cancellable>,
+        );
+        if let Ok(reply) = reply
+            && let Some((value,)) = reply.get::<(glib::Variant,)>()
+            && let Some(registered) = value.get::<bool>()
+        {
+            return registered;
+        }
+    }
+
+    false
+}
+
 fn update_tray_notification_setting(enabled: bool) {
     if let Ok(mut guard) = TRAY_HANDLE.lock()
         && let Some(handle) = guard.as_mut()
@@ -4315,6 +4435,36 @@ fn try_run() -> Result<(), String> {
         profile.qualifier()
     );
 
+    let settings = match v2ray_rs_core::persistence::load_settings(&paths) {
+        Ok(settings) => settings,
+        Err(err) => {
+            log::warn!("load settings during startup: {err}");
+            AppSettings::default()
+        }
+    };
+    // gettext's setlocale is not thread-safe, so it must run before GTK or the
+    // tray service can spawn any thread. A language change needs a restart.
+    crate::i18n::init(settings.language);
+
+    let app_id = profile.app_id();
+    let app = adw::Application::builder().application_id(&app_id).build();
+    // Default profile paths can rely on GApplication's session-bus uniqueness:
+    // a second launch activates the primary window and exits 0. Directory
+    // overrides need the per-profile lock instead because the application ID
+    // alone does not identify the directory set.
+    if !overrides.has_directory_overrides() {
+        match app.register(None::<&gtk::gio::Cancellable>) {
+            Ok(()) if app.is_remote() => {
+                app.run_with_args::<&str>(&[]);
+                return Ok(());
+            }
+            Ok(()) => {}
+            Err(err) => {
+                log::warn!("session-bus registration failed, using the instance lock: {err}");
+            }
+        }
+    }
+
     let _lock = InstanceLock::acquire(&paths).map_err(|e| {
         if let v2ray_rs_core::instance::InstanceError::LockHeld { pid, profile: p } = e {
             eprintln!("Another instance is already running (PID {pid}), profile '{p}' is locked.");
@@ -4376,17 +4526,6 @@ fn try_run() -> Result<(), String> {
         log::debug!("rustls crypto provider already installed or unavailable: {err:?}");
     }
 
-    let app_id = profile.app_id();
-
-    let settings = match v2ray_rs_core::persistence::load_settings(&paths) {
-        Ok(settings) => settings,
-        Err(err) => {
-            log::warn!("load settings during startup: {err}");
-            AppSettings::default()
-        }
-    };
-    crate::i18n::init(settings.language);
-
     let rt = tokio::runtime::Runtime::new()
         .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
     let _rt_guard = rt.enter();
@@ -4433,8 +4572,6 @@ fn try_run() -> Result<(), String> {
     let resource = gtk::gio::Resource::from_data(&resource_bytes)
         .map_err(|err| format!("failed to load icon resource: {err}"))?;
     gtk::gio::resources_register(&resource);
-
-    let app = adw::Application::builder().application_id(&app_id).build();
 
     // Register our CLI options with GTK so it doesn't complain about "unknown options"
     app.add_main_option(

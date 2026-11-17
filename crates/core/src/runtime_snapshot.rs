@@ -9,6 +9,7 @@ use crate::models::{
 pub struct RuntimeConfigSnapshot {
     pub backend_type: BackendType,
     pub binary_path: Option<PathBuf>,
+    pub config_output_dir: Option<PathBuf>,
     pub socks_port: u16,
     pub http_port: u16,
     pub listen_address: String,
@@ -35,6 +36,7 @@ impl RuntimeConfigSnapshot {
     ) -> bool {
         self.backend_type != settings.backend.backend_type
             || self.binary_path != settings.backend.binary_path
+            || self.config_output_dir != settings.backend.config_output_dir
             || self.socks_port != settings.socks_port
             || self.http_port != settings.http_port
             || self.listen_address != settings.listen_address
@@ -53,6 +55,7 @@ impl RuntimeConfigSnapshot {
     pub fn restore_settings(&self, settings: &mut AppSettings) {
         settings.backend.backend_type = self.backend_type;
         settings.backend.binary_path = self.binary_path.clone();
+        settings.backend.config_output_dir = self.config_output_dir.clone();
         settings.socks_port = self.socks_port;
         settings.http_port = self.http_port;
         settings.listen_address = self.listen_address.clone();
@@ -91,6 +94,7 @@ mod tests {
         RuntimeConfigSnapshot {
             backend_type,
             binary_path: Some(PathBuf::from(binary_path)),
+            config_output_dir: None,
             socks_port: 1080,
             http_port: 1081,
             listen_address: "127.0.0.1".to_string(),
@@ -159,10 +163,31 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_config_snapshot_detects_config_output_dir_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                config_output_dir: None,
+            },
+            socks_port: 1080,
+            http_port: 1081,
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.backend.config_output_dir = Some(PathBuf::from("/srv/v2ray-rs"));
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
     fn test_runtime_config_snapshot_restore_only_updates_runtime_fields() {
         let snapshot = RuntimeConfigSnapshot {
             backend_type: BackendType::SingBox,
             binary_path: Some(PathBuf::from("/usr/bin/sing-box")),
+            config_output_dir: None,
             socks_port: 2080,
             http_port: 2081,
             listen_address: "0.0.0.0".to_string(),
@@ -260,6 +285,7 @@ mod tests {
         let snapshot = RuntimeConfigSnapshot {
             backend_type: BackendType::Xray,
             binary_path: Some(PathBuf::from("/usr/bin/xray")),
+            config_output_dir: None,
             socks_port: 1080,
             http_port: 1081,
             listen_address: "127.0.0.1".to_string(),
@@ -345,6 +371,7 @@ mod tests {
         let snapshot = RuntimeConfigSnapshot {
             backend_type: BackendType::Xray,
             binary_path: Some(PathBuf::from("/usr/bin/xray")),
+            config_output_dir: None,
             socks_port: 1080,
             http_port: 1081,
             listen_address: "127.0.0.1".to_string(),
