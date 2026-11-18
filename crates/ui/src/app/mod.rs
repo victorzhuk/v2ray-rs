@@ -9,6 +9,7 @@ use relm4::prelude::*;
 use tokio::sync::broadcast;
 
 use crate::cli::CliArgs;
+use crate::i18n::tr;
 use v2ray_rs_core::cli::PathOverrides;
 use v2ray_rs_core::config::{ConfigWriter, ResolvedNodeSet};
 use v2ray_rs_core::geodata::GeodataManager;
@@ -95,7 +96,7 @@ pub struct App {
     status_label: gtk::Label,
     status_details: gtk::Label,
     toast_overlay: adw::ToastOverlay,
-    preferences_dialog: Option<adw::PreferencesDialog>,
+    preferences_dialog: Option<crate::preferences::PreferencesHandle>,
     config_preview: Option<Controller<ConfigPreviewDialog>>,
     runtime_snapshot: Option<RuntimeConfigSnapshot>,
     restart_required: bool,
@@ -171,6 +172,7 @@ pub enum AppMsg {
     RoutingChanged(RoutingRuleSet),
     ManualNodesChanged,
     SubscriptionsChanged,
+    SubscriptionsPersisted,
     ApplyAndRestart,
     SwitchView(usize),
     ShowToast(String),
@@ -800,7 +802,7 @@ impl SimpleComponent for App {
         adw::ApplicationWindow {
             set_default_width: DEFAULT_WINDOW_WIDTH,
             set_default_height: DEFAULT_WINDOW_HEIGHT,
-            set_title: Some("V2Ray Manager"),
+            set_title: Some(&tr("V2Ray Manager")),
             set_icon_name: Some(&model.paths.profile().app_id()),
 
             connect_close_request[sender] => move |_| {
@@ -816,7 +818,7 @@ impl SimpleComponent for App {
 
                     adw::StatusPage {
                         set_icon_name: Some("dialog-warning-symbolic"),
-                        set_title: "Settings File Needs Repair",
+                        set_title: &tr("Settings File Needs Repair"),
                         set_description: model.settings_load_error.as_deref(),
                         set_vexpand: true,
                     },
@@ -828,13 +830,13 @@ impl SimpleComponent for App {
                         set_margin_all: 24,
 
                         gtk::Button {
-                            set_label: "Quit",
+                            set_label: &tr("Quit"),
                             add_css_class: "pill",
                             connect_clicked => AppMsg::QuitAfterSettingsError,
                         },
 
                         gtk::Button {
-                            set_label: "Reset Settings",
+                            set_label: &tr("Reset Settings"),
                             add_css_class: "pill",
                             add_css_class: "destructive-action",
                             connect_clicked => AppMsg::ResetBrokenSettings,
@@ -854,17 +856,17 @@ impl SimpleComponent for App {
                     adw::HeaderBar {
                         #[wrap(Some)]
                         set_title_widget = &adw::WindowTitle {
-                            set_title: "V2Ray Manager",
+                            set_title: &tr("V2Ray Manager"),
                         },
 
                         pack_end = &gtk::MenuButton {
                             set_icon_name: "open-menu-symbolic",
-                            set_tooltip_text: Some("Main Menu"),
+                            set_tooltip_text: Some(&tr("Main Menu")),
                             #[wrap(Some)]
                             set_popover = &gtk::PopoverMenu::from_model(Some(&{
                                 let menu = gtk::gio::Menu::new();
-                                menu.append(Some("View Generated Config"), Some("win.view-generated-config"));
-                                menu.append(Some("Preferences"), Some("win.preferences"));
+                                menu.append(Some(&tr("View Generated Config")), Some("win.view-generated-config"));
+                                menu.append(Some(&tr("Preferences")), Some("win.preferences"));
                                 menu
                             })) {},
                         },
@@ -885,8 +887,8 @@ impl SimpleComponent for App {
 
                                 adw::Banner {
                                     set_hexpand: true,
-                                    set_title: "Configuration changed",
-                                    set_button_label: Some("Apply & Restart"),
+                                    set_title: &tr("Configuration changed"),
+                                    set_button_label: Some(&tr("Apply & Restart")),
                                     #[watch]
                                     set_revealed: model.restart_banner_visible(),
 
@@ -916,14 +918,14 @@ impl SimpleComponent for App {
                                     set_margin_bottom: 6,
 
                                     gtk::ToggleButton {
-                                        set_label: "Subscriptions",
+                                        set_label: &tr("Subscriptions"),
                                         #[watch]
                                         set_active: model.current_view == 0,
                                         connect_clicked => AppMsg::SwitchView(0),
                                     },
 
                                     gtk::ToggleButton {
-                                        set_label: "Nodes",
+                                        set_label: &tr("Nodes"),
                                         #[watch]
                                         set_active: model.current_view == 1,
                                         connect_clicked => AppMsg::SwitchView(1),
@@ -985,18 +987,18 @@ impl SimpleComponent for App {
                                     "network-wired-symbolic"
                                 },
                                 #[watch]
-                                set_label: if model.connected { "Disconnect" } else { "Connect" },
+                                set_label: &tr(if model.connected { "Disconnect" } else { "Connect" }),
                             },
                             #[watch]
                             set_sensitive: model.button_sensitive && (model.connected || model.has_active_nodes),
                             #[watch]
-                            set_tooltip_text: Some(if !model.connected && !model.has_active_nodes {
+                            set_tooltip_text: Some(&tr(if !model.connected && !model.has_active_nodes {
                                 "No enabled proxy nodes"
                             } else if model.connected {
                                 "Disconnect from proxy"
                             } else {
                                 "Connect to proxy"
-                            }),
+                            })),
                             #[watch]
                             set_css_classes: &["pill", if model.connected { "destructive-action" } else { "suggested-action" }],
                             connect_clicked => AppMsg::ToggleConnection,
@@ -1088,6 +1090,7 @@ impl SimpleComponent for App {
             .forward(sender.input_sender(), |msg| match msg {
                 SubscriptionsOutput::ActiveNodesChanged(has) => AppMsg::ActiveNodesChanged(has),
                 SubscriptionsOutput::SubscriptionsChanged => AppMsg::SubscriptionsChanged,
+                SubscriptionsOutput::SubscriptionsPersisted => AppMsg::SubscriptionsPersisted,
                 SubscriptionsOutput::ConnectNode(sub_id, node_id) => AppMsg::ConnectToNode(
                     ConnectionNodeRef::Subscription {
                         subscription_id: sub_id,
@@ -1715,10 +1718,10 @@ impl SimpleComponent for App {
                 self.quit(&sender, true);
             }
             AppMsg::OpenPreferences(page) => {
-                if let Some(dialog) = &self.preferences_dialog {
-                    dialog.present(Some(&self.window));
+                if let Some(prefs) = &self.preferences_dialog {
+                    prefs.dialog.present(Some(&self.window));
                     if let Some(name) = page {
-                        dialog.set_visible_page_name(name);
+                        prefs.dialog.set_visible_page_name(name);
                     }
                     return;
                 }
@@ -1728,7 +1731,7 @@ impl SimpleComponent for App {
                 let s = sender.input_sender().clone();
                 let s1 = s.clone();
                 let toast_overlay = self.toast_overlay.clone();
-                let dialog = crate::preferences::show_preferences(
+                let prefs = crate::preferences::show_preferences(
                     &window,
                     &self.store,
                     &settings,
@@ -1743,15 +1746,15 @@ impl SimpleComponent for App {
                     },
                 );
                 if let Some(name) = page {
-                    dialog.set_visible_page_name(name);
+                    prefs.dialog.set_visible_page_name(name);
                 }
                 {
                     let s = sender.input_sender().clone();
-                    dialog.connect_closed(move |_| {
+                    prefs.dialog.connect_closed(move |_| {
                         s.emit(AppMsg::PreferencesClosed);
                     });
                 }
-                self.preferences_dialog = Some(dialog);
+                self.preferences_dialog = Some(prefs);
             }
             AppMsg::PreferencesClosed => {
                 self.flush_pending_settings(&sender);
@@ -1837,9 +1840,20 @@ impl SimpleComponent for App {
             AppMsg::ManualNodesChanged => {
                 self.refresh_has_active_nodes();
                 self.handle_manual_node_changed(&sender);
+                if let Some(prefs) = &self.preferences_dialog {
+                    prefs.refresh_nodes();
+                }
             }
             AppMsg::SubscriptionsChanged => {
                 self.handle_subscription_changed(&sender);
+                if let Some(prefs) = &self.preferences_dialog {
+                    prefs.refresh_nodes();
+                }
+            }
+            AppMsg::SubscriptionsPersisted => {
+                if let Some(prefs) = &self.preferences_dialog {
+                    prefs.refresh_nodes();
+                }
             }
             AppMsg::ConfigRegenerated(result) => {
                 let rerun = self.regen.completed();
@@ -1898,32 +1912,29 @@ fn status_texts(view: &StatusView) -> (String, String) {
             );
             match view.health {
                 Some(Health::Unhealthy(reason)) => (
-                    "Proxy not responding".to_string(),
-                    format!("{details} · last probe: {reason}"),
+                    tr("Proxy not responding"),
+                    format!("{details} · {}: {reason}", tr("last probe")),
                 ),
                 _ if view.dns_failing => (
-                    "Connected".to_string(),
-                    format!("DNS via proxy failing · {details}"),
+                    tr("Connected"),
+                    format!("{} · {details}", tr("DNS via proxy failing")),
                 ),
-                _ => ("Connected".to_string(), details),
+                _ => (tr("Connected"), details),
             }
         }
         (ProcessState::Starting, _) => {
             let primary = match (view.prev_state, view.origin, view.attempt) {
-                (ProcessState::Running, _, _) => "Restarting after crash".to_string(),
+                (ProcessState::Running, _, _) => tr("Restarting after crash"),
                 (_, ConnectOrigin::AutoReconnect, n) if n > 0 => {
-                    format!("Reconnecting ({n}/{MAX_AUTO_RECONNECTS})")
+                    format!("{} ({n}/{MAX_AUTO_RECONNECTS})", tr("Reconnecting"))
                 }
-                _ => "Connecting…".to_string(),
+                _ => tr("Connecting…"),
             };
-            (primary, "Resolving nodes".into())
+            (primary, tr("Resolving nodes"))
         }
-        (ProcessState::Stopping, _) => ("Disconnecting…".to_string(), "Stopping backend".into()),
-        (ProcessState::Error(msg), _) => ("Error".to_string(), msg.clone()),
-        _ => (
-            "Disconnected".to_string(),
-            "No active connection".to_string(),
-        ),
+        (ProcessState::Stopping, _) => (tr("Disconnecting…"), tr("Stopping backend")),
+        (ProcessState::Error(msg), _) => (tr("Error"), msg.clone()),
+        _ => (tr("Disconnected"), tr("No active connection")),
     }
 }
 

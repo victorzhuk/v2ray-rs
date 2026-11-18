@@ -60,11 +60,48 @@ pub(super) fn upsert_dns_server(
     Ok(())
 }
 
+pub(super) fn initial_server_port(
+    existing: Option<&DnsServerConfig>,
+    protocol: DnsProtocol,
+) -> (u16, bool) {
+    match existing {
+        Some(srv) => (
+            srv.port.unwrap_or_else(|| srv.protocol.default_port()),
+            srv.port.is_some(),
+        ),
+        None => (protocol.default_port(), false),
+    }
+}
+
+pub(super) fn resolve_server_port(
+    raw_port: u16,
+    protocol: DnsProtocol,
+    port_customized: bool,
+) -> Option<u16> {
+    if !port_customized || raw_port == protocol.default_port() {
+        None
+    } else {
+        Some(raw_port)
+    }
+}
+
+pub(super) fn initial_detour_index(
+    existing: Option<&DnsServerConfig>,
+    backend: BackendType,
+) -> u32 {
+    match existing.and_then(|srv| srv.detour.as_deref()) {
+        Some("direct") => 1,
+        Some(_) => 0,
+        None => u32::from(backend == BackendType::SingBox),
+    }
+}
+
 pub(super) fn dns_server_from_inputs(
     tag_entry: &adw::EntryRow,
     protocol_combo: &adw::ComboRow,
     address_entry: &adw::EntryRow,
     port_spin: &adw::SpinRow,
+    port_customized: bool,
     honors_detour: bool,
     detour_combo: &adw::ComboRow,
 ) -> Result<DnsServerConfig, String> {
@@ -80,11 +117,7 @@ pub(super) fn dns_server_from_inputs(
 
     let protocol = index_to_protocol(protocol_combo.selected());
     let port_value = port_spin.value() as u16;
-    let port = if port_value == protocol.default_port() {
-        None
-    } else {
-        Some(port_value)
-    };
+    let port = resolve_server_port(port_value, protocol, port_customized);
 
     let detour = if honors_detour {
         Some(if detour_combo.selected() == 1 {
@@ -194,37 +227,34 @@ pub(super) fn show_dns_remove_server_dialog(tag: String, ctx: &DnsRenderCtx) {
 pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &DnsRenderCtx) {
     let is_edit = existing.is_some();
 
-    let (init_tag, init_protocol, init_address, init_port, init_detour) = match &existing {
+    let (init_tag, init_protocol_idx, init_protocol, init_address) = match &existing {
         Some(srv) => (
             srv.tag.clone(),
             protocol_to_index(srv.protocol),
+            srv.protocol,
             srv.address.clone(),
-            srv.port.unwrap_or_default(),
-            srv.detour.clone().unwrap_or_default(),
         ),
-        None => (
-            String::new(),
-            0,
-            String::new(),
-            DnsProtocol::Udp.default_port(),
-            String::new(),
-        ),
+        None => (String::new(), 0, DnsProtocol::Udp, String::new()),
     };
+    let (init_port, init_port_customized) = initial_server_port(existing.as_ref(), init_protocol);
+    let port_customized = Rc::new(Cell::new(init_port_customized));
+    let suppress_port_tracking = Rc::new(Cell::new(false));
 
     let backend = ctx.state.borrow().backend.backend_type;
     // sing-box emits `detour` on the server; xray expresses a direct detour as
     // a routing rule. v2ray has neither.
     let honors_detour = matches!(backend, BackendType::SingBox | BackendType::Xray);
+    let init_detour_idx = initial_detour_index(existing.as_ref(), backend);
 
     let dialog = adw::AlertDialog::builder()
         .heading(if is_edit {
-            "Edit DNS Server"
+            tr("Edit DNS Server")
         } else {
-            "Add DNS Server"
+            tr("Add DNS Server")
         })
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("save", &tr(if is_edit { "Save" } else { "Add" }));
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
@@ -251,7 +281,7 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
         .model(&gtk::StringList::new(&[
             "UDP", "TCP", "DoH", "DoT", "DoQ", "H3",
         ]))
-        .selected(init_protocol)
+        .selected(init_protocol_idx)
         .build();
     group.add(&protocol_combo);
 
@@ -278,7 +308,7 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
         .title("Detour")
         .visible(honors_detour)
         .model(&gtk::StringList::new(&["proxy", "direct"]))
-        .selected(if init_detour == "direct" { 1 } else { 0 })
+        .selected(init_detour_idx)
         .build();
     if let Some(note) = detour_note(backend) {
         detour_combo.set_subtitle(note);
@@ -391,6 +421,7 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
         let protocol_combo = protocol_combo.clone();
         let address_entry = address_entry.clone();
         let port_spin = port_spin.clone();
+        let port_customized = port_customized.clone();
         let detour_combo = detour_combo.clone();
         move || {
             let server = dns_server_from_inputs(
@@ -398,6 +429,7 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
                 &protocol_combo,
                 &address_entry,
                 &port_spin,
+                port_customized.get(),
                 honors_detour,
                 &detour_combo,
             )?;
@@ -446,15 +478,42 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
     }
     {
         let update_validation = update_validation.clone();
-        port_spin.connect_changed(move |_| update_validation());
+        let protocol_combo = protocol_combo.clone();
+        let port_customized = port_customized.clone();
+        let suppress_port_tracking = suppress_port_tracking.clone();
+        port_spin.connect_changed(move |spin| {
+            if !suppress_port_tracking.get() {
+                let proto = index_to_protocol(protocol_combo.selected());
+                port_customized.set(spin.value() as u16 != proto.default_port());
+            }
+            update_validation();
+        });
+    }
+    {
+        let update_validation = update_validation.clone();
+        let protocol_combo = protocol_combo.clone();
+        let port_customized = port_customized.clone();
+        let suppress_port_tracking = suppress_port_tracking.clone();
+        port_spin.connect_value_notify(move |spin| {
+            if !suppress_port_tracking.get() {
+                let proto = index_to_protocol(protocol_combo.selected());
+                port_customized.set(spin.value() as u16 != proto.default_port());
+            }
+            update_validation();
+        });
     }
     {
         let port_spin = port_spin.clone();
-        let previous_default = Cell::new(index_to_protocol(init_protocol).default_port());
+        let port_customized = port_customized.clone();
+        let suppress_port_tracking = suppress_port_tracking.clone();
+        let previous_default = Cell::new(init_protocol.default_port());
         protocol_combo.connect_selected_notify(move |row| {
             let next_default = index_to_protocol(row.selected()).default_port();
-            if port_spin.value() as u16 == previous_default.get() {
+            if !port_customized.get() || port_spin.value() as u16 == previous_default.get() {
+                suppress_port_tracking.set(true);
                 port_spin.set_value(next_default as f64);
+                suppress_port_tracking.set(false);
+                port_customized.set(false);
             }
             previous_default.set(next_default);
         });
@@ -492,4 +551,65 @@ pub(super) fn show_dns_server_dialog(existing: Option<DnsServerConfig>, ctx: &Dn
     });
 
     dialog.present(crate::active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn initial_port_uses_protocol_default_and_preserves_none() {
+        let doh = DnsServerConfig {
+            tag: "remote".into(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".into(),
+            port: None,
+            detour: Some("proxy".into()),
+        };
+
+        let (init_port, customized) = initial_server_port(Some(&doh), doh.protocol);
+        assert_eq!(init_port, 443);
+        assert!(!customized);
+        assert_eq!(
+            resolve_server_port(init_port, doh.protocol, customized),
+            None
+        );
+
+        let custom = DnsServerConfig {
+            port: Some(8443),
+            ..doh.clone()
+        };
+        let (custom_port, custom_flag) = initial_server_port(Some(&custom), custom.protocol);
+        assert_eq!(custom_port, 8443);
+        assert!(custom_flag);
+        assert_eq!(
+            resolve_server_port(custom_port, custom.protocol, custom_flag),
+            Some(8443)
+        );
+    }
+
+    #[test]
+    fn initial_detour_index_defaults_none_to_direct_on_singbox() {
+        let unset = DnsServerConfig {
+            tag: "domestic".into(),
+            protocol: DnsProtocol::Udp,
+            address: "223.5.5.5".into(),
+            port: None,
+            detour: None,
+        };
+
+        assert_eq!(initial_detour_index(Some(&unset), BackendType::SingBox), 1);
+        assert_eq!(initial_detour_index(Some(&unset), BackendType::Xray), 0);
+        assert_eq!(initial_detour_index(None, BackendType::SingBox), 1);
+        assert_eq!(initial_detour_index(None, BackendType::Xray), 0);
+
+        let explicit_proxy = DnsServerConfig {
+            detour: Some("proxy".into()),
+            ..unset.clone()
+        };
+        assert_eq!(
+            initial_detour_index(Some(&explicit_proxy), BackendType::SingBox),
+            0
+        );
+    }
 }

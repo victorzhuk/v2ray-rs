@@ -13,6 +13,8 @@ use v2ray_rs_core::models::{
 };
 use v2ray_rs_core::persistence::AppPaths;
 
+use crate::i18n::tr;
+
 use super::{
     SettingsCallback, SettingsObservers, ToastCallback, clear_preferences_group,
     current_backend_status, emit, render_detected_backends, set_current_backend_status,
@@ -27,7 +29,7 @@ pub(super) fn build_network_page(
     toast_cb: &ToastCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("Network")
+        .title(tr("Network"))
         .icon_name("network-server-symbolic")
         .build();
 
@@ -35,8 +37,8 @@ pub(super) fn build_network_page(
     let backend_type = s.backend.backend_type;
 
     let backend_group = adw::PreferencesGroup::builder()
-        .title("Backend")
-        .description("Select proxy backend")
+        .title(tr("Backend"))
+        .description(tr("Select proxy backend"))
         .build();
     let detected_state = Rc::new(RefCell::new(Vec::<DetectedBackend>::new()));
     let backend_loading_row = adw::ActionRow::builder()
@@ -97,11 +99,11 @@ pub(super) fn build_network_page(
     page.add(&custom_group);
 
     let ports_group = adw::PreferencesGroup::builder()
-        .title("Proxy Ports")
+        .title(tr("Proxy Ports"))
         .build();
 
     let socks_row = adw::SpinRow::builder()
-        .title("SOCKS5 Port")
+        .title(tr("SOCKS5 Port"))
         .adjustment(&gtk::Adjustment::new(
             s.socks_port as f64,
             1024.0,
@@ -114,7 +116,7 @@ pub(super) fn build_network_page(
     ports_group.add(&socks_row);
 
     let http_row = adw::SpinRow::builder()
-        .title("HTTP Port")
+        .title(tr("HTTP Port"))
         .adjustment(&gtk::Adjustment::new(
             s.http_port as f64,
             1024.0,
@@ -181,17 +183,17 @@ pub(super) fn build_network_page(
     page.add(&ports_group);
 
     let sub_group = adw::PreferencesGroup::builder()
-        .title("Subscriptions")
+        .title(tr("Subscriptions"))
         .build();
 
     let auto_update_row = adw::SwitchRow::builder()
-        .title("Auto-update subscriptions")
+        .title(tr("Auto-update subscriptions"))
         .active(s.auto_update_subscriptions)
         .build();
     sub_group.add(&auto_update_row);
 
     let interval_row = adw::SpinRow::builder()
-        .title("Update interval (hours)")
+        .title(tr("Update interval (hours)"))
         .sensitive(s.auto_update_subscriptions)
         .adjustment(&gtk::Adjustment::new(
             (s.subscription_update_interval_secs / 3600) as f64,

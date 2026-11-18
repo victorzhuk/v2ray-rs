@@ -227,6 +227,11 @@ impl WorkspaceStore {
         Ok(())
     }
 
+    pub fn reset_routing_rules(&self) -> Result<(), PersistenceError> {
+        let _guard = self.lock();
+        self.persist_routing_rules(RoutingRuleSet::new())
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -434,5 +439,22 @@ mod tests {
 
         assert!(store.load_subscriptions().unwrap().is_empty());
         assert!(!store.paths().subscriptions_path().exists());
+    }
+
+    #[test]
+    fn reset_routing_rules_recovers_from_corrupt_file() {
+        let (_tmp, store) = store();
+        std::fs::write(store.paths().routing_rules_path(), b"{corrupt json").unwrap();
+        assert!(store.load_routing_rules().is_err());
+
+        store.reset_routing_rules().unwrap();
+
+        let rules = store.load_routing_rules().unwrap();
+        assert!(rules.rules().is_empty());
+
+        let reloaded = WorkspaceStore::new(store.paths().clone())
+            .load_routing_rules()
+            .unwrap();
+        assert!(reloaded.rules().is_empty());
     }
 }

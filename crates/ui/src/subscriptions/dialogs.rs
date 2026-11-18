@@ -84,11 +84,11 @@ pub(super) fn show_availability_dialog(
 
 pub(super) fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Add Subscription")
+        .heading(tr("Add Subscription"))
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("add", "Add");
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("add", &tr("Add"));
     dialog.set_response_appearance("add", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("add"));
     dialog.set_close_response("cancel");
@@ -102,18 +102,20 @@ pub(super) fn show_add_dialog(sender: ComponentSender<SubscriptionsPage>) {
         .margin_end(12)
         .build();
 
-    let name_entry = adw::EntryRow::builder().title("Name").build();
-    let url_entry = adw::EntryRow::builder().title("URL").build();
+    let name_entry = adw::EntryRow::builder().title(tr("Name")).build();
+    let url_entry = adw::EntryRow::builder().title(tr("URL")).build();
 
     let group = adw::PreferencesGroup::new();
     group.add(&name_entry);
     group.add(&url_entry);
-    let file_entry = adw::EntryRow::builder().title("Local File Path").build();
+    let file_entry = adw::EntryRow::builder()
+        .title(tr("Local File Path"))
+        .build();
     group.add(&file_entry);
     content.append(&group);
 
     let paste_label = gtk::Label::builder()
-        .label("Or paste a config-bundle JSON subscription")
+        .label(tr("Or paste a config-bundle JSON subscription"))
         .halign(gtk::Align::Start)
         .css_classes(["caption"])
         .build();
@@ -292,11 +294,11 @@ pub(super) fn show_rename_dialog(
     sender: ComponentSender<SubscriptionsPage>,
 ) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Rename Subscription")
+        .heading(tr("Rename Subscription"))
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("rename", "Rename");
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("rename", &tr("Rename"));
     dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("rename"));
     dialog.set_close_response("cancel");
@@ -311,7 +313,7 @@ pub(super) fn show_rename_dialog(
         .build();
 
     let name_entry = adw::EntryRow::builder()
-        .title("Name")
+        .title(tr("Name"))
         .text(current_name)
         .build();
 
@@ -355,12 +357,12 @@ pub(super) fn show_rename_dialog(
 
 pub(super) fn show_delete_dialog(id: Uuid, sender: ComponentSender<SubscriptionsPage>) {
     let dialog = adw::AlertDialog::builder()
-        .heading("Delete Subscription")
-        .body("Are you sure you want to delete this subscription?")
+        .heading(tr("Delete Subscription"))
+        .body(tr("Are you sure you want to delete this subscription?"))
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("delete", "Delete");
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("delete", &tr("Delete"));
     dialog.set_response_appearance("delete", adw::ResponseAppearance::Destructive);
     dialog.set_default_response(Some("cancel"));
     dialog.set_close_response("cancel");

@@ -38,6 +38,23 @@ pub(super) fn private_dns_warning(
         .then_some(PRIVATE_DNS_WARNING)
 }
 
+/// Addresses of all enabled nodes across enabled subscriptions and manual nodes.
+pub(super) fn collect_enabled_node_addresses(
+    subscriptions: &[Subscription],
+    manual_nodes: &[ManualNode],
+) -> Vec<String> {
+    let mut addrs = Vec::new();
+    for sub in subscriptions.iter().filter(|s| s.enabled) {
+        for sn in sub.nodes.iter().filter(|n| n.enabled) {
+            addrs.push(sn.node.address().to_string());
+        }
+    }
+    for mn in manual_nodes.iter().filter(|n| n.enabled) {
+        addrs.push(mn.node.address().to_string());
+    }
+    addrs
+}
+
 /// Names of enabled subscriptions whose imported provider profile carries its
 /// own DNS config — those nodes bypass the app-wide DNS settings.
 pub(super) fn dns_profile_subscription_names(subscriptions: &[Subscription]) -> Vec<String> {

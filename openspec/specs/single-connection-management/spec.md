@@ -22,7 +22,7 @@ The system SHALL allow users to define, save, edit, enable, disable, and delete 
 - **THEN** the node is removed from manual-node persistence and no longer appears in the nodes list
 
 ### Requirement: Protocol-specific manual node forms
-The system SHALL provide protocol-specific forms for VLESS, VMess, Shadowsocks, and Trojan using the existing proxy-node model fields.
+The system SHALL provide protocol-specific forms for VLESS, VMess, Shadowsocks, and Trojan using the existing proxy-node model fields, and editing an existing manual node SHALL preserve transport metadata not exposed as editable form fields (such as custom WebSocket HTTP headers) when the transport type remains WebSocket.
 
 #### Scenario: Choose VMess in the add dialog
 - **WHEN** the user selects `VMess`
@@ -31,6 +31,10 @@ The system SHALL provide protocol-specific forms for VLESS, VMess, Shadowsocks, 
 #### Scenario: Choose Trojan in the add dialog
 - **WHEN** the user selects `Trojan`
 - **THEN** the form shows the Trojan fields required by the proxy-node model
+
+#### Scenario: Editing a WebSocket manual node preserves custom headers
+- **WHEN** an existing manual node has `TransportSettings::Ws` with custom `headers` (for example `{"User-Agent": "custom"}`) and the user edits its remark, address, or WebSocket path/host and saves
+- **THEN** the saved manual node SHALL retain its existing custom `headers` map instead of clearing it
 
 ### Requirement: Enabled manual nodes participate in connection planning
 Enabled manual nodes SHALL participate in candidate planning and manual-node changes SHALL follow the connected-state restart policy.

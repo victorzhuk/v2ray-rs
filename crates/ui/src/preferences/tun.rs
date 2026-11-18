@@ -11,6 +11,8 @@ use v2ray_rs_core::models::{
     validate_exclude_route, validate_ip_cidr, validate_tun_interface_name,
 };
 
+use crate::i18n::tr;
+
 use super::{SettingsCallback, SettingsObservers, ToastCallback, subscribe_settings};
 
 type RenderFn = Rc<dyn Fn()>;
@@ -130,7 +132,7 @@ pub(super) fn build_tun_page(
     toast_cb: &ToastCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("TUN")
+        .title(tr("TUN"))
         .icon_name("network-vpn-symbolic")
         .build();
     page.set_name(Some(TUN_PAGE_NAME));
@@ -140,12 +142,12 @@ pub(super) fn build_tun_page(
 
     // --- Primary group ------------------------------------------------------
     let primary = adw::PreferencesGroup::builder()
-        .title("TUN mode")
-        .description("Route all system traffic through the active proxy")
+        .title(tr("TUN mode"))
+        .description(tr("Route all system traffic through the active proxy"))
         .build();
 
     let enable_row = adw::SwitchRow::builder()
-        .title("Enable TUN")
+        .title(tr("Enable TUN"))
         .active(state.borrow().tun.enabled)
         .sensitive(!is_v2ray)
         .build();

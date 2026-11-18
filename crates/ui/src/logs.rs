@@ -1,6 +1,8 @@
 use adw::prelude::*;
 use relm4::prelude::*;
 
+use crate::i18n::tr;
+
 const MAX_LOG_LINES: i32 = 10_000;
 
 pub struct LogsPage {
@@ -35,7 +37,7 @@ impl SimpleComponent for LogsPage {
 
                 gtk::Button {
                     set_icon_name: "edit-clear-all-symbolic",
-                    set_tooltip_text: Some("Clear logs"),
+                    set_tooltip_text: Some(&tr("Clear logs")),
                     add_css_class: "flat",
                     connect_clicked => LogsMsg::Clear,
                 },
@@ -60,7 +62,7 @@ impl SimpleComponent for LogsPage {
 
                     gtk::Label {
                         set_halign: gtk::Align::Start,
-                        set_label: "Process not running. Showing the most recent logs from this session.",
+                        set_label: &tr("Process not running. Showing the most recent logs from this session."),
                         add_css_class: "dim-label",
                     },
                 },

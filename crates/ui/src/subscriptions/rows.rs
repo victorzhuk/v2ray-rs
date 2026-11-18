@@ -173,8 +173,8 @@ pub(super) fn render_list(
     if subs.is_empty() {
         let empty = adw::StatusPage::builder()
             .icon_name("folder-download-symbolic")
-            .title("No Subscriptions")
-            .description("Add a subscription to get started")
+            .title(tr("No Subscriptions"))
+            .description(tr("Add a subscription to get started"))
             .build();
         let row = gtk::ListBoxRow::builder()
             .selectable(false)

@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use adw::prelude::*;
 use relm4::adw;
 use relm4::prelude::*;
@@ -8,6 +10,7 @@ use v2ray_rs_core::models::{
     TransportSettings, TrojanConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
 };
 
+use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
 pub struct NodesPage {
@@ -137,6 +140,7 @@ struct TransportRows {
     kind: adw::ComboRow,
     ws_path: adw::EntryRow,
     ws_host: adw::EntryRow,
+    ws_headers: HashMap<String, String>,
     grpc_service_name: adw::EntryRow,
     grpc_multi_mode: adw::SwitchRow,
     h2_host: adw::EntryRow,
@@ -155,9 +159,13 @@ impl TransportRows {
             TransportSettings::H2(_) => 3,
             TransportSettings::Xhttp(_) => 4,
         };
-        let (ws_path, ws_host) = match initial {
-            TransportSettings::Ws(ws) => (ws.path.clone(), ws.host.clone().unwrap_or_default()),
-            _ => ("/".into(), String::new()),
+        let (ws_path, ws_host, ws_headers) = match initial {
+            TransportSettings::Ws(ws) => (
+                ws.path.clone(),
+                ws.host.clone().unwrap_or_default(),
+                ws.headers.clone(),
+            ),
+            _ => ("/".into(), String::new(), HashMap::new()),
         };
         let (grpc_service_name, grpc_multi_mode) = match initial {
             TransportSettings::Grpc(grpc) => (grpc.service_name.clone(), grpc.multi_mode),
@@ -195,6 +203,7 @@ impl TransportRows {
                 .title("WS Host")
                 .text(&ws_host)
                 .build(),
+            ws_headers,
             grpc_service_name: adw::EntryRow::builder()
                 .title("gRPC Service Name")
                 .text(&grpc_service_name)
@@ -269,7 +278,7 @@ impl TransportRows {
             1 => TransportSettings::Ws(WsSettings {
                 path: trimmed_text(&self.ws_path),
                 host: trimmed_optional_text(&self.ws_host),
-                headers: Default::default(),
+                headers: self.ws_headers.clone(),
             }),
             2 => TransportSettings::Grpc(GrpcSettings {
                 service_name: trimmed_text(&self.grpc_service_name),
@@ -709,11 +718,11 @@ impl Component for NodesPage {
                         set_label: model
                             .load_error
                             .as_deref()
-                            .unwrap_or("Failed to load manual nodes"),
+                            .unwrap_or(&tr("Failed to load manual nodes")),
                     },
 
                     gtk::Button {
-                        set_label: "Reset Data",
+                        set_label: &tr("Reset Data"),
                         add_css_class: "destructive-action",
                         connect_clicked => NodesMsg::ResetStorage,
                     },
@@ -728,7 +737,7 @@ impl Component for NodesPage {
 
                 gtk::Button {
                     set_icon_name: "edit-paste-symbolic",
-                    set_tooltip_text: Some("Import from URL"),
+                    set_tooltip_text: Some(&tr("Import from URL")),
                     add_css_class: "flat",
                     #[watch]
                     set_sensitive: model.load_error.is_none(),
@@ -739,7 +748,7 @@ impl Component for NodesPage {
 
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
-                    set_tooltip_text: Some("Add Manual Node"),
+                    set_tooltip_text: Some(&tr("Add Manual Node")),
                     add_css_class: "flat",
                     #[watch]
                     set_sensitive: model.load_error.is_none(),
@@ -1361,6 +1370,58 @@ mod tests {
             assert!(rows.spider_x.is_sensitive());
             let tls = rows.value().expect("TLS stays enabled");
             assert_eq!(tls.spider_x.as_deref(), Some("/spx"));
+        });
+    }
+
+    #[test]
+    fn ws_transport_round_trip_preserves_custom_headers() {
+        crate::gtk_test::run(|| {
+            let mut headers = HashMap::new();
+            headers.insert("User-Agent".into(), "custom-agent/1.0".into());
+            headers.insert("X-Edge".into(), "token".into());
+
+            let initial = ProxyNode::Vless(VlessConfig {
+                address: "edge.example.com".into(),
+                port: 443,
+                uuid: "11111111-1111-1111-1111-111111111111".into(),
+                encryption: Some("none".into()),
+                flow: None,
+                transport: TransportSettings::Ws(WsSettings {
+                    path: "/ws".into(),
+                    host: Some("cdn.example.com".into()),
+                    headers: headers.clone(),
+                }),
+                tls: None,
+                remark: Some("Before".into()),
+            });
+
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            let form = NodeForm::from_node(&initial, &content);
+            if let NodeForm::Vless {
+                common, transport, ..
+            } = &form
+            {
+                common.remark.set_text("After");
+                transport.ws_path.set_text("/ws-v2");
+            } else {
+                panic!("expected VLESS form");
+            }
+
+            let saved = form.to_node();
+            match saved {
+                ProxyNode::Vless(cfg) => {
+                    assert_eq!(cfg.remark.as_deref(), Some("After"));
+                    match cfg.transport {
+                        TransportSettings::Ws(ws) => {
+                            assert_eq!(ws.path, "/ws-v2");
+                            assert_eq!(ws.host.as_deref(), Some("cdn.example.com"));
+                            assert_eq!(ws.headers, headers);
+                        }
+                        other => panic!("expected Ws transport, got {other:?}"),
+                    }
+                }
+                other => panic!("expected Vless node, got {other:?}"),
+            }
         });
     }
 }

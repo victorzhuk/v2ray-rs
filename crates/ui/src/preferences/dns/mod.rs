@@ -10,9 +10,12 @@ use std::str::FromStr;
 use v2ray_rs_core::config::effective_dns::{DnsSource, EffectiveDns, effective_dns};
 use v2ray_rs_core::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
-    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, RoutingRuleSet, Subscription,
-    builtin_dns_presets, validate_domain_keyword,
+    DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, ManualNode, RoutingRuleSet,
+    Subscription, builtin_dns_presets, validate_domain_keyword,
 };
+
+use crate::i18n::tr;
+use crate::workspace::WorkspaceStore;
 
 use super::{
     RoutingObservers, SettingsCallback, SettingsObservers, clear_preferences_group, emit,
@@ -20,66 +23,67 @@ use super::{
 };
 
 pub(super) fn build_dns_page(
+    store: &WorkspaceStore,
     state: &Rc<RefCell<AppSettings>>,
     cb: &SettingsCallback,
     settings_observers: &SettingsObservers,
     rules: &Rc<RefCell<RoutingRuleSet>>,
     routing_observers: &RoutingObservers,
-    subscriptions: &[Subscription],
+    nodes_observers: &RoutingObservers,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("DNS")
+        .title(tr("DNS"))
         .icon_name("network-transmit-symbolic")
         .build();
 
     let s = state.borrow();
 
     let primary_group = adw::PreferencesGroup::builder()
-        .title("Primary DNS")
+        .title(tr("Primary DNS"))
         .build();
 
     let enable_row = adw::SwitchRow::builder()
-        .title("Enable DNS")
+        .title(tr("Enable DNS"))
         .active(s.dns.enabled)
         .build();
     primary_group.add(&enable_row);
 
     let strategy_row = adw::ComboRow::builder()
-        .title("IP Strategy")
+        .title(tr("IP Strategy"))
         .model(&gtk::StringList::new(&[
-            "Prefer IPv4",
-            "Prefer IPv6",
-            "IPv4 Only",
-            "IPv6 Only",
+            &tr("Prefer IPv4"),
+            &tr("Prefer IPv6"),
+            &tr("IPv4 Only"),
+            &tr("IPv6 Only"),
         ]))
         .selected(strategy_to_index(s.dns.strategy))
         .build();
     primary_group.add(&strategy_row);
 
     let remote_server_row = adw::ActionRow::builder()
-        .title("Remote")
-        .subtitle("Not configured")
+        .title(tr("Remote"))
+        .subtitle(tr("Not configured"))
         .build();
     let remote_edit_btn = gtk::Button::builder()
         .icon_name("document-edit-symbolic")
         .valign(gtk::Align::Center)
         .has_frame(false)
         .css_classes(["flat"])
-        .tooltip_text("Edit Remote Server")
+        .tooltip_text(tr("Edit Remote Server"))
         .build();
     remote_server_row.add_suffix(&remote_edit_btn);
     primary_group.add(&remote_server_row);
 
     let domestic_server_row = adw::ActionRow::builder()
-        .title("Domestic")
-        .subtitle("Not configured")
+        .title(tr("Domestic"))
+        .subtitle(tr("Not configured"))
         .build();
     let domestic_edit_btn = gtk::Button::builder()
         .icon_name("document-edit-symbolic")
         .valign(gtk::Align::Center)
         .has_frame(false)
         .css_classes(["flat"])
-        .tooltip_text("Edit Domestic Server")
+        .tooltip_text(tr("Edit Domestic Server"))
         .build();
     domestic_server_row.add_suffix(&domestic_edit_btn);
     primary_group.add(&domestic_server_row);
@@ -118,11 +122,13 @@ pub(super) fn build_dns_page(
         });
     }
     let advanced_expander = adw::ExpanderRow::builder()
-        .title("Advanced")
-        .subtitle("Full configuration")
+        .title(tr("Advanced"))
+        .subtitle(tr("Full configuration"))
         .build();
 
-    let servers_group = adw::PreferencesGroup::builder().title("Servers").build();
+    let servers_group = adw::PreferencesGroup::builder()
+        .title(tr("Servers"))
+        .build();
     let servers_toolbar = adw::ActionRow::builder().activatable(false).build();
     let servers_toolbar_box = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
@@ -268,19 +274,24 @@ pub(super) fn build_dns_page(
     let advanced_group = adw::PreferencesGroup::new();
 
     let effective_group = adw::PreferencesGroup::builder()
-        .title("Effective DNS")
+        .title(tr("Effective DNS"))
         .build();
     {
         let rules = rules.clone();
+        let store = store.clone();
         let effective_group = effective_group.clone();
-        let profile_subscriptions = dns_profile_subscription_names(subscriptions);
         let render_effective: Rc<dyn Fn(&AppSettings)> = Rc::new(move |settings: &AppSettings| {
             clear_preferences_group(&effective_group);
+            let subscriptions = store.load_subscriptions().unwrap_or_default();
+            let manual_nodes = store.load_manual_nodes_or_default();
+            let profile_subscriptions = dns_profile_subscription_names(&subscriptions);
+            let node_addrs = collect_enabled_node_addresses(&subscriptions, &manual_nodes);
+            let node_addr_refs: Vec<&str> = node_addrs.iter().map(String::as_str).collect();
             let summary = effective_dns(
                 settings.backend.backend_type,
                 settings,
                 rules.borrow().rules(),
-                &[],
+                &node_addr_refs,
             );
             for row in effective_dns_rows(&summary, &profile_subscriptions) {
                 effective_group.add(&adw::ActionRow::builder().title(row).build());
@@ -297,6 +308,13 @@ pub(super) fn build_dns_page(
             let render_effective = render_effective.clone();
             let state = state.clone();
             routing_observers
+                .borrow_mut()
+                .push(Rc::new(move || render_effective(&state.borrow())));
+        }
+        {
+            let render_effective = render_effective.clone();
+            let state = state.clone();
+            nodes_observers
                 .borrow_mut()
                 .push(Rc::new(move || render_effective(&state.borrow())));
         }
@@ -1263,6 +1281,77 @@ mod tests {
         assert_eq!(
             primary_row_missing_note(AUTO_SPLIT_DOMESTIC_TAG, true),
             "Not configured - set up in Advanced"
+        );
+    }
+
+    #[test]
+    fn collect_enabled_node_addresses_triggers_xray_tun_bootstrap_rows() {
+        use v2ray_rs_core::models::{ProxyNode, SubscriptionNode, TransportSettings, VlessConfig};
+
+        let make_vless = |addr: &str| {
+            ProxyNode::Vless(VlessConfig {
+                address: addr.into(),
+                port: 443,
+                uuid: "11111111-1111-1111-1111-111111111111".into(),
+                encryption: Some("none".into()),
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: None,
+            })
+        };
+
+        let mut sub_enabled = Subscription::new_from_url("Enabled", "https://example.com/1");
+        sub_enabled.nodes = vec![SubscriptionNode::new(make_vless("edge.example.com")), {
+            let mut disabled_node = SubscriptionNode::new(make_vless("disabled.example.com"));
+            disabled_node.enabled = false;
+            disabled_node
+        }];
+
+        let mut sub_disabled = Subscription::new_from_url("Disabled", "https://example.com/2");
+        sub_disabled.enabled = false;
+        sub_disabled.nodes = vec![SubscriptionNode::new(make_vless("sub-off.example.com"))];
+
+        let mut manual_disabled = ManualNode::new(make_vless("manual-off.example.com"));
+        manual_disabled.enabled = false;
+        let manual_enabled = ManualNode::new(make_vless("manual.example.com"));
+
+        let addrs = collect_enabled_node_addresses(
+            &[sub_enabled, sub_disabled],
+            &[manual_enabled, manual_disabled],
+        );
+        assert_eq!(addrs, vec!["edge.example.com", "manual.example.com"]);
+
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "remote".into(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".into(),
+            port: None,
+            detour: Some("proxy".into()),
+        }];
+
+        let addr_refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
+        let summary = effective_dns(BackendType::Xray, &settings, &[], &addr_refs);
+        let bootstrap_scopes: Vec<String> = summary
+            .entries()
+            .iter()
+            .filter(|e| e.source() == DnsSource::Bootstrap)
+            .map(|e| e.scope().to_string())
+            .collect();
+        assert!(
+            bootstrap_scopes
+                .iter()
+                .any(|s| s.contains("edge.example.com")),
+            "expected edge.example.com in bootstrap scopes: {bootstrap_scopes:?}"
+        );
+        assert!(
+            bootstrap_scopes
+                .iter()
+                .any(|s| s.contains("manual.example.com")),
+            "expected manual.example.com in bootstrap scopes: {bootstrap_scopes:?}"
         );
     }
 }

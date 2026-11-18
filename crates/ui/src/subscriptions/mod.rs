@@ -20,6 +20,7 @@ use v2ray_rs_subscription::{
 };
 
 use crate::failure_streak::FailureStreak;
+use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
 pub struct SubscriptionsPage {
@@ -103,6 +104,7 @@ pub enum Direction {
 pub enum SubscriptionsOutput {
     ActiveNodesChanged(bool),
     SubscriptionsChanged,
+    SubscriptionsPersisted,
     ConnectNode(Uuid, Uuid),
     Notice(String),
 }
@@ -262,11 +264,11 @@ impl Component for SubscriptionsPage {
                         set_label: model
                             .load_error
                             .as_deref()
-                            .unwrap_or("Failed to load subscriptions"),
+                            .unwrap_or(&tr("Failed to load subscriptions")),
                     },
 
                     gtk::Button {
-                        set_label: "Reset Data",
+                        set_label: &tr("Reset Data"),
                         add_css_class: "destructive-action",
                         connect_clicked => SubscriptionsMsg::ResetStorage,
                     },
@@ -281,7 +283,7 @@ impl Component for SubscriptionsPage {
 
                 gtk::Button {
                     set_icon_name: "list-add-symbolic",
-                    set_tooltip_text: Some("Add Subscription"),
+                    set_tooltip_text: Some(&tr("Add Subscription")),
                     add_css_class: "flat",
                     #[watch]
                     set_sensitive: model.load_error.is_none(),
@@ -1347,6 +1349,8 @@ impl Component for SubscriptionsPage {
             SubscriptionsCmdOutput::SubscriptionsSaved(result) => {
                 if let Err(err) = result {
                     report_subscription_persist_error(&sender, &err);
+                } else {
+                    let _ = sender.output(SubscriptionsOutput::SubscriptionsPersisted);
                 }
             }
             SubscriptionsCmdOutput::SnapshotSaved(result) => {

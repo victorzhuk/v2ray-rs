@@ -411,16 +411,17 @@ pub(super) fn try_run() -> Result<(), String> {
         profile.qualifier()
     );
 
-    let settings = match WorkspaceStore::new(paths.clone()).load_settings() {
+    let settings = match v2ray_rs_core::persistence::load_settings(&paths) {
         Ok(settings) => settings,
         Err(err) => {
             log::warn!("load settings during startup: {err}");
             AppSettings::default()
         }
     };
-    // gettext's setlocale is not thread-safe, so it must run before GTK or the
-    // tray service can spawn any thread. A language change needs a restart.
-    crate::i18n::init(settings.language);
+    // gettext's setlocale and env LANGUAGE are not thread-safe, so this must
+    // run before WorkspaceStore, GTK, Tokio, or the tray service spawn threads.
+    // A language change needs a restart.
+    crate::i18n::init_process_locale(settings.language);
 
     let app_id = profile.app_id();
     let app = adw::Application::builder().application_id(&app_id).build();

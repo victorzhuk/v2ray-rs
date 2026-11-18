@@ -14,6 +14,7 @@ use v2ray_rs_core::models::{
 };
 use v2ray_rs_core::persistence::{self, AppPaths};
 
+use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
 use super::{RoutingCallback, emit_routing};
@@ -25,7 +26,7 @@ pub(super) fn build_routing_page(
     on_changed: &RoutingCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("Routing")
+        .title(tr("Routing"))
         .icon_name("network-workgroup-symbolic")
         .build();
 
@@ -43,14 +44,14 @@ pub(super) fn build_routing_page(
         .build();
 
     let presets_btn = gtk::Button::builder()
-        .label("Presets")
+        .label(tr("Presets"))
         .css_classes(["flat"])
         .build();
     toolbar.append(&presets_btn);
 
     let add_btn = gtk::Button::builder()
         .icon_name("list-add-symbolic")
-        .tooltip_text("Add Rule")
+        .tooltip_text(tr("Add Rule"))
         .css_classes(["flat"])
         .build();
     toolbar.append(&add_btn);
@@ -88,7 +89,11 @@ pub(super) fn build_routing_page(
     page
 }
 
-pub(super) fn build_routing_error_page(paths: &AppPaths, error: String) -> adw::PreferencesPage {
+pub(super) fn build_routing_error_page(
+    store: &WorkspaceStore,
+    on_reset: &RoutingCallback,
+    error: String,
+) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title("Routing")
         .icon_name("network-workgroup-symbolic")
@@ -117,13 +122,11 @@ pub(super) fn build_routing_error_page(paths: &AppPaths, error: String) -> adw::
         .build();
     row.add_suffix(&reset_btn);
 
-    let routing_path = paths.routing_rules_path();
-    reset_btn.connect_clicked(move |button| match std::fs::remove_file(&routing_path) {
+    let store = store.clone();
+    let on_reset = on_reset.clone();
+    reset_btn.connect_clicked(move |button| match store.reset_routing_rules() {
         Ok(()) => {
-            status.set_label("Routing rules reset. Reopen Preferences to continue.");
-            button.set_sensitive(false);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            on_reset(RoutingRuleSet::new());
             status.set_label("Routing rules reset. Reopen Preferences to continue.");
             button.set_sensitive(false);
         }
@@ -485,20 +488,44 @@ fn rule_match_from_input(type_idx: u32, value: &str) -> Result<RuleMatch, String
     Ok(match_condition)
 }
 
+fn build_saved_routing_rule(
+    existing: Option<&RoutingRule>,
+    match_condition: RuleMatch,
+    action: RuleAction,
+    via_node: Option<ConnectionNodeRef>,
+) -> RoutingRule {
+    RoutingRule {
+        id: existing.map_or_else(Uuid::new_v4, |r| r.id),
+        match_condition,
+        action,
+        enabled: existing.is_none_or(|r| r.enabled),
+        group: existing.and_then(|r| r.group.clone()),
+        via_node: if action == RuleAction::Proxy {
+            via_node
+        } else {
+            None
+        },
+    }
+}
+
 fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
     let is_edit = existing.is_some();
 
     let dialog = adw::AlertDialog::builder()
-        .heading(if is_edit { "Edit Rule" } else { "Add Rule" })
+        .heading(if is_edit {
+            tr("Edit Rule")
+        } else {
+            tr("Add Rule")
+        })
         .build();
 
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("save", &tr(if is_edit { "Save" } else { "Add" }));
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
 
-    let (init_type_idx, init_value, init_action_idx, editing_id) = match &existing {
+    let (init_type_idx, init_value, init_action_idx) = match &existing {
         Some(rule) => {
             let (ti, val) = match &rule.match_condition {
                 RuleMatch::GeoIp { country_code } => (0u32, country_code.clone()),
@@ -516,9 +543,9 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
                 RuleAction::Direct => 1,
                 RuleAction::Block => 2,
             };
-            (ti, val, ai, Some(rule.id))
+            (ti, val, ai)
         }
-        None => (0, String::new(), 0, None),
+        None => (0, String::new(), 0),
     };
 
     let content = gtk::Box::builder()
@@ -789,6 +816,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
     value_entry.add_suffix(&show_suggestions);
 
     let ctx = ctx.clone();
+    let existing_rule = existing.clone();
     dialog.connect_response(None, move |_, response| {
         if response != "save" {
             return;
@@ -822,14 +850,8 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             _ => None,
         };
 
-        let rule = RoutingRule {
-            id: editing_id.unwrap_or_else(Uuid::new_v4),
-            match_condition,
-            action,
-            enabled: true,
-            group: None,
-            via_node,
-        };
+        let rule =
+            build_saved_routing_rule(existing_rule.as_ref(), match_condition, action, via_node);
 
         {
             let mut rs = ctx.rule_set.borrow_mut();
@@ -1096,5 +1118,49 @@ mod routing_row_tests {
             })),
             None
         );
+    }
+
+    #[test]
+    fn editing_rule_preserves_disabled_state_and_group() {
+        let id = Uuid::new_v4();
+        let via = Some(ConnectionNodeRef::Manual {
+            node_id: Uuid::new_v4(),
+        });
+        let existing = RoutingRule {
+            id,
+            match_condition: RuleMatch::Domain {
+                pattern: "example.com".into(),
+            },
+            action: RuleAction::Proxy,
+            enabled: false,
+            group: Some("work".into()),
+            via_node: via,
+        };
+
+        let updated = build_saved_routing_rule(
+            Some(&existing),
+            RuleMatch::Domain {
+                pattern: "corp.example.com".into(),
+            },
+            RuleAction::Direct,
+            via,
+        );
+        assert_eq!(updated.id, id);
+        assert!(!updated.enabled);
+        assert_eq!(updated.group.as_deref(), Some("work"));
+        assert_eq!(updated.action, RuleAction::Direct);
+        assert_eq!(updated.via_node, None);
+
+        let created = build_saved_routing_rule(
+            None,
+            RuleMatch::GeoIp {
+                country_code: "RU".into(),
+            },
+            RuleAction::Proxy,
+            via,
+        );
+        assert!(created.enabled);
+        assert_eq!(created.group, None);
+        assert_eq!(created.via_node, via);
     }
 }

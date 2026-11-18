@@ -230,3 +230,234 @@ msgstr "Редактировать правило"
 
 msgid "Delete rule"
 msgstr "Удалить правило"
+
+msgid "Settings File Needs Repair"
+msgstr "Файл настроек требует восстановления"
+
+msgid "Quit"
+msgstr "Выход"
+
+msgid "Reset Settings"
+msgstr "Сбросить настройки"
+
+msgid "Main Menu"
+msgstr "Главное меню"
+
+msgid "View Generated Config"
+msgstr "Показать сгенерированную конфигурацию"
+
+msgid "Preferences"
+msgstr "Параметры"
+
+msgid "Configuration changed"
+msgstr "Конфигурация изменена"
+
+msgid "Apply & Restart"
+msgstr "Применить и перезапустить"
+
+msgid "Nodes"
+msgstr "Узлы"
+
+msgid "No enabled proxy nodes"
+msgstr "Нет включённых прокси-узлов"
+
+msgid "Disconnect from proxy"
+msgstr "Отключиться от прокси"
+
+msgid "Connect to proxy"
+msgstr "Подключиться к прокси"
+
+msgid "Proxy not responding"
+msgstr "Прокси не отвечает"
+
+msgid "last probe"
+msgstr "последняя проверка"
+
+msgid "DNS via proxy failing"
+msgstr "Ошибка DNS через прокси"
+
+msgid "Restarting after crash"
+msgstr "Перезапуск после сбоя"
+
+msgid "Reconnecting"
+msgstr "Переподключение"
+
+msgid "Connecting…"
+msgstr "Подключение…"
+
+msgid "Resolving nodes"
+msgstr "Поиск узлов"
+
+msgid "Disconnecting…"
+msgstr "Отключение…"
+
+msgid "Stopping backend"
+msgstr "Остановка бэкенда"
+
+msgid "Error"
+msgstr "Ошибка"
+
+msgid "No active connection"
+msgstr "Нет активного подключения"
+
+msgid "Process not running. Showing the most recent logs from this session."
+msgstr "Процесс не запущен. Показаны последние строки журнала за этот сеанс."
+
+msgid "Failed to load subscriptions"
+msgstr "Не удалось загрузить подписки"
+
+msgid "Reset Data"
+msgstr "Сбросить данные"
+
+msgid "Local File Path"
+msgstr "Локальный путь к файлу"
+
+msgid "Or paste a config-bundle JSON subscription"
+msgstr "Или вставьте JSON-конфигурацию подписки"
+
+msgid "Rename Subscription"
+msgstr "Переименовать подписку"
+
+msgid "Rename"
+msgstr "Переименовать"
+
+msgid "Failed to load manual nodes"
+msgstr "Не удалось загрузить ручные узлы"
+
+msgid "Import from URL"
+msgstr "Импорт из URL"
+
+msgid "Add Manual Node"
+msgstr "Добавить узел вручную"
+
+msgid "A desktop GUI for managing v2ray, xray, and sing-box proxy configurations.\n\nLet's get started with the initial setup."
+msgstr "Графическое приложение для управления конфигурациями v2ray, xray и sing-box.\n\nДавайте выполним начальную настройку."
+
+msgid "Custom Backend Path"
+msgstr "Свой путь к бэкенду"
+
+msgid "Validate and use a manually provided backend binary"
+msgstr "Проверить и использовать вручную указанный исполняемый файл бэкенда"
+
+msgid "Backend type"
+msgstr "Тип бэкенда"
+
+msgid "Binary path"
+msgstr "Путь к файлу"
+
+msgid "Custom path status"
+msgstr "Статус пути"
+
+msgid "Not validated"
+msgstr "Не проверено"
+
+msgid "Validate Custom Path"
+msgstr "Проверить путь"
+
+msgid "Add either a proxy subscription URL or a local file path (optional)"
+msgstr "Укажите URL подписки или путь к локальному файлу (необязательно)"
+
+msgid "Subscription Name"
+msgstr "Название подписки"
+
+msgid "You're all set! Click Finish to start using V2Ray Manager."
+msgstr "Всё готово! Нажмите «Готово», чтобы начать работу с V2Ray Manager."
+
+msgid "System"
+msgstr "Система"
+
+msgid "Integration"
+msgstr "Интеграция"
+
+msgid "Restart the application to apply the new language"
+msgstr "Перезапустите приложение, чтобы применить новый язык"
+
+msgid "Diagnostics"
+msgstr "Диагностика"
+
+msgid "Backend log level"
+msgstr "Уровень журнала бэкенда"
+
+msgid "Connection log"
+msgstr "Журнал подключений"
+
+msgid "Network"
+msgstr "Сеть"
+
+msgid "Routing"
+msgstr "Маршрутизация"
+
+msgid "DNS"
+msgstr "DNS"
+
+msgid "Primary DNS"
+msgstr "Основной DNS"
+
+msgid "Enable DNS"
+msgstr "Включить DNS"
+
+msgid "IP Strategy"
+msgstr "Стратегия IP"
+
+msgid "Prefer IPv4"
+msgstr "Предпочитать IPv4"
+
+msgid "Prefer IPv6"
+msgstr "Предпочитать IPv6"
+
+msgid "IPv4 Only"
+msgstr "Только IPv4"
+
+msgid "IPv6 Only"
+msgstr "Только IPv6"
+
+msgid "Remote"
+msgstr "Удалённый"
+
+msgid "Not configured"
+msgstr "Не настроено"
+
+msgid "Edit Remote Server"
+msgstr "Изменить удалённый сервер"
+
+msgid "Domestic"
+msgstr "Локальный"
+
+msgid "Edit Domestic Server"
+msgstr "Изменить локальный сервер"
+
+msgid "Advanced"
+msgstr "Дополнительно"
+
+msgid "Full configuration"
+msgstr "Полная конфигурация"
+
+msgid "Servers"
+msgstr "Серверы"
+
+msgid "Effective DNS"
+msgstr "Итоговый DNS"
+
+msgid "Edit DNS Server"
+msgstr "Редактировать DNS-сервер"
+
+msgid "Add DNS Server"
+msgstr "Добавить DNS-сервер"
+
+msgid "Edit Host"
+msgstr "Редактировать запись"
+
+msgid "Add Host"
+msgstr "Добавить запись"
+
+msgid "TUN"
+msgstr "TUN"
+
+msgid "TUN mode"
+msgstr "Режим TUN"
+
+msgid "Route all system traffic through the active proxy"
+msgstr "Направлять весь системный трафик через активный прокси"
+
+msgid "Enable TUN"
+msgstr "Включить TUN"

@@ -1,20 +1,41 @@
 use super::*;
 pub(super) fn upsert_dns_host(
     settings: &mut AppSettings,
-    original_domain: Option<&str>,
+    original: Option<(&str, &str)>,
     host: HostOverride,
 ) -> Result<(), String> {
-    if let Some(original_domain) = original_domain {
+    if let Some((orig_domain, orig_ip)) = original {
         let Some(idx) = settings
             .dns
             .hosts
             .iter()
-            .position(|existing| existing.domain == original_domain)
+            .position(|existing| existing.domain == orig_domain && existing.ip == orig_ip)
         else {
-            return Err(format!("DNS host '{original_domain}' no longer exists"));
+            return Err(format!(
+                "DNS host '{orig_domain}' ({orig_ip}) no longer exists"
+            ));
         };
+        if settings.dns.hosts.iter().enumerate().any(|(i, existing)| {
+            i != idx && existing.domain == host.domain && existing.ip == host.ip
+        }) {
+            return Err(format!(
+                "DNS host '{}' -> '{}' already exists",
+                host.domain, host.ip
+            ));
+        }
         settings.dns.hosts[idx] = host;
     } else {
+        if settings
+            .dns
+            .hosts
+            .iter()
+            .any(|existing| existing.domain == host.domain && existing.ip == host.ip)
+        {
+            return Err(format!(
+                "DNS host '{}' -> '{}' already exists",
+                host.domain, host.ip
+            ));
+        }
         settings.dns.hosts.push(host);
     }
 
@@ -52,6 +73,19 @@ pub(super) fn render_dns_hosts(ctx: &DnsRenderCtx) {
             .title(&host.domain)
             .subtitle(&host.ip)
             .build();
+
+        let edit_btn = gtk::Button::builder()
+            .icon_name("document-edit-symbolic")
+            .valign(gtk::Align::Center)
+            .has_frame(false)
+            .css_classes(["flat"])
+            .build();
+        let ctx_clone = ctx.clone();
+        let host_clone = host.clone();
+        edit_btn.connect_clicked(move |_| {
+            show_dns_host_dialog(Some(host_clone.clone()), &ctx_clone);
+        });
+        row.add_suffix(&edit_btn);
 
         let remove_btn = gtk::Button::builder()
             .icon_name("user-trash-symbolic")
@@ -91,10 +125,14 @@ pub(super) fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRend
     };
 
     let dialog = adw::AlertDialog::builder()
-        .heading(if is_edit { "Edit Host" } else { "Add Host" })
+        .heading(if is_edit {
+            tr("Edit Host")
+        } else {
+            tr("Add Host")
+        })
         .build();
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("save", if is_edit { "Save" } else { "Add" });
+    dialog.add_response("cancel", &tr("Cancel"));
+    dialog.add_response("save", &tr(if is_edit { "Save" } else { "Add" }));
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
     dialog.set_default_response(Some("save"));
     dialog.set_close_response("cancel");
@@ -146,7 +184,9 @@ pub(super) fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRend
             let mut next = state.borrow().clone();
             upsert_dns_host(
                 &mut next,
-                existing.as_ref().map(|host| host.domain.as_str()),
+                existing
+                    .as_ref()
+                    .map(|host| (host.domain.as_str(), host.ip.as_str())),
                 host.clone(),
             )?;
             validate_dns_settings_for_backend(&next)?;
@@ -197,7 +237,9 @@ pub(super) fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRend
         if apply_dns_mutation(&ctx, |settings| {
             upsert_dns_host(
                 settings,
-                existing_host.as_ref().map(|host| host.domain.as_str()),
+                existing_host
+                    .as_ref()
+                    .map(|host| (host.domain.as_str(), host.ip.as_str())),
                 host,
             )
         })
@@ -208,4 +250,83 @@ pub(super) fn show_dns_host_dialog(existing: Option<HostOverride>, ctx: &DnsRend
     });
 
     dialog.present(crate::active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_dns_host_edits_matching_pair_and_keeps_siblings() {
+        let mut settings = AppSettings::default();
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "1.2.3.4".into(),
+            },
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "2001:db8::1".into(),
+            },
+        ];
+
+        upsert_dns_host(
+            &mut settings,
+            Some(("api.example.com", "1.2.3.4")),
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "1.2.3.5".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(settings.dns.hosts.len(), 2);
+        assert_eq!(settings.dns.hosts[0].ip, "1.2.3.5");
+        assert_eq!(settings.dns.hosts[1].ip, "2001:db8::1");
+    }
+
+    #[test]
+    fn upsert_dns_host_rejects_duplicates_and_missing_original() {
+        let mut settings = AppSettings::default();
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "1.2.3.4".into(),
+            },
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "2001:db8::1".into(),
+            },
+        ];
+
+        let dup_add = upsert_dns_host(
+            &mut settings,
+            None,
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "1.2.3.4".into(),
+            },
+        );
+        assert!(dup_add.is_err());
+
+        let dup_edit = upsert_dns_host(
+            &mut settings,
+            Some(("api.example.com", "1.2.3.4")),
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "2001:db8::1".into(),
+            },
+        );
+        assert!(dup_edit.is_err());
+
+        let missing = upsert_dns_host(
+            &mut settings,
+            Some(("api.example.com", "9.9.9.9")),
+            HostOverride {
+                domain: "api.example.com".into(),
+                ip: "1.2.3.5".into(),
+            },
+        );
+        assert!(missing.is_err());
+    }
 }

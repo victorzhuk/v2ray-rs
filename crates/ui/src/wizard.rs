@@ -8,6 +8,7 @@ use v2ray_rs_core::backend::{
 };
 use v2ray_rs_core::models::{AppSettings, BackendType, SubscriptionSource};
 
+use crate::i18n::tr;
 use crate::subscriptions::{
     SubscriptionSourceInput, strip_v2raytun_import_prefix, subscription_source_from_inputs,
 };
@@ -92,8 +93,8 @@ impl SimpleComponent for OnboardingWizard {
 
                     adw::StatusPage {
                         set_icon_name: Some("network-vpn-symbolic"),
-                        set_title: "Welcome to V2Ray Manager",
-                        set_description: Some("A desktop GUI for managing v2ray, xray, and sing-box proxy configurations.\n\nLet's get started with the initial setup."),
+                        set_title: &tr("Welcome to V2Ray Manager"),
+                        set_description: Some(&tr("A desktop GUI for managing v2ray, xray, and sing-box proxy configurations.\n\nLet's get started with the initial setup.")),
                         set_vexpand: true,
                     },
 
@@ -104,7 +105,7 @@ impl SimpleComponent for OnboardingWizard {
                         set_margin_all: 24,
 
                         gtk::Button {
-                            set_label: "Next",
+                            set_label: &tr("Next"),
                             add_css_class: "pill",
                             add_css_class: "suggested-action",
                             connect_clicked => WizardMsg::NextPage,
@@ -134,8 +135,8 @@ impl SimpleComponent for OnboardingWizard {
 
                                 adw::StatusPage {
                                     set_icon_name: Some("application-x-executable-symbolic"),
-                                    set_title: "Select Backend",
-                                    set_description: Some("Choose which proxy backend to use"),
+                                    set_title: &tr("Select Backend"),
+                                    set_description: Some(&tr("Choose which proxy backend to use")),
                                 },
 
                                 #[name = "backend_list_container"]
@@ -144,11 +145,11 @@ impl SimpleComponent for OnboardingWizard {
                                 },
 
                                 adw::PreferencesGroup {
-                                    set_title: "Custom Backend Path",
-                                    set_description: Some("Validate and use a manually provided backend binary"),
+                                    set_title: &tr("Custom Backend Path"),
+                                    set_description: Some(&tr("Validate and use a manually provided backend binary")),
 
                                     adw::ComboRow {
-                                        set_title: "Backend type",
+                                        set_title: &tr("Backend type"),
                                         set_model: Some(&gtk::StringList::new(&["v2ray", "xray", "sing-box"])),
                                         #[watch]
                                         set_selected: model.custom_backend_type.to_index(),
@@ -158,7 +159,7 @@ impl SimpleComponent for OnboardingWizard {
                                     },
 
                                     adw::EntryRow {
-                                        set_title: "Binary path",
+                                        set_title: &tr("Binary path"),
                                         #[watch]
                                         set_text: &model.custom_backend_path,
                                         connect_changed[sender] => move |entry| {
@@ -167,12 +168,12 @@ impl SimpleComponent for OnboardingWizard {
                                     },
 
                                     adw::ActionRow {
-                                        set_title: "Custom path status",
+                                        set_title: &tr("Custom path status"),
                                         #[watch]
                                         set_subtitle: model
                                             .custom_backend_status
                                             .as_deref()
-                                            .unwrap_or("Not validated"),
+                                            .unwrap_or(&tr("Not validated")),
                                     },
                                 },
 
@@ -189,7 +190,7 @@ impl SimpleComponent for OnboardingWizard {
                                     },
 
                                     gtk::Button {
-                                        set_label: "Validate Custom Path",
+                                        set_label: &tr("Validate Custom Path"),
                                         add_css_class: "pill",
                                         #[watch]
                                         set_sensitive: !model.custom_backend_path.trim().is_empty() && !model.validating_custom_backend,
@@ -198,7 +199,7 @@ impl SimpleComponent for OnboardingWizard {
 
                                     #[name = "backend_next_button"]
                                     gtk::Button {
-                                        set_label: "Next",
+                                        set_label: &tr("Next"),
                                         add_css_class: "pill",
                                         add_css_class: "suggested-action",
                                         #[watch]
@@ -233,13 +234,13 @@ impl SimpleComponent for OnboardingWizard {
 
                                 adw::StatusPage {
                                     set_icon_name: Some("folder-download-symbolic"),
-                                    set_title: "Import Subscription",
-                                    set_description: Some("Add either a proxy subscription URL or a local file path (optional)"),
+                                    set_title: &tr("Import Subscription"),
+                                    set_description: Some(&tr("Add either a proxy subscription URL or a local file path (optional)")),
                                 },
 
                                 adw::PreferencesGroup {
                                     adw::EntryRow {
-                                        set_title: "Subscription Name",
+                                        set_title: &tr("Subscription Name"),
                                         connect_changed[sender] => move |entry| {
                                             sender.input(WizardMsg::SubscriptionNameChanged(entry.text().to_string()));
                                         },
@@ -247,14 +248,14 @@ impl SimpleComponent for OnboardingWizard {
 
                                     #[name = "subscription_entry"]
                                     adw::EntryRow {
-                                        set_title: "Subscription URL",
+                                        set_title: &tr("Subscription URL"),
                                         connect_changed[sender] => move |entry| {
                                             sender.input(WizardMsg::SubscriptionUrlChanged(entry.text().to_string()));
                                         },
                                     },
 
                                     adw::EntryRow {
-                                        set_title: "Local File Path",
+                                        set_title: &tr("Local File Path"),
                                         connect_changed[sender] => move |entry| {
                                             sender.input(WizardMsg::SubscriptionFilePathChanged(entry.text().to_string()));
                                         },
@@ -267,13 +268,13 @@ impl SimpleComponent for OnboardingWizard {
                                     set_spacing: 12,
 
                                     gtk::Button {
-                                        set_label: "Skip",
+                                        set_label: &tr("Skip"),
                                         add_css_class: "pill",
                                         connect_clicked => WizardMsg::SkipSubscription,
                                     },
 
                                     gtk::Button {
-                                        set_label: "Import",
+                                        set_label: &tr("Import"),
                                         add_css_class: "pill",
                                         add_css_class: "suggested-action",
                                         #[watch]
@@ -293,8 +294,8 @@ impl SimpleComponent for OnboardingWizard {
 
                     adw::StatusPage {
                         set_icon_name: Some("emblem-ok-symbolic"),
-                        set_title: "Setup Complete",
-                        set_description: Some("You're all set! Click Finish to start using V2Ray Manager."),
+                        set_title: &tr("Setup Complete"),
+                        set_description: Some(&tr("You're all set! Click Finish to start using V2Ray Manager.")),
                         set_vexpand: true,
                     },
 
@@ -305,7 +306,7 @@ impl SimpleComponent for OnboardingWizard {
                         set_margin_all: 24,
 
                         gtk::Button {
-                            set_label: "Finish",
+                            set_label: &tr("Finish"),
                             add_css_class: "pill",
                             add_css_class: "suggested-action",
                             connect_clicked => WizardMsg::Complete,

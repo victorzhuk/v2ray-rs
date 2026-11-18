@@ -6,7 +6,9 @@ use std::rc::Rc;
 
 use v2ray_rs_core::models::{AppSettings, BackendLogLevel, BackendType, Language};
 
-use super::{SettingsCallback, SettingsObservers, emit, subscribe_settings};
+use crate::i18n::tr;
+
+use super::{SettingsCallback, SettingsObservers, ToastCallback, emit, subscribe_settings};
 
 const CONNECTION_LOG_NOTE: &str = "Write accepted connections to the backend log";
 const SINGBOX_CONNECTION_LOG_NOTE: &str =
@@ -16,19 +18,22 @@ pub(super) fn build_system_page(
     state: &Rc<RefCell<AppSettings>>,
     cb: &SettingsCallback,
     observers: &SettingsObservers,
+    toast_cb: &ToastCallback,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
-        .title("System")
+        .title(tr("System"))
         .icon_name("preferences-system-symbolic")
         .build();
 
     let s = state.borrow();
 
-    let interface_group = adw::PreferencesGroup::builder().title("Interface").build();
+    let interface_group = adw::PreferencesGroup::builder()
+        .title(tr("Interface"))
+        .build();
 
     let lang_row = adw::ComboRow::builder()
-        .title("Language")
-        .model(&gtk::StringList::new(&["English", "Russian"]))
+        .title(tr("Language"))
+        .model(&gtk::StringList::new(&[&tr("English"), &tr("Russian")]))
         .selected(match s.language {
             Language::English => 0,
             Language::Russian => 1,
@@ -38,17 +43,17 @@ pub(super) fn build_system_page(
     page.add(&interface_group);
 
     let integration_group = adw::PreferencesGroup::builder()
-        .title("Integration")
+        .title(tr("Integration"))
         .build();
 
     let tray_row = adw::SwitchRow::builder()
-        .title("Minimize to tray")
+        .title(tr("Minimize to tray"))
         .active(s.minimize_to_tray)
         .build();
     integration_group.add(&tray_row);
 
     let notif_row = adw::SwitchRow::builder()
-        .title("Enable notifications")
+        .title(tr("Enable notifications"))
         .active(s.notifications_enabled)
         .build();
     integration_group.add(&notif_row);
@@ -62,12 +67,20 @@ pub(super) fn build_system_page(
     {
         let st = state.clone();
         let cb = cb.clone();
+        let toast_cb = toast_cb.clone();
         lang_row.connect_selected_notify(move |row| {
-            st.borrow_mut().language = match row.selected() {
+            let next = match row.selected() {
                 1 => Language::Russian,
                 _ => Language::English,
             };
-            emit(&st, &cb);
+            let changed = st.borrow().language != next;
+            if changed {
+                st.borrow_mut().language = next;
+                emit(&st, &cb);
+                let notice = tr("Restart the application to apply the new language");
+                row.set_subtitle(&notice);
+                toast_cb(&notice);
+            }
         });
     }
     {
@@ -103,13 +116,13 @@ fn build_diagnostics_group(
     observers: &SettingsObservers,
 ) -> (adw::PreferencesGroup, adw::ComboRow, adw::SwitchRow) {
     let group = adw::PreferencesGroup::builder()
-        .title("Diagnostics")
+        .title(tr("Diagnostics"))
         .build();
 
     let s = state.borrow();
     let levels: Vec<&str> = BackendLogLevel::ALL.iter().map(|l| l.as_str()).collect();
     let level_row = adw::ComboRow::builder()
-        .title("Backend log level")
+        .title(tr("Backend log level"))
         .model(&gtk::StringList::new(&levels))
         .selected(
             BackendLogLevel::ALL
@@ -122,8 +135,8 @@ fn build_diagnostics_group(
 
     let (sensitive, note) = connection_log_note(s.backend.backend_type);
     let connection_row = adw::SwitchRow::builder()
-        .title("Connection log")
-        .subtitle(note)
+        .title(tr("Connection log"))
+        .subtitle(tr(note))
         .sensitive(sensitive)
         .active(s.logging.connection_log)
         .build();
@@ -154,7 +167,7 @@ fn build_diagnostics_group(
         subscribe_settings(observers, move |settings| {
             let (sensitive, note) = connection_log_note(settings.backend.backend_type);
             row.set_sensitive(sensitive);
-            row.set_subtitle(note);
+            row.set_subtitle(&tr(note));
         });
     }
 
@@ -220,6 +233,66 @@ mod tests {
             notify(&xray);
             assert!(switch_row.is_sensitive());
             assert_eq!(switch_row.subtitle().as_deref(), Some(CONNECTION_LOG_NOTE));
+        });
+    }
+
+    #[test]
+    fn changing_language_persists_setting_and_surfaces_restart_notice() {
+        crate::gtk_test::run(|| {
+            let state = Rc::new(RefCell::new(AppSettings::default()));
+            let saved: Rc<RefCell<Vec<Language>>> = Rc::new(RefCell::new(Vec::new()));
+            let toasts: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+
+            let saved_cb = saved.clone();
+            let cb: SettingsCallback = Rc::new(move |s| saved_cb.borrow_mut().push(s.language));
+            let observers: SettingsObservers = Rc::new(RefCell::new(Vec::new()));
+            let toasts_cb = toasts.clone();
+            let toast_cb: ToastCallback =
+                Rc::new(move |msg| toasts_cb.borrow_mut().push(msg.to_string()));
+
+            let page = build_system_page(&state, &cb, &observers, &toast_cb);
+            let group = page
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Box>()
+                .ok()
+                .and_then(|_| None::<adw::ComboRow>);
+            let _ = group;
+
+            fn find_combo_row(widget: &gtk::Widget) -> Option<adw::ComboRow> {
+                if let Ok(combo) = widget.clone().downcast::<adw::ComboRow>()
+                    && combo.title() == "Language"
+                {
+                    return Some(combo);
+                }
+                let mut child = widget.first_child();
+                while let Some(c) = child {
+                    if let Some(found) = find_combo_row(&c) {
+                        return Some(found);
+                    }
+                    child = c.next_sibling();
+                }
+                None
+            }
+
+            let lang_row = find_combo_row(page.upcast_ref()).expect("Language row");
+            lang_row.set_selected(1);
+
+            assert_eq!(state.borrow().language, Language::Russian);
+            assert_eq!(*saved.borrow(), vec![Language::Russian]);
+            assert_eq!(toasts.borrow().len(), 1);
+            assert!(
+                toasts.borrow()[0].contains("Restart"),
+                "expected restart notice toast, got {:?}",
+                *toasts.borrow()
+            );
+            assert!(
+                lang_row
+                    .subtitle()
+                    .as_deref()
+                    .is_some_and(|s| s.contains("Restart")),
+                "expected restart subtitle on Language row"
+            );
         });
     }
 }

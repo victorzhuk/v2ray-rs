@@ -6,6 +6,7 @@ use std::rc::Rc;
 use v2ray_rs_core::backend::{DetectedBackend, backend_name};
 use v2ray_rs_core::models::{AppSettings, RoutingRuleSet};
 
+use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
 mod dns;
@@ -28,6 +29,20 @@ pub(crate) type SettingsObserver = Rc<dyn Fn(&AppSettings)>;
 pub(crate) type SettingsObservers = Rc<RefCell<Vec<SettingsObserver>>>;
 pub(crate) type RoutingObservers = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 
+pub struct PreferencesHandle {
+    pub dialog: adw::PreferencesDialog,
+    nodes_observers: RoutingObservers,
+}
+
+impl PreferencesHandle {
+    pub fn refresh_nodes(&self) {
+        let observers: Vec<_> = self.nodes_observers.borrow().iter().cloned().collect();
+        for observer in observers {
+            observer();
+        }
+    }
+}
+
 pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     store: &WorkspaceStore,
@@ -35,9 +50,9 @@ pub fn show_preferences(
     on_settings_changed: impl Fn(AppSettings) + 'static,
     on_routing_changed: impl Fn(RoutingRuleSet) + 'static,
     on_toast: impl Fn(&str) + 'static,
-) -> adw::PreferencesDialog {
+) -> PreferencesHandle {
     let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("Preferences");
+    dialog.set_title(&tr("Preferences"));
 
     let settings_state = Rc::new(RefCell::new(settings.clone()));
     let settings_observers: SettingsObservers = Rc::new(RefCell::new(Vec::new()));
@@ -72,7 +87,12 @@ pub fn show_preferences(
     };
     let toast_cb: ToastCallback = Rc::new(on_toast);
 
-    let system_page = build_system_page(&settings_state, &settings_cb, &settings_observers);
+    let system_page = build_system_page(
+        &settings_state,
+        &settings_cb,
+        &settings_observers,
+        &toast_cb,
+    );
     dialog.add(&system_page);
 
     let network_page = build_network_page(
@@ -86,18 +106,19 @@ pub fn show_preferences(
 
     let routing_page = match routing_result {
         Ok(_) => build_routing_page(store, &settings_state, &routing_state, &routing_cb),
-        Err(err) => build_routing_error_page(store.paths(), err.to_string()),
+        Err(err) => build_routing_error_page(store, &routing_cb, err.to_string()),
     };
     dialog.add(&routing_page);
 
-    let subscriptions = store.load_subscriptions().unwrap_or_default();
+    let nodes_observers: RoutingObservers = Rc::new(RefCell::new(Vec::new()));
     let dns_page = build_dns_page(
+        store,
         &settings_state,
         &settings_cb,
         &settings_observers,
         &routing_state,
         &routing_observers,
-        &subscriptions,
+        &nodes_observers,
     );
     dialog.add(&dns_page);
 
@@ -110,7 +131,10 @@ pub fn show_preferences(
     dialog.add(&tun_page);
 
     dialog.present(Some(parent));
-    dialog
+    PreferencesHandle {
+        dialog,
+        nodes_observers,
+    }
 }
 
 pub(crate) fn emit(state: &Rc<RefCell<AppSettings>>, cb: &SettingsCallback) {
