@@ -120,7 +120,7 @@ fmt-fix:
 # =============================================================================
 
 .PHONY: test test-core test-ui test-tray test-process test-subscription \
-        test-netctl test-run test-tun-session test-watch
+        test-netctl test-run test-tun-session test-installers test-watch
 
 test:
 	@printf "$(BLUE)Running all tests...$(RESET)\n"
@@ -157,6 +157,12 @@ test-run:
 test-tun-session:
 	@printf "$(BLUE)Testing tun-session crate...$(RESET)\n"
 	$(TEST) -p $(TUN_SESSION) $(CARGO_FLAGS) $(TEST_ARGS)
+
+test-installers:
+	@printf "$(BLUE)Testing release installers...$(RESET)\n"
+	scripts/test-installers.sh
+	scripts/test-arch-hook.sh
+	scripts/test-arch-hook-namespace.sh
 
 test-watch:
 	@printf "$(YELLOW)Running tests in watch mode (requires cargo-watch)...$(RESET)\n"
@@ -290,6 +296,7 @@ help:
 	@echo "  make test-netctl    Test netctl crate"
 	@echo "  make test-run       Test run crate"
 	@echo "  make test-tun-session Test tun-session crate"
+	@echo "  make test-installers Test release installers"
 	@echo "  make test-watch     Run tests in watch mode"
 	@echo ""
 	@printf "$(BLUE)Run:$(RESET)\n"

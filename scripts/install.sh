@@ -269,15 +269,10 @@ resolve_expected_sha256() {
 verify_checksum() {
     local _file="$1" _url="$2" _want _got
 
-    if ! check_cmd sha256sum; then
-        insist "sha256sum not found; the download was NOT verified"
-        return 0
-    fi
+    check_cmd sha256sum || err "sha256sum not found; refusing to install an unverified download"
 
-    _want=$(resolve_expected_sha256 "$_url" "$_file") || {
-        insist "no checksum available for this download; it was NOT verified"
-        return 0
-    }
+    _want=$(resolve_expected_sha256 "$_url" "$_file") ||
+        err "no checksum available for this download; refusing to install it"
 
     _got=$(sha256sum -b "$_file" | awk '{print $1}')
     [ -n "$_got" ] || err "could not hash $_file"

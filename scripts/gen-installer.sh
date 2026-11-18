@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Bakes the release version and artifact digest into a copy of install.sh.
-# The repository copy keeps its @VERSION@/@SHA256@ placeholders and falls back
-# to the latest release with no digest check.
+# The repository copy keeps its @VERSION@/@SHA256@ placeholders, so it accepts a
+# download only when the release publishes a matching .sha256 beside it.
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then

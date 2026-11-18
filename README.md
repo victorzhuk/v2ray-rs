@@ -49,11 +49,12 @@ Installs under `$HOME/.local` by default:
 
 The script verifies the download against a checksum baked in when the installer
 was published, falling back to the `.sha256` beside the tarball when you pin a
-different version or override the URL, and telling you plainly if it ends up
-with neither. It checks that GTK and libadwaita are new enough before unpacking
-anything, and adds `bin/` to `PATH` only when it is missing — appending to
-`~/.profile`, `~/.bashrc` and `~/.zshrc`, never creating a `~/.bash_profile`
-that would shadow an existing `~/.profile`.
+different version or override the URL. If neither digest is available, or the
+download does not match it, the installer exits without unpacking anything and
+leaves an existing installation untouched. It checks that GTK and libadwaita
+are new enough before unpacking anything, and adds `bin/` to `PATH` only when
+it is missing — appending to `~/.profile`, `~/.bashrc` and `~/.zshrc`, never
+creating a `~/.bash_profile` that would shadow an existing `~/.profile`.
 
 It never runs `sudo`. A home-directory install cannot support TUN mode, because
 the privileged helpers have to be owned by root; the script says so and points

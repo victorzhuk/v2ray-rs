@@ -17,6 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.
 
 ### Security
+- Make both release installers fail closed when `sha256sum` or an expected digest is unavailable, malformed, or mismatched; the prefix and any existing installation stay untouched, including in quiet mode.
+- Verify Arch helper ownership and restricted modes before granting `CAP_NET_ADMIN` or the setuid bit, and revoke partial grants when provisioning fails.
 - Route HTTP and HTTPS Real Delay and availability probes exclusively through the node's loopback inbound, ignoring ambient proxy variables, and skip egress probes for nodes whose delay test failed.
 - Block subscription redirects to loopback, link-local, private, unique-local, unspecified, and `localhost` targets.
 - Reject imported TLS nodes that disable certificate verification (`allowInsecure`) with visible warnings instead of importing them.
@@ -28,6 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ship `v2ray-rs-run` without the setuid bit in package archives and apply `root:v2ray-rs` `4750` only in install hooks; create `v2ray-rs-bypass` during privileged setup and skip the wrapper in user-local installs.
 
 ### Fixed
+- Preserve the `v2ray-rs` group and `v2ray-rs-bypass` user across Arch package removal so a reinstall keeps their UID, GID, and memberships, and report any helper cleanup that fails.
 - Resolve TUN proxy hostnames lazily per candidate, pre-pin at most eight candidates before strict xray routing, reuse last good pins under parked routes, and cancel lookups and pin probes when Stop arrives.
 - Batch Real Delay and availability probes into groups of at most 64 nodes, reuse one observatory gRPC channel, stop polling once every tag reports, and bound Clash API response bodies.
 - Flush debounced settings on Preferences close and quit, keep editor dialogs open with inline validation, preserve unset DNS ports and exact host overrides, and initialize the wizard from loaded settings without a redundant backend scan.

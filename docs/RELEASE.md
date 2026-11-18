@@ -78,6 +78,18 @@ release tarball, which does not exist until `release` has uploaded it.
 `make dist` reproduces the tarball locally, but against this host's glibc — use
 it to check the layout, not to check portability.
 
+## Installer verification
+
+Both installers refuse to modify the prefix unless the payload matches a
+SHA-256 digest. They prefer the digest baked into the generated installer, then
+the `.sha256` published beside the artifact. A missing `sha256sum`, a missing or
+malformed sidecar, and a mismatched digest all exit unsuccessfully before
+extraction, execution, or any prefix write; `--quiet` does not relax this. An
+offline mirror must publish the matching `.sha256` beside the artifact, or the
+installer must be regenerated with the artifact digest. `make test-installers`
+exercises every failure mode against local fixtures, asserts that an existing
+prefix is untouched, and checks that no downloaded payload runs.
+
 ## Verifying a release
 
 ```bash
@@ -183,6 +195,17 @@ tarball. `v2ray-rs-bin` declares `provides`/`conflicts` on `v2ray-rs` — the
 usual one-sided arrangement for a `-bin` sibling — so only one can be installed.
 Both share `pkg/archlinux/v2ray-rs.install`, which creates the `v2ray-rs` group
 and `v2ray-rs-bypass` user and applies the helper capabilities.
+
+Provisioning starts from group-restricted helpers. The hook verifies that both
+helpers exist, applies `root:v2ray-rs` ownership and mode 0750, verifies that
+baseline, then grants `CAP_NET_ADMIN` to netctl and the setuid bit to run. It
+verifies the final state — netctl 0750 with `cap_net_admin`, run 4750, both
+owned by `root:v2ray-rs` — and on any failure reports the affected helper,
+removes a partially applied capability or setuid bit, and leaves TUN disabled
+until an operator repairs permissions. Removal strips the capability but keeps
+the `v2ray-rs` group and `v2ray-rs-bypass` user, so a reinstall preserves their
+UID, GID, and memberships. `make test-installers` exercises install, upgrade,
+induced failure, removal, and reinstall against a temporary helper tree.
 
 An AUR repository is created by the first push to its name, so no manual
 registration is needed. The push only fails if someone else already owns
