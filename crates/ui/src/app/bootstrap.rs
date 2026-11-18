@@ -587,7 +587,11 @@ pub(super) fn try_run() -> Result<(), String> {
         let (tray_tx, tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayAction>();
         let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
         let data_dir = paths.data_dir().to_path_buf();
-        let tray_id = tray_id(&profile, overrides.has_directory_overrides(), paths.runtime_dir());
+        let tray_id = tray_id(
+            &profile,
+            overrides.has_directory_overrides(),
+            paths.runtime_dir(),
+        );
         match rt.block_on(async {
             v2ray_rs_tray::TrayService::spawn_with_data_dir(
                 event_rx,

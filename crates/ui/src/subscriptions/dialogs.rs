@@ -485,10 +485,7 @@ mod tests {
         for raw in ["v2raytun://import/", "v2raytun://import/IA=="] {
             let err = subscription_form_error("Name", raw, "", "")
                 .unwrap_or_else(|| panic!("empty-decoded v2raytun link accepted: {raw}"));
-            assert!(
-                err.contains("not a valid subscription URL"),
-                "{raw}: {err}"
-            );
+            assert!(err.contains("not a valid subscription URL"), "{raw}: {err}");
             let err = subscription_form_error("Name", raw, "/tmp/subs.txt", "")
                 .unwrap_or_else(|| panic!("file path bypassed empty-decoded link: {raw}"));
             assert!(err.contains("not a valid subscription URL"), "{raw}: {err}");
@@ -528,7 +525,10 @@ mod tests {
         let created = std::fs::read_dir(paths.subscription_blobs_dir())
             .map(|entries| entries.count())
             .unwrap_or(0);
-        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+        assert_eq!(
+            created, 0,
+            "no blob file may be written for a refused paste"
+        );
     }
 
     #[test]
@@ -543,7 +543,10 @@ mod tests {
         let created = std::fs::read_dir(paths.subscription_blobs_dir())
             .map(|entries| entries.count())
             .unwrap_or(0);
-        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+        assert_eq!(
+            created, 0,
+            "no blob file may be written for a refused paste"
+        );
     }
 
     #[test]
@@ -563,7 +566,10 @@ mod tests {
         let created = std::fs::read_dir(paths.subscription_blobs_dir())
             .map(|entries| entries.count())
             .unwrap_or(0);
-        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+        assert_eq!(
+            created, 0,
+            "no blob file may be written for a refused paste"
+        );
     }
 
     #[test]
@@ -595,6 +601,9 @@ mod tests {
         let created = std::fs::read_dir(paths.subscription_blobs_dir())
             .map(|entries| entries.count())
             .unwrap_or(0);
-        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+        assert_eq!(
+            created, 0,
+            "no blob file may be written for a refused paste"
+        );
     }
 }

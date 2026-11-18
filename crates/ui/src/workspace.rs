@@ -1,4 +1,4 @@
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, mpsc};
 
 use uuid::Uuid;
 use v2ray_rs_core::models::{AppSettings, ManualNode, RoutingRuleSet, Subscription};

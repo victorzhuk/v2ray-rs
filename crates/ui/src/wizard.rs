@@ -4,13 +4,13 @@ use relm4::gtk::glib;
 use relm4::prelude::*;
 
 use v2ray_rs_core::backend::{
-    all_install_guidance, backend_name, detect_all, validate_custom_path, DetectedBackend,
+    DetectedBackend, all_install_guidance, backend_name, detect_all, validate_custom_path,
 };
 use v2ray_rs_core::models::{AppSettings, BackendType, SubscriptionSource};
 
 use crate::i18n::tr;
 use crate::subscriptions::{
-    strip_v2raytun_import_prefix, subscription_source_from_inputs, SubscriptionSourceInput,
+    SubscriptionSourceInput, strip_v2raytun_import_prefix, subscription_source_from_inputs,
 };
 use v2ray_rs_subscription::subscription_url_is_public;
 
