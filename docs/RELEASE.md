@@ -10,7 +10,7 @@
 | `v2ray-rs-x86_64.AppImage` | `appimage` job | bundles GTK 4.18, libadwaita, and `v2ray-rs-netctl` |
 | `v2ray-rs-x86_64.AppImage.sha256` | `appimage` job | |
 | `install-appimage.sh` | `appimage` job | `scripts/install-appimage.sh` with the version substituted; installs the AppImage into a user prefix |
-| `PKGBUILD`, `PKGBUILD-bin` | `release` job | copies of the two Arch recipes |
+| `PKGBUILD`, `PKGBUILD-bin` | `release` job | copies of the two Arch recipes with the release SHA-256 digests stamped into `sha256sums` — never `SKIP`; the tracked repo copies keep `SKIP` for the AUR `updpkgsums` flow |
 | `v2ray-rs.install` | `release` job | Arch install scriptlet shared by `PKGBUILD` and `PKGBUILD-bin` |
 
 ## Linkage
@@ -55,7 +55,12 @@ functions.
 
 The tag push runs the reusable quality workflow alongside packaging. Publication
 requires quality checks, the tarball, the AppImage, and its smoke test to pass
-for the tagged revision. The tag must match the workspace version. Quality
+for the tagged revision. The tag must match the workspace version, and so must both Arch `pkgver`
+fields. The `Metadata` step runs inside the `tarball` job after its build
+steps, so drift between `Cargo.toml`, `pkg/archlinux/PKGBUILD`, and
+`pkg/archlinux/bin/PKGBUILD` blocks publication — everything downstream of the
+tarball job: AppImage, release, AUR — not every build; the `quality` job and
+the build steps that already ran are unaffected. Quality
 includes required xray, v2ray, and sing-box checks, display-backed tests, and
 isolated routing acceptance. Real Delay acceptance drives the production
 measurement path against locally installed xray and v2ray serving a loopback
@@ -65,8 +70,13 @@ backends, display, or routing prerequisites fail their jobs. Test commands have
 deadlines and worker limits.
 
 Backend and packaging downloads use fixed release asset IDs or a commit-pinned
-source URL. Every download is verified against a SHA-256 digest before extraction
-or execution. Updating a pin requires verifying the new upstream asset and its
+source URL, and the pinned upstream downloads are verified against a SHA-256
+digest before use. The release tarball is verified where its sidecar is
+consumed: both installers check it before extraction, and the `release` job
+checks it before stamping `PKGBUILD-bin`. The tagged source archive remains
+the exception: it is hashed after download, and that digest is what the
+`release` job stamps into `PKGBUILD`.
+Updating a pin requires verifying the new upstream asset and its
 digest together. A deleted asset fails the build; it never selects a replacement.
 The selected linuxdeploy AppImage includes its AppImage output plugin and
 appimagetool, so the same digest covers those bundled tools. The AppImage runtime
@@ -92,7 +102,9 @@ extraction, execution, or any prefix write; `--quiet` does not relax this. An
 offline mirror must publish the matching `.sha256` beside the artifact, or the
 installer must be regenerated with the artifact digest. `make test-installers`
 exercises every failure mode against local fixtures, asserts that an existing
-prefix is untouched, and checks that no downloaded payload runs.
+prefix is untouched, and checks that no downloaded payload runs. It also
+verifies workspace/PKGBUILD version parity and the checksum stamping the
+`release` job applies to the published `PKGBUILD` and `PKGBUILD-bin` assets.
 
 ## Verifying a release
 

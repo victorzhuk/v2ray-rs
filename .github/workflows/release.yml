@@ -105,7 +105,8 @@ jobs:
       - name: Metadata
         id: meta
         run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          scripts/check-pkgbuild-version.sh
+          version=$(scripts/check-pkgbuild-version.sh --print-version)
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
             echo "::error::release tag does not match workspace version"
             exit 1
@@ -313,6 +314,7 @@ jobs:
           # Both recipes declare install=v2ray-rs.install; without it a
           # downloaded PKGBUILD cannot be built.
           cp pkg/archlinux/v2ray-rs.install release-assets/v2ray-rs.install
+          scripts/stamp-release-pkgbuilds.sh release-assets
       - uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true

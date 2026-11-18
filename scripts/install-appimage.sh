@@ -25,6 +25,7 @@ APP_NAME="v2ray-rs"
 REPO="victorzhuk/v2ray-rs"
 ARTIFACT="v2ray-rs-x86_64.AppImage"
 INSTALL_URL="https://github.com/victorzhuk/v2ray-rs/releases/latest/download/install-appimage.sh"
+TARBALL_INSTALL_URL="https://github.com/victorzhuk/v2ray-rs/releases/latest/download/install.sh"
 DESKTOP_FILE="com.github.v2ray-rs.desktop"
 
 # gen-installer-appimage.sh rewrites these two assignments at release time.
@@ -481,6 +482,7 @@ replace_home() {
 }
 
 print_tun_instructions() {
+    local _user="${USER:-$(id -un 2>/dev/null || printf '<your-user>')}"
     if check_cmd getent && getent group "$APP_NAME" >/dev/null 2>&1; then
         say ""
         say "System group '$APP_NAME' present; TUN mode is reachable through the app."
@@ -493,7 +495,7 @@ TUN mode needs the system group '$APP_NAME', which a user-local install
 cannot create. Ask an administrator to run:
 
     sudo groupadd --system $APP_NAME
-    sudo usermod -aG $APP_NAME $USER
+    sudo usermod -aG $APP_NAME $_user
 
 then log out and back in for the group to take effect.
 
@@ -506,7 +508,7 @@ AppImage update.
 
 For the supported TUN path, use the system-wide tarball install:
 
-    curl -fsSL $INSTALL_URL | sudo env V2RAY_RS_INSTALL_DIR=/usr/local sh
+    curl -fsSL $TARBALL_INSTALL_URL | sudo env V2RAY_RS_INSTALL_DIR=/usr/local sh
 
 or a distribution package (on Arch: yay -S v2ray-rs-bin).
 
