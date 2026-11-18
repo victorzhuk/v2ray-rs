@@ -7,9 +7,9 @@ use crate::config::{ConfigError, ConfigGenerator, ResolvedNodeSet, common::strip
 use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
-    DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, ProxyNode,
-    RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
-    TunConfig, VlessConfig, VmessConfig, WsSettings,
+    DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, HostOverride,
+    ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
+    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -89,7 +89,9 @@ fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
     // on the one the DNS feature builds.
     if let Some(hosts) = hosts_server(settings) {
         servers.push(hosts);
-        rules.push(hosts_rule(settings));
+        if let Some(rule) = hosts_rule(settings) {
+            rules.push(rule);
+        }
     }
 
     let mut doh = json!({
@@ -119,6 +121,15 @@ fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
     dns_config
 }
 
+pub(crate) fn host_matches_singbox_strategy(host: &HostOverride, strategy: DnsStrategy) -> bool {
+    match strategy {
+        DnsStrategy::PreferIpv4 | DnsStrategy::PreferIpv6 => {
+            host.ip.parse::<std::net::IpAddr>().is_ok()
+        }
+        DnsStrategy::Ipv4Only | DnsStrategy::Ipv6Only => host.matches_strategy(strategy),
+    }
+}
+
 fn hosts_server(settings: &AppSettings) -> Option<Value> {
     if settings.dns.hosts.is_empty() {
         return None;
@@ -126,12 +137,19 @@ fn hosts_server(settings: &AppSettings) -> Option<Value> {
 
     let mut predefined = serde_json::Map::new();
     for host in &settings.dns.hosts {
+        if !host_matches_singbox_strategy(host, settings.dns.strategy) {
+            continue;
+        }
         predefined
             .entry(host.domain.clone())
             .or_insert_with(|| json!([]))
             .as_array_mut()
             .expect("predefined entries are arrays")
             .push(json!(host.ip));
+    }
+
+    if predefined.is_empty() {
+        return None;
     }
 
     Some(json!({
@@ -141,14 +159,17 @@ fn hosts_server(settings: &AppSettings) -> Option<Value> {
     }))
 }
 
-fn hosts_rule(settings: &AppSettings) -> Value {
-    let domains: Vec<&str> = settings
-        .dns
-        .hosts
-        .iter()
-        .map(|h| h.domain.as_str())
-        .collect();
-    json!({ "domain": domains, "server": HOSTS_SERVER_TAG })
+fn hosts_rule(settings: &AppSettings) -> Option<Value> {
+    let mut domains: Vec<&str> = Vec::new();
+    for host in &settings.dns.hosts {
+        if !host_matches_singbox_strategy(host, settings.dns.strategy) {
+            continue;
+        }
+        if !domains.contains(&host.domain.as_str()) {
+            domains.push(host.domain.as_str());
+        }
+    }
+    (!domains.is_empty()).then(|| json!({ "domain": domains, "server": HOSTS_SERVER_TAG }))
 }
 
 /// Whether a `hosts` server will exist in the generated config and answer for
@@ -157,7 +178,11 @@ fn hosts_rule(settings: &AppSettings) -> Value {
 fn pinned_by_hosts(settings: &AppSettings, host: &str) -> bool {
     (settings.dns.enabled || settings.tun.enabled)
         && host.parse::<std::net::IpAddr>().is_err()
-        && settings.dns.hosts.iter().any(|h| h.domain == host)
+        && settings
+            .dns
+            .hosts
+            .iter()
+            .any(|h| h.domain == host && host_matches_singbox_strategy(h, settings.dns.strategy))
 }
 
 fn strategy_str(strategy: DnsStrategy) -> &'static str {
@@ -688,8 +713,8 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         all
     };
 
-    if !settings.dns.hosts.is_empty() {
-        dns_rules.insert(0, hosts_rule(settings));
+    if let Some(rule) = hosts_rule(settings) {
+        dns_rules.insert(0, rule);
     }
 
     if settings.dns.fakeip.enabled {
@@ -2681,11 +2706,11 @@ mod tests {
         settings.dns.hosts = vec![
             HostOverride {
                 domain: "example.com".to_string(),
-                ip: "192.0.2.1".to_string(),
+                ip: "2001:db8::1".to_string(),
             },
             HostOverride {
                 domain: "test.local".to_string(),
-                ip: "10.0.0.1".to_string(),
+                ip: "fd00::1".to_string(),
             },
         ];
 
@@ -2708,12 +2733,9 @@ mod tests {
         assert_eq!(hosts_server["type"], "hosts");
         assert_eq!(
             hosts_server["predefined"]["example.com"],
-            json!(["192.0.2.1"])
+            json!(["2001:db8::1"])
         );
-        assert_eq!(
-            hosts_server["predefined"]["test.local"],
-            json!(["10.0.0.1"])
-        );
+        assert_eq!(hosts_server["predefined"]["test.local"], json!(["fd00::1"]));
 
         let fakeip_server = servers
             .iter()
@@ -3232,5 +3254,129 @@ mod tests {
             .expect("domestic split rule missing");
         assert_eq!(remote["rule_set"], json!(["geosite-google"]));
         assert_eq!(domestic["rule_set"], json!(["geosite-category-ru"]));
+    }
+
+    #[test]
+    fn test_singbox_default_and_preset_servers_detour_remote_via_proxy_only() {
+        for dns in [
+            DnsConfig {
+                enabled: true,
+                ..DnsConfig::default()
+            },
+            {
+                let mut d = DnsConfig::default();
+                d.apply_dns_preset(&crate::models::builtin_dns_presets()[0]);
+                d
+            },
+        ] {
+            let mut settings = default_settings();
+            settings.dns = dns;
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+            let servers = config["dns"]["servers"].as_array().unwrap();
+            let remote = servers.iter().find(|s| s["tag"] == "remote").unwrap();
+            let domestic = servers.iter().find(|s| s["tag"] == "domestic").unwrap();
+            assert_eq!(remote["detour"], "proxy-0-Test SS");
+            assert!(domestic.get("detour").is_none());
+        }
+
+        // Custom server with detour: None keeps existing direct/un-detoured behavior.
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "custom".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: None,
+        }];
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+        let custom = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == "custom")
+            .unwrap();
+        assert!(custom.get("detour").is_none());
+    }
+
+    #[test]
+    fn test_singbox_dual_stack_hosts_dedup_domain_and_keep_both_families() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.strategy = DnsStrategy::PreferIpv4;
+        settings.dns.hosts = vec![
+            HostOverride {
+                domain: "ss.example.com".into(),
+                ip: "203.0.113.10".into(),
+            },
+            HostOverride {
+                domain: "ss.example.com".into(),
+                ip: "2001:db8::10".into(),
+            },
+            HostOverride {
+                domain: "other.example.com".into(),
+                ip: "198.51.100.1".into(),
+            },
+        ];
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+        let hosts_srv = config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["tag"] == "hosts")
+            .unwrap();
+        assert_eq!(
+            hosts_srv["predefined"]["ss.example.com"],
+            json!(["203.0.113.10", "2001:db8::10"])
+        );
+        assert_eq!(
+            config["dns"]["rules"][0]["domain"],
+            json!(["ss.example.com", "other.example.com"])
+        );
+        assert_eq!(config["outbounds"][0]["domain_resolver"], "hosts");
+    }
+
+    #[test]
+    fn test_singbox_wrong_family_host_pin_omitted_under_single_family_strategy() {
+        for (strategy, pin_ip) in [
+            (DnsStrategy::Ipv4Only, "2001:db8::10"),
+            (DnsStrategy::Ipv6Only, "203.0.113.10"),
+        ] {
+            let mut settings = default_settings();
+            settings.tun.enabled = true;
+            settings.dns.enabled = true;
+            settings.dns.strategy = strategy;
+            settings.dns.hosts = vec![HostOverride {
+                domain: "ss.example.com".into(),
+                ip: pin_ip.into(),
+            }];
+
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+
+            assert!(
+                config["dns"]["servers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s["tag"] != "hosts")
+            );
+            assert!(
+                config["dns"]["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|r| r["server"] != "hosts")
+            );
+            assert!(config["outbounds"][0].get("domain_resolver").is_none());
+        }
     }
 }

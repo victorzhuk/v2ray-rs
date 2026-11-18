@@ -322,3 +322,65 @@ fn invalid_dns_servers_and_hosts_are_dropped_with_warnings() {
         );
     }
 }
+
+#[test]
+fn xray_local_dns_schemes_and_pseudo_servers_import_accurately() {
+    use v2ray_rs_core::models::DnsProtocol;
+
+    let bundle = serde_json::json!({
+        "remarks": "DNS Local",
+        "outbounds": [
+            vless_outbound(
+                "proxy",
+                "dns.example.net",
+                serde_json::json!({"network": "tcp"})
+            )
+        ],
+        "dns": {
+            "servers": [
+                "https+local://1.1.1.1/dns-query",
+                "quic+local://dns.adguard.com:853",
+                "tcp+local://223.5.5.5:5353",
+                "localhost",
+                "fakedns",
+                "https://dns.example.com/custom-endpoint"
+            ]
+        },
+        "routing": {"rules": []}
+    });
+
+    let import = parse_json_subscription(&bundle.to_string()).expect("bundle detected");
+    let profile = import.profile.expect("profile extracted");
+    let dns = profile.dns.expect("dns profile kept");
+    assert_eq!(dns.servers.len(), 3, "{:?}", dns.servers);
+
+    assert_eq!(dns.servers[0].protocol, DnsProtocol::Doh);
+    assert_eq!(dns.servers[0].address, "1.1.1.1");
+    assert_eq!(dns.servers[0].port, None);
+    assert_eq!(dns.servers[0].detour.as_deref(), Some("direct"));
+
+    assert_eq!(dns.servers[1].protocol, DnsProtocol::Doq);
+    assert_eq!(dns.servers[1].address, "dns.adguard.com");
+    assert_eq!(dns.servers[1].port, Some(853));
+    assert_eq!(dns.servers[1].detour.as_deref(), Some("direct"));
+
+    assert_eq!(dns.servers[2].protocol, DnsProtocol::Tcp);
+    assert_eq!(dns.servers[2].address, "223.5.5.5");
+    assert_eq!(dns.servers[2].port, Some(5353));
+    assert_eq!(dns.servers[2].detour.as_deref(), Some("direct"));
+
+    for expected in [
+        "localhost",
+        "fakedns",
+        "https://dns.example.com/custom-endpoint",
+    ] {
+        assert!(
+            profile
+                .skipped
+                .iter()
+                .any(|warning| warning.contains(expected)),
+            "missing warning {expected:?}: {:?}",
+            profile.skipped
+        );
+    }
+}

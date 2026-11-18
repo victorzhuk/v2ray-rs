@@ -53,6 +53,7 @@ pub(super) fn missing_geodata(
         || geo_dns(dns)
         || subscriptions
             .iter()
+            .filter(|s| s.enabled)
             .filter(|s| s.use_imported_profile)
             .filter_map(|s| s.imported_profile.as_ref())
             .any(|p| p.rules.iter().any(geo_rule) || p.dns.as_ref().is_some_and(geo_dns))

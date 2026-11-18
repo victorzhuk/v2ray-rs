@@ -704,7 +704,15 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
             }
         };
 
-        let (protocol, address, port) = parse_dns_server_address(&raw_address);
+        let (protocol, address, port, detour) = match parse_xray_dns_server(&raw_address) {
+            Ok(parsed) => parsed,
+            Err(reason) => {
+                skipped.push(format!(
+                    "dns server {i} ('{raw_address}'): {reason}, ignored"
+                ));
+                continue;
+            }
+        };
         if !valid_dns_address(&address) {
             skipped.push(format!(
                 "dns server {i}: invalid address '{raw_address}', ignored"
@@ -733,7 +741,7 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
             protocol,
             address,
             port,
-            detour: None,
+            detour,
         });
     }
 
@@ -825,21 +833,51 @@ fn dns_domain_rule_match(d: &str) -> Option<DnsRuleMatch> {
     }
 }
 
-fn parse_dns_server_address(raw: &str) -> (DnsProtocol, String, Option<u16>) {
-    if let Ok(parsed) = url::Url::parse(raw)
-        && let Some(host) = parsed.host_str()
-    {
+fn parse_xray_dns_server(
+    raw: &str,
+) -> Result<(DnsProtocol, String, Option<u16>, Option<String>), String> {
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("localhost") || trimmed.eq_ignore_ascii_case("fakedns") {
+        return Err("unsupported pseudo-server".to_string());
+    }
+
+    let (normalized, local_detour) = if let Some(rest) = trimmed.strip_prefix("https+local://") {
+        (format!("https://{rest}"), Some("direct".to_string()))
+    } else if let Some(rest) = trimmed.strip_prefix("quic+local://") {
+        (format!("quic://{rest}"), Some("direct".to_string()))
+    } else if let Some(rest) = trimmed.strip_prefix("tcp+local://") {
+        (format!("tcp://{rest}"), Some("direct".to_string()))
+    } else {
+        (trimmed.to_string(), None)
+    };
+
+    if normalized.contains("://") {
+        let parsed = url::Url::parse(&normalized).map_err(|_| "invalid server URL".to_string())?;
+        let Some(host) = parsed.host_str() else {
+            return Err("missing host in server URL".to_string());
+        };
         let protocol = match parsed.scheme() {
             "https" => DnsProtocol::Doh,
             "h3" => DnsProtocol::H3,
             "tls" => DnsProtocol::Dot,
             "quic" => DnsProtocol::Doq,
             "tcp" => DnsProtocol::Tcp,
-            _ => DnsProtocol::Udp,
+            other => return Err(format!("unsupported DNS scheme '{other}'")),
         };
-        return (protocol, crate::parser::normalize_host(host), parsed.port());
+        if matches!(protocol, DnsProtocol::Doh | DnsProtocol::H3)
+            && !matches!(parsed.path(), "" | "/" | "/dns-query")
+        {
+            return Err(format!("unsupported custom DoH path '{}'", parsed.path()));
+        }
+        return Ok((
+            protocol,
+            crate::parser::normalize_host(host),
+            parsed.port(),
+            local_detour,
+        ));
     }
-    (DnsProtocol::Udp, raw.to_string(), None)
+
+    Ok((DnsProtocol::Udp, trimmed.to_string(), None, None))
 }
 
 fn valid_dns_address(address: &str) -> bool {

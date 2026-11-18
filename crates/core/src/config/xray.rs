@@ -726,4 +726,68 @@ mod tests {
             assert!(outbound["streamSettings"]["sockopt"]["mark"].is_null());
         }
     }
+
+    #[test]
+    fn test_xray_tun_default_and_preset_domestic_routes_direct_while_none_stays_default() {
+        use crate::models::{DnsConfig, DnsProtocol, DnsServerConfig, builtin_dns_presets};
+
+        for (dns, expected_domestic) in [
+            (
+                DnsConfig {
+                    enabled: true,
+                    ..DnsConfig::default()
+                },
+                "udp://223.5.5.5:53",
+            ),
+            (
+                {
+                    let mut d = DnsConfig::default();
+                    d.apply_dns_preset(&builtin_dns_presets()[0]);
+                    d
+                },
+                "udp://1.0.0.1:53",
+            ),
+        ] {
+            let mut settings = AppSettings::default();
+            settings.tun.enabled = true;
+            settings.dns = dns;
+
+            let config = XrayGenerator
+                .generate(&[xray_vless_with_xtls()], &[], &settings)
+                .unwrap();
+
+            let servers = config["dns"]["servers"].as_array().unwrap();
+            assert!(
+                servers
+                    .iter()
+                    .any(|s| s["tag"] == "dns-direct" && s["address"] == expected_domestic),
+                "domestic server must get dns-direct tag under xray TUN: {servers:?}"
+            );
+            let rules = config["routing"]["rules"].as_array().unwrap();
+            assert!(rules.iter().any(|r| {
+                r["inboundTag"] == serde_json::json!(["dns-direct"]) && r["outboundTag"] == "direct"
+            }));
+        }
+
+        // Custom server with detour: None keeps default-route behavior (no dns-direct on user server).
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "custom".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "9.9.9.9".to_string(),
+            port: None,
+            detour: None,
+        }];
+        let config = XrayGenerator
+            .generate(&[xray_vless_with_xtls()], &[], &settings)
+            .unwrap();
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        assert!(
+            servers
+                .iter()
+                .all(|s| s["address"] != "udp://9.9.9.9:53" || s.get("tag").is_none())
+        );
+    }
 }

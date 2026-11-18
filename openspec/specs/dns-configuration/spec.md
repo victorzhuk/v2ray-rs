@@ -44,7 +44,7 @@ The system SHALL support multiple named DNS servers. Each server SHALL have a ta
 
 #### Scenario: Default DNS servers
 - **WHEN** no DNS configuration exists (fresh install)
-- **THEN** the system SHALL provide two default servers: a "remote" server (DoH, 1.1.1.1) and a "domestic" server (UDP, 223.5.5.5)
+- **THEN** the system SHALL provide two default servers: a `"remote"` server (DoH, `1.1.1.1`, detour `"proxy"`) and a `"domestic"` server (UDP, `223.5.5.5`, detour `"direct"`)
 
 #### Scenario: Add custom server
 - **WHEN** the user adds a DNS server with tag "adguard", protocol DoH, address "dns.adguard.com"
@@ -166,7 +166,7 @@ The system SHALL deserialize existing settings.toml files (with the old minimal 
 
 #### Scenario: Old config migrates server addresses
 - **WHEN** a settings.toml contains `[dns]` with `enabled = true`, `remote = { protocol = "doh", address = "8.8.8.8" }`, and `domestic = { protocol = "plain", address = "114.114.114.114" }`
-- **THEN** the system SHALL load successfully with `enabled = true`, `servers` containing a "remote" server (DoH, 8.8.8.8) and a "domestic" server (UDP, 114.114.114.114), and all new fields at defaults
+- **THEN** the system SHALL load successfully with `enabled = true`, `servers` containing a `"remote"` server (DoH, `8.8.8.8`, detour `"proxy"`) and a `"domestic"` server (UDP, `114.114.114.114`, detour `"direct"`), and all new fields at defaults
 
 #### Scenario: Old config does not lose user DNS settings
 - **WHEN** a settings.toml has old-format `remote` and `domestic` fields with non-default addresses
@@ -275,7 +275,7 @@ When DNS is enabled and `use_custom_rules` is false, the generators SHALL emit d
 - **THEN** derived DNS rules SHALL be emitted as before and no warning SHALL be logged
 
 ### Requirement: Effective DNS resolver set is derivable
-The system SHALL derive, for a backend, the DNS settings, the TUN settings, and the routing rules used to generate a config, the ordered list of resolvers the generated config uses. Each entry SHALL state the resolver address, its transport, its path (`direct`, `proxy`, `routing` when the backend's routing rules decide, `system` for the operating-system resolver, or `static` for host overrides), its source (`user`, `fallback`, `bootstrap`, `system`, or `profile` when a subscription's imported profile supplied the DNS settings), and its scope (all domains or the listed domains). The list SHALL match the resolvers present in the generated config for the same inputs. Deriving it SHALL NOT change which resolvers are generated.
+The system SHALL derive, for a backend, the DNS settings, the TUN settings, and the routing rules used to generate a config, the ordered list of resolvers the generated config uses. Each entry SHALL state the resolver address, its transport, its path (`direct`, `proxy`, `routing` when the backend's routing rules decide, `system` for the operating-system resolver, or `static` for host overrides), its source (`user`, `fallback`, `bootstrap`, `system`, or `profile` when a subscription's imported profile supplied the DNS settings), and its scope (all domains or the listed domains). Static host override entries SHALL include only override mappings that satisfy the backend's active query strategy so domains omitted from the generated `hosts` table never appear in the Effective DNS list. The list SHALL match the resolvers present in the generated config for the same inputs. Deriving it SHALL NOT change which resolvers are generated.
 
 #### Scenario: xray TUN with DNS disabled
 - **WHEN** the backend is xray, TUN is enabled, and DNS is disabled
@@ -304,6 +304,10 @@ The system SHALL derive, for a backend, the DNS settings, the TUN settings, and 
 #### Scenario: Imported profile supplies DNS
 - **WHEN** the inputs come from a subscription node whose enabled imported profile carries DNS settings
 - **THEN** entries built from those settings SHALL have source `profile`
+
+#### Scenario: Wrong-family host overrides omitted from Effective DNS
+- **WHEN** the backend is xray or v2ray, the query strategy is `Ipv4Only`, and a static host override maps `v6.example.com` only to `2001:db8::1`
+- **THEN** `v6.example.com` SHALL NOT appear as a `static` entry in the Effective DNS list
 
 ### Requirement: DNS validation covers reserved tags, rule values, host overrides, and TUN path
 `DnsConfig` validation SHALL reject reserved internal server tags (`hosts`, `fakeip`, `sys-dns-bootstrap`, `tun-dns-fallback`), validate every `DnsRuleMatch` and `HostOverride` domain and IP, and validate `client_subnet` and `hosts` whenever TUN is enabled even if `dns.enabled` is `false`.

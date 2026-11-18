@@ -39,16 +39,16 @@ Applying a DNS provider preset SHALL replace the current DNS server list and str
 - **THEN** the existing DNS server list and strategy remain unchanged
 
 ### Requirement: Preset server conventions
-Each preset's remote server SHALL use DoH protocol (encrypted, suitable for proxy routing) and the domestic server SHALL use UDP protocol (fast, suitable for direct routing).
+Each preset's remote server SHALL use DoH protocol with detour `"proxy"` (encrypted, routed through the proxy) and the domestic server SHALL use UDP protocol with detour `"direct"` (fast, routed directly).
 
 #### Scenario: Cloudflare preset servers
 - **WHEN** the Cloudflare preset is accessed
-- **THEN** it SHALL have a remote server with DoH protocol and address "1.1.1.1", and a domestic server with UDP protocol and address "1.0.0.1"
+- **THEN** it SHALL have a remote server with DoH protocol, address `"1.1.1.1"`, and detour `"proxy"`, and a domestic server with UDP protocol, address `"1.0.0.1"`, and detour `"direct"`
 
 #### Scenario: AdGuard preset servers
 - **WHEN** the AdGuard preset is accessed
-- **THEN** it SHALL have a remote server with DoH protocol and address "dns.adguard.com", and a domestic server with UDP protocol and address "94.140.14.14"
+- **THEN** it SHALL have a remote server with DoH protocol, address `"dns.adguard.com"`, and detour `"proxy"`, and a domestic server with UDP protocol, address `"94.140.14.14"`, and detour `"direct"`
 
 #### Scenario: Yandex preset servers
 - **WHEN** the Yandex DNS preset is accessed
-- **THEN** it SHALL have a remote server with DoH protocol and address "common.dot.dns.yandex.net", and a domestic server with UDP protocol and address "77.88.8.8"
+- **THEN** it SHALL have a remote server with DoH protocol, address `"common.dot.dns.yandex.net"`, and detour `"proxy"`, and a domestic server with UDP protocol, address `"77.88.8.8"`, and detour `"direct"`

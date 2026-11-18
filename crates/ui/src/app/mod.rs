@@ -2752,6 +2752,16 @@ mod tests {
             false,
             false
         ));
+        let mut disabled_sub = profile_sub(true, vec![geosite_rule(true)], None);
+        disabled_sub.enabled = false;
+        assert!(!missing_geodata(
+            BackendType::Xray,
+            &[],
+            &[disabled_sub],
+            &dns,
+            false,
+            false
+        ));
     }
 
     #[test]

@@ -72,11 +72,15 @@ The system SHALL place downloaded geodata files and the geodata index under the 
 - **THEN** each profile SHALL maintain its own copy of the geodata files and index
 
 ### Requirement: v2ray and xray connects require referenced geodata
-When the selected backend is v2ray or xray and the enabled routing rules, the active imported-profile rules, or the DNS rules used for the connection reference a GeoIP or GeoSite tag, the system SHALL check before starting the connection that `geoip.dat` and `geosite.dat` exist in the profile's geodata directory. When either is missing, Connect SHALL fail without spawning a backend, and the user SHALL see an error stating that the rules need geodata that has not been downloaded, with an action that starts the geodata download for the current backend. sing-box connects SHALL NOT be blocked by missing rule-set files, which fall back to remote rule-sets.
+When the selected backend is v2ray or xray and the enabled routing rules, an enabled subscription's active imported-profile rules, or the DNS rules used for the connection reference a GeoIP or GeoSite tag, the system SHALL check before starting the connection that `geoip.dat` and `geosite.dat` exist in the profile's geodata directory. Disabled subscriptions SHALL NOT participate in this preflight check even when `use_imported_profile` is `true`. When either file is missing, Connect SHALL fail without spawning a backend, and the user SHALL see an error stating that the rules need geodata that has not been downloaded, with an action that starts the geodata download for the current backend. sing-box connects SHALL NOT be blocked by missing rule-set files, which fall back to remote rule-sets.
 
 #### Scenario: Missing geodata blocks an xray connect
 - **WHEN** the backend is xray, an enabled rule matches GeoSite `google`, and `geosite.dat` does not exist
 - **THEN** Connect SHALL fail without spawning a backend and the error SHALL offer a "Download geodata" action
+
+#### Scenario: Disabled subscription with imported profile does not block connect
+- **WHEN** the backend is xray, no enabled rule or enabled subscription references GeoIP or GeoSite, a disabled subscription has `use_imported_profile = true` with GeoIP/GeoSite rules, and no geodata files exist
+- **THEN** Connect SHALL proceed without requiring geodata
 
 #### Scenario: Download action fetches geodata
 - **WHEN** the user invokes "Download geodata" from that error

@@ -454,7 +454,7 @@ fn static_entries_v2ray(settings: &AppSettings) -> Option<Vec<EffectiveDnsEntry>
     let mut entries = Vec::new();
     let mut named: Vec<String> = Vec::new();
     for host in &settings.dns.hosts {
-        if host.ip.parse::<std::net::IpAddr>().is_err() {
+        if !host.matches_strategy(settings.dns.strategy) {
             continue;
         }
         if !named.contains(&host.domain) {
@@ -523,6 +523,9 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
     if !settings.dns.hosts.is_empty() {
         let mut seen: Vec<String> = Vec::new();
         for host in &settings.dns.hosts {
+            if !super::singbox::host_matches_singbox_strategy(host, settings.dns.strategy) {
+                continue;
+            }
             if !seen.contains(&host.domain) {
                 seen.push(host.domain.clone());
                 entries.push(entry(
@@ -661,8 +664,8 @@ mod tests {
     use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
     use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
     use crate::models::{
-        ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, HostOverride,
-        ImportedProfile, ProxyNode, Subscription,
+        ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
+        HostOverride, ImportedProfile, ProxyNode, Subscription,
     };
     use chrono::Utc;
     use uuid::Uuid;
@@ -1173,7 +1176,7 @@ mod tests {
         settings.dns.hosts = vec![
             host("router.local", "192.168.1.1"),
             host("router.local", "192.168.1.2"),
-            host("nas.local", "fd00::10"),
+            host("nas.local", "192.168.1.3"),
         ];
 
         let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
@@ -1197,6 +1200,59 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("router.local"))
         );
+    }
+
+    #[test]
+    fn wrong_family_hosts_omitted_to_match_generated_configs() {
+        for backend in [BackendType::V2ray, BackendType::Xray, BackendType::SingBox] {
+            let mut settings = default_settings();
+            settings.dns.enabled = true;
+            settings.dns.strategy = DnsStrategy::Ipv4Only;
+            settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
+            settings.dns.hosts = vec![
+                host("v4.example.com", "192.0.2.10"),
+                host("v6.example.com", "2001:db8::10"),
+            ];
+            let nodes = [node_with_address("203.0.113.10")];
+            let config = match backend {
+                BackendType::SingBox => SingboxGenerator
+                    .generate(&nodes, &[], &settings)
+                    .expect("sing-box config"),
+                BackendType::V2ray => {
+                    generate_v2ray_family_config(&nodes, &[], &settings, V2rayFamilyBackend::V2ray)
+                }
+                BackendType::Xray => {
+                    generate_v2ray_family_config(&nodes, &[], &settings, V2rayFamilyBackend::Xray)
+                }
+            };
+            let summary = effective_dns(backend, &settings, &[], &["203.0.113.10"]);
+            let static_domains: std::collections::HashSet<String> = summary
+                .entries()
+                .iter()
+                .filter(|e| e.path == DnsPath::Static)
+                .map(|e| e.address.clone())
+                .collect();
+            let expected: std::collections::HashSet<String> =
+                ["v4.example.com".to_string()].into_iter().collect();
+            assert_eq!(static_domains, expected, "{backend:?}");
+
+            let table = match backend {
+                BackendType::SingBox => &config["dns"]["servers"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|s| s["type"] == "hosts")
+                    .expect("hosts server")["predefined"],
+                _ => &config["dns"]["hosts"],
+            };
+            let table_keys: std::collections::HashSet<String> = table
+                .as_object()
+                .expect("hosts table object")
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(table_keys, expected, "{backend:?}");
+        }
     }
 
     #[test]

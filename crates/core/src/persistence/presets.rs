@@ -5,6 +5,15 @@ use crate::models::Preset;
 
 use super::{AppPaths, PersistenceError, create_dir_with_permissions, read_file};
 
+fn fnv1a_64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
 fn slugify(name: &str) -> String {
     let slug = name
         .to_lowercase()
@@ -19,10 +28,7 @@ fn slugify(name: &str) -> String {
         return slug;
     }
 
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    name.hash(&mut hasher);
-    format!("preset-{:016x}", hasher.finish())
+    format!("preset-{:016x}", fnv1a_64(name.as_bytes()))
 }
 
 pub fn save_preset(paths: &AppPaths, preset: &Preset) -> Result<(), PersistenceError> {
@@ -60,10 +66,25 @@ pub fn delete_preset(paths: &AppPaths, name: &str) -> Result<bool, PersistenceEr
     let path = dir.join(filename);
     if path.exists() {
         fs::remove_file(&path)?;
-        Ok(true)
-    } else {
-        Ok(false)
+        return Ok(true);
     }
+    if !dir.exists() {
+        return Ok(false);
+    }
+    // Fallback for legacy DefaultHasher filenames created before fixed FNV-1a.
+    for entry in fs::read_dir(&dir)? {
+        let entry = entry?;
+        let candidate = entry.path();
+        if candidate.extension().is_some_and(|ext| ext == "json")
+            && let Ok(contents) = read_file(&candidate)
+            && let Ok(preset) = serde_json::from_str::<Preset>(&contents)
+            && preset.name == name
+        {
+            fs::remove_file(&candidate)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -72,14 +93,24 @@ mod tests {
 
     #[test]
     fn test_slugify_non_ascii_name_uses_hash_fallback() {
-        let slug = slugify("Блокировка рекламы");
-        assert!(!slug.is_empty());
-        assert!(slug.starts_with("preset-"));
-        let suffix = slug.trim_start_matches("preset-");
-        assert_eq!(suffix.len(), 16);
-        assert!(suffix.chars().all(|c| c.is_ascii_hexdigit()));
-        assert_eq!(slug, slugify("Блокировка рекламы"));
-        assert_ne!(slug, slugify("Другой пресет"));
+        assert_eq!(slugify("Работа"), "preset-4e6851489e20ed0b");
+        assert_eq!(slugify("Дом"), "preset-9e6bfa5cb92c37cb");
+        assert_eq!(slugify("Блокировка рекламы"), "preset-2a06eb44e8ba1509");
+        assert_eq!(slugify("Другой пресет"), "preset-51bc0ac2bc4ce149");
+    }
+
+    #[test]
+    fn test_delete_preset_falls_back_to_legacy_filename_by_name() {
+        let (_tmp, paths) = super::super::test_paths();
+        let dir = paths.presets_dir();
+        create_dir_with_permissions(&dir).unwrap();
+        let mut preset = crate::models::builtin_presets().remove(0);
+        preset.name = "Работа".to_string();
+        let json = serde_json::to_string_pretty(&preset).unwrap();
+        atomic_write(&dir.join("preset-0000000000000000.json"), json.as_bytes()).unwrap();
+
+        assert!(delete_preset(&paths, "Работа").unwrap());
+        assert!(load_custom_presets(&paths).unwrap().is_empty());
     }
 
     #[test]

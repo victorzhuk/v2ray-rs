@@ -310,6 +310,11 @@ impl From<DnsConfigWire> for DnsConfig {
 }
 
 fn migrate_legacy_server(tag: &str, legacy: LegacyDnsServer) -> DnsServerConfig {
+    let detour = match tag {
+        "remote" => Some("proxy".to_string()),
+        "domestic" => Some("direct".to_string()),
+        _ => None,
+    };
     DnsServerConfig {
         tag: tag.to_string(),
         protocol: match legacy.protocol {
@@ -318,7 +323,7 @@ fn migrate_legacy_server(tag: &str, legacy: LegacyDnsServer) -> DnsServerConfig 
         },
         address: legacy.address,
         port: None,
-        detour: None,
+        detour,
     }
 }
 
@@ -345,14 +350,14 @@ fn standard_preset(
                 protocol: DnsProtocol::Doh,
                 address: remote_addr.to_string(),
                 port: None,
-                detour: None,
+                detour: Some("proxy".to_string()),
             },
             DnsServerConfig {
                 tag: "domestic".to_string(),
                 protocol: DnsProtocol::Udp,
                 address: domestic_addr.to_string(),
                 port: None,
-                detour: None,
+                detour: Some("direct".to_string()),
             },
         ],
         strategy: DnsStrategy::PreferIpv4,
@@ -423,14 +428,14 @@ impl Default for DnsConfig {
                     protocol: DnsProtocol::Doh,
                     address: "1.1.1.1".to_string(),
                     port: None,
-                    detour: None,
+                    detour: Some("proxy".to_string()),
                 },
                 DnsServerConfig {
                     tag: "domestic".to_string(),
                     protocol: DnsProtocol::Udp,
                     address: "223.5.5.5".to_string(),
                     port: None,
-                    detour: None,
+                    detour: Some("direct".to_string()),
                 },
             ],
             rules: Vec::new(),
@@ -928,9 +933,11 @@ mod tests {
         assert_eq!(cfg.servers[0].tag, "remote");
         assert_eq!(cfg.servers[0].protocol, DnsProtocol::Doh);
         assert_eq!(cfg.servers[0].address, "1.1.1.1");
+        assert_eq!(cfg.servers[0].detour.as_deref(), Some("proxy"));
         assert_eq!(cfg.servers[1].tag, "domestic");
         assert_eq!(cfg.servers[1].protocol, DnsProtocol::Udp);
         assert_eq!(cfg.servers[1].address, "223.5.5.5");
+        assert_eq!(cfg.servers[1].detour.as_deref(), Some("direct"));
         assert!(cfg.rules.is_empty());
         assert!(!cfg.fakeip.enabled);
         assert!(!cfg.disable_cache);
@@ -998,9 +1005,11 @@ domestic = { protocol = "plain", address = "223.5.5.5" }
         assert_eq!(cfg.servers[0].tag, "remote");
         assert_eq!(cfg.servers[0].protocol, DnsProtocol::Doh);
         assert_eq!(cfg.servers[0].address, "1.1.1.1");
+        assert_eq!(cfg.servers[0].detour.as_deref(), Some("proxy"));
         assert_eq!(cfg.servers[1].tag, "domestic");
         assert_eq!(cfg.servers[1].protocol, DnsProtocol::Udp);
         assert_eq!(cfg.servers[1].address, "223.5.5.5");
+        assert_eq!(cfg.servers[1].detour.as_deref(), Some("direct"));
     }
 
     #[test]
@@ -1609,6 +1618,10 @@ server_tag = "google"
             }
 
             assert_eq!(preset.strategy, DnsStrategy::PreferIpv4);
+            assert_eq!(preset.servers[0].tag, "remote");
+            assert_eq!(preset.servers[0].detour.as_deref(), Some("proxy"));
+            assert_eq!(preset.servers[1].tag, "domestic");
+            assert_eq!(preset.servers[1].detour.as_deref(), Some("direct"));
         }
     }
 
