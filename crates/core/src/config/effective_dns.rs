@@ -8,8 +8,8 @@ use super::common::strip_suffix_wildcard;
 use crate::config::dns_plan::ResolvedDnsPlan;
 use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
-    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol,
-    DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
+    AppSettings, BackendType, DnsProtocol, DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,14 +509,27 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
             ));
         }
 
-        if !plan.servers.is_empty() && !plan.has_ip_literal_server() {
-            entries.push(entry(
-                "local",
-                None,
-                DnsPath::System,
-                DnsSource::System,
-                DnsScope::All,
-            ));
+        // Mirrors the generated bootstrap in build_dns: same shared
+        // selection predicate, `local` without TUN, direct-dialed DoH under
+        // TUN where the OS resolver routes through the tunnel.
+        if super::singbox::bootstrap_resolver_selected(settings) {
+            if settings.tun.enabled {
+                entries.push(entry(
+                    FALLBACK_DNS,
+                    Some(DnsProtocol::Doh),
+                    DnsPath::Direct,
+                    DnsSource::Bootstrap,
+                    DnsScope::All,
+                ));
+            } else {
+                entries.push(entry(
+                    "local",
+                    None,
+                    DnsPath::System,
+                    DnsSource::System,
+                    DnsScope::All,
+                ));
+            }
         }
     }
 
@@ -682,9 +695,9 @@ impl EffectiveDns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SingboxGenerator;
     use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
-    use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
+    use crate::config::v2ray::{generate_v2ray_family_config, V2rayFamilyBackend};
+    use crate::config::SingboxGenerator;
     use crate::models::{
         ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
         HostOverride, ImportedProfile, ProxyNode, Subscription,
@@ -778,12 +791,10 @@ mod tests {
         assert_eq!(summary.entries()[0].scope, DnsScope::All);
         assert_eq!(summary.entries()[1].address, FALLBACK_DNS_SECONDARY);
         assert_eq!(summary.entries()[1].source, DnsSource::Fallback);
-        assert!(
-            !summary
-                .entries()
-                .iter()
-                .any(|e| e.address == "1.0.0.1" || e.address.starts_with("https://1.0.0.1"))
-        );
+        assert!(!summary
+            .entries()
+            .iter()
+            .any(|e| e.address == "1.0.0.1" || e.address.starts_with("https://1.0.0.1")));
         assert!(summary.uses_fallback());
         assert!(!summary.system_resolver());
     }
@@ -797,12 +808,10 @@ mod tests {
 
         let summary = effective_dns(BackendType::Xray, &settings, &[], &[node.address()]);
 
-        assert!(
-            summary
-                .entries()
-                .iter()
-                .all(|e| e.source != DnsSource::Bootstrap)
-        );
+        assert!(summary
+            .entries()
+            .iter()
+            .all(|e| e.source != DnsSource::Bootstrap));
     }
 
     #[test]
@@ -832,12 +841,10 @@ mod tests {
         let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
 
         assert!(!summary.uses_fallback());
-        assert!(
-            summary
-                .entries()
-                .iter()
-                .any(|e| e.source == DnsSource::User && e.scope == DnsScope::All)
-        );
+        assert!(summary
+            .entries()
+            .iter()
+            .any(|e| e.source == DnsSource::User && e.scope == DnsScope::All));
     }
 
     #[test]
@@ -1216,12 +1223,10 @@ mod tests {
             DnsScope::Domains(vec!["router.local".into()])
         );
         assert_eq!(statics[1].address, "nas.local");
-        assert!(
-            !summary
-                .log_lines()
-                .iter()
-                .any(|l| l.contains("router.local"))
-        );
+        assert!(!summary
+            .log_lines()
+            .iter()
+            .any(|l| l.contains("router.local")));
     }
 
     #[test]
@@ -1313,12 +1318,10 @@ mod tests {
             .find(|e| e.address == "https://doh.provider.example/dns-query")
             .unwrap();
         assert_eq!(user.source, DnsSource::Profile);
-        assert!(
-            summary
-                .entries()
-                .iter()
-                .all(|e| e.source != DnsSource::User)
-        );
+        assert!(summary
+            .entries()
+            .iter()
+            .all(|e| e.source != DnsSource::User));
     }
 
     #[test]
@@ -1389,17 +1392,12 @@ mod tests {
         assert!(lines.contains(&format!(
             "server={FALLBACK_DNS} path=direct source=bootstrap scope=example.com"
         )));
-        assert!(
-            lines.contains(
-                &"server=77.88.8.8:53 path=direct source=user scope=domain:ru".to_string()
-            )
-        );
+        assert!(lines
+            .contains(&"server=77.88.8.8:53 path=direct source=user scope=domain:ru".to_string()));
         assert!(lines.iter().any(|l| l.contains("source=fallback")));
-        assert!(
-            lines
-                .iter()
-                .all(|l| !l.contains("pinned.local") && !l.contains("source=static"))
-        );
+        assert!(lines
+            .iter()
+            .all(|l| !l.contains("pinned.local") && !l.contains("source=static")));
     }
 
     /// The summary stores sing-box addresses raw (`1.1.1.1`) while the derived
@@ -1503,6 +1501,11 @@ mod tests {
                 "unscoped" => {
                     settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
                 }
+                "proxy-detoured" => {
+                    let mut remote = server("remote", DnsProtocol::Doh, "1.1.1.1");
+                    remote.detour = Some("proxy".to_string());
+                    settings.dns.servers = vec![remote];
+                }
                 "custom-rules" => {
                     settings.dns.use_custom_rules = true;
                     settings.dns.servers = vec![
@@ -1531,7 +1534,7 @@ mod tests {
     #[test]
     fn effective_dns_addresses_match_generated_servers() {
         let node_kinds = ["203.0.113.10", "example.com"];
-        let server_modes = ["unscoped", "custom-rules", "auto-split"];
+        let server_modes = ["unscoped", "proxy-detoured", "custom-rules", "auto-split"];
         let mut cases = 0;
 
         for tun in [false, true] {
@@ -1594,14 +1597,58 @@ mod tests {
                             effective_dns(BackendType::SingBox, &settings, &rules, &[node_addr]);
                         assert_cross_check(&config, &summary, BackendType::SingBox, &label);
 
-                        // 48-case budget counts one cell per backend.
+                        // 60-case budget counts one cell per backend.
                         cases += 3;
                     }
                 }
             }
         }
 
-        assert_eq!(cases, 48, "matrix must cover 48 cells");
+        assert_eq!(cases, 60, "matrix must cover 60 cells");
+    }
+
+    /// The summary's bootstrap entry must mirror the generated resolver:
+    /// `local`/system resolver without TUN, direct-dialed DoH reported as
+    /// source `bootstrap` under TUN, scope `all` in both cases.
+    #[test]
+    fn singbox_bootstrap_summary_entry_matches_generated_resolver() {
+        let cases = [
+            (false, "local", None, DnsPath::System, DnsSource::System),
+            (
+                true,
+                FALLBACK_DNS,
+                Some(DnsProtocol::Doh),
+                DnsPath::Direct,
+                DnsSource::Bootstrap,
+            ),
+        ];
+        for (tun, address, transport, path, source) in cases {
+            let mut settings = default_settings();
+            settings.tun.enabled = tun;
+            settings.dns.enabled = true;
+            let mut remote = server("remote", DnsProtocol::Doh, "1.1.1.1");
+            remote.detour = Some("proxy".to_string());
+            settings.dns.servers = vec![remote];
+
+            let summary = effective_dns(BackendType::SingBox, &settings, &[], &["203.0.113.10"]);
+            let bootstrap = summary
+                .entries()
+                .iter()
+                .find(|e| e.source == source && e.path == path)
+                .expect("bootstrap resolver entry missing from the summary");
+            assert_eq!(bootstrap.address, address);
+            assert_eq!(bootstrap.transport, transport);
+            assert_eq!(bootstrap.scope, DnsScope::All);
+            if tun {
+                assert!(
+                    summary
+                        .entries()
+                        .iter()
+                        .all(|e| !(e.path == DnsPath::System && e.address == "local")),
+                    "no local system resolver may be reported under TUN"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1661,12 +1708,10 @@ mod tests {
 
             // Static entries are not resolvers: absent from log lines and from
             // the generated server address set, which still matches exactly.
-            assert!(
-                summary
-                    .log_lines()
-                    .iter()
-                    .all(|l| { !l.contains("router.local") && !l.contains("nas.local") })
-            );
+            assert!(summary
+                .log_lines()
+                .iter()
+                .all(|l| { !l.contains("router.local") && !l.contains("nas.local") }));
             assert_cross_check(&config, &summary, backend, "hosts cell");
         }
     }

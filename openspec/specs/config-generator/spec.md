@@ -60,7 +60,7 @@ The system SHALL generate a valid JSON configuration file for v2ray/xray contain
 - **THEN** its `tlsSettings` SHALL contain `"allowInsecure": true`
 
 ### Requirement: Generate sing-box configuration
-The system SHALL generate a valid JSON configuration file in sing-box's configuration schema. When DNS is enabled, the DNS section SHALL include typed server objects, DNS rules, strategy, FakeIP, cache settings, and client subnet, and the route section SHALL include `default_domain_resolver` set to the tag of the first DNS server whose address is a literal IP, falling back to the first server's tag. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the `mixed` inbound SHALL NOT emit `udp_disabled: true` so UDP remains enabled.
+The system SHALL generate a valid JSON configuration file in sing-box's configuration schema. When DNS is enabled, the DNS section SHALL include typed server objects, DNS rules, strategy, FakeIP, cache settings, and client subnet, and the route section SHALL include `default_domain_resolver` set to the tag of the first DNS server whose address is a literal IP and whose detour is absent or `"direct"`, falling back to a generated bootstrap DNS server (`sys-dns-bootstrap`) emitted in `dns.servers`. When TUN is enabled, the bootstrap SHALL be a direct-dialed DoH server at an IP-literal endpoint, `{"tag": "sys-dns-bootstrap", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query"}` with no `detour`, and no `local` server SHALL be emitted. When TUN is disabled, the bootstrap SHALL be `{"tag": "sys-dns-bootstrap", "type": "local"}`. Inbound `listen` SHALL be taken from `AppSettings::listen_address` (default `127.0.0.1`), and the `mixed` inbound SHALL NOT emit `udp_disabled: true` so UDP remains enabled.
 
 #### Scenario: sing-box basic config
 - **WHEN** the user has one enabled Shadowsocks node with sing-box selected
@@ -92,7 +92,23 @@ The system SHALL generate a valid JSON configuration file in sing-box's configur
 
 #### Scenario: sing-box default_domain_resolver is set when DNS is enabled
 - **WHEN** DNS is enabled with 2 or more servers
-- **THEN** the sing-box config route section SHALL include `default_domain_resolver` set to a DNS server tag
+- **THEN** the sing-box config route section SHALL include `default_domain_resolver` set to a non-proxy-detoured DNS server tag
+
+#### Scenario: sing-box default_domain_resolver skips proxy-detoured IP servers
+- **WHEN** DNS is enabled without TUN using `DnsConfig::default()` or the Cloudflare/Google preset (`"remote"` at `1.1.1.1` or `8.8.8.8` with `detour = "proxy"`, `"domestic"` at an IP literal with `detour = "direct"`) and the proxy outbound is addressed by hostname
+- **THEN** `route.default_domain_resolver` SHALL be `"domestic"` rather than `"remote"`, so dialing the proxy hostname never recurses through `"remote"` -> `"proxy-0"`
+
+#### Scenario: sing-box emits direct DoH bootstrap under TUN when no direct IP server exists
+- **WHEN** DNS is enabled, TUN is enabled, and no configured DNS server is both IP-literal and non-proxy-detoured
+- **THEN** `dns.servers` SHALL include `{"tag": "sys-dns-bootstrap", "type": "https", "server": "1.1.1.1", "server_port": 443, "path": "/dns-query"}` without `detour`, both `route.default_domain_resolver` and any hostname-addressed DNS server's `domain_resolver` SHALL be `"sys-dns-bootstrap"`, and no `local` server SHALL be emitted
+
+#### Scenario: sing-box emits local bootstrap without TUN when no direct IP server exists
+- **WHEN** DNS is enabled, TUN is disabled, and no configured DNS server is both IP-literal and non-proxy-detoured
+- **THEN** `dns.servers` SHALL include `{"tag": "sys-dns-bootstrap", "type": "local"}` without a proxy detour, and both `route.default_domain_resolver` and any hostname-addressed DNS server's `domain_resolver` SHALL be `"sys-dns-bootstrap"`
+
+#### Scenario: Effective DNS reports the bootstrap resolver
+- **WHEN** the bootstrap resolver is selected
+- **THEN** the Effective DNS summary SHALL list it with address `https://1.1.1.1/dns-query`, transport DoH, path `direct`, source `bootstrap`, scope `all` under TUN, and address `local`, no transport, path `system`, source `system`, scope `all` without TUN
 
 #### Scenario: sing-box DNS with detour
 - **WHEN** DNS is enabled and the "remote" server has a detour set to anything other than "direct"
@@ -100,7 +116,7 @@ The system SHALL generate a valid JSON configuration file in sing-box's configur
 
 #### Scenario: sing-box DNS with strategy and client subnet
 - **WHEN** DNS is enabled with strategy Ipv6Only and client_subnet "2001:db8::1"
-- **THEN** the sing-box config dns section SHALL include "strategy": "ipv6_only" and "client_subnet": "2001:db8::1"
+- **THEN** the sing-box config dns section SHALL include "strategy": "ipv6_only" and every emitted configured upstream DNS server object SHALL carry "client_subnet": "2001:db8::1" (the generated bootstrap resolver carries none)
 
 ### Requirement: Defensive listen-address validation in writer
 The config writer SHALL validate `AppSettings::listen_address` before invoking any generator. If the value is not a parseable IPv4 or IPv6 literal, the writer SHALL substitute `127.0.0.1`, log a warning, and proceed; it SHALL NOT abort writing.

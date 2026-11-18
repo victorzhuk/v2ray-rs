@@ -1,10 +1,13 @@
-use std::io::Write;
-use std::process::Command;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use v2ray_rs_core::config::{ConfigWriter, ResolvedNodeSet, SingboxGenerator};
 use v2ray_rs_core::models::{
-    AppSettings, BackendLogLevel, BackendType, DnsHijackMode, DnsProtocol, DnsServerConfig,
-    FakeIpConfig, HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig,
+    AppSettings, BackendLogLevel, BackendType, DnsConfig, DnsHijackMode, DnsProtocol,
+    DnsServerConfig, FakeIpConfig, HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch,
+    ShadowsocksConfig,
 };
 use v2ray_rs_core::persistence::AppPaths;
 use v2ray_rs_core::profile::AppProfile;
@@ -438,6 +441,71 @@ fn hostname_only_dns_servers_pass_sing_box_check() {
     check("hostname-only-dns-servers", &settings);
 }
 
+/// Under TUN with DNS enabled, a proxy-detoured DoH server leaves no IP-literal
+/// direct candidate for `route.default_domain_resolver`, so the generator
+/// injects the `sys-dns-bootstrap` HTTPS resolver. `sing-box check` must accept
+/// those exact field names, and a `local` resolver is forbidden there: the OS
+/// resolver itself routes through the tunnel, so it would resolve in a circle.
+#[test]
+fn tun_dns_bootstrap_passes_sing_box_check() {
+    if !sing_box_available() {
+        eprintln!("sing-box not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns.enabled = true;
+    settings.dns.servers = vec![
+        DnsServerConfig {
+            tag: "remote".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "1.1.1.1".to_string(),
+            port: None,
+            detour: Some("proxy".to_string()),
+        },
+        DnsServerConfig {
+            tag: "remote-host".to_string(),
+            protocol: DnsProtocol::Doh,
+            address: "dns.google".to_string(),
+            port: None,
+            detour: Some("direct".to_string()),
+        },
+    ];
+    settings.tun.enabled = true;
+
+    check_with_rules("tun-dns-bootstrap", &settings, &[], |config| {
+        assert_eq!(
+            config["route"]["default_domain_resolver"], "sys-dns-bootstrap",
+            "route.default_domain_resolver must point at the bootstrap: {config}"
+        );
+        let servers = config["dns"]["servers"].as_array().unwrap();
+        let hostname_server = servers
+            .iter()
+            .find(|s| s["tag"] == "remote-host")
+            .unwrap_or_else(|| panic!("remote-host missing from dns.servers: {config}"));
+        assert_eq!(
+            hostname_server["domain_resolver"], "sys-dns-bootstrap",
+            "hostname-addressed server must resolve via the bootstrap: {config}"
+        );
+        let bootstrap = servers
+            .iter()
+            .find(|s| s["tag"] == "sys-dns-bootstrap")
+            .unwrap_or_else(|| panic!("sys-dns-bootstrap missing from dns.servers: {config}"));
+        assert_eq!(bootstrap["type"], "https");
+        assert_eq!(bootstrap["server"], "1.1.1.1");
+        assert_eq!(bootstrap["server_port"], 443);
+        assert_eq!(bootstrap["path"], "/dns-query");
+        assert!(
+            bootstrap.get("detour").is_none(),
+            "sys-dns-bootstrap must dial direct"
+        );
+        assert!(
+            servers.iter().all(|s| s["type"] != "local"),
+            "local resolver inside the tunnel resolves through itself"
+        );
+    });
+}
+
 /// Auto-derived DNS rules must only name server tags that actually exist in
 /// dns.servers: with no server tagged `domestic`, a Direct GeoSite rule used to
 /// produce a rule pointing at a missing server.
@@ -638,4 +706,289 @@ fn local_ruleset_config_passes_sing_box_check() {
         "local ruleset config: sing-box check failed\nstderr: {}\nconfig: {json}",
         String::from_utf8_lossy(&output.stderr),
     );
+}
+
+const ROUNDTRIP_PASSWORD: &str = "roundtrip-pass";
+const ROUNDTRIP_BODY: &str = "roundtrip-ok-body";
+
+/// Takes `count` distinct loopback ports from the OS, then drops the
+/// listeners: parallel or repeated runs must never collide on fixed ports.
+fn ephemeral_ports(count: usize) -> Vec<u16> {
+    let listeners: Vec<std::net::TcpListener> = (0..count)
+        .map(|_| {
+            std::net::TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral loopback port")
+        })
+        .collect();
+    listeners
+        .iter()
+        .map(|l| l.local_addr().expect("listener local address").port())
+        .collect()
+}
+
+fn python3_available() -> bool {
+    let available = Command::new("python3")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    assert!(
+        available || std::env::var_os("V2RAY_RS_REQUIRE_BACKENDS").is_none(),
+        "required backend python3 is unavailable"
+    );
+    available
+}
+
+/// Kills the backend on drop, so a failing assert never leaks listeners into
+/// later tests sharing the process.
+struct ManagedChild(Option<std::process::Child>);
+
+impl ManagedChild {
+    /// Kills the backend and returns everything it wrote to its pipes.
+    fn drain(mut self) -> String {
+        let Some(child) = self.0.as_mut() else {
+            return String::new();
+        };
+        let _ = child.kill();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+        let _ = child.wait();
+        let mut bytes = Vec::new();
+        if let Some(mut pipe) = stdout {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        if let Some(mut pipe) = stderr {
+            let _ = pipe.read_to_end(&mut bytes);
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn config_tempfile(config: &serde_json::Value) -> tempfile::NamedTempFile {
+    let mut file = tempfile::Builder::new().suffix(".json").tempfile().unwrap();
+    file.write_all(&serde_json::to_vec(config).unwrap())
+        .unwrap();
+    file.flush().unwrap();
+    file
+}
+
+fn wait_listening(port: u16, deadline: Instant, config: impl Fn() -> String) {
+    while Instant::now() < deadline {
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!(
+        "nothing listened on 127.0.0.1:{port} in time\nconfig: {}",
+        config()
+    );
+}
+
+fn target_http_script(target_port: u16) -> String {
+    format!(
+        r#"import http.server
+
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = b"{ROUNDTRIP_BODY}"
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *a):
+        pass
+
+http.server.HTTPServer(("127.0.0.1", {target_port}), H).serve_forever()
+"#
+    )
+}
+
+/// Speaks HTTP-proxy to the mixed inbound: absolute-form GET, then reads until
+/// the server closes the connection. The read deadline is what makes a
+/// resolver-recursion deadlock fail the test instead of hanging it.
+fn proxied_get(proxy_port: u16, target: &str, deadline: Instant) -> Result<String, String> {
+    let addr: SocketAddr = format!("127.0.0.1:{proxy_port}")
+        .parse()
+        .expect("parse loopback address");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+        .map_err(|e| format!("connect to mixed inbound: {e}"))?;
+    stream
+        .set_read_timeout(Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .max(Duration::from_millis(200)),
+        ))
+        .map_err(|e| format!("set read timeout: {e}"))?;
+    let request = format!(
+        "GET http://{target}/probe HTTP/1.1\r\nHost: {target}\r\nConnection: close\r\n\r\n"
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("send request: {e}"))?;
+
+    let mut response = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return Err("read timed out waiting for the proxied response".into());
+        }
+        let mut buf = [0u8; 4096];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(format!("read response: {e}")),
+        }
+    }
+    Ok(String::from_utf8_lossy(&response).into_owned())
+}
+
+/// The regression this DNS plane exists to prevent: with DNS enabled and TUN
+/// off, a hostname-addressed proxy node ("localhost" here) used to be resolved
+/// through the proxy-detoured DoH server itself - the "remote" -> "proxy-0"
+/// dial loop - so every proxied connection hung forever while `sing-box check`
+/// and inbound startup succeeded. The generated config must resolve the node
+/// through the direct "domestic" server, and a real request must complete.
+#[test]
+fn loopback_proxy_roundtrip_succeeds_with_default_dns() {
+    if !sing_box_available() || !python3_available() {
+        eprintln!("sing-box or python3 not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns = DnsConfig {
+        enabled: true,
+        ..DnsConfig::default()
+    };
+    let ports = ephemeral_ports(4);
+    let mixed_port = ports[0];
+    let ss_port = ports[1];
+    let target_port = ports[2];
+    // The second generated inbound (plain HTTP) takes ports[3].
+    let spare_port = ports[3];
+
+    let node = ProxyNode::Shadowsocks(ShadowsocksConfig {
+        address: "localhost".into(),
+        port: ss_port,
+        method: "aes-256-gcm".into(),
+        password: ROUNDTRIP_PASSWORD.into(),
+        remark: Some("Roundtrip SS".into()),
+    });
+    let mut config = SingboxGenerator
+        .generate(&[node], &[], &settings)
+        .unwrap_or_else(|err| panic!("generate failed: {err}"));
+
+    assert_eq!(
+        config["route"]["default_domain_resolver"], "domestic",
+        "resolver must be the direct IP-literal server, never the proxy-detoured one"
+    );
+    assert!(
+        config["dns"]["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["tag"] != "sys-dns-bootstrap"),
+        "the direct 'domestic' server makes the bootstrap resolver unnecessary"
+    );
+
+    if let Some(inbounds) = config["inbounds"].as_array_mut() {
+        for (i, inbound) in inbounds.iter_mut().enumerate() {
+            inbound["listen_port"] =
+                serde_json::json!(if i == 0 { mixed_port } else { spare_port });
+        }
+    }
+    let json = serde_json::to_string_pretty(&config).unwrap();
+
+    let mut script = tempfile::Builder::new().suffix(".py").tempfile().unwrap();
+    script
+        .write_all(target_http_script(target_port).as_bytes())
+        .unwrap();
+    script.flush().unwrap();
+
+    let fixture = config_tempfile(&serde_json::json!({
+        "log": {"level": "warning"},
+        "inbounds": [{
+            "type": "shadowsocks",
+            "tag": "ss-in",
+            "listen": "127.0.0.1",
+            "listen_port": ss_port,
+            "method": "aes-256-gcm",
+            "password": ROUNDTRIP_PASSWORD,
+        }],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"final": "direct"},
+    }));
+    let generated = config_tempfile(&config);
+
+    let check = Command::new("sing-box")
+        .args(["check", "-c"])
+        .arg(generated.path())
+        .output()
+        .expect("run sing-box check on the generated config");
+    assert!(
+        check.status.success(),
+        "generated round-trip config failed sing-box check\nstderr: {}\nconfig: {json}",
+        String::from_utf8_lossy(&check.stderr),
+    );
+
+    let _target = ManagedChild(Some(
+        Command::new("python3")
+            .arg(script.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn loopback HTTP target"),
+    ));
+    let _ss_server = ManagedChild(Some(
+        Command::new("sing-box")
+            .args(["run", "-c"])
+            .arg(fixture.path())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn loopback shadowsocks server"),
+    ));
+    let client = ManagedChild(Some(
+        Command::new("sing-box")
+            .args(["run", "-c"])
+            .arg(generated.path())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sing-box under test"),
+    ));
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let config_dump = || json.clone();
+    wait_listening(ss_port, deadline, config_dump);
+    wait_listening(mixed_port, deadline, config_dump);
+
+    let target = format!("127.0.0.1:{target_port}");
+    match proxied_get(mixed_port, &target, deadline) {
+        Ok(response) => {
+            let status = response.split("\r\n").next().unwrap_or_default();
+            assert!(
+                status.starts_with("HTTP/") && status.contains(" 200 "),
+                "unexpected proxied response: {response}"
+            );
+            assert!(
+                response.contains(ROUNDTRIP_BODY),
+                "proxied response body missing: {response}"
+            );
+        }
+        Err(err) => {
+            let logs = client.drain();
+            panic!("proxied round-trip failed: {err}\nsing-box log: {logs}\nconfig: {json}");
+        }
+    }
 }

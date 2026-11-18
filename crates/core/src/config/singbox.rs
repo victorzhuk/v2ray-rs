@@ -196,14 +196,30 @@ fn strategy_str(strategy: DnsStrategy) -> &'static str {
 
 const BOOTSTRAP_RESOLVER_TAG: &str = "sys-dns-bootstrap";
 
+/// `route.default_domain_resolver` dials its server directly, so a candidate
+/// must be an IP literal whose detour keeps it off the proxy chain: a
+/// proxy-detoured resolver would dial the proxy to resolve the proxy's own
+/// hostname and deadlock every connection. With no such server configured,
+/// the local bootstrap resolver takes over.
 fn default_domain_resolver_tag(settings: &AppSettings) -> Option<String> {
     settings
         .dns
         .servers
         .iter()
-        .find(|s| s.address.parse::<std::net::IpAddr>().is_ok())
+        .find(|s| {
+            s.address.parse::<std::net::IpAddr>().is_ok()
+                && (s.detour.is_none() || s.detours_direct())
+        })
         .map(|s| s.tag.clone())
         .or_else(|| (!settings.dns.servers.is_empty()).then(|| BOOTSTRAP_RESOLVER_TAG.to_string()))
+}
+
+/// True when `route.default_domain_resolver` lands on the generated
+/// `sys-dns-bootstrap` server. The Effective DNS summary must mirror the
+/// generated `dns.servers`, so both call sites share this predicate instead
+/// of restating the selection rule.
+pub(crate) fn bootstrap_resolver_selected(settings: &AppSettings) -> bool {
+    default_domain_resolver_tag(settings).as_deref() == Some(BOOTSTRAP_RESOLVER_TAG)
 }
 
 fn build_inbounds(settings: &AppSettings) -> Value {
@@ -541,15 +557,28 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
         }));
     }
 
-    // A DNS server addressed by hostname (common for public DoH, e.g. dns.google)
-    // can't resolve itself. When none of the configured servers is IP-literal,
-    // `default_domain_resolver_tag` falls back to this local-system bootstrap
-    // so sing-box has somewhere non-circular to resolve those hostnames.
-    if !plan.servers.is_empty() && !plan.has_ip_literal_server() {
-        servers.push(json!({
-            "tag": BOOTSTRAP_RESOLVER_TAG,
-            "type": "local",
-        }));
+    // Emitted exactly when `bootstrap_resolver_selected` holds: every
+    // configured server is then either hostname-addressed (it cannot resolve
+    // itself, e.g. dns.google) or proxy-detoured (resolving through it would
+    // dial the proxy being dialed), so sing-box needs this non-circular
+    // resolver. Under TUN the OS resolver itself routes through the tunnel,
+    // so the bootstrap must be a direct-dialed anycast DoH endpoint; a
+    // `local` server would resolve through the very tunnel it must escape.
+    if bootstrap_resolver_selected(settings) {
+        if settings.tun.enabled {
+            servers.push(json!({
+                "tag": BOOTSTRAP_RESOLVER_TAG,
+                "type": "https",
+                "server": "1.1.1.1",
+                "server_port": 443,
+                "path": "/dns-query",
+            }));
+        } else {
+            servers.push(json!({
+                "tag": BOOTSTRAP_RESOLVER_TAG,
+                "type": "local",
+            }));
+        }
     }
 
     let final_server = plan.first_tag().map(str::to_string);
@@ -2165,6 +2194,158 @@ mod tests {
         );
     }
 
+    /// `DnsConfig::default()` and every builtin preset put the proxy-detoured
+    /// DoH "remote" server first and a direct IP-literal "domestic" server
+    /// second. The resolver must pick "domestic": picking "remote" makes the
+    /// proxy dial itself to resolve its own hostname.
+    #[test]
+    fn test_dns_default_resolver_skips_proxy_detoured_remote_across_default_and_presets() {
+        let mut configs = vec![DnsConfig {
+            enabled: true,
+            ..DnsConfig::default()
+        }];
+        configs.extend(crate::models::builtin_dns_presets().iter().map(|preset| {
+            let mut dns = DnsConfig::default();
+            dns.apply_dns_preset(preset);
+            dns
+        }));
+        assert_eq!(
+            configs.len(),
+            1 + crate::models::builtin_dns_presets().len(),
+            "coverage must span the default config and every builtin preset"
+        );
+
+        for dns in configs {
+            let mut settings = default_settings();
+            settings.dns = dns;
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+
+            assert_eq!(
+                config["route"]["default_domain_resolver"], "domestic",
+                "resolver must skip the proxy-detoured 'remote' server"
+            );
+            let servers = config["dns"]["servers"].as_array().unwrap();
+            assert!(
+                servers.iter().all(|s| s["tag"] != BOOTSTRAP_RESOLVER_TAG),
+                "the direct 'domestic' server makes the bootstrap unnecessary"
+            );
+        }
+    }
+
+    /// A setup with only proxy-detoured IP-literal servers (single custom DoH
+    /// behind the proxy) has no dialable resolver at all; the bootstrap must be
+    /// emitted and selected, while `dns.final` stays on "remote". Without TUN
+    /// it is the OS `local` resolver; under TUN the OS resolver routes through
+    /// the tunnel, so the bootstrap must be a direct-dialed anycast DoH
+    /// endpoint and no `local` server may appear anywhere in `dns.servers`.
+    #[test]
+    fn test_dns_proxy_only_ip_doh_servers_fall_back_to_bootstrap() {
+        for (tun_enabled, bootstrap_type) in [(false, "local"), (true, "https")] {
+            let mut settings = default_settings();
+            settings.tun.enabled = tun_enabled;
+            settings.dns.enabled = true;
+            settings.dns.servers = vec![DnsServerConfig {
+                tag: "remote".to_string(),
+                protocol: DnsProtocol::Doh,
+                address: "1.1.1.1".to_string(),
+                port: None,
+                detour: Some("proxy".to_string()),
+            }];
+
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+
+            assert_eq!(
+                config["route"]["default_domain_resolver"],
+                BOOTSTRAP_RESOLVER_TAG
+            );
+            assert_eq!(config["dns"]["final"], "remote");
+            let servers = config["dns"]["servers"].as_array().unwrap();
+            if tun_enabled {
+                assert!(
+                    servers.iter().all(|s| s["type"] != "local"),
+                    "no local resolver may be emitted under TUN"
+                );
+            }
+            let bootstrap = servers
+                .iter()
+                .find(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG)
+                .expect("bootstrap resolver must be emitted when every IP server detours via proxy");
+            assert_eq!(bootstrap["type"], bootstrap_type);
+            assert!(
+                bootstrap.get("detour").is_none(),
+                "the bootstrap must dial outside the tunnel"
+            );
+            if tun_enabled {
+                assert_eq!(bootstrap["server"], "1.1.1.1");
+                assert_eq!(bootstrap["server_port"], 443);
+                assert_eq!(bootstrap["path"], "/dns-query");
+            }
+        }
+    }
+
+    /// A hostname-addressed direct server must not inherit a proxy-detoured
+    /// resolver: resolving dns.google through "remote" dials the proxy before
+    /// the proxy itself can be dialed. Both the route default and the
+    /// hostname server's own `domain_resolver` must land on the bootstrap,
+    /// `local` without TUN and the direct DoH endpoint under TUN.
+    #[test]
+    fn test_dns_hostname_direct_server_resolves_via_bootstrap_not_via_proxy_detoured_server() {
+        for tun_enabled in [false, true] {
+            let mut settings = default_settings();
+            settings.tun.enabled = tun_enabled;
+            settings.dns.enabled = true;
+            settings.dns.servers = vec![
+                DnsServerConfig {
+                    tag: "remote".to_string(),
+                    protocol: DnsProtocol::Doh,
+                    address: "1.1.1.1".to_string(),
+                    port: None,
+                    detour: Some("proxy".to_string()),
+                },
+                DnsServerConfig {
+                    tag: "direct-doh".to_string(),
+                    protocol: DnsProtocol::Doh,
+                    address: "dns.google".to_string(),
+                    port: None,
+                    detour: Some("direct".to_string()),
+                },
+            ];
+
+            let config = SingboxGenerator
+                .generate(&[ss_node()], &[], &settings)
+                .unwrap();
+
+            assert_eq!(
+                config["route"]["default_domain_resolver"],
+                BOOTSTRAP_RESOLVER_TAG
+            );
+            let servers = config["dns"]["servers"].as_array().unwrap();
+            if tun_enabled {
+                assert!(
+                    servers.iter().all(|s| s["type"] != "local"),
+                    "no local resolver may be emitted under TUN"
+                );
+            }
+            let bootstrap = servers
+                .iter()
+                .find(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG)
+                .expect("bootstrap resolver must be emitted for the hostname-addressed server");
+            assert_eq!(
+                bootstrap["type"],
+                if tun_enabled { "https" } else { "local" }
+            );
+            let direct = servers
+                .iter()
+                .find(|s| s["tag"] == "direct-doh")
+                .expect("direct-doh server missing");
+            assert_eq!(direct["domain_resolver"], BOOTSTRAP_RESOLVER_TAG);
+        }
+    }
+
     #[test]
     fn test_dns_tcp_server() {
         let mut settings = default_settings();
@@ -2766,7 +2947,19 @@ mod tests {
         assert_eq!(dns_rules[3]["server"], "fakeip");
         assert_eq!(dns_rules[3]["query_type"], json!(["A", "AAAA"]));
 
-        assert_eq!(config["route"]["default_domain_resolver"], "cloudflare");
+        // Both configured servers are unusable for bootstrapping: "cloudflare"
+        // detours through the proxy and "google" cannot resolve its own
+        // hostname, so the generated local bootstrap resolver takes over.
+        assert_eq!(
+            config["route"]["default_domain_resolver"],
+            BOOTSTRAP_RESOLVER_TAG
+        );
+        let bootstrap = servers
+            .iter()
+            .find(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG)
+            .expect("bootstrap resolver missing from dns.servers");
+        assert_eq!(bootstrap["type"], "local");
+        assert_eq!(google["domain_resolver"], BOOTSTRAP_RESOLVER_TAG);
 
         let json_str = serde_json::to_string(&config).unwrap();
         let _: Value = serde_json::from_str(&json_str).unwrap();

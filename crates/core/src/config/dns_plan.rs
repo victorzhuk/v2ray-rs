@@ -118,12 +118,6 @@ impl ResolvedDnsPlan {
             .or_else(|| self.servers.first())
     }
 
-    pub fn has_ip_literal_server(&self) -> bool {
-        self.servers
-            .iter()
-            .any(|server| server.address.parse::<std::net::IpAddr>().is_ok())
-    }
-
     /// xray and v2ray only accept resolver domains through `full:` entries.
     pub fn full_bootstrap_domains(&self) -> Vec<String> {
         self.bootstrap_domains
