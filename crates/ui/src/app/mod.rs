@@ -2255,12 +2255,10 @@ mod tests {
         settings.tun.enabled = true;
         settings.backend.backend_type = BackendType::Xray;
         settings.tun.interface_name = "utun".into();
-        let journal = |backend: BackendType, iface: &str| {
-            v2ray_rs_core::persistence::TunSession {
-                backend,
-                iface: iface.to_owned(),
-                ownership: None,
-            }
+        let journal = |backend: BackendType, iface: &str| v2ray_rs_core::persistence::TunSession {
+            backend,
+            iface: iface.to_owned(),
+            ownership: None,
         };
 
         // Same backend and interface reuses the parked session.
