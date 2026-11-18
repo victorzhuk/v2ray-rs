@@ -264,7 +264,16 @@ pub(super) fn subscription_form_error(
         return Some("A subscription name is required".to_string());
     }
 
-    let url = strip_v2raytun_import_prefix(url.trim());
+    let raw_url = url.trim();
+    let url = strip_v2raytun_import_prefix(raw_url);
+    if !raw_url.is_empty() && url.trim().is_empty() {
+        return Some("The v2raytun import link is not a valid subscription URL".to_string());
+    }
+    if !url.trim().is_empty() && !subscription_url_is_public(url.trim()) {
+        return Some(
+            "Subscription URL must be an http(s) URL pointing to a public host".to_string(),
+        );
+    }
     if subscription_source_from_inputs(&url, file_path, pasted_json).is_some() {
         return None;
     }
@@ -286,6 +295,38 @@ pub(super) fn write_subscription_blob(
         .join(format!("{}.json", Uuid::new_v4()));
     v2ray_rs_core::fs::atomic_write(&path, content.as_bytes()).map_err(PersistenceError::Io)?;
     Ok(path)
+}
+
+/// A pasted payload lands on disk before the subscription service parses it,
+/// so the size and node limits must hold here; otherwise a paste the service
+/// would refuse to import still persists credential-bearing content.
+pub(super) fn write_pasted_subscription_blob(
+    paths: &AppPaths,
+    content: &str,
+) -> Result<std::path::PathBuf, String> {
+    let len = content.len();
+    if len as u64 > MAX_SUBSCRIPTION_SIZE {
+        return Err(format!(
+            "Pasted subscription is {len} bytes, exceeding the limit of {MAX_SUBSCRIPTION_SIZE}"
+        ));
+    }
+    let nodes = parse_json_subscription(content)
+        .ok_or_else(|| {
+            "Pasted content is not a valid subscription bundle (JSON expected)".to_string()
+        })?
+        .result
+        .nodes
+        .len();
+    if nodes == 0 {
+        return Err("Pasted subscription contains no valid nodes".to_string());
+    }
+    if nodes > MAX_SUBSCRIPTION_NODES {
+        return Err(format!(
+            "Pasted subscription imports {nodes} nodes, exceeding the limit of {MAX_SUBSCRIPTION_NODES}"
+        ));
+    }
+    write_subscription_blob(paths, content)
+        .map_err(|err| format!("Failed to save pasted subscription: {err}"))
 }
 
 pub(super) fn show_rename_dialog(
@@ -379,6 +420,7 @@ pub(super) fn show_delete_dialog(id: Uuid, sender: ComponentSender<Subscriptions
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use v2ray_rs_core::profile::AppProfile;
 
     #[test]
@@ -396,5 +438,163 @@ mod tests {
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    #[test]
+    fn form_rejects_private_subscription_urls() {
+        for url in [
+            "http://127.0.0.1:8080/sub",
+            "http://169.254.169.254/latest/meta-data/",
+            "https://[::1]/sub",
+            "https://[::ffff:10.0.0.1]/sub",
+            "https://localhost/sub",
+            "ftp://example.com/sub",
+        ] {
+            let err = subscription_form_error("Name", url, "", "")
+                .unwrap_or_else(|| panic!("private URL accepted: {url}"));
+            assert!(err.contains("public"), "{url}: {err}");
+            assert!(
+                subscription_form_error("Name", url, "/tmp/subs.txt", "").is_some(),
+                "a file path must not bypass a rejected URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn form_rejects_base64_v2raytun_private_urls() {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode("http://169.254.169.254/latest/meta-data/");
+        let wrapped = format!("v2raytun://import/{encoded}");
+
+        let err = subscription_form_error("Name", &wrapped, "", "")
+            .expect("decoded private URL must be rejected");
+
+        assert!(err.contains("public"), "{err}");
+    }
+
+    #[test]
+    fn form_accepts_public_url() {
+        assert_eq!(
+            subscription_form_error("Name", "https://example.com/sub", "", ""),
+            None
+        );
+    }
+
+    #[test]
+    fn form_rejects_v2raytun_link_decoding_to_empty() {
+        for raw in ["v2raytun://import/", "v2raytun://import/IA=="] {
+            let err = subscription_form_error("Name", raw, "", "")
+                .unwrap_or_else(|| panic!("empty-decoded v2raytun link accepted: {raw}"));
+            assert!(
+                err.contains("not a valid subscription URL"),
+                "{raw}: {err}"
+            );
+            let err = subscription_form_error("Name", raw, "/tmp/subs.txt", "")
+                .unwrap_or_else(|| panic!("file path bypassed empty-decoded link: {raw}"));
+            assert!(err.contains("not a valid subscription URL"), "{raw}: {err}");
+        }
+    }
+
+    #[test]
+    fn oversized_paste_is_refused_before_a_blob_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        let bundle: Vec<serde_json::Value> = (0..=MAX_SUBSCRIPTION_NODES)
+            .map(|i| {
+                serde_json::json!({
+                    "remarks": format!("N{i}"),
+                    "outbounds": [{
+                        "protocol": "vless",
+                        "settings": {
+                            "vnext": [{
+                                "address": format!("node{i}.example.com"),
+                                "port": 443,
+                                "users": [{"id": "fixture-uuid", "encryption": "none"}]
+                            }]
+                        }
+                    }]
+                })
+            })
+            .collect();
+        let payload = serde_json::to_string(&bundle).unwrap();
+
+        let err = write_pasted_subscription_blob(&paths, &payload)
+            .expect_err("oversized paste must be refused before touching disk");
+        assert!(
+            err.contains(&MAX_SUBSCRIPTION_NODES.to_string()),
+            "refusal must report the limit: {err}"
+        );
+
+        let created = std::fs::read_dir(paths.subscription_blobs_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+    }
+
+    #[test]
+    fn unparseable_paste_is_refused_without_writing_a_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+
+        let err = write_pasted_subscription_blob(&paths, "not a bundle")
+            .expect_err("unparseable paste must be refused before touching disk");
+        assert!(err.contains("not a valid subscription bundle"), "{err}");
+
+        let created = std::fs::read_dir(paths.subscription_blobs_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+    }
+
+    #[test]
+    fn empty_bundle_paste_is_refused_without_writing_a_blob() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        let payload = serde_json::to_string(&serde_json::json!([{
+            "remarks": "no proxy outbound",
+            "outbounds": [{"protocol": "blackhole", "settings": {}}]
+        }]))
+        .unwrap();
+
+        let err = write_pasted_subscription_blob(&paths, &payload)
+            .expect_err("a bundle without valid nodes must be refused before touching disk");
+        assert!(err.contains("no valid nodes"), "{err}");
+
+        let created = std::fs::read_dir(paths.subscription_blobs_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(created, 0, "no blob file may be written for a refused paste");
+    }
+
+    #[test]
+    fn oversized_payload_bytes_are_refused_before_a_blob_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        let payload = serde_json::to_string(&serde_json::json!([{
+            "remarks": "x".repeat(MAX_SUBSCRIPTION_SIZE as usize + 1),
+            "outbounds": [{
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [{
+                        "address": "node.example.com",
+                        "port": 443,
+                        "users": [{"id": "fixture-uuid", "encryption": "none"}]
+                    }]
+                }
+            }]
+        }]))
+        .unwrap();
+
+        let err = write_pasted_subscription_blob(&paths, &payload)
+            .expect_err("oversized payload must be refused before touching disk");
+        assert!(
+            err.contains(&MAX_SUBSCRIPTION_SIZE.to_string()),
+            "refusal must report the limit: {err}"
+        );
+
+        let created = std::fs::read_dir(paths.subscription_blobs_dir())
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(created, 0, "no blob file may be written for a refused paste");
     }
 }

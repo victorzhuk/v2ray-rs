@@ -3571,6 +3571,7 @@ dependencies = [
  "uuid",
  "v2ray-rs-core",
  "v2ray-rs-process",
+ "v2ray-rs-subscription",
 ]
 
 [[package]]

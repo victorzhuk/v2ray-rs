@@ -4,14 +4,15 @@ use relm4::gtk::glib;
 use relm4::prelude::*;
 
 use v2ray_rs_core::backend::{
-    DetectedBackend, all_install_guidance, backend_name, detect_all, validate_custom_path,
+    all_install_guidance, backend_name, detect_all, validate_custom_path, DetectedBackend,
 };
 use v2ray_rs_core::models::{AppSettings, BackendType, SubscriptionSource};
 
 use crate::i18n::tr;
 use crate::subscriptions::{
-    SubscriptionSourceInput, strip_v2raytun_import_prefix, subscription_source_from_inputs,
+    strip_v2raytun_import_prefix, subscription_source_from_inputs, SubscriptionSourceInput,
 };
+use v2ray_rs_subscription::subscription_url_is_public;
 
 pub struct OnboardingWizard {
     settings: AppSettings,
@@ -260,6 +261,26 @@ impl SimpleComponent for OnboardingWizard {
                                             sender.input(WizardMsg::SubscriptionFilePathChanged(entry.text().to_string()));
                                         },
                                     },
+                                },
+
+                                gtk::Label {
+                                    #[watch]
+                                    set_label: &subscription_inputs_error(
+                                        &model.subscription_url,
+                                        &model.subscription_file_path,
+                                    )
+                                    .as_deref()
+                                    .map(tr)
+                                    .unwrap_or_default(),
+                                    #[watch]
+                                    set_visible: subscription_inputs_error(
+                                        &model.subscription_url,
+                                        &model.subscription_file_path,
+                                    )
+                                    .is_some(),
+                                    set_halign: gtk::Align::Center,
+                                    set_wrap: true,
+                                    add_css_class: "error",
                                 },
 
                                 gtk::Box {
@@ -704,7 +725,31 @@ fn extract_file_name(path: &str) -> Option<String> {
 }
 
 fn subscription_inputs_valid(url: &str, file_path: &str) -> bool {
-    !url.trim().is_empty() ^ !file_path.trim().is_empty()
+    subscription_inputs_error(url, file_path).is_none()
+}
+
+fn subscription_inputs_error(url: &str, file_path: &str) -> Option<String> {
+    let raw_url = url.trim();
+    let url = strip_v2raytun_import_prefix(raw_url);
+    let has_url = !raw_url.is_empty();
+    if has_url && url.trim().is_empty() {
+        return Some("The v2raytun import link is not a valid subscription URL".to_string());
+    }
+    let has_file = !file_path.trim().is_empty();
+    if has_url && !subscription_url_is_public(url.trim()) {
+        return Some(
+            "Subscription URL must be an http(s) URL pointing to a public host".to_string(),
+        );
+    }
+    if has_url && has_file {
+        return Some(
+            "Provide either a subscription URL or a local file path, not both".to_string(),
+        );
+    }
+    if !has_url && !has_file {
+        return Some("Add a subscription URL or a local file path".to_string());
+    }
+    None
 }
 
 fn complete_subscription(
@@ -719,7 +764,9 @@ fn complete_subscription(
     let subscription_url = strip_v2raytun_import_prefix(subscription_url.trim());
     let source = subscription_source_from_inputs(&subscription_url, subscription_file_path, "")
         .and_then(|input| match input {
-            SubscriptionSourceInput::Url(url) => Some(SubscriptionSource::Url { url }),
+            SubscriptionSourceInput::Url(url) => {
+                subscription_url_is_public(&url).then_some(SubscriptionSource::Url { url })
+            }
             SubscriptionSourceInput::File(path) => Some(SubscriptionSource::File { path }),
             SubscriptionSourceInput::Paste(_) => None,
         })?;
@@ -754,6 +801,7 @@ fn auto_selected_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     #[test]
     fn test_auto_selected_backend_only_picks_single_available() {
@@ -805,6 +853,55 @@ mod tests {
             None
         );
         assert_eq!(complete_subscription(true, "", "/tmp/subs.txt", ""), None);
+    }
+
+    #[test]
+    fn subscription_inputs_reject_private_urls() {
+        for url in [
+            "http://127.0.0.1:8080/sub",
+            "http://169.254.169.254/latest/meta-data/",
+            "https://localhost/sub",
+            "ftp://example.com/sub",
+        ] {
+            assert!(!subscription_inputs_valid(url, ""), "{url}");
+            let err = subscription_inputs_error(url, "")
+                .unwrap_or_else(|| panic!("no feedback for {url}"));
+            assert!(err.contains("public"), "{url}: {err}");
+            assert!(
+                !subscription_inputs_valid(url, "/tmp/subs.txt"),
+                "a file path must not bypass a rejected URL: {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn subscription_inputs_reject_base64_v2raytun_private_urls() {
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode("http://169.254.169.254/latest/meta-data/");
+        let wrapped = format!("v2raytun://import/{encoded}");
+
+        assert!(!subscription_inputs_valid(&wrapped, ""));
+        assert!(complete_subscription(false, &wrapped, "", "").is_none());
+        assert!(subscription_inputs_valid("https://example.com/sub", ""));
+        assert!(subscription_inputs_valid("", "/tmp/subs.txt"));
+        assert!(!subscription_inputs_valid(
+            "https://example.com/sub",
+            "/tmp/subs.txt"
+        ));
+    }
+
+    #[test]
+    fn subscription_inputs_reject_v2raytun_link_decoding_to_empty() {
+        for raw in ["v2raytun://import/", "v2raytun://import/IA=="] {
+            assert!(!subscription_inputs_valid(raw, ""), "{raw}");
+            assert!(
+                !subscription_inputs_valid(raw, "/tmp/subs.txt"),
+                "a file path must not bypass an empty-decoded v2raytun link: {raw}"
+            );
+            let err = subscription_inputs_error(raw, "/tmp/subs.txt")
+                .unwrap_or_else(|| panic!("no feedback for {raw}"));
+            assert!(err.contains("not a valid subscription URL"), "{raw}: {err}");
+        }
     }
 
     #[test]

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
+[features]
+# Enables loopback-capable client constructors for local HTTP fixtures.
+test-utils = []
+
 [dependencies]
 libc.workspace = true
 v2ray-rs-core.workspace = true
@@ -31,3 +35,6 @@ http.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
 v2ray-rs-core = { workspace = true, features = ["test-utils"] }
+# Self reference so integration tests and examples can reach the
+# `test-utils`-gated loopback constructors.
+v2ray-rs-subscription = { path = ".", features = ["test-utils"] }

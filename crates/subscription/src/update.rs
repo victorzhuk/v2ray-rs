@@ -8,12 +8,19 @@ use v2ray_rs_core::models::{
     ImportedProfile, ProxyNode, Subscription, SubscriptionNode, SubscriptionSource,
 };
 
+#[cfg(any(test, feature = "test-utils"))]
+use crate::fetch::fetch_with_client_allow_private;
 use crate::fetch::{FetchError, fetch_from_file, fetch_with_client};
 use crate::json_import::parse_json_subscription;
 use crate::parser::parse_subscription_uris;
 use std::future::Future;
 
 const DEFAULT_MAX_RETRIES: u32 = 3;
+
+/// Hard ceiling on parsed proxy nodes per subscription import, enforced
+/// before any reconciliation or persistence. Keeps a compact URI list within
+/// the 10 MiB payload limit from materializing an unbounded widget tree.
+pub const MAX_SUBSCRIPTION_NODES: usize = 4_096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParseFailure {
@@ -36,6 +43,11 @@ pub enum UpdateError {
     Fetch(#[from] FetchError),
     #[error("subscription contained no valid proxy URIs")]
     InvalidContent { failures: Vec<ParseFailure> },
+    #[error(
+        "subscription exceeds the node limit: {parsed} parsed nodes (maximum {})",
+        MAX_SUBSCRIPTION_NODES
+    )]
+    TooManyNodes { parsed: usize },
 }
 
 pub fn reconcile_nodes(
@@ -165,6 +177,22 @@ pub async fn fetch_with_retry(
     .await
 }
 
+/// Loopback-only fixtures; pairs with `fetch_with_client_allow_private` so
+/// tests exercise the real retry loop against local HTTP servers.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn fetch_with_retry_allow_private(
+    client: &reqwest::Client,
+    url: &str,
+    max_retries: u32,
+) -> Result<String, FetchError> {
+    fetch_with_retry_impl(
+        || fetch_with_client_allow_private(client, url),
+        tokio::time::sleep,
+        max_retries,
+    )
+    .await
+}
+
 async fn fetch_with_retry_impl<F, Fut, S, Slp>(
     fetch_fn: F,
     sleep_fn: S,
@@ -199,9 +227,44 @@ pub async fn update_subscription(
     client: &reqwest::Client,
     subscription: &mut Subscription,
 ) -> Result<UpdateResult, UpdateError> {
+    update_subscription_impl(client, subscription, FetchMode::Enforced).await
+}
+
+/// Loopback-only fixtures; routes the fetch through the permissive
+/// `fetch_with_client_allow_private` while keeping parse, node-cap, and
+/// reconciliation behavior identical to production.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn update_subscription_allow_private(
+    client: &reqwest::Client,
+    subscription: &mut Subscription,
+) -> Result<UpdateResult, UpdateError> {
+    update_subscription_impl(client, subscription, FetchMode::AllowPrivate).await
+}
+
+/// Chooses the fetch entry point for one subscription update. Parse,
+/// node-cap, and reconciliation behavior are identical for every mode.
+#[derive(Clone, Copy)]
+enum FetchMode {
+    Enforced,
+    #[cfg(any(test, feature = "test-utils"))]
+    AllowPrivate,
+}
+
+async fn update_subscription_impl(
+    client: &reqwest::Client,
+    subscription: &mut Subscription,
+    mode: FetchMode,
+) -> Result<UpdateResult, UpdateError> {
     let raw_content = match &subscription.source {
         SubscriptionSource::Url { url } => {
-            fetch_with_retry(client, url, DEFAULT_MAX_RETRIES).await?
+            let url = url.clone();
+            match mode {
+                FetchMode::Enforced => fetch_with_retry(client, &url, DEFAULT_MAX_RETRIES).await?,
+                #[cfg(any(test, feature = "test-utils"))]
+                FetchMode::AllowPrivate => {
+                    fetch_with_retry_allow_private(client, &url, DEFAULT_MAX_RETRIES).await?
+                }
+            }
         }
         SubscriptionSource::File { path } => {
             let path = path.clone();
@@ -238,6 +301,12 @@ pub async fn update_subscription(
             error: error.to_string(),
         })
         .collect();
+
+    if import.nodes.len() > MAX_SUBSCRIPTION_NODES {
+        return Err(UpdateError::TooManyNodes {
+            parsed: import.nodes.len(),
+        });
+    }
 
     if import.nodes.is_empty() {
         return Err(UpdateError::InvalidContent {
@@ -560,6 +629,64 @@ mod tests {
             other => panic!("expected InvalidContent, got {other:?}"),
         }
         assert!(subscription.nodes.is_empty());
+    }
+
+    /// Answers with the address of a live loopback listener so the test can
+    /// prove the private answer is refused inside the resolver, before any
+    /// connect attempt.
+    struct RebindResolver {
+        calls: Arc<AtomicU32>,
+        addr: std::net::SocketAddr,
+    }
+
+    impl reqwest::dns::Resolve for RebindResolver {
+        fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::ready(Ok(Box::new(
+                vec![self.addr].into_iter(),
+            ) as reqwest::dns::Addrs)))
+        }
+    }
+
+    #[tokio::test]
+    async fn rebinding_dns_answer_refused_without_retries() {
+        let _ = test_client();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let calls = Arc::new(AtomicU32::new(0));
+        let client = reqwest::Client::builder()
+            .dns_resolver(crate::fetch::PublicTargetsResolver::with_inner(Arc::new(
+                RebindResolver {
+                    calls: calls.clone(),
+                    addr: listener.local_addr().unwrap(),
+                },
+            )))
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        let result = fetch_with_retry_impl(
+            || fetch_with_client(&client, "http://rebind.example.internal/sub"),
+            |_: Duration| async {},
+            3,
+        )
+        .await;
+
+        let err = result.unwrap_err();
+        assert!(matches!(err, FetchError::InvalidUrl(_)), "{err:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a DNS-answer refusal is non-transient and must not retry"
+        );
+        // The resolver refused the address, so nothing ever dialed the live
+        // listener: its backlog must stay empty.
+        let accept = listener.accept().map(|_| ());
+        assert_eq!(
+            accept.unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the private DNS answer must never open a connection"
+        );
     }
 
     #[tokio::test]

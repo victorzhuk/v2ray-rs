@@ -15,8 +15,9 @@ use v2ray_rs_core::models::{
 use v2ray_rs_core::persistence::{AppPaths, PersistenceError};
 use v2ray_rs_core::runtime_snapshot::subscriptions_runtime_state_eq;
 use v2ray_rs_subscription::{
-    RealDelayReport, SubscriptionError, SubscriptionImportOutcome, SubscriptionService,
-    UpdateError, UpdateResult, reconcile_nodes, same_connection,
+    MAX_SUBSCRIPTION_NODES, MAX_SUBSCRIPTION_SIZE, RealDelayReport, SubscriptionError,
+    SubscriptionImportOutcome, SubscriptionService, UpdateError, UpdateResult,
+    parse_json_subscription, reconcile_nodes, same_connection, subscription_url_is_public,
 };
 
 use crate::failure_streak::FailureStreak;
@@ -561,14 +562,12 @@ impl Component for SubscriptionsPage {
                     SubscriptionSourceInput::Url(url) => SubscriptionSource::Url { url },
                     SubscriptionSourceInput::File(path) => SubscriptionSource::File { path },
                     SubscriptionSourceInput::Paste(json) => {
-                        match write_subscription_blob(&self.paths, &json) {
+                        match write_pasted_subscription_blob(&self.paths, &json) {
                             Ok(path) => SubscriptionSource::File {
                                 path: path.to_string_lossy().into_owned(),
                             },
                             Err(err) => {
-                                let _ = sender.output(SubscriptionsOutput::Notice(format!(
-                                    "Failed to save pasted subscription: {err}"
-                                )));
+                                let _ = sender.output(SubscriptionsOutput::Notice(err));
                                 return;
                             }
                         }

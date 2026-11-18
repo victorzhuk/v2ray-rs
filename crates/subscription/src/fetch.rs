@@ -1,8 +1,12 @@
+use std::error::Error as StdError;
+use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use futures::StreamExt;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use thiserror::Error;
 
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -19,7 +23,7 @@ pub(crate) fn redirect_allowed(
     hops: usize,
     cap: usize,
 ) -> bool {
-    if hops >= cap || !redirect_target_is_public(next) {
+    if hops >= cap || !target_is_public(next) {
         return false;
     }
     match next.scheme() {
@@ -29,20 +33,125 @@ pub(crate) fn redirect_allowed(
     }
 }
 
-/// Rejects redirect targets that would reach the local host or a private
-/// network: loopback, link-local, RFC 1918, unique-local, unspecified, and
-/// `localhost` names. DNS names are not resolved here; public names stay
+/// Shared public-target policy for redirect hops, initial subscription URLs,
+/// and UI validation. DNS names are not resolved here; public names stay
 /// allowed and private literals cannot masquerade as one.
-fn redirect_target_is_public(url: &reqwest::Url) -> bool {
+fn target_is_public(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
+    // A trailing root dot names the same host (`localhost.` == `localhost`):
+    // strip exactly one, or a refused name escapes as unclassified and an IP
+    // literal skips the literal check.
+    let host = host.strip_suffix('.').unwrap_or(host);
     let literal = host.trim_start_matches('[').trim_end_matches(']');
     if let Ok(ip) = literal.parse::<std::net::IpAddr>() {
         return !ip_is_private_or_local(ip);
     }
     let host = host.to_ascii_lowercase();
     host != "localhost" && !host.ends_with(".localhost")
+}
+
+/// The one public subscription-URL predicate shared by the fetch path and the
+/// UI forms: an `http`/`https` URL whose host is a public literal or a
+/// non-localhost name. Any other input — unparsable text, foreign scheme,
+/// private literal — is rejected, so classification logic cannot drift between
+/// fetch-time enforcement and form-time feedback.
+pub fn subscription_url_is_public(url: &str) -> bool {
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    matches!(parsed.scheme(), "http" | "https") && target_is_public(&parsed)
+}
+
+/// Carried through the resolver error chain so `fetch_with_client` can
+/// classify a DNS-answer refusal as a non-transient `FetchError::InvalidUrl`
+/// instead of a retryable network error.
+#[derive(Debug)]
+struct PrivateTargetRejected {
+    host: String,
+}
+
+impl std::fmt::Display for PrivateTargetRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "host {} resolves to a private or local address",
+            self.host
+        )
+    }
+}
+
+impl std::error::Error for PrivateTargetRejected {}
+
+fn is_private_target_rejection(err: &reqwest::Error) -> bool {
+    let mut source = err.source();
+    while let Some(err) = source {
+        if err.downcast_ref::<PrivateTargetRejected>().is_some() {
+            return true;
+        }
+        source = err.source();
+    }
+    false
+}
+
+/// OS-backed lookup passed to [`PublicTargetsResolver`] in production.
+struct TokioLookup;
+
+impl Resolve for TokioLookup {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0u16)).await?.collect();
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
+}
+
+/// Connector-level resolver refusing every answer that contains a private or
+/// local address. Wired into the production subscription client so a
+/// rebinding DNS answer cannot redirect a connect, including on redirect
+/// hops where only the URL string was validated. A single private answer
+/// rejects the whole lookup: partial filtering would let an attacker mix
+/// public answers with the private one they want reached.
+pub(crate) struct PublicTargetsResolver {
+    inner: Arc<dyn Resolve>,
+}
+
+impl Default for PublicTargetsResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PublicTargetsResolver {
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(TokioLookup),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_inner(inner: Arc<dyn Resolve>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Resolve for PublicTargetsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let inner = self.inner.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_owned();
+            let addrs: Vec<SocketAddr> = inner.resolve(name).await?.collect();
+            if addrs.iter().any(|addr| ip_is_private_or_local(addr.ip())) {
+                return Err(Box::new(PrivateTargetRejected { host })
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addrs.into_iter()) as Addrs)
+        })
+    }
 }
 
 fn ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
@@ -84,7 +193,7 @@ pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
             let host = attempt.url().host_str().unwrap_or("unknown host");
             let reason = if hops >= cap {
                 format!("too many redirects (host {host})")
-            } else if !redirect_target_is_public(attempt.url()) {
+            } else if !target_is_public(attempt.url()) {
                 format!("refusing redirect to a private or local target (host {host})")
             } else {
                 format!("refusing insecure or unsupported redirect for host {host}")
@@ -94,7 +203,7 @@ pub(crate) fn redirect_policy(cap: usize) -> reqwest::redirect::Policy {
     })
 }
 
-const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
+pub const MAX_SUBSCRIPTION_SIZE: u64 = 10 * 1024 * 1024; // 10 MB
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error("network error: {0}")]
@@ -124,6 +233,26 @@ impl FetchError {
     }
 }
 pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<String, FetchError> {
+    fetch_with_targets_policy(client, url, true).await
+}
+
+/// Loopback-only fixtures; skips the initial public-target check so tests can
+/// serve subscriptions from `127.0.0.1`. Production callers never see this
+/// path: the equivalent service constructor is itself
+/// `#[cfg(any(test, feature = "test-utils"))]`-gated.
+#[cfg(any(test, feature = "test-utils"))]
+pub async fn fetch_with_client_allow_private(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<String, FetchError> {
+    fetch_with_targets_policy(client, url, false).await
+}
+
+async fn fetch_with_targets_policy(
+    client: &reqwest::Client,
+    url: &str,
+    enforce_public_targets: bool,
+) -> Result<String, FetchError> {
     let parsed = reqwest::Url::parse(url).map_err(|e| FetchError::InvalidUrl(e.to_string()))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err(FetchError::InvalidUrl(format!(
@@ -131,12 +260,27 @@ pub async fn fetch_with_client(client: &reqwest::Client, url: &str) -> Result<St
             parsed.scheme()
         )));
     }
+    if enforce_public_targets && !target_is_public(&parsed) {
+        return Err(FetchError::InvalidUrl(format!(
+            "refusing subscription target that is not a public host (host {})",
+            parsed.host_str().unwrap_or("unknown host")
+        )));
+    }
     if parsed.scheme() == "http" {
         log::warn!("fetching subscription over plaintext HTTP — credentials may be exposed");
     }
 
     let response = client.get(parsed).send().await.map_err(|e| {
-        if e.is_timeout() {
+        if is_private_target_rejection(&e) {
+            let host = e
+                .url()
+                .and_then(|u| u.host_str())
+                .unwrap_or("unknown host")
+                .to_owned();
+            FetchError::InvalidUrl(format!(
+                "refusing DNS answer resolving to a private or local address (host {host})"
+            ))
+        } else if e.is_timeout() {
             FetchError::Timeout
         } else if e.is_builder() {
             FetchError::RequestBuildError(e.without_url().to_string())
@@ -442,7 +586,7 @@ mod tests {
             .connect_timeout(Duration::from_millis(500))
             .build()
             .unwrap();
-        let result = fetch_with_client(&client, &url).await;
+        let result = fetch_with_client_allow_private(&client, &url).await;
         let err = result.expect_err("connecting to a closed port must fail");
         let msg = err.to_string();
         assert!(
@@ -477,7 +621,7 @@ mod tests {
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
-        let result = fetch_with_client(&client, &format!("http://{addr}/sub")).await;
+        let result = fetch_with_client_allow_private(&client, &format!("http://{addr}/sub")).await;
         let err = result.expect_err("HTTP 500 must fail");
         server.await.unwrap();
         let msg = err.to_string();
@@ -573,5 +717,96 @@ mod tests {
                 "public redirect target refused: {target}"
             );
         }
+    }
+
+    #[test]
+    fn subscription_url_predicate_matches_target_policy() {
+        for url in [
+            "http://127.0.0.1:8080/sub",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]/sub",
+            "http://[::ffff:10.0.0.1]/sub",
+            "https://localhost/sub",
+            "https://sub.localhost/sub",
+            "http://localhost./sub",
+            "http://x.localhost./sub",
+            "http://127.0.0.1./sub",
+            "http://10.1.2.3/sub",
+            "http://192.168.1.1/sub",
+            "http://172.16.0.1/sub",
+            "https://100.64.0.1/sub",
+            "https://198.18.0.1/sub",
+            "http://0.0.0.0/sub",
+            "http://255.255.255.255/sub",
+            "http://[fe80::1]/sub",
+            "http://[fc00::1]/sub",
+            "ftp://example.com/sub",
+            "not a url",
+        ] {
+            assert!(!subscription_url_is_public(url), "accepted: {url}");
+        }
+        for url in [
+            "https://example.com/sub",
+            "http://198.51.100.7/sub",
+            "https://[2001:db8::1]/sub",
+        ] {
+            assert!(subscription_url_is_public(url), "refused: {url}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_with_client_rejects_private_initial_urls() {
+        let client = test_client();
+        for url in [
+            "http://127.0.0.1:8080/sub",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://[::1]:8080/sub",
+            "http://[::ffff:10.0.0.1]/sub",
+            "https://localhost/sub",
+        ] {
+            let err = fetch_with_client(&client, url).await.unwrap_err();
+            assert!(matches!(err, FetchError::InvalidUrl(_)), "{url}: {err:?}");
+            assert!(!err.is_transient(), "{url}: refusal must not retry");
+        }
+    }
+
+    struct StaticResolver {
+        addrs: Vec<std::net::SocketAddr>,
+    }
+
+    impl Resolve for StaticResolver {
+        fn resolve(&self, _name: Name) -> Resolving {
+            let addrs = self.addrs.clone();
+            Box::pin(std::future::ready(Ok(
+                Box::new(addrs.into_iter()) as Addrs
+            )))
+        }
+    }
+
+    #[tokio::test]
+    async fn resolver_rejects_any_private_dns_answer() {
+        let resolver = PublicTargetsResolver::with_inner(Arc::new(StaticResolver {
+            addrs: vec!["8.8.8.8:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap()],
+        }));
+        let name = std::str::FromStr::from_str("rebind.example.com").unwrap();
+
+        let result = resolver.resolve(name).await;
+
+        assert!(
+            result.is_err(),
+            "a lookup containing a private answer must be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolver_allows_public_dns_answers() {
+        let resolver = PublicTargetsResolver::with_inner(Arc::new(StaticResolver {
+            addrs: vec!["8.8.8.8:0".parse().unwrap(), "1.1.1.1:0".parse().unwrap()],
+        }));
+        let name = std::str::FromStr::from_str("example.com").unwrap();
+
+        let addrs = resolver.resolve(name).await.unwrap();
+
+        assert_eq!(addrs.count(), 2);
     }
 }

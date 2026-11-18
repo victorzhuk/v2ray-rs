@@ -7,7 +7,10 @@ pub(crate) mod ping;
 pub(crate) mod real_delay;
 pub(crate) mod update;
 
-pub use fetch::{FetchError, decode_subscription_content, fetch_from_file};
+pub use fetch::{
+    FetchError, MAX_SUBSCRIPTION_SIZE, decode_subscription_content, fetch_from_file,
+    subscription_url_is_public,
+};
 pub use json_import::{JsonImport, parse_json_subscription};
 pub use manager::{SubscriptionError, SubscriptionImportOutcome, SubscriptionService};
 pub use observatory::{
@@ -20,6 +23,6 @@ pub use real_delay::{
     probe_batch_count,
 };
 pub use update::{
-    ParseFailure, UpdateError, UpdateResult, reconcile_nodes, reconcile_with_counts,
-    same_connection,
+    MAX_SUBSCRIPTION_NODES, ParseFailure, UpdateError, UpdateResult, reconcile_nodes,
+    reconcile_with_counts, same_connection,
 };
