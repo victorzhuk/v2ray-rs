@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-11-18
+
 ### Added
 - Default profile paths now use D-Bus application activation: a second launch focuses the running window and exits `0`. Directory overrides and buses without a primary instance keep the exit-`75` lock fallback.
 - Release acceptance now measures Real Delay through installed xray and v2ray against a local fixture, with bounded lifetimes and a missing-backend failure.
@@ -18,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.
 
 ### Security
+- Subscription fetches now reject private or local initial URLs and DNS answers (loopback, link-local, RFC 1918, CGNAT, benchmarking, unique-local, metadata endpoints) before connecting, and imports are capped at 4,096 nodes per subscription without replacing stored nodes.
 - Update `rustls-webpki` to 0.103.16 and `webpki-root-certs` to 1.0.10 to clear the certificate trust advisories RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
 - Make both release installers fail closed when `sha256sum` or an expected digest is unavailable, malformed, or mismatched; the prefix and any existing installation stay untouched, including in quiet mode.
 - Verify Arch helper ownership and restricted modes before granting `CAP_NET_ADMIN` or the setuid bit, and revoke partial grants when provisioning fails.
@@ -32,6 +35,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ship `v2ray-rs-run` without the setuid bit in package archives and apply `root:v2ray-rs` `4750` only in install hooks; create `v2ray-rs-bypass` during privileged setup and skip the wrapper in user-local installs.
 
 ### Fixed
+- sing-box no longer points `default_domain_resolver` or a hostname DNS server's `domain_resolver` at a DNS server that detours through the proxy; when no direct IP-literal server exists it emits a generated bootstrap resolver (a local resolver without TUN, a direct-dialed DoH server at `1.1.1.1` under TUN, where the OS resolver would reach the tunnel). Effective DNS reports the same entry.
+- Concurrent latency, Real Delay, egress, and availability updates serialize on one workspace lock instead of clobbering sibling samples; connect-time pruning only writes when it drops a node and never blocks connecting.
+- Custom routing presets whose names slug to the same file no longer overwrite or shadow each other; directory-override instances run beside a default-profile instance, the instance lock publishes its holder PID, and tray items are scoped per profile.
+- TUN failover no longer tears down the route session a replacement candidate adopted; `xray-up` reconciles the optional 8998/8999 policy rules to its flags and prunes stale journal entries; the UI releases parked fail-closed routes on aborted preflight or non-TUN switches and keeps probes suppressed through `Starting`, `Stopping`, and any state with a TUN journal.
+- The AppImage installer names `install.sh` for the system-wide tarball path and survives an unset `USER`; release `Metadata` fails on Arch `pkgver` drift; published `PKGBUILD`/`PKGBUILD-bin` assets carry verified SHA-256 digests instead of `SKIP`.
 - Treat a sub-millisecond v2ray observatory average as a valid delay sample and keep a delay observed in an earlier poll instead of letting a later poll overwrite it with a missing value.
 - Preserve the `v2ray-rs` group and `v2ray-rs-bypass` user across Arch package removal so a reinstall keeps their UID, GID, and memberships, and report any helper cleanup that fails.
 - Resolve TUN proxy hostnames lazily per candidate, pre-pin at most eight candidates before strict xray routing, reuse last good pins under parked routes, and cancel lookups and pin probes when Stop arrives.
@@ -918,7 +926,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.4...HEAD
+[0.20.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.2...v0.20.3
 [0.20.2]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.1...v0.20.2
 [0.20.1]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.0...v0.20.1
