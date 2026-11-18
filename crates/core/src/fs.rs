@@ -1,7 +1,7 @@
 use std::io::Write;
 use std::path::Path;
 
-pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub fn atomic_write(path: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,

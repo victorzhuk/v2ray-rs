@@ -443,7 +443,10 @@ pub(super) fn try_run() -> Result<(), String> {
 
     let _lock = InstanceLock::acquire(&paths).map_err(|e| {
         if let v2ray_rs_core::instance::InstanceError::LockHeld { pid, profile: p } = e {
-            eprintln!("Another instance is already running (PID {pid}), profile '{p}' is locked.");
+            let pid_label = pid.map_or_else(|| "unknown".to_string(), |n| n.to_string());
+            eprintln!(
+                "Another instance is already running (PID {pid_label}), profile '{p}' is locked."
+            );
             std::process::exit(75);
         }
         format!("failed to acquire instance lock: {e}")

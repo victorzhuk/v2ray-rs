@@ -243,13 +243,9 @@ fn build_client() -> Result<reqwest::blocking::Client, GeodataError> {
     reqwest::blocking::Client::builder()
         .timeout(GEODATA_DOWNLOAD_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(
-            |attempt| match redirect_verdict(
-                attempt.previous().iter().any(|url| url.scheme() == "https"),
-                attempt.url().scheme(),
-                attempt.previous().len(),
-            ) {
+            |attempt| match redirect_verdict(attempt.url(), attempt.previous().len()) {
                 Ok(()) => attempt.follow(),
-                Err(_) => attempt.stop(),
+                Err(reason) => attempt.error(reason),
             },
         ))
         .build()
@@ -260,19 +256,26 @@ fn build_client() -> Result<reqwest::blocking::Client, GeodataError> {
 }
 
 #[cfg(feature = "geodata-fetch")]
-fn redirect_verdict(
-    origin_https: bool,
-    next_scheme: &str,
-    hops: usize,
-) -> Result<(), &'static str> {
-    if origin_https && next_scheme == "http" {
-        return Err("refusing redirect from https to http");
-    }
-    if !matches!(next_scheme, "http" | "https") {
-        return Err("refusing redirect to unsupported scheme");
-    }
+fn redirect_verdict(next: &reqwest::Url, hops: usize) -> Result<(), &'static str> {
     if hops >= MAX_REDIRECTS {
         return Err("too many redirects");
+    }
+    if next.scheme() != "https" {
+        return Err("refusing non-HTTPS geodata redirect");
+    }
+    let Some(host) = next.host_str().filter(|h| !h.is_empty()) else {
+        return Err("refusing geodata redirect without host");
+    };
+    let literal = host.trim_start_matches('[').trim_end_matches(']');
+    if literal.parse::<std::net::IpAddr>().is_ok() {
+        return Err("refusing geodata redirect to IP literal");
+    }
+    let host_lc = host.to_ascii_lowercase();
+    let is_github = host_lc == "github.com"
+        || (host_lc.len() > ".githubusercontent.com".len()
+            && host_lc.ends_with(".githubusercontent.com"));
+    if !is_github {
+        return Err("refusing geodata redirect outside GitHub hosts");
     }
     Ok(())
 }
@@ -684,11 +687,22 @@ mod tests {
 
     #[cfg(feature = "geodata-fetch")]
     #[test]
-    fn redirect_verdict_refuses_downgrade_and_caps_hops() {
-        assert!(redirect_verdict(true, "http", 0).is_err());
-        assert!(redirect_verdict(false, "http", 0).is_ok());
-        assert!(redirect_verdict(true, "https", 4).is_ok());
-        assert!(redirect_verdict(true, "https", MAX_REDIRECTS).is_err());
-        assert!(redirect_verdict(true, "ftp", 0).is_err());
+    fn redirect_verdict_enforces_https_github_hosts_and_caps_hops() {
+        let gh = reqwest::Url::parse("https://github.com/v2fly/geoip/releases").unwrap();
+        let cdn = reqwest::Url::parse("https://objects.githubusercontent.com/file.dat").unwrap();
+        let http = reqwest::Url::parse("http://objects.githubusercontent.com/file.dat").unwrap();
+        let off_domain = reqwest::Url::parse("https://evil.example.com/geoip.dat").unwrap();
+        let loopback = reqwest::Url::parse("https://127.0.0.1/geoip.dat").unwrap();
+        let cgnat = reqwest::Url::parse("https://100.64.0.10/geoip.dat").unwrap();
+        let ftp = reqwest::Url::parse("ftp://github.com/geoip.dat").unwrap();
+
+        assert!(redirect_verdict(&gh, 0).is_ok());
+        assert!(redirect_verdict(&cdn, 4).is_ok());
+        assert!(redirect_verdict(&cdn, MAX_REDIRECTS).is_err());
+        assert!(redirect_verdict(&http, 0).is_err());
+        assert!(redirect_verdict(&off_domain, 0).is_err());
+        assert!(redirect_verdict(&loopback, 0).is_err());
+        assert!(redirect_verdict(&cgnat, 0).is_err());
+        assert!(redirect_verdict(&ftp, 0).is_err());
     }
 }

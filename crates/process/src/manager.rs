@@ -7,13 +7,14 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 use tokio::time::sleep;
 
 use crate::pid::PidFile;
+use crate::spawn::{MAX_LOG_LINE_BYTES, read_bounded_line};
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{self, HelperRun, TunRuntime};
 use v2ray_rs_core::ansi::strip_ansi;
@@ -1013,9 +1014,11 @@ impl ProcessManager {
             let buffer = Arc::clone(&self.log_buffer);
             let writer = self.log_writer.clone();
             self.log_handles.push(tokio::spawn(async move {
-                let reader = BufReader::new(stdout);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stdout);
+                let mut buf = Vec::new();
+                while let Ok(Some(line)) =
+                    read_bounded_line(&mut reader, &mut buf, MAX_LOG_LINE_BYTES).await
+                {
                     let line = strip_ansi(&line);
                     write_stream_line(&writer, "stdout", &line);
                     let log_line = LogLine::stdout(line);
@@ -1033,9 +1036,11 @@ impl ProcessManager {
             let buffer = Arc::clone(&self.log_buffer);
             let writer = self.log_writer.clone();
             self.log_handles.push(tokio::spawn(async move {
-                let reader = BufReader::new(stderr);
-                let mut lines = reader.lines();
-                while let Ok(Some(line)) = lines.next_line().await {
+                let mut reader = BufReader::new(stderr);
+                let mut buf = Vec::new();
+                while let Ok(Some(line)) =
+                    read_bounded_line(&mut reader, &mut buf, MAX_LOG_LINE_BYTES).await
+                {
                     let line = strip_ansi(&line);
                     write_stream_line(&writer, "stderr", &line);
                     let log_line = LogLine::stderr(line);

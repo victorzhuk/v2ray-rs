@@ -23,7 +23,8 @@ use chrono::Utc;
 use serde_json::Value;
 use std::time::Instant;
 use v2ray_rs_core::config::{
-    egress_inbound_ports, pick_free_loopback_ports, probe_generator_for, probe_tag,
+    egress_inbound_ports, generate_clash_api_secret, pick_free_loopback_ports, probe_generator_for,
+    probe_tag,
 };
 use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, derive_verdict};
 use v2ray_rs_core::models::{
@@ -221,12 +222,14 @@ async fn run_probe_batch(
         return RealDelayReport::failed(len, "could not allocate egress loopback ports");
     };
 
-    let config = generator.generate(
+    let api_secret = (backend == BackendType::SingBox).then(generate_clash_api_secret);
+    let config = generator.generate_with_secret(
         nodes,
         api_port,
         &cfg.test_url,
         cfg.timeout_ms,
         &egress_ports,
+        api_secret.as_deref(),
     );
     let config_json = match serde_json::to_vec_pretty(&config) {
         Ok(bytes) => bytes,
@@ -299,7 +302,14 @@ async fn run_probe_batch(
 
     match backend {
         BackendType::SingBox => {
-            let results = singbox_delays(api_port, len, &cfg.test_url, cfg.timeout_ms).await;
+            let results = singbox_delays(
+                api_port,
+                len,
+                &cfg.test_url,
+                cfg.timeout_ms,
+                api_secret.as_deref(),
+            )
+            .await;
             let extras = node_pass(&config, &results).await;
             let _ = runner.stop().await;
             drop(temp);
@@ -499,6 +509,7 @@ async fn singbox_delays(
     count: usize,
     test_url: &str,
     timeout_ms: u32,
+    api_secret: Option<&str>,
 ) -> Vec<Option<u64>> {
     let client = match reqwest::Client::builder().no_proxy().build() {
         Ok(c) => c,
@@ -507,14 +518,18 @@ async fn singbox_delays(
     let encoded_url = utf8_percent_encode(test_url, NON_ALPHANUMERIC).to_string();
     // Allow the backend's own per-probe timeout to elapse before we give up.
     let request_timeout = Duration::from_millis(u64::from(timeout_ms).saturating_add(3000));
+    let api_secret = api_secret.map(str::to_owned);
 
     let futures = (0..count).map(|i| {
         let client = client.clone();
+        let api_secret = api_secret.clone();
         let url = format!(
             "http://127.0.0.1:{api_port}/proxies/{tag}/delay?url={encoded_url}&timeout={timeout_ms}",
             tag = probe_tag(i),
         );
-        async move { query_singbox_delay(&client, &url, request_timeout).await }
+        async move {
+            query_singbox_delay(&client, &url, request_timeout, api_secret.as_deref()).await
+        }
     });
     run_bounded(MAX_CONCURRENT_NODE_PROBES, futures).await
 }
@@ -534,8 +549,13 @@ async fn query_singbox_delay(
     client: &reqwest::Client,
     url: &str,
     timeout: Duration,
+    api_secret: Option<&str>,
 ) -> Option<u64> {
-    let mut response = client.get(url).timeout(timeout).send().await.ok()?;
+    let mut req = client.get(url).timeout(timeout);
+    if let Some(secret) = api_secret.filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(secret);
+    }
+    let mut response = req.send().await.ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -960,8 +980,11 @@ mod tests {
     }
 
     /// Minimal mock Clash API: for `GET /proxies/probe-<i>/delay`, returns the
-    /// i-th canned response. A `None` response yields HTTP 408.
-    async fn spawn_mock_clash(responses: Vec<Option<u64>>) -> u16 {
+    /// i-th canned response when authorized with `expected_secret` (if set).
+    async fn spawn_mock_clash(
+        responses: Vec<Option<u64>>,
+        expected_secret: Option<&'static str>,
+    ) -> u16 {
         let listener = TokioListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move {
@@ -974,6 +997,25 @@ mod tests {
                     let mut buf = [0u8; 2048];
                     let n = socket.read(&mut buf).await.unwrap_or(0);
                     let req = String::from_utf8_lossy(&buf[..n]);
+                    let authorized = match expected_secret {
+                        Some(secret) => req.lines().any(|line| {
+                            line.strip_prefix("authorization: ")
+                                .or_else(|| line.strip_prefix("Authorization: "))
+                                .is_some_and(|v| v.trim() == format!("Bearer {secret}"))
+                        }),
+                        None => true,
+                    };
+                    if !authorized {
+                        let body = "{\"message\":\"unauthorized\"}";
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        let _ = socket.flush().await;
+                        return;
+                    }
                     let first_line = req.lines().next().unwrap_or("");
                     let idx = first_line
                         .split_whitespace()
@@ -1011,9 +1053,20 @@ mod tests {
     #[tokio::test]
     async fn singbox_delays_success_and_partial_failures() {
         install_crypto_provider();
-        let port = spawn_mock_clash(vec![Some(120), None, Some(248)]).await;
-        let results = singbox_delays(port, 3, "https://www.gstatic.com/generate_204", 5000).await;
+        let port = spawn_mock_clash(vec![Some(120), None, Some(248)], Some("test-secret")).await;
+        let results = singbox_delays(
+            port,
+            3,
+            "https://www.gstatic.com/generate_204",
+            5000,
+            Some("test-secret"),
+        )
+        .await;
         assert_eq!(results, vec![Some(120), None, Some(248)]);
+
+        let unauth_results =
+            singbox_delays(port, 3, "https://www.gstatic.com/generate_204", 5000, None).await;
+        assert_eq!(unauth_results, vec![None, None, None]);
     }
 
     #[tokio::test]
@@ -1024,7 +1077,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        let results = singbox_delays(port, 2, "https://www.gstatic.com/generate_204", 200).await;
+        let results = singbox_delays(
+            port,
+            2,
+            "https://www.gstatic.com/generate_204",
+            200,
+            Some("secret"),
+        )
+        .await;
         assert_eq!(results, vec![None, None]);
     }
 

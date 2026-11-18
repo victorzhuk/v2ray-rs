@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use v2ray_rs_core::models::{ProbeScheme, ProbeTarget, parse_probe_target};
 
 /// Probes the local HTTP proxy without an HTTP client stack: a plain `GET` for
 /// `http://` targets and a `CONNECT` tunnel for `https://` ones. The tunnel
@@ -13,88 +14,32 @@ pub async fn probe_via_http_proxy(
     url: &str,
     timeout: Duration,
 ) -> Result<(), String> {
-    let target = Target::parse(url)?;
+    let target = parse_probe_target(url).map_err(|err| err.to_string())?;
     match tokio::time::timeout(timeout, exchange(proxy, &target)).await {
         Ok(result) => result,
         Err(_) => Err("timed out".to_string()),
     }
 }
 
-struct Target {
-    scheme: Scheme,
-    authority: String,
-    host: String,
-    port: u16,
-    path: String,
-}
-
-#[derive(PartialEq)]
-enum Scheme {
-    Http,
-    Https,
-}
-
-impl Target {
-    fn parse(url: &str) -> Result<Self, String> {
-        let (scheme, rest) = if let Some(rest) = url.strip_prefix("http://") {
-            (Scheme::Http, rest)
-        } else if let Some(rest) = url.strip_prefix("https://") {
-            (Scheme::Https, rest)
-        } else {
-            return Err(format!("unsupported probe URL: {url}"));
-        };
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if authority.is_empty() {
-            return Err(format!("probe URL has no host: {url}"));
-        }
-
-        let (host, port) = split_authority(authority);
-        let port = port.unwrap_or(if scheme == Scheme::Https { 443 } else { 80 });
-        Ok(Self {
-            scheme,
-            authority: authority.to_string(),
-            host,
-            port,
-            path: format!("/{path}"),
-        })
-    }
-
-    fn request(&self) -> String {
-        match self.scheme {
-            Scheme::Http => format!(
-                "GET http://{}{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-                self.authority, self.path, self.host
-            ),
-            Scheme::Https => format!(
-                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
-                self.host, self.port, self.host, self.port
-            ),
-        }
+fn format_request(target: &ProbeTarget) -> String {
+    match target.scheme {
+        ProbeScheme::Http => format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
+            target.request_target, target.host_header
+        ),
+        ProbeScheme::Https => format!(
+            "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+            target.host, target.port, target.host, target.port
+        ),
     }
 }
 
-fn split_authority(authority: &str) -> (String, Option<u16>) {
-    if let Some(rest) = authority.strip_prefix('[')
-        && let Some((host, tail)) = rest.split_once(']')
-    {
-        let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
-        return (format!("[{host}]"), port);
-    }
-    match authority.rsplit_once(':') {
-        Some((host, port)) if !host.is_empty() => match port.parse() {
-            Ok(port) => (host.to_string(), Some(port)),
-            Err(_) => (authority.to_string(), None),
-        },
-        _ => (authority.to_string(), None),
-    }
-}
-
-async fn exchange(proxy: SocketAddr, target: &Target) -> Result<(), String> {
+async fn exchange(proxy: SocketAddr, target: &ProbeTarget) -> Result<(), String> {
     let mut stream = TcpStream::connect(proxy)
         .await
         .map_err(|error| error.to_string())?;
     stream
-        .write_all(target.request().as_bytes())
+        .write_all(format_request(target).as_bytes())
         .await
         .map_err(|error| error.to_string())?;
 
@@ -117,11 +62,11 @@ async fn exchange(proxy: SocketAddr, target: &Target) -> Result<(), String> {
     status_code(&response).map_or_else(
         || Err("proxy closed the connection without a response".to_string()),
         |status| {
-            if status < 400 {
-                Ok(())
-            } else {
-                Err(status.to_string())
-            }
+            let ok = match target.scheme {
+                ProbeScheme::Https => (200..=299).contains(&status),
+                ProbeScheme::Http => (200..=399).contains(&status),
+            };
+            if ok { Ok(()) } else { Err(status.to_string()) }
         },
     )
 }
@@ -226,5 +171,82 @@ mod tests {
 
         assert_eq!(result, Ok(()));
         assert!(rx.await.unwrap().starts_with("CONNECT probe.test:443"));
+    }
+
+    #[tokio::test]
+    async fn http_probe_includes_non_default_port_in_host_header() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let read = socket.read(&mut buf).await.unwrap();
+            tx.send(String::from_utf8_lossy(&buf[..read]).to_string())
+                .unwrap();
+            let _ = socket
+                .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .await;
+        });
+
+        let result = probe_via_http_proxy(
+            addr,
+            "http://probe.example.com:8080/generate_204",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        let req = rx.await.unwrap();
+        assert!(
+            req.contains("Host: probe.example.com:8080\r\n"),
+            "missing non-default port in Host header: {req:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_1xx_and_non_2xx_connect() {
+        let interim = spawn_proxy(Some("HTTP/1.1 100 Continue\r\n\r\n")).await;
+        assert!(
+            probe_via_http_proxy(interim, PROBE_URL, Duration::from_secs(5))
+                .await
+                .is_err()
+        );
+
+        let redirect = spawn_proxy(Some(
+            "HTTP/1.1 302 Found\r\nLocation: https://example.com/\r\n\r\n",
+        ))
+        .await;
+        assert!(
+            probe_via_http_proxy(
+                redirect,
+                "https://probe.test/generate_204",
+                Duration::from_secs(5)
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            probe_via_http_proxy(redirect, PROBE_URL, Duration::from_secs(5))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_invalid_url_before_dialing() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        for bad in [
+            "https://user:pass@example.com/",
+            "https://[::1]extra/path",
+            "https://example.com/path#frag",
+        ] {
+            let err = probe_via_http_proxy(addr, bad, Duration::from_secs(5))
+                .await
+                .unwrap_err();
+            assert!(err.contains("invalid test URL"), "{bad}: {err}");
+        }
     }
 }

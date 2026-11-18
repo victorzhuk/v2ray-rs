@@ -16,7 +16,7 @@ pub use redact::redact_json;
 pub use probe::{
     EGRESS_TAG_PREFIX, PROBE_TAG_PREFIX, ProbeConfigGenerator, SingboxProbeGenerator,
     V2rayProbeGenerator, XrayProbeGenerator, egress_inbound_ports, egress_tag,
-    pick_free_loopback_ports, probe_generator_for, probe_tag,
+    generate_clash_api_secret, pick_free_loopback_ports, probe_generator_for, probe_tag,
 };
 pub use singbox::SingboxGenerator;
 pub use v2ray::V2rayGenerator;

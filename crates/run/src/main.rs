@@ -43,6 +43,7 @@ fn main() {
     }
     let sanitized = sanitize_env(&std::env::vars().collect::<Vec<_>>(), &user);
     apply_env(&sanitized);
+    close_inherited_fds();
     exec_command(&command);
 }
 
@@ -151,6 +152,50 @@ fn apply_env(sanitized: &[(String, String)]) {
         }
         for (k, v) in sanitized {
             std::env::set_var(k, v);
+        }
+    }
+}
+
+fn close_inherited_fds() {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3 as libc::c_uint,
+            libc::c_uint::MAX,
+            0 as libc::c_uint,
+        )
+    };
+    if rc == 0 {
+        return;
+    }
+    close_fds_via_procfs();
+}
+
+fn close_fds_via_procfs() {
+    unsafe {
+        let dir = libc::opendir(c"/proc/self/fd".as_ptr());
+        if dir.is_null() {
+            return;
+        }
+        let dir_fd = libc::dirfd(dir);
+        let mut to_close = Vec::new();
+        loop {
+            let entry = libc::readdir(dir);
+            if entry.is_null() {
+                break;
+            }
+            let name = CStr::from_ptr((*entry).d_name.as_ptr());
+            if let Ok(text) = name.to_str()
+                && let Ok(fd) = text.parse::<libc::c_int>()
+                && fd >= 3
+                && fd != dir_fd
+            {
+                to_close.push(fd);
+            }
+        }
+        libc::closedir(dir);
+        for fd in to_close {
+            libc::close(fd);
         }
     }
 }
@@ -308,5 +353,53 @@ mod tests {
             .map(|s| CString::new(s.into_vec()).map_err(|_| "argv contains invalid byte"))
             .collect();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn close_inherited_fds_closes_non_cloexec_descriptors() {
+        let dev_null = CString::new("/dev/null").unwrap();
+        let fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 3, "expected fd >= 3, got {fd}");
+        unsafe {
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0);
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            close_inherited_fds();
+            let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+            unsafe { libc::_exit(if still_open { 2 } else { 0 }) };
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::close(fd) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+    }
+
+    #[test]
+    fn close_fds_via_procfs_closes_non_cloexec_descriptors() {
+        let dev_null = CString::new("/dev/null").unwrap();
+        let fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 3, "expected fd >= 3, got {fd}");
+        unsafe {
+            assert_eq!(libc::fcntl(fd, libc::F_SETFD, 0), 0);
+        }
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            close_fds_via_procfs();
+            let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+            unsafe { libc::_exit(if still_open { 2 } else { 0 }) };
+        }
+
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        unsafe { libc::close(fd) };
+        assert_eq!(waited, pid);
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
     }
 }

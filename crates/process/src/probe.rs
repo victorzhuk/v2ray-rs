@@ -1,4 +1,3 @@
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -54,9 +53,10 @@ impl ProbeRunner {
         self.api_port
     }
 
-    /// Spawns the ephemeral backend with the generated probe config. Sets
-    /// `PR_SET_PDEATHSIG` on Linux so the kernel terminates the probe if this
-    /// process (v2ray-rs) dies.
+    /// Spawns the ephemeral backend with the generated probe config. Cleanup on
+    /// cancellation or drop relies on `kill_on_drop(true)`, explicit `stop()`,
+    /// and `Drop` `SIGKILL` (avoiding Linux `PR_SET_PDEATHSIG`, which binds to
+    /// the spawning Tokio worker thread rather than the process).
     pub async fn start(&mut self) -> Result<(), ProbeError> {
         let binary = self.binary.clone();
         let config_path = self.config_path.clone();
@@ -69,15 +69,6 @@ impl ProbeRunner {
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped())
                 .kill_on_drop(true);
-            // SAFETY: set_pdeathsig only sets a process attribute and does not
-            // allocate or touch shared state in the forked child.
-            unsafe {
-                cmd.as_std_mut().pre_exec(|| {
-                    nix::sys::prctl::set_pdeathsig(Signal::SIGTERM)
-                        .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-                    Ok(())
-                });
-            }
             cmd
         })
         .await
@@ -225,6 +216,43 @@ mod tests {
 
         drop(runner);
         sleep(Duration::from_millis(150)).await;
+        assert!(!pid_alive(pid));
+    }
+
+    #[tokio::test]
+    async fn spawning_thread_exit_does_not_kill_probe_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_sleeper_binary(dir.path());
+        let config = dir.path().join("probe.json");
+        std::fs::write(&config, "{}").unwrap();
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let mut runner = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let mut runner = ProbeRunner::new(binary, config, port);
+                runner.start().await.unwrap();
+                runner
+            })
+        })
+        .join()
+        .unwrap();
+
+        sleep(Duration::from_millis(150)).await;
+        let pid = runner.child.as_ref().unwrap().id().unwrap() as i32;
+        assert!(
+            pid_alive(pid),
+            "probe child should outlive the OS thread that spawned it"
+        );
+
+        runner.stop().await.unwrap();
+        sleep(Duration::from_millis(100)).await;
         assert!(!pid_alive(pid));
     }
 }

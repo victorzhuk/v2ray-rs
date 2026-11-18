@@ -19,7 +19,7 @@ impl LockGuard {
         match Flock::lock(file, lock_arg) {
             Ok(flock) => Ok(Self { _flock: flock }),
             Err(_) => Err(InstanceError::LockHeld {
-                pid: std::process::id(),
+                pid: None,
                 profile: "unknown".to_string(),
             }),
         }
@@ -161,7 +161,7 @@ impl InstanceLock {
         let path = paths.instance_lock_path();
 
         if let Some(parent) = path.parent() {
-            std_fs::create_dir_all(parent)?;
+            crate::persistence::create_dir_with_permissions(parent)?;
         }
 
         let file = std_fs::OpenOptions::new()
@@ -173,7 +173,7 @@ impl InstanceLock {
 
         let guard = LockGuard::acquire(file).map_err(|e| {
             if let InstanceError::LockHeld { .. } = e {
-                let holder_pid = read_holder_pid(paths).unwrap_or(std::process::id());
+                let holder_pid = read_holder_pid(paths).ok();
                 InstanceError::LockHeld {
                     pid: holder_pid,
                     profile: paths.profile().qualifier().to_string(),
@@ -193,6 +193,15 @@ fn read_holder_pid(paths: &AppPaths) -> Result<u32, InstanceError> {
     Ok(stamp.last_started_pid)
 }
 
+fn format_lock_held(pid: Option<u32>, profile: &str) -> String {
+    match pid {
+        Some(pid) => {
+            format!("another instance is running (PID {pid}), profile '{profile}' is locked")
+        }
+        None => format!("another instance is running (PID unknown), profile '{profile}' is locked"),
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum InstanceError {
     #[error("io: {0}")]
@@ -201,8 +210,8 @@ pub enum InstanceError {
     Json(#[from] serde_json::Error),
     #[error("persistence: {0}")]
     Persistence(#[from] PersistenceError),
-    #[error("another instance is running (PID {pid}), profile '{profile}' is locked")]
-    LockHeld { pid: u32, profile: String },
+    #[error("{}", format_lock_held(*.pid, profile))]
+    LockHeld { pid: Option<u32>, profile: String },
     #[error("refusing to reset production profile without --i-understand")]
     ResetProductionDenied,
 }
@@ -408,6 +417,16 @@ mod tests {
         let lock = InstanceLock::acquire(&paths).unwrap();
 
         assert!(paths.instance_lock_path().exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std_fs::metadata(paths.runtime_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
 
         drop(lock);
     }
@@ -426,7 +445,7 @@ mod tests {
         let result = InstanceLock::acquire(&paths);
         match result.err() {
             Some(InstanceError::LockHeld { pid, .. }) => {
-                assert_eq!(pid, 4242, "holder PID must come from instance.json")
+                assert_eq!(pid, Some(4242), "holder PID must come from instance.json")
             }
             Some(other) => panic!("expected LockHeld, got {other:?}"),
             None => panic!("second acquire unexpectedly succeeded"),
@@ -437,6 +456,23 @@ mod tests {
             restored.last_started_pid, 4242,
             "contention must not overwrite the holder stamp"
         );
+    }
+
+    #[test]
+    fn test_instance_lock_missing_stamp_reports_unknown_pid() {
+        let (_tmp, paths) = test_paths();
+        let _lock1 = InstanceLock::acquire(&paths).unwrap();
+
+        let err = InstanceLock::acquire(&paths)
+            .err()
+            .expect("second acquire must fail");
+        match &err {
+            InstanceError::LockHeld { pid, .. } => {
+                assert_eq!(*pid, None, "missing stamp must not report caller PID");
+            }
+            other => panic!("expected LockHeld, got {other:?}"),
+        }
+        assert!(err.to_string().contains("PID unknown"), "{err}");
     }
 
     #[test]

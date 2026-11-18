@@ -9,8 +9,10 @@
 //! probed outbound as `probe-<idx>` for stable mapping back to the node index.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::net::TcpListener;
 
+use rand::RngCore;
 use serde_json::{Value, json};
 
 use crate::models::{BackendType, SubscriptionNode};
@@ -80,6 +82,19 @@ pub fn egress_inbound_ports(config: &Value) -> HashMap<usize, u16> {
         .collect()
 }
 
+/// Generates a per-batch 128-bit random bearer secret (32 lowercase hex chars)
+/// for authenticating loopback Clash-compatible probe controllers.
+#[must_use]
+pub fn generate_clash_api_secret() -> String {
+    let mut bytes = [0u8; 16];
+    rand::rng().fill_bytes(&mut bytes);
+    let mut out = String::with_capacity(32);
+    for b in bytes {
+        let _ = write!(&mut out, "{b:02x}");
+    }
+    out
+}
+
 pub trait ProbeConfigGenerator: Send + Sync {
     /// Generates a probe config exposing an API on `127.0.0.1:<api_port>` with
     /// every node in `nodes` present as an outbound tagged `probe-<idx>`, plus
@@ -93,6 +108,20 @@ pub trait ProbeConfigGenerator: Send + Sync {
         timeout_ms: u32,
         egress_ports: &[u16],
     ) -> Value;
+
+    /// Generates a probe config using an explicit controller bearer secret
+    /// when supported by the backend.
+    fn generate_with_secret(
+        &self,
+        nodes: &[&SubscriptionNode],
+        api_port: u16,
+        test_url: &str,
+        timeout_ms: u32,
+        egress_ports: &[u16],
+        _api_secret: Option<&str>,
+    ) -> Value {
+        self.generate(nodes, api_port, test_url, timeout_ms, egress_ports)
+    }
 
     fn outbound_tag(&self, idx: usize) -> String {
         probe_tag(idx)
@@ -112,14 +141,12 @@ pub fn probe_generator_for(backend: BackendType) -> Option<Box<dyn ProbeConfigGe
 
 pub struct SingboxProbeGenerator;
 
-impl ProbeConfigGenerator for SingboxProbeGenerator {
-    fn generate(
-        &self,
+impl SingboxProbeGenerator {
+    fn build_config(
         nodes: &[&SubscriptionNode],
         api_port: u16,
-        _test_url: &str,
-        _timeout_ms: u32,
         egress_ports: &[u16],
+        api_secret: Option<&str>,
     ) -> Value {
         // A node whose transport sing-box can't emit (xhttp) just can't be
         // probed on this backend; drop it rather than fail the whole batch.
@@ -153,19 +180,50 @@ impl ProbeConfigGenerator for SingboxProbeGenerator {
             }));
         }
 
+        let mut clash_api = json!({
+            "external_controller": format!("127.0.0.1:{api_port}"),
+        });
+        if let Some(secret) = api_secret.filter(|s| !s.is_empty()) {
+            clash_api["secret"] = json!(secret);
+        }
+
         json!({
             "log": { "level": "warn" },
             "outbounds": built.into_iter().map(|(_, ob)| ob).collect::<Vec<_>>(),
             "inbounds": inbounds,
             "experimental": {
-                "clash_api": {
-                    "external_controller": format!("127.0.0.1:{api_port}"),
-                }
+                "clash_api": clash_api,
             },
             "route": {
                 "rules": route_rules,
             }
         })
+    }
+}
+
+impl ProbeConfigGenerator for SingboxProbeGenerator {
+    fn generate(
+        &self,
+        nodes: &[&SubscriptionNode],
+        api_port: u16,
+        _test_url: &str,
+        _timeout_ms: u32,
+        egress_ports: &[u16],
+    ) -> Value {
+        let secret = generate_clash_api_secret();
+        Self::build_config(nodes, api_port, egress_ports, Some(&secret))
+    }
+
+    fn generate_with_secret(
+        &self,
+        nodes: &[&SubscriptionNode],
+        api_port: u16,
+        _test_url: &str,
+        _timeout_ms: u32,
+        egress_ports: &[u16],
+        api_secret: Option<&str>,
+    ) -> Value {
+        Self::build_config(nodes, api_port, egress_ports, api_secret)
     }
 }
 
@@ -443,11 +501,16 @@ mod tests {
                 .is_none_or(Vec::is_empty)
         );
 
-        // API bound to loopback only.
+        // API bound to loopback only with non-empty bearer secret.
         assert_eq!(
             config["experimental"]["clash_api"]["external_controller"],
             "127.0.0.1:19080"
         );
+        let secret = config["experimental"]["clash_api"]["secret"]
+            .as_str()
+            .expect("sing-box probe config must emit clash_api.secret");
+        assert_eq!(secret.len(), 32);
+        assert!(secret.chars().all(|c| c.is_ascii_hexdigit()));
 
         // Every node present as an outbound with the expected probe tag.
         let outbounds = config["outbounds"].as_array().unwrap();

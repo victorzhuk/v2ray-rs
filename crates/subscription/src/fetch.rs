@@ -48,11 +48,16 @@ fn redirect_target_is_public(url: &reqwest::Url) -> bool {
 fn ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            let is_benchmarking = octets[0] == 198 && (octets[1] & 0xfe) == 18;
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_unspecified()
                 || v4.is_broadcast()
+                || is_cgnat
+                || is_benchmarking
         }
         std::net::IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
@@ -532,6 +537,12 @@ mod tests {
             "http://10.1.2.3/sub",
             "http://192.168.1.1/sub",
             "http://172.16.0.1/sub",
+            "https://100.64.0.1/sub",
+            "https://100.127.255.254/sub",
+            "https://198.18.0.1/sub",
+            "https://198.19.255.254/sub",
+            "https://[::ffff:100.64.0.1]/sub",
+            "https://[::ffff:198.18.0.1]/sub",
             "http://[::1]/sub",
             "http://[fe80::1]/sub",
             "http://[fc00::1]/sub",

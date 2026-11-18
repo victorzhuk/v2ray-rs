@@ -282,15 +282,7 @@ pub(super) fn write_subscription_blob(
     let path = paths
         .subscription_blobs_dir()
         .join(format!("{}.json", Uuid::new_v4()));
-    std::fs::write(&path, content.as_bytes()).map_err(PersistenceError::Io)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .map_err(PersistenceError::Io)?;
-    }
-
+    v2ray_rs_core::fs::atomic_write(&path, content.as_bytes()).map_err(PersistenceError::Io)?;
     Ok(path)
 }
 
@@ -380,4 +372,27 @@ pub(super) fn show_delete_dialog(id: Uuid, sender: ComponentSender<Subscriptions
     });
 
     dialog.present(crate::active_window().as_ref());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use v2ray_rs_core::profile::AppProfile;
+
+    #[test]
+    fn write_subscription_blob_writes_owner_only_mode_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        let path = write_subscription_blob(&paths, r#"{"outbounds":[]}"#).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            r#"{"outbounds":[]}"#
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
 }

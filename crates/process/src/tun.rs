@@ -4,10 +4,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ipnet::IpNet;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
+use tokio::io::{AsyncRead, BufReader};
 use tokio::process::Command;
 use tokio::time::sleep;
 
+use crate::spawn::{MAX_HELPER_OUTPUT_LINES, MAX_LOG_LINE_BYTES, read_bounded_line};
 use v2ray_rs_core::models::BackendType;
 
 /// How long to wait for an xray TUN device to appear after spawn before giving up.
@@ -786,9 +787,15 @@ where
     R: AsyncRead + Unpin + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stream).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            sink.lock().unwrap_or_else(|e| e.into_inner()).push(line);
+        let mut reader = BufReader::new(stream);
+        let mut buf = Vec::new();
+        while let Ok(Some(line)) =
+            read_bounded_line(&mut reader, &mut buf, MAX_LOG_LINE_BYTES).await
+        {
+            let mut guard = sink.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.len() < MAX_HELPER_OUTPUT_LINES {
+                guard.push(line);
+            }
         }
     })
 }
@@ -1535,5 +1542,17 @@ mod tests {
             assert!(Query::from(grants(gid().as_raw()).contains(&gid())) == Query::Yes);
             assert!(Query::from(grants(1).contains(&gid())) == Query::No);
         }
+    }
+
+    #[tokio::test]
+    async fn spawn_reader_caps_total_lines_and_line_length() {
+        let mut payload = Vec::new();
+        for i in 0..(MAX_HELPER_OUTPUT_LINES + 50) {
+            payload.extend_from_slice(format!("line-{i}\n").as_bytes());
+        }
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let handle = spawn_reader(std::io::Cursor::new(payload), Arc::clone(&sink));
+        handle.await.unwrap();
+        assert_eq!(sink.lock().unwrap().len(), MAX_HELPER_OUTPUT_LINES);
     }
 }

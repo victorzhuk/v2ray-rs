@@ -53,15 +53,65 @@ pub enum ValidationError {
     InvalidProcessName(String),
 }
 
-/// Validates a Real Delay test URL: must parse as a URL with an `http` or
-/// `https` scheme. Other schemes and unparseable inputs are rejected.
-pub fn validate_test_url(url_str: &str) -> Result<(), ValidationError> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeScheme {
+    Http,
+    Https,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProbeTarget {
+    pub scheme: ProbeScheme,
+    pub host: String,
+    pub port: u16,
+    pub host_header: String,
+    pub request_target: String,
+}
+
+/// Parses and validates a Real Delay / health probe URL: must be `http://` or
+/// `https://` with a non-empty host, no userinfo credentials, no `#fragment`,
+/// and no ASCII control characters.
+pub fn parse_probe_target(url_str: &str) -> Result<ProbeTarget, ValidationError> {
+    if url_str.chars().any(char::is_control) {
+        return Err(ValidationError::InvalidTestUrl(url_str.to_string()));
+    }
     let parsed = url::Url::parse(url_str)
         .map_err(|_| ValidationError::InvalidTestUrl(url_str.to_string()))?;
-    match parsed.scheme() {
-        "http" | "https" => Ok(()),
-        _ => Err(ValidationError::InvalidTestUrl(url_str.to_string())),
+    let scheme = match parsed.scheme() {
+        "http" => ProbeScheme::Http,
+        "https" => ProbeScheme::Https,
+        _ => return Err(ValidationError::InvalidTestUrl(url_str.to_string())),
+    };
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err(ValidationError::InvalidTestUrl(url_str.to_string()));
     }
+    let Some(host) = parsed.host_str().filter(|h| !h.is_empty()) else {
+        return Err(ValidationError::InvalidTestUrl(url_str.to_string()));
+    };
+    let default_port = match scheme {
+        ProbeScheme::Http => 80,
+        ProbeScheme::Https => 443,
+    };
+    let port = parsed.port_or_known_default().unwrap_or(default_port);
+    let host_header = if port == default_port {
+        host.to_string()
+    } else {
+        format!("{host}:{port}")
+    };
+    Ok(ProbeTarget {
+        scheme,
+        host: host.to_string(),
+        port,
+        host_header,
+        request_target: parsed.as_str().to_string(),
+    })
+}
+
+/// Validates a Real Delay test URL: must parse as an `http://` or `https://`
+/// URL with a non-empty host, no credentials, no fragment, and no control
+/// characters.
+pub fn validate_test_url(url_str: &str) -> Result<(), ValidationError> {
+    parse_probe_target(url_str).map(|_| ())
 }
 
 /// Validates a GeoIP country code or extended tag.
@@ -568,6 +618,46 @@ mod tests {
                 validate_rule_match(&m).is_err(),
                 "should be invalid: {:?}",
                 m
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_and_parse_probe_target() {
+        let valid_https = parse_probe_target("https://www.gstatic.com/generate_204").unwrap();
+        assert_eq!(valid_https.scheme, ProbeScheme::Https);
+        assert_eq!(valid_https.host, "www.gstatic.com");
+        assert_eq!(valid_https.port, 443);
+        assert_eq!(valid_https.host_header, "www.gstatic.com");
+
+        let valid_http_port =
+            parse_probe_target("http://probe.example.com:8080/generate_204?x=1").unwrap();
+        assert_eq!(valid_http_port.scheme, ProbeScheme::Http);
+        assert_eq!(valid_http_port.host, "probe.example.com");
+        assert_eq!(valid_http_port.port, 8080);
+        assert_eq!(valid_http_port.host_header, "probe.example.com:8080");
+        assert_eq!(
+            valid_http_port.request_target,
+            "http://probe.example.com:8080/generate_204?x=1"
+        );
+
+        let valid_v6 = parse_probe_target("https://[2001:db8::1]:8443/ping").unwrap();
+        assert_eq!(valid_v6.host, "[2001:db8::1]");
+        assert_eq!(valid_v6.port, 8443);
+
+        for invalid in [
+            "not-a-url",
+            "ftp://example.com/",
+            "http://",
+            "https://user:pass@example.com/",
+            "https://user@example.com/",
+            "https://example.com/generate_204#section",
+            "https://[::1]extra/path",
+            "https://example.com/\nX-Injected: 1",
+        ] {
+            assert!(
+                validate_test_url(invalid).is_err(),
+                "expected invalid test URL: {invalid:?}"
             );
         }
     }
