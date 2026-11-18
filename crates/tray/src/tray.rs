@@ -43,6 +43,7 @@ impl TrayHandle {
 }
 
 struct AppTray {
+    tray_id: String,
     process_state: ProcessState,
     connection: Option<ConnectionMetadata>,
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
@@ -52,7 +53,7 @@ struct AppTray {
 
 impl Tray for AppTray {
     fn id(&self) -> String {
-        "v2ray-rs".into()
+        self.tray_id.clone()
     }
 
     fn title(&self) -> String {
@@ -327,6 +328,7 @@ impl TrayService {
         event_rx: broadcast::Receiver<ProcessEvent>,
         notifier: Notifier,
         on_action: impl Fn(TrayAction) + Send + Sync + 'static,
+        tray_id: String,
     ) -> Result<TrayHandle, ksni::Error> {
         let on_action = Arc::new(on_action);
 
@@ -337,6 +339,7 @@ impl TrayService {
             .unwrap_or_default();
 
         let tray = AppTray {
+            tray_id,
             process_state: ProcessState::Stopped,
             connection: None,
             on_action,
@@ -359,6 +362,7 @@ impl TrayService {
         notifier: Notifier,
         on_action: impl Fn(TrayAction) + Send + Sync + 'static,
         data_dir: &Path,
+        tray_id: String,
     ) -> Result<TrayHandle, ksni::Error> {
         let on_action = Arc::new(on_action);
 
@@ -372,6 +376,7 @@ impl TrayService {
         let _ = tokio::task::spawn_blocking(move || icons::install_icons(&install_dir)).await;
 
         let tray = AppTray {
+            tray_id,
             process_state: ProcessState::Stopped,
             connection: None,
             on_action,
@@ -453,5 +458,18 @@ mod tests {
     fn toggle_disabled_while_stopping() {
         let (_, enabled) = toggle_action(&ProcessState::Stopping);
         assert!(!enabled);
+    }
+
+    #[test]
+    fn id_returns_injected_tray_id() {
+        let tray = AppTray {
+            tray_id: "com.github.v2ray-rs.dev".into(),
+            process_state: ProcessState::Stopped,
+            connection: None,
+            on_action: Arc::new(|action: TrayAction| drop(action)),
+            _icon_theme_dir: None,
+            icon_theme_path: String::new(),
+        };
+        assert_eq!(Tray::id(&tray), "com.github.v2ray-rs.dev");
     }
 }

@@ -173,7 +173,7 @@ impl InstanceLock {
 
         let guard = LockGuard::acquire(file).map_err(|e| {
             if let InstanceError::LockHeld { .. } = e {
-                let holder_pid = read_holder_pid(paths).ok();
+                let holder_pid = read_holder_pid(paths);
                 InstanceError::LockHeld {
                     pid: holder_pid,
                     profile: paths.profile().qualifier().to_string(),
@@ -183,14 +183,60 @@ impl InstanceLock {
             }
         })?;
 
+        // The stamp lives under the holder's state_dir, invisible to a
+        // contender sharing only the runtime dir; the companion travels with
+        // the lock file instead.
+        let _ = write_holder_pid(&path, std::process::id());
+
         Ok(Self { _guard: guard })
     }
 }
 
-fn read_holder_pid(paths: &AppPaths) -> Result<u32, InstanceError> {
+/// Companion beside the lock file carrying the holder's pid.
+fn holder_pid_path(lock_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = lock_path.to_path_buf();
+    path.as_mut_os_string().push(".pid");
+    path
+}
+
+/// Best effort at acquire: flock already guarantees exclusivity, so a failed
+/// diagnostic write only downgrades contender diagnostics to the stamp
+/// fallback. `record_lock_holder` propagates the error instead.
+fn write_holder_pid(lock_path: &std::path::Path, pid: u32) -> std::io::Result<()> {
+    let path = holder_pid_path(lock_path);
+    atomic_write(&path, pid.to_string().as_bytes())
+}
+
+/// Republishes the holder pid beside the lock file this process holds: a
+/// reset clears the companion while the flock survives, leaving contenders
+/// only the (also cleared) stamp and reporting `PID unknown`. Callers must
+/// hold the instance lock.
+pub fn record_lock_holder(paths: &AppPaths) -> std::io::Result<()> {
+    let lock_path = paths.instance_lock_path();
+    if !lock_path.exists() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "instance lock file not found; refusing to write holder pid",
+        ));
+    }
+    write_holder_pid(&lock_path, std::process::id())
+}
+
+fn read_stamp_holder_pid(paths: &AppPaths) -> Result<u32, InstanceError> {
     let content = std_fs::read_to_string(paths.instance_stamp_path())?;
     let stamp: InstanceStamp = serde_json::from_str(&content)?;
     Ok(stamp.last_started_pid)
+}
+
+/// The companion file is authoritative because it travels with the lock; the
+/// instance stamp is the fallback for holders written before it existed.
+fn read_holder_pid(paths: &AppPaths) -> Option<u32> {
+    if let Ok(content) = std_fs::read_to_string(holder_pid_path(&paths.instance_lock_path())) {
+        if let Ok(pid) = content.trim().parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    read_stamp_holder_pid(paths).ok()
 }
 
 fn format_lock_held(pid: Option<u32>, profile: &str) -> String {
@@ -445,7 +491,11 @@ mod tests {
         let result = InstanceLock::acquire(&paths);
         match result.err() {
             Some(InstanceError::LockHeld { pid, .. }) => {
-                assert_eq!(pid, Some(4242), "holder PID must come from instance.json")
+                assert_eq!(
+                    pid,
+                    Some(std::process::id()),
+                    "holder PID must come from the lock companion file"
+                )
             }
             Some(other) => panic!("expected LockHeld, got {other:?}"),
             None => panic!("second acquire unexpectedly succeeded"),
@@ -459,9 +509,58 @@ mod tests {
     }
 
     #[test]
+    fn test_instance_lock_holder_pid_prefers_companion_over_stamp() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().unwrap();
+        let _lock1 = InstanceLock::acquire(&paths).unwrap();
+
+        // Companion and stamp disagree: the companion travels with the lock
+        // and must win.
+        std_fs::write(holder_pid_path(&paths.instance_lock_path()), b"9999").unwrap();
+        let mut stamp = InstanceStamp::load_or_create(&paths).unwrap();
+        stamp.last_started_pid = 4242;
+        stamp.save_to(&paths.instance_stamp_path()).unwrap();
+
+        let err = InstanceLock::acquire(&paths)
+            .err()
+            .expect("second acquire must fail");
+        match err {
+            InstanceError::LockHeld {
+                pid: Some(9999), ..
+            } => {}
+            other => panic!("expected LockHeld with companion pid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_instance_lock_holder_pid_falls_back_to_stamp_without_companion() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().unwrap();
+        let _lock1 = InstanceLock::acquire(&paths).unwrap();
+
+        // Holders written before the companion existed leave no .pid file.
+        std_fs::remove_file(holder_pid_path(&paths.instance_lock_path())).unwrap();
+        let mut stamp = InstanceStamp::load_or_create(&paths).unwrap();
+        stamp.last_started_pid = 4242;
+        stamp.save_to(&paths.instance_stamp_path()).unwrap();
+
+        let err = InstanceLock::acquire(&paths)
+            .err()
+            .expect("second acquire must fail");
+        match err {
+            InstanceError::LockHeld {
+                pid: Some(4242), ..
+            } => {}
+            other => panic!("expected LockHeld with stamp pid, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_instance_lock_missing_stamp_reports_unknown_pid() {
         let (_tmp, paths) = test_paths();
         let _lock1 = InstanceLock::acquire(&paths).unwrap();
+        // Neither companion nor stamp carries holder identity.
+        std_fs::remove_file(holder_pid_path(&paths.instance_lock_path())).unwrap();
 
         let err = InstanceLock::acquire(&paths)
             .err()
@@ -486,5 +585,28 @@ mod tests {
 
         let lock2 = InstanceLock::acquire(&paths);
         assert!(lock2.is_ok());
+    }
+
+    #[test]
+    fn test_record_lock_holder_rewrites_companion_after_wipe() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().unwrap();
+        let _lock = InstanceLock::acquire(&paths).unwrap();
+        let companion = holder_pid_path(&paths.instance_lock_path());
+        std_fs::remove_file(&companion).unwrap();
+
+        record_lock_holder(&paths).unwrap();
+
+        let content = std_fs::read_to_string(&companion).unwrap();
+        assert_eq!(content.trim(), std::process::id().to_string());
+    }
+
+    #[test]
+    fn test_record_lock_holder_refuses_without_lock_file() {
+        let (_tmp, paths) = test_paths();
+        paths.ensure_dirs().unwrap();
+
+        assert!(record_lock_holder(&paths).is_err());
+        assert!(!holder_pid_path(&paths.instance_lock_path()).exists());
     }
 }

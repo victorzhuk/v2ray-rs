@@ -98,3 +98,10 @@ The system SHALL support optional desktop notifications for tray-visible connect
 #### Scenario: Broadcast lag resyncs tray icon to current state
 - **WHEN** rapid log events cause `RecvError::Lagged` on the tray broadcast receiver across a state transition to `Running`
 - **THEN** the tray listener SHALL read the current state snapshot and update the tray icon and menu to `Connected`
+
+### Requirement: System tray item identity is scoped to the active profile
+The StatusNotifierItem identifier published to the system tray SHALL incorporate the active runtime profile identifier so concurrent profile instances register distinct tray items on the session bus.
+
+#### Scenario: Production and custom profile publish distinct tray IDs
+- **WHEN** a `production` instance and a `custom:work` instance both spawn their system tray service
+- **THEN** each tray item SHALL advertise a distinct profile-scoped `id` rather than colliding on `"v2ray-rs"`

@@ -627,19 +627,12 @@ impl App {
     }
 
     fn load_pruned_latency_snapshot(
-        &mut self,
+        &self,
         subscriptions: &[Subscription],
         manual_nodes: &[ManualNode],
-    ) -> Result<(LatencySnapshot, bool), String> {
-        let mut snapshot = self
-            .store
-            .load_latency_snapshot()
-            .map_err(|err| err.to_string())?;
+    ) -> (LatencySnapshot, bool) {
         let known = v2ray_rs_core::resolve::all_node_refs(subscriptions, manual_nodes);
-        let before = snapshot.len();
-        snapshot.retain_known(&known);
-        let pruned = snapshot.len() != before;
-        Ok((snapshot, pruned))
+        pruned_latency_snapshot(&self.store, &known)
     }
 
     fn start_connection(
@@ -789,6 +782,32 @@ impl App {
         );
         self.process_handle = Some(handle);
         Ok(())
+    }
+}
+
+/// Prunes the cached snapshot against `known`, persisting only when something
+/// was dropped. A load or persistence failure degrades to the local copy so a
+/// stale latency file never blocks connecting.
+fn pruned_latency_snapshot(
+    store: &WorkspaceStore,
+    known: &std::collections::HashSet<ConnectionNodeRef>,
+) -> (LatencySnapshot, bool) {
+    let cached = store.load_latency_snapshot().unwrap_or_default();
+    let mut pruned = cached.clone();
+    let before = pruned.len();
+    pruned.retain_known(known);
+    if pruned.len() == before {
+        return (cached, false);
+    }
+    match store.update_latency_snapshot(|snapshot| {
+        snapshot.retain_known(known);
+        snapshot.clone()
+    }) {
+        Ok(updated) => (updated, true),
+        Err(err) => {
+            log::warn!("failed to persist pruned latency snapshot: {err}");
+            (pruned, true)
+        }
     }
 }
 
@@ -1360,17 +1379,8 @@ impl SimpleComponent for App {
                         return;
                     }
                 };
-                let (snapshot, pruned) =
-                    match self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            self.show_toast(&format!("Failed to load latency data: {err}"));
-                            return;
-                        }
-                    };
-                if pruned && let Err(err) = self.store.save_latency_snapshot(&snapshot) {
-                    log::warn!("prune latency snapshot: {err}");
-                }
+                let (snapshot, _pruned) =
+                    self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes);
 
                 let planner = ConnectionPlanner::new(
                     self.settings.auto_resolve_strategy,
@@ -1433,13 +1443,7 @@ impl SimpleComponent for App {
                     }
                 };
                 let (snapshot, _) =
-                    match self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes) {
-                        Ok(result) => result,
-                        Err(err) => {
-                            self.show_toast(&format!("Failed to load latency data: {err}"));
-                            return;
-                        }
-                    };
+                    self.load_pruned_latency_snapshot(&subscriptions, &manual_nodes);
 
                 let Some(candidate) =
                     resolve_candidate(target, &subscriptions, &manual_nodes, &snapshot)
@@ -3558,6 +3562,32 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
         (tmp, paths)
+    }
+
+    #[test]
+    fn prune_keeps_clean_snapshot_and_leaves_the_file_untouched() {
+        let (_tmp, paths) = test_instance_paths();
+        paths.ensure_dirs().unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+
+        let node_ref = ConnectionNodeRef::Manual {
+            node_id: uuid::Uuid::new_v4(),
+        };
+        let mut snapshot = LatencySnapshot::new();
+        snapshot.upsert(node_ref, 120, chrono::Utc::now());
+        store.save_latency_snapshot(&snapshot).unwrap();
+        let on_disk = std::fs::read(paths.latency_snapshot_path()).unwrap();
+
+        let known = std::collections::HashSet::from([node_ref]);
+        let (result, pruned) = pruned_latency_snapshot(&store, &known);
+
+        assert!(!pruned);
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            std::fs::read(paths.latency_snapshot_path()).unwrap(),
+            on_disk,
+            "no-op prune must not rewrite latency_snapshot.json"
+        );
     }
 
     #[test]

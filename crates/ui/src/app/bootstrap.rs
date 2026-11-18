@@ -354,6 +354,10 @@ pub(super) fn reset_instance_preserving_lock(
 
     paths.ensure_dirs()?;
 
+    // The wipe removes the lock's `.pid` companion while the flock survives;
+    // every caller reaching this line holds the instance lock, so republish
+    // the holder pid.
+    v2ray_rs_core::instance::record_lock_holder(paths)?;
     Ok(())
 }
 
@@ -416,6 +420,38 @@ pub(super) fn try_activate_running_instance(app_id: &str) -> bool {
             false
         }
     }
+}
+
+fn application_flags(has_directory_overrides: bool) -> gtk::gio::ApplicationFlags {
+    if has_directory_overrides {
+        gtk::gio::ApplicationFlags::NON_UNIQUE
+    } else {
+        gtk::gio::ApplicationFlags::empty()
+    }
+}
+
+fn tray_id(
+    profile: &AppProfile,
+    has_directory_overrides: bool,
+    runtime_dir: &std::path::Path,
+) -> String {
+    // Frozen ids: Development and Custom("dev") must publish distinct SNI
+    // ids; the reverse-DNS app_id collides them on com.github.v2ray-rs.dev.
+    let base = match profile {
+        AppProfile::Production => "v2ray-rs".to_string(),
+        AppProfile::Development => "v2ray-rs-development".to_string(),
+        AppProfile::Test => "v2ray-rs-test".to_string(),
+        AppProfile::Custom(name) => format!("v2ray-rs-custom-{name}"),
+    };
+    if !has_directory_overrides {
+        return base;
+    }
+    // DefaultHasher's fixed keys keep the suffix stable across processes, so
+    // distinct overridden runtime dirs publish distinct SNI ids.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    runtime_dir.hash(&mut hasher);
+    format!("{base}-{:016x}", hasher.finish())
 }
 
 pub(super) fn try_run() -> Result<(), String> {
@@ -551,6 +587,7 @@ pub(super) fn try_run() -> Result<(), String> {
         let (tray_tx, tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayAction>();
         let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
         let data_dir = paths.data_dir().to_path_buf();
+        let tray_id = tray_id(&profile, overrides.has_directory_overrides(), paths.runtime_dir());
         match rt.block_on(async {
             v2ray_rs_tray::TrayService::spawn_with_data_dir(
                 event_rx,
@@ -559,6 +596,7 @@ pub(super) fn try_run() -> Result<(), String> {
                     let _ = tray_tx.send(action);
                 },
                 &data_dir,
+                tray_id,
             )
             .await
         }) {
@@ -583,7 +621,10 @@ pub(super) fn try_run() -> Result<(), String> {
         .map_err(|err| format!("failed to load icon resource: {err}"))?;
     gtk::gio::resources_register(&resource);
 
-    let app = adw::Application::builder().application_id(&app_id).build();
+    let app = adw::Application::builder()
+        .application_id(&app_id)
+        .flags(application_flags(overrides.has_directory_overrides()))
+        .build();
 
     // Register our CLI options with GTK so it doesn't complain about "unknown options"
     app.add_main_option(
@@ -695,4 +736,67 @@ pub(super) fn try_run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn application_flags_non_unique_only_for_directory_overrides() {
+        assert_eq!(
+            application_flags(false),
+            gtk::gio::ApplicationFlags::empty()
+        );
+        assert_eq!(
+            application_flags(true),
+            gtk::gio::ApplicationFlags::NON_UNIQUE
+        );
+    }
+
+    #[test]
+    fn tray_id_scopes_by_profile_and_runtime_dir() {
+        let run_a = std::path::Path::new("/tmp/run-a");
+        let run_b = std::path::Path::new("/tmp/run-b");
+
+        let production = tray_id(&AppProfile::Production, false, run_a);
+        let development = tray_id(&AppProfile::Development, false, run_a);
+        let test = tray_id(&AppProfile::Test, false, run_a);
+        let custom_work = tray_id(&AppProfile::Custom("work".to_string()), false, run_a);
+        let custom_dev = tray_id(&AppProfile::Custom("dev".to_string()), false, run_a);
+        assert_eq!(production, "v2ray-rs");
+        assert_eq!(development, "v2ray-rs-development");
+        assert_eq!(test, "v2ray-rs-test");
+        assert_eq!(custom_work, "v2ray-rs-custom-work");
+        assert_eq!(custom_dev, "v2ray-rs-custom-dev");
+
+        let all = [&production, &development, &test, &custom_work, &custom_dev];
+        for i in 0..all.len() {
+            for j in i + 1..all.len() {
+                assert_ne!(all[i], all[j]);
+            }
+        }
+
+        let overridden_a = tray_id(&AppProfile::Production, true, run_a);
+        let overridden_b = tray_id(&AppProfile::Production, true, run_b);
+        assert_ne!(overridden_a, production);
+        assert_ne!(overridden_a, overridden_b);
+        assert_eq!(overridden_a, tray_id(&AppProfile::Production, true, run_a));
+    }
+
+    #[test]
+    fn reset_republishes_holder_pid_companion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let paths =
+            v2ray_rs_core::persistence::AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        paths.ensure_dirs().unwrap();
+        let _lock = InstanceLock::acquire(&paths).unwrap();
+        let mut companion = paths.instance_lock_path().into_os_string();
+        companion.push(".pid");
+
+        reset_instance_preserving_lock(&paths, &AppProfile::Test, true).unwrap();
+
+        let content = std::fs::read_to_string(&companion).unwrap();
+        assert_eq!(content.trim(), std::process::id().to_string());
+    }
 }

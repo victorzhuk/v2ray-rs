@@ -75,13 +75,9 @@ pub(super) fn persist_latency_snapshot<F>(
 {
     let store = store.clone();
     sender.oneshot_command(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            let mut snapshot = store.load_latency_snapshot()?;
-            apply(&mut snapshot);
-            store.save_latency_snapshot(&snapshot)
-        })
-        .await
-        .unwrap_or_else(|join_err| Err(PersistenceError::Io(std::io::Error::other(join_err))));
+        let result = tokio::task::spawn_blocking(move || store.update_latency_snapshot(apply))
+            .await
+            .unwrap_or_else(|join_err| Err(PersistenceError::Io(std::io::Error::other(join_err))));
         SubscriptionsCmdOutput::SnapshotSaved(result)
     });
 }
@@ -96,20 +92,60 @@ pub(super) fn invalidate_node_samples(
     subscription_id: Uuid,
     node_ids: &[Uuid],
 ) {
+    trim_node_samples(egress_samples, verdicts, subscription_id, node_ids);
+    let node_ids = node_ids.to_vec();
+    persist_latency_snapshot(sender, store, move |snapshot| {
+        remove_connection_samples(snapshot, subscription_id, &node_ids);
+    });
+}
+
+/// Drops in-memory egress and verdict state for every refreshed subscription's
+/// changed nodes and queues one snapshot rewrite without all their samples.
+pub(super) fn invalidate_node_samples_batch(
+    sender: &ComponentSender<SubscriptionsPage>,
+    store: &WorkspaceStore,
+    egress_samples: &mut HashMap<(Uuid, Uuid), EgressSample>,
+    verdicts: &mut HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
+    changed: &[(Uuid, Vec<Uuid>)],
+) {
+    for (subscription_id, node_ids) in changed {
+        trim_node_samples(egress_samples, verdicts, *subscription_id, node_ids);
+    }
+    if changed.is_empty() {
+        return;
+    }
+    let changed = changed.to_vec();
+    persist_latency_snapshot(sender, store, move |snapshot| {
+        for (subscription_id, node_ids) in &changed {
+            remove_connection_samples(snapshot, *subscription_id, node_ids);
+        }
+    });
+}
+
+fn trim_node_samples(
+    egress_samples: &mut HashMap<(Uuid, Uuid), EgressSample>,
+    verdicts: &mut HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>,
+    subscription_id: Uuid,
+    node_ids: &[Uuid],
+) {
     let changed: HashSet<Uuid> = node_ids.iter().copied().collect();
     egress_samples
         .retain(|(sub_id, node_id), _| *sub_id != subscription_id || !changed.contains(node_id));
     verdicts
         .retain(|(sub_id, node_id), _| *sub_id != subscription_id || !changed.contains(node_id));
-    let node_ids = node_ids.to_vec();
-    persist_latency_snapshot(sender, store, move |snapshot| {
-        for node_id in node_ids {
-            snapshot.remove(ConnectionNodeRef::Subscription {
-                subscription_id,
-                node_id,
-            });
-        }
-    });
+}
+
+fn remove_connection_samples(
+    snapshot: &mut v2ray_rs_core::resolve::LatencySnapshot,
+    subscription_id: Uuid,
+    node_ids: &[Uuid],
+) {
+    for node_id in node_ids {
+        snapshot.remove(ConnectionNodeRef::Subscription {
+            subscription_id,
+            node_id: *node_id,
+        });
+    }
 }
 
 pub(super) fn subscriptions_eligible_for_latency_test(

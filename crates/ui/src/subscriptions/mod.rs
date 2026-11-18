@@ -1295,16 +1295,13 @@ impl Component for SubscriptionsPage {
                         !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
                     self.persister
                         .submit(&self.store, &sender, self.subscriptions.clone());
-                    for (sub_id, node_ids) in &changed_samples {
-                        invalidate_node_samples(
-                            &sender,
-                            &self.store,
-                            &mut self.egress_samples,
-                            &mut self.verdicts,
-                            *sub_id,
-                            node_ids,
-                        );
-                    }
+                    invalidate_node_samples_batch(
+                        &sender,
+                        &self.store,
+                        &mut self.egress_samples,
+                        &mut self.verdicts,
+                        &changed_samples,
+                    );
                     if runtime_changed {
                         let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
                     }

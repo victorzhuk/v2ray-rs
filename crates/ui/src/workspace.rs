@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex, RwLock, mpsc};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 
 use uuid::Uuid;
 use v2ray_rs_core::models::{AppSettings, ManualNode, RoutingRuleSet, Subscription};
@@ -213,6 +213,22 @@ impl WorkspaceStore {
         self.persist_latency(snapshot.clone())
     }
 
+    /// Mutates and persists the latency snapshot.
+    ///
+    /// The mutate closure runs while the store mutex is held: it must not call
+    /// other `WorkspaceStore` methods — the lock is non-reentrant and would
+    /// self-deadlock.
+    pub fn update_latency_snapshot<R>(
+        &self,
+        mutate: impl FnOnce(&mut LatencySnapshot) -> R,
+    ) -> Result<R, PersistenceError> {
+        let _guard = self.lock();
+        let mut latency = (*self.latency_locked()?).clone();
+        let result = mutate(&mut latency);
+        self.persist_latency(latency)?;
+        Ok(result)
+    }
+
     pub fn reset_subscriptions(&self) -> Result<(), std::io::Error> {
         let _guard = self.lock();
         remove_if_exists(self.paths.subscriptions_path())?;
@@ -422,6 +438,52 @@ mod tests {
                 .len(),
             workers * per_worker
         );
+    }
+
+    #[test]
+    fn concurrent_latency_updates_do_not_lose_writes() {
+        let (_tmp, store) = store();
+        let workers = 8;
+        let per_worker = 25;
+        let node_ref =
+            |worker: usize, i: usize| v2ray_rs_core::models::ConnectionNodeRef::Subscription {
+                subscription_id: Uuid::from_u128(worker as u128),
+                node_id: Uuid::from_u128(i as u128),
+            };
+        let handles: Vec<_> = (0..workers)
+            .map(|worker| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    for i in 0..per_worker {
+                        store
+                            .update_latency_snapshot(|snapshot| {
+                                snapshot.upsert(node_ref(worker, i), 42, chrono::Utc::now());
+                            })
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let snapshot = store.load_latency_snapshot().unwrap();
+        let persisted = persistence::load_latency_snapshot(store.paths()).unwrap();
+        for worker in 0..workers {
+            for i in 0..per_worker {
+                let expected = node_ref(worker, i);
+                assert!(
+                    snapshot.get(expected).is_some(),
+                    "in-memory snapshot missing worker {worker} sample {i}"
+                );
+                assert!(
+                    persisted.get(expected).is_some(),
+                    "latency_snapshot.json missing worker {worker} sample {i}"
+                );
+            }
+        }
     }
 
     #[test]
