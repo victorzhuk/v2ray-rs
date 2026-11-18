@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUN journals use `tun_session.v1.json`; pending journals must be recovered before downgrading.
 
 ### Security
+- Update `rustls-webpki` to 0.103.16 and `webpki-root-certs` to 1.0.10 to clear the certificate trust advisories RUSTSEC-2026-0382 and RUSTSEC-2026-0383.
 - Make both release installers fail closed when `sha256sum` or an expected digest is unavailable, malformed, or mismatched; the prefix and any existing installation stay untouched, including in quiet mode.
 - Verify Arch helper ownership and restricted modes before granting `CAP_NET_ADMIN` or the setuid bit, and revoke partial grants when provisioning fails.
 - Route HTTP and HTTPS Real Delay and availability probes exclusively through the node's loopback inbound, ignoring ambient proxy variables, and skip egress probes for nodes whose delay test failed.
