@@ -163,9 +163,16 @@ superseded one.
 
 `PidFile` writes an ownership record (binary path + config path) and
 `check_and_kill_orphaned()` kills stale processes from a previous run using
-`kill(pid, 0)` as a liveness probe. `ProbeRunner` runs a temporary backend
-instance for Real Delay measurement; `measure_real_delay` in `real_delay.rs`
-is its only user.
+`kill(pid, 0)` as a liveness probe. `ProbeRunner` (`crates/process/src/probe.rs`)
+runs a temporary backend instance for Real Delay measurement;
+`measure_real_delay` in `crates/subscription/src/real_delay.rs` is its only user.
+
+`crates/process/src/session/` houses the GTK-free headless connection
+supervisor: `mod.rs` drives candidate failover, connect-time hostname DNS pinning
+(`resolve_pins` / `apply_pins`), log batching, and `SessionEvent` emission;
+`health.rs` monitors proxy reachability and DNS failure windows; `probe.rs`
+executes plain HTTP health probes; `backend_warning.rs` classifies startup
+warnings and fatal failures.
 
 ### `netctl` (`v2ray-rs-netctl`)
 
@@ -265,27 +272,47 @@ and any pending addition. It has no protocol, GUI, or netlink dependency.
 
 ### `tray` (`v2ray-rs-tray`)
 
-Depends on `core` and `process`. Implements the StatusNotifierItem protocol via
-`ksni`. Uses FreeDesktop theme-aware symbolic SVG icons (three embedded: disconnected/connected/error). Falls back to ARGB32 pixmap rendering when the DE has no theme lookup. `TrayService::spawn()` listens on the process broadcast channel and rebuilds the menu on state changes. `Notifier` sends desktop notifications via `notify-rust`.
+Depends only on `core` (no `process` dependency). Implements the
+StatusNotifierItem protocol via `ksni`. Uses FreeDesktop theme-aware symbolic
+SVG icons (three embedded: disconnected/connected/error). Falls back to ARGB32
+pixmap rendering when the DE has no theme lookup. `TrayService::spawn()` /
+`TrayService::spawn_with_data_dir()` listens on a
+`tokio::sync::broadcast::Receiver<ProcessEvent>` (fed by the UI bridge) and
+rebuilds the menu on state changes. `Notifier` sends desktop notifications via
+`notify-rust`.
 
 ### `ui` (`v2ray-rs-ui`)
 
 Depends on all other library crates. The GTK4/Relm4 application binary entry
-point is `run()`. `WorkspaceStore` is the public type exported for integration.
+point is `run()`. `WorkspaceStore` (`crates/ui/src/workspace.rs`) is the public
+authoritative store holding `Arc` snapshots of settings, subscriptions, manual
+nodes, routing rules, and latency data with a single serialized background
+writer thread.
 
-`App` (app.rs) uses a `gtk::Paned` (subscriptions above, logs below); routing
-and settings live in an `adw::PreferencesDialog` off the hamburger menu.
-`ToastOverlay` wraps content; a bottom `gtk::ActionBar` shows connection status.
-`geodata_service.rs` drives async geodata downloads off the GTK main thread via
-`glib::MainContext::spawn_local` + `tokio::task::spawn_blocking`. `wizard.rs`
-handles first-run onboarding.
+`crates/ui/src/app/` splits `App` across `mod.rs` (state and update loop),
+`bootstrap.rs` (startup, recovery, tray wiring), `session_bridge.rs` (connect,
+failover, reconnect policy, and applying `SessionEvent::NodePins`),
+`config_regen.rs` (coalesced regeneration), and `dialogs.rs` (quit/disconnect
+and toast plans). `connection.rs` is the thin Relm4 bridge starting
+`v2ray_rs_process::session::spawn`. The main window uses a `gtk::Paned`
+(subscriptions/nodes above, logs below); routing and settings live in an
+`adw::PreferencesDialog` (`crates/ui/src/preferences/` covering `system.rs`,
+`network.rs`, `routing.rs`, `tun.rs`, and `dns/{mod.rs,servers.rs,rules.rs,hosts.rs,effective.rs}`)
+off the hamburger menu. `subscriptions/` is split into `mod.rs`, `rows.rs`,
+`dialogs.rs`, and `probes.rs`; `ToastOverlay` wraps content; a bottom
+`gtk::ActionBar` shows connection status. `geodata_service.rs` drives async
+geodata downloads off the GTK main thread via `glib::MainContext::spawn_local`
++ `tokio::task::spawn_blocking`. `wizard.rs` handles first-run onboarding,
+`nodes.rs` edits manual nodes, `logs.rs` renders backend logs, and `i18n.rs`
+initializes `LC_MESSAGES` gettext translations.
 
-The connection task subscribes to backend log lines before `start()` returns,
-so lines printed during startup reach the logs page. `backend_warning.rs`
-matches each line against known per-backend patterns (xray/v2ray `is
-deprecated`, xray REALITY `potential MITM or redirection`, sing-box `WARN` +
-`deprecated`) and raises a toast quoting the line (leading timestamp dropped,
-160 chars max), once per pattern per connection.
+The session supervisor subscribes to backend log lines before `start()`
+returns, so lines printed during startup reach the logs page.
+`crates/process/src/session/backend_warning.rs` matches each line against known
+per-backend patterns (xray/v2ray `is deprecated`, xray REALITY `potential MITM or
+redirection`, sing-box `WARN` + `deprecated`) and raises a toast quoting the
+line (leading timestamp dropped, 160 chars max), once per pattern per
+connection.
 
 ### `run` (`v2ray-rs-run`)
 
@@ -483,9 +510,10 @@ DNS feature is off. For xray that plane is tagged `dns-internal` and routed to
 the first proxy outbound, which creates a circularity for the proxy's own
 hostname. Three mechanisms break it, in order of consultation:
 
-1. **Connect-time pin.** `connection.rs` resolves every hostname-addressed node
-   through the OS resolver before the route helper runs and writes the answers,
-   both families, into `dns.hosts` of the effective settings. The xray generator
+1. **Connect-time pin.** `crates/process/src/session/mod.rs` resolves every
+   hostname-addressed node through the OS resolver before the route helper runs
+   and writes the answers, both families, into `dns.hosts` of the effective
+   settings (emitting `SessionEvent::NodePins` back to `app/session_bridge.rs`). The xray generator
    keeps the family its `queryStrategy` uses (`Prefer*` collapses to one there)
    and drops a domain left with nothing usable, since a `hosts` hit is an
    authoritative answer rather than a fall-through; sing-box takes both families
@@ -636,6 +664,7 @@ $XDG_CONFIG_HOME/v2ray-rs/
 
 $XDG_DATA_HOME/v2ray-rs/
   subscriptions.json
+  subscription_blobs/        — persisted config-bundle JSON subscription files (0o600)
   routing_rules.json
   custom_nodes.json
   presets/                   — user-created presets

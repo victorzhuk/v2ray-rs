@@ -199,7 +199,12 @@ jobs:
           sha256sum -b v2ray-rs-x86_64.AppImage >v2ray-rs-x86_64.AppImage.sha256
       - name: Generate installer
         run: |
-          scripts/gen-installer-appimage.sh "${GITHUB_REF_NAME#v}" \
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          scripts/gen-installer-appimage.sh "$version" \
             v2ray-rs-x86_64.AppImage install-appimage.sh
       - name: Assert bundled libraries
         run: |

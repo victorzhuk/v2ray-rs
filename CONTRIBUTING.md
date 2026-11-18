@@ -18,8 +18,8 @@ Thank you for your interest in contributing to v2ray-rs! This document provides 
 
 ### Prerequisites
 
-- Rust 1.85 or later
-- Linux development environment with GTK4/libadwaita dev files
+- Rust 1.93 or later (`rust-toolchain.toml` pins `1.93.1`)
+- Linux development environment with GTK4/libadwaita dev files and `protobuf-compiler` (`protoc`)
 - Git
 
 ### First-time Setup
@@ -34,13 +34,13 @@ git remote add upstream https://github.com/victorzhuk/v2ray-rs.git
 
 # Install development dependencies
 # Ubuntu/Debian
-sudo apt install libgtk-4-dev libadwaita-1-dev
+sudo apt install libgtk-4-dev libadwaita-1-dev protobuf-compiler
 
 # Build the project
 cargo build
 
-# Run tests
-cargo test --workspace
+# Run tests (bounded timeout and thread cap)
+timeout 5m cargo test --workspace -- --test-threads=4
 ```
 
 ### Development Environment
@@ -126,14 +126,13 @@ Commit message format:
 ### 5. Test Your Changes
 
 ```bash
-# Run all tests
-cargo test --workspace
-
-# Run with race detector
-cargo test --workspace --release --all-features
+# Run all tests (bounded timeout and worker cap)
+make test
+# Or directly:
+timeout 5m cargo test --workspace -- --test-threads=4
 
 # Run linter
-cargo clippy --workspace -- -D warnings
+cargo clippy --workspace --all-targets -- -D warnings
 
 # Format code
 cargo fmt --all
@@ -317,17 +316,28 @@ crates/
 │   ├── src/
 │   │   ├── models/    # Domain entities
 │   │   ├── config/    # Backend config generation
-│   │   ├── persistence.rs
+│   │   ├── persistence/ # XDG atomic persistence modules
 │   │   ├── backend.rs
 │   │   ├── geodata.rs
 │   │   └── routing_manager.rs
 ├── subscription/      # Subscription fetching/parsing
-├── process/           # Process lifecycle management
+├── process/           # Process lifecycle + session supervision
+│   └── src/session/   # Headless session, health, probes, warnings
 ├── netctl/            # Privileged route helper
 ├── run/               # Setuid bypass wrapper
 ├── tun-session/       # Shared TUN ownership journal
 ├── tray/              # System tray (StatusNotifierItem)
 └── ui/                # GTK4/Relm4 GUI
+    └── src/
+        ├── app/       # Main App component, bootstrap, session bridge
+        ├── subscriptions/ # Subscription list, dialogs, latency probes
+        ├── preferences/ # System, network, routing, DNS, TUN settings
+        ├── workspace.rs # Authoritative snapshot store + writer thread
+        ├── connection.rs
+        ├── nodes.rs
+        ├── logs.rs
+        ├── wizard.rs
+        └── i18n.rs
 ```
 
 ### Adding New Features
@@ -384,21 +394,21 @@ openspec archive feature-name
 
 ### Artifacts Structure
 
+Canonical specifications live in `openspec/specs/<capability>/spec.md`. Active changes record deltas under `openspec/changes/<change>/`:
+
 ```
 openspec/changes/feature-name/
 ├── proposal.md      # Requirements, user stories
 ├── design.md        # Architecture, data flow
 ├── tasks.md         # Implementation checklist
-├── specs/           # Delta specs per component
-│   ├── core.md
-│   ├── subscription.md
-│   └── process.md
-└── README.md        # Change summary
+└── specs/           # Delta specs per capability
+    └── <capability>/
+        └── spec.md
 ```
 
 ### Agent Delegation
 
-See `.opencode/skills/openspec-apply-change/SKILL.md` for agent workflow guidance.
+See `.agents/skills/openspec-apply-change/SKILL.md` for agent workflow guidance.
 
 ---
 

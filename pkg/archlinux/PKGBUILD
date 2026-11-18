@@ -6,7 +6,7 @@ arch=('x86_64')
 url="https://github.com/victorzhuk/v2ray-rs"
 license=('Apache-2.0')
 depends=('gtk4' 'libadwaita' 'dbus' 'libcap')
-makedepends=('rust' 'cargo')
+makedepends=('rust' 'cargo' 'protobuf')
 optdepends=(
     'v2ray: V2Ray proxy backend'
     'xray: Xray proxy backend'

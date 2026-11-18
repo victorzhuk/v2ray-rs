@@ -11,6 +11,7 @@
 | `v2ray-rs-x86_64.AppImage.sha256` | `appimage` job | |
 | `install-appimage.sh` | `appimage` job | `scripts/install-appimage.sh` with the version substituted; installs the AppImage into a user prefix |
 | `PKGBUILD`, `PKGBUILD-bin` | `release` job | copies of the two Arch recipes |
+| `v2ray-rs.install` | `release` job | Arch install scriptlet shared by `PKGBUILD` and `PKGBUILD-bin` |
 
 ## Linkage
 

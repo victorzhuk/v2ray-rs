@@ -29,6 +29,9 @@ UI := v2ray-rs-ui
 TRAY := v2ray-rs-tray
 PROCESS := v2ray-rs-process
 SUBSCRIPTION := v2ray-rs-subscription
+NETCTL := v2ray-rs-netctl
+RUN := v2ray-rs-run
+TUN_SESSION := v2ray-rs-tun-session
 
 # =============================================================================
 # Default Target
@@ -43,7 +46,8 @@ default: check build test
 # =============================================================================
 
 .PHONY: build build-dev \
-        build-core build-ui build-tray build-process build-subscription
+        build-core build-ui build-tray build-process build-subscription \
+        build-netctl build-run build-tun-session
 
 build:
 	@printf "$(BLUE)Building release...$(RESET)\n"
@@ -73,6 +77,18 @@ build-subscription:
 	@printf "$(BLUE)Building subscription crate...$(RESET)\n"
 	$(CARGO) build -p $(SUBSCRIPTION) --release $(CARGO_FLAGS)
 
+build-netctl:
+	@printf "$(BLUE)Building netctl crate...$(RESET)\n"
+	$(CARGO) build -p $(NETCTL) --release $(CARGO_FLAGS)
+
+build-run:
+	@printf "$(BLUE)Building run crate...$(RESET)\n"
+	$(CARGO) build -p $(RUN) --release $(CARGO_FLAGS)
+
+build-tun-session:
+	@printf "$(BLUE)Building tun-session crate...$(RESET)\n"
+	$(CARGO) build -p $(TUN_SESSION) --release $(CARGO_FLAGS)
+
 # =============================================================================
 # Check Targets
 # =============================================================================
@@ -81,11 +97,11 @@ build-subscription:
 
 check:
 	@printf "$(BLUE)Running cargo check...$(RESET)\n"
-	$(CARGO) check $(CARGO_FLAGS)
+	$(CARGO) check --workspace $(CARGO_FLAGS)
 
 check-all:
 	@printf "$(BLUE)Running cargo check (all targets)...$(RESET)\n"
-	$(CARGO) check --all-targets $(CARGO_FLAGS)
+	$(CARGO) check --workspace --all-targets $(CARGO_FLAGS)
 
 clippy:
 	@printf "$(BLUE)Running clippy...$(RESET)\n"
@@ -103,7 +119,8 @@ fmt-fix:
 # Test Targets
 # =============================================================================
 
-.PHONY: test test-core test-ui test-tray test-process test-subscription test-watch
+.PHONY: test test-core test-ui test-tray test-process test-subscription \
+        test-netctl test-run test-tun-session test-watch
 
 test:
 	@printf "$(BLUE)Running all tests...$(RESET)\n"
@@ -128,6 +145,18 @@ test-process:
 test-subscription:
 	@printf "$(BLUE)Testing subscription crate...$(RESET)\n"
 	$(TEST) -p $(SUBSCRIPTION) $(CARGO_FLAGS) $(TEST_ARGS)
+
+test-netctl:
+	@printf "$(BLUE)Testing netctl crate...$(RESET)\n"
+	$(TEST) -p $(NETCTL) $(CARGO_FLAGS) $(TEST_ARGS)
+
+test-run:
+	@printf "$(BLUE)Testing run crate...$(RESET)\n"
+	$(TEST) -p $(RUN) $(CARGO_FLAGS) $(TEST_ARGS)
+
+test-tun-session:
+	@printf "$(BLUE)Testing tun-session crate...$(RESET)\n"
+	$(TEST) -p $(TUN_SESSION) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-watch:
 	@printf "$(YELLOW)Running tests in watch mode (requires cargo-watch)...$(RESET)\n"
@@ -166,11 +195,11 @@ run-dev:
 
 doc:
 	@printf "$(BLUE)Generating documentation...$(RESET)\n"
-	$(CARGO) doc --no-deps $(CARGO_FLAGS)
+	$(CARGO) doc --workspace --no-deps $(CARGO_FLAGS)
 
 doc-open:
 	@printf "$(GREEN)Generating and opening documentation...$(RESET)\n"
-	$(CARGO) doc --no-deps --open $(CARGO_FLAGS)
+	$(CARGO) doc --workspace --no-deps --open $(CARGO_FLAGS)
 
 # =============================================================================
 # Lint/Quality Targets
@@ -183,9 +212,9 @@ lint: fmt clippy
 
 fix:
 	@printf "$(GREEN)Auto-fixing code issues...$(RESET)\n"
-	$(CARGO) fix --allow-staged --allow-dirty $(CARGO_FLAGS)
+	$(CARGO) fix --workspace --allow-staged --allow-dirty $(CARGO_FLAGS)
 	$(CARGO) fmt
-	$(CARGO) clippy --all-features --fix --allow-staged --allow-dirty $(CARGO_FLAGS) -- -D warnings
+	$(CARGO) clippy --workspace --all-targets --all-features --fix --allow-staged --allow-dirty $(CARGO_FLAGS) -- -D warnings
 
 # =============================================================================
 # Release Target
@@ -240,6 +269,9 @@ help:
 	@echo "  make build-tray     Build tray crate"
 	@echo "  make build-process  Build process crate"
 	@echo "  make build-subscription Build subscription crate"
+	@echo "  make build-netctl   Build netctl crate"
+	@echo "  make build-run      Build run crate"
+	@echo "  make build-tun-session Build tun-session crate"
 	@echo ""
 	@printf "$(BLUE)Check:$(RESET)\n"
 	@echo "  make check          Run cargo check"
@@ -255,6 +287,9 @@ help:
 	@echo "  make test-tray      Test tray crate"
 	@echo "  make test-process   Test process crate"
 	@echo "  make test-subscription Test subscription crate"
+	@echo "  make test-netctl    Test netctl crate"
+	@echo "  make test-run       Test run crate"
+	@echo "  make test-tun-session Test tun-session crate"
 	@echo "  make test-watch     Run tests in watch mode"
 	@echo ""
 	@printf "$(BLUE)Run:$(RESET)\n"
