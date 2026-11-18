@@ -607,7 +607,13 @@ where
                     if let Some(idx) = parse_probe_index(&status.outbound_tag)
                         && idx < count
                     {
-                        results[idx] = status.delay_ms;
+                        // A later poll can report the same outbound as not
+                        // alive after an earlier successful probe; keep the
+                        // delay already observed in this session instead of
+                        // discarding it.
+                        if status.delay_ms.is_some() {
+                            results[idx] = status.delay_ms;
+                        }
                         settled[idx] = true;
                     }
                 }
@@ -1383,6 +1389,49 @@ mod tests {
 
         let result = observatory_delays_with_query(3, 5000, query_fn).await;
         assert_eq!(result.results, vec![Some(150), Some(300), Some(200)]);
+        assert!(result.diagnostic.is_none());
+        assert!(call_count.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[tokio::test]
+    async fn observatory_delays_keep_delay_observed_in_earlier_poll() {
+        // v2ray reports a sub-millisecond average as zero and can later report
+        // the same outbound as dead. The observed delay must survive.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let call_count = std::sync::Arc::new(AtomicUsize::new(0));
+        let cc = call_count.clone();
+        let query_fn = move || {
+            let cc = cc.clone();
+            async move {
+                let c = cc.fetch_add(1, Ordering::SeqCst) + 1;
+                if c == 1 {
+                    Ok(vec![ObservatoryStatus {
+                        outbound_tag: "probe-0".to_string(),
+                        delay_ms: Some(0),
+                        alive: true,
+                        last_error: None,
+                    }])
+                } else {
+                    Ok(vec![
+                        ObservatoryStatus {
+                            outbound_tag: "probe-0".to_string(),
+                            delay_ms: None,
+                            alive: true,
+                            last_error: None,
+                        },
+                        ObservatoryStatus {
+                            outbound_tag: "probe-1".to_string(),
+                            delay_ms: None,
+                            alive: false,
+                            last_error: None,
+                        },
+                    ])
+                }
+            }
+        };
+
+        let result = observatory_delays_with_query(2, 5000, query_fn).await;
+        assert_eq!(result.results, vec![Some(0), None]);
         assert!(result.diagnostic.is_none());
         assert!(call_count.load(Ordering::SeqCst) >= 2);
     }

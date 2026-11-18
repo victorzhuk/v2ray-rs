@@ -56,9 +56,13 @@ functions.
 The tag push runs the reusable quality workflow alongside packaging. Publication
 requires quality checks, the tarball, the AppImage, and its smoke test to pass
 for the tagged revision. The tag must match the workspace version. Quality
-includes required xray and sing-box checks, display-backed tests, and isolated
-routing acceptance. Missing required backends, display, or routing prerequisites
-fail their jobs. Test commands have deadlines and worker limits.
+includes required xray, v2ray, and sing-box checks, display-backed tests, and
+isolated routing acceptance. Real Delay acceptance drives the production
+measurement path against locally installed xray and v2ray serving a loopback
+fixture, and checks that a reachable node alone receives a delay while probe
+processes and temporary configs exit with the session. Missing required
+backends, display, or routing prerequisites fail their jobs. Test commands have
+deadlines and worker limits.
 
 Backend and packaging downloads use fixed release asset IDs or a commit-pinned
 source URL. Every download is verified against a SHA-256 digest before extraction

@@ -73,6 +73,19 @@ pub struct ObservatoryStatus {
     pub last_error: Option<String>,
 }
 
+impl From<OutboundStatus> for ObservatoryStatus {
+    fn from(status: OutboundStatus) -> Self {
+        Self {
+            outbound_tag: status.outbound_tag,
+            // An alive outbound answered the probe, even when the measured
+            // average is below one millisecond and rounds to zero.
+            delay_ms: status.alive.then_some(status.delay.max(0) as u64),
+            alive: status.alive,
+            last_error: (!status.last_error_reason.is_empty()).then_some(status.last_error_reason),
+        }
+    }
+}
+
 // ==========================================
 // Error Type
 // ==========================================
@@ -184,20 +197,7 @@ impl ObservatoryClient {
                 result
                     .status
                     .into_iter()
-                    .map(|s| ObservatoryStatus {
-                        outbound_tag: s.outbound_tag,
-                        delay_ms: if s.alive && s.delay > 0 {
-                            Some(s.delay as u64)
-                        } else {
-                            None
-                        },
-                        alive: s.alive,
-                        last_error: if s.last_error_reason.is_empty() {
-                            None
-                        } else {
-                            Some(s.last_error_reason)
-                        },
-                    })
+                    .map(ObservatoryStatus::from)
                     .collect()
             })
             .unwrap_or_default())
@@ -319,6 +319,41 @@ mod tests {
         assert_eq!(decoded.delay, 5000);
         assert_eq!(decoded.last_seen_time, 4000);
         assert_eq!(decoded.last_try_time, 5000);
+    }
+
+    #[test]
+    fn test_outbound_status_maps_alive_zero_delay_to_sample() {
+        let mapped = ObservatoryStatus::from(OutboundStatus {
+            alive: true,
+            delay: 0,
+            last_error_reason: String::new(),
+            outbound_tag: "probe-0".to_string(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        });
+
+        assert_eq!(mapped.outbound_tag, "probe-0");
+        assert_eq!(mapped.delay_ms, Some(0));
+        assert!(mapped.alive);
+        assert!(mapped.last_error.is_none());
+    }
+
+    #[test]
+    fn test_outbound_status_maps_dead_without_sample() {
+        let mapped = ObservatoryStatus::from(OutboundStatus {
+            alive: false,
+            delay: 0,
+            last_error_reason: "connection refused".to_string(),
+            outbound_tag: "probe-1".to_string(),
+            last_seen_time: 0,
+            last_try_time: 0,
+            health_ping: None,
+        });
+
+        assert_eq!(mapped.delay_ms, None);
+        assert!(!mapped.alive);
+        assert_eq!(mapped.last_error.as_deref(), Some("connection refused"));
     }
 
     #[test]

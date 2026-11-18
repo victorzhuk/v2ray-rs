@@ -61,8 +61,16 @@ jobs:
           echo 'b651f7e1d9966ee2c1b1ee1bf8b52c72771824d3065dce96bbc8bcc19ed95f82  xray.zip' | sha256sum -c -
           unzip -p xray.zip xray > /usr/local/bin/xray
           chmod 0755 /usr/local/bin/xray
+          curl --fail --location --retry 3 --max-time 120 \
+            -H 'Accept: application/octet-stream' \
+            https://api.github.com/repos/v2fly/v2ray-core/releases/assets/499340613 \
+            -o v2ray.zip
+          echo '6bbb8aee65a57d0b12599b4b7c842b3ad0daca4436e661d94015c447cb31b4fa  v2ray.zip' | sha256sum -c -
+          unzip -p v2ray.zip v2ray > /usr/local/bin/v2ray
+          chmod 0755 /usr/local/bin/v2ray
           sing-box version
           xray version
+          v2ray version
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@1.93.1
       - uses: Swatinem/rust-cache@v2

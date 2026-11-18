@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Default profile paths now use D-Bus application activation: a second launch focuses the running window and exits `0`. Directory overrides and buses without a primary instance keep the exit-`75` lock fallback.
+- Release acceptance now measures Real Delay through installed xray and v2ray against a local fixture, with bounded lifetimes and a missing-backend failure.
 
 ### Changed
 - Connection supervision now lives in `v2ray-rs-process` and shares one DNS derivation plan with the backend generators; workspace state is served from in-memory snapshots with serialized persistence.
@@ -31,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ship `v2ray-rs-run` without the setuid bit in package archives and apply `root:v2ray-rs` `4750` only in install hooks; create `v2ray-rs-bypass` during privileged setup and skip the wrapper in user-local installs.
 
 ### Fixed
+- Treat a sub-millisecond v2ray observatory average as a valid delay sample and keep a delay observed in an earlier poll instead of letting a later poll overwrite it with a missing value.
 - Preserve the `v2ray-rs` group and `v2ray-rs-bypass` user across Arch package removal so a reinstall keeps their UID, GID, and memberships, and report any helper cleanup that fails.
 - Resolve TUN proxy hostnames lazily per candidate, pre-pin at most eight candidates before strict xray routing, reuse last good pins under parked routes, and cancel lookups and pin probes when Stop arrives.
 - Batch Real Delay and availability probes into groups of at most 64 nodes, reuse one observatory gRPC channel, stop polling once every tag reports, and bound Clash API response bodies.
