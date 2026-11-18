@@ -337,6 +337,25 @@ impl ProcessManager {
         self.tun.is_some()
     }
 
+    /// Kernel identity this manager's TUN runtime claims:
+    /// `(backend, iface, session_id)`. `None` without an attached runtime or
+    /// a recorded journal, because such a manager cannot be matched against a
+    /// replacement's adopted session.
+    pub fn tun_identity(&self) -> Option<(BackendType, &str, &str)> {
+        let rt = self.tun.as_ref()?;
+        let journal = rt.journal.as_ref()?;
+        Some((rt.backend, rt.iface.as_str(), journal.session_id.as_str()))
+    }
+
+    /// Disarms a superseded manager's TUN runtime without touching kernel
+    /// state. A replacement candidate already adopted this manager's
+    /// `(backend, iface, session_id)`, so kernel ownership passed to it and
+    /// the teardown obligation here is void. Shutdown afterwards releases
+    /// only this manager's child process and log readers.
+    pub fn abandon_superseded_tun(&mut self) {
+        self.tun = None;
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ProcessEvent> {
         self.state.subscribe()
     }
@@ -2122,6 +2141,110 @@ mod tests {
                 .with_tun(Some(xray_on_lo(helper)))
                 .has_tun_runtime()
         );
+    }
+
+    fn xray_on_lo_with_journal(
+        helper: PathBuf,
+        dir: &std::path::Path,
+        session_id: &str,
+    ) -> TunRuntime {
+        let mut rt = xray_on_lo(helper);
+        rt.journal = Some(tun::TunJournal {
+            path: dir.join("tun_session.v1.json"),
+            session_id: session_id.into(),
+        });
+        rt
+    }
+
+    #[test]
+    fn tun_identity_is_backend_iface_and_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let (helper, _) = stub_helper(dir.path(), "exit 0\n");
+
+        let mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(xray_on_lo_with_journal(
+            helper.clone(),
+            dir.path(),
+            "s1",
+        )));
+        assert_eq!(mgr.tun_identity(), Some((BackendType::Xray, "lo", "s1")));
+
+        let mut other_iface = xray_on_lo_with_journal(helper.clone(), dir.path(), "s1");
+        other_iface.iface = "tun9".into();
+        let mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(other_iface));
+        assert_ne!(mgr.tun_identity(), Some((BackendType::Xray, "lo", "s1")));
+
+        let mut other_session = xray_on_lo_with_journal(helper.clone(), dir.path(), "s1");
+        other_session.journal.as_mut().unwrap().session_id = "s2".into();
+        let mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(other_session));
+        assert_ne!(mgr.tun_identity(), Some((BackendType::Xray, "lo", "s1")));
+
+        let mut other_backend = xray_on_lo_with_journal(helper, dir.path(), "s1");
+        other_backend.backend = BackendType::SingBox;
+        let mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(other_backend));
+        assert_ne!(mgr.tun_identity(), Some((BackendType::Xray, "lo", "s1")));
+
+        let mut no_journal = xray_on_lo(PathBuf::from("netctl"));
+        no_journal.journal = None;
+        let mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(no_journal));
+        assert_eq!(mgr.tun_identity(), None);
+
+        assert_eq!(manager_for(&dir, "exec sleep 30\n").tun_identity(), None);
+    }
+
+    #[tokio::test]
+    async fn abandon_superseded_tun_drops_the_teardown_and_helper_calls() {
+        // Control: a crashed candidate's armed runtime still tears its kernel
+        // state down, so the empty calls file below proves the mechanism
+        // rather than a broken fixture.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (helper, calls) = stub_helper(dir.path(), "exit 0\n");
+        let mut mgr = manager_for(&dir, "exit 1\n");
+        mgr.set_auto_restart(false);
+        mgr.start().await.unwrap();
+        mgr.tun = Some(xray_on_lo_with_journal(helper, dir.path(), "s1"));
+        mgr.wait_and_handle_exit().await.unwrap();
+        assert!(matches!(mgr.state(), ProcessState::Error(_)));
+        assert!(
+            read_lines(&calls).is_empty(),
+            "give-up must not call the helper"
+        );
+        mgr.shutdown_with(StopReason::NodeSwitch).await;
+        assert_eq!(read_lines(&calls), ["xray-down"]);
+
+        // A superseded runtime handed its kernel state to the replacement:
+        // shutdown releases the process without any helper invocation.
+        let armed = tempfile::TempDir::new().unwrap();
+        let (helper, calls) = stub_helper(armed.path(), "exit 0\n");
+        let mut mgr = manager_for(&armed, "exit 1\n");
+        mgr.set_auto_restart(false);
+        mgr.start().await.unwrap();
+        mgr.tun = Some(xray_on_lo_with_journal(helper, armed.path(), "s1"));
+        mgr.wait_and_handle_exit().await.unwrap();
+        mgr.abandon_superseded_tun();
+        assert!(!mgr.has_tun_runtime());
+        assert_eq!(mgr.tun_identity(), None);
+        mgr.shutdown_with(StopReason::NodeSwitch).await;
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert!(read_lines(&calls).is_empty());
+    }
+
+    #[tokio::test]
+    async fn abandoned_singbox_runtime_shutdown_leaves_the_journal_untouched() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let journal = dir.path().join("tun_session.v1.json");
+        std::fs::write(&journal, b"{}\n").unwrap();
+        let mut rt = xray_on_lo(dir.path().join("unused-netctl"));
+        rt.backend = BackendType::SingBox;
+        rt.journal = Some(tun::TunJournal {
+            path: journal.clone(),
+            session_id: "s1".into(),
+        });
+        let mut mgr = manager_for(&dir, "exec sleep 30\n").with_tun(Some(rt));
+
+        mgr.abandon_superseded_tun();
+        mgr.shutdown_with(StopReason::NodeSwitch).await;
+        assert_eq!(mgr.state(), ProcessState::Stopped);
+        assert_eq!(std::fs::read(&journal).unwrap(), b"{}\n");
     }
 
     fn crashing_backend(dir: &std::path::Path, crashes: usize) -> String {

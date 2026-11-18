@@ -174,6 +174,13 @@ supervisor: `mod.rs` drives candidate failover, connect-time hostname DNS pinnin
 executes plain HTTP health probes; `backend_warning.rs` classifies startup
 warnings and fatal failures.
 
+When a replacement reaches Running, the supervisor shuts down the parked failed
+manager with `NodeSwitch`. If both managers have the same TUN identity
+(`backend`, interface, and journal session ID), it first abandons the parked
+runtime, preventing `xray-down`, journal completion, or sing-box absence checks
+against the replacement's tunnel. Different or unavailable identities retain
+the full teardown path.
+
 ### `netctl` (`v2ray-rs-netctl`)
 
 Standalone binary with `CAP_NET_ADMIN` set via `setcap`. It shares the small
@@ -211,6 +218,12 @@ The remaining subcommands retain the following routing policy:
   upstream queries on the 9000 bypass. Without `--strict`, because the rules
   resolve to table 2023, an unclean exit leaves entries that match nothing
   rather than blackholing DNS.
+
+  Before installing optional rules, each `xray-up` reconciles 8998 and 8999
+  against its flags: an absent flag removes rules at its priority, and a changed
+  bypass UID removes the old 8998 rule instead of stacking it. Journaled
+  sessions remove verified owned rules from both kernel state and the ownership
+  journal; unexpected routing state still stops automatic mutation.
 
   `--exclude` (repeatable, from `exclude_routes`) adds one rule per prefix at
   8997 sending that destination to `main`, ahead of every other xray rule, so

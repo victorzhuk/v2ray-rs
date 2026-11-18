@@ -178,7 +178,9 @@ pub enum AppMsg {
     ShowToast(String),
     FlushSettings(AppSettings),
     AutoReconnect(u32),
-    TunReleased,
+    /// Route release finished; the flag reports whether routes and the
+    /// recovery journal were cleared. A failed release keeps its journal.
+    TunReleased(bool),
     TunGrantRequired(u64),
     NodePins(u64, Vec<HostOverride>),
     DownloadGeodata,
@@ -233,9 +235,7 @@ impl App {
             .emit(SubscriptionsMsg::SetActiveNode(sub_active));
         self.nodes_page.emit(NodesMsg::SetActiveNode(manual_active));
 
-        let tun_active = tun_active_for(state, self.runtime_snapshot.as_ref());
-        self.subscriptions_page
-            .emit(SubscriptionsMsg::SetTunActive(tun_active));
+        self.sync_tun_probe_gate();
 
         if let Ok(guard) = TRAY_EVENT_TX.lock()
             && let Some(tx) = guard.as_ref()
@@ -272,7 +272,9 @@ impl App {
     fn stop_session(&mut self, sender: &ComponentSender<Self>) {
         let reconnect_pending = self.reconnect_pending;
         self.session_target = session_target_after_stop(self.session_target, reconnect_pending);
-        self.clear_restart_flow();
+        // Keep the launched snapshot until the terminal state applies: the
+        // probe gate reads it while the backend tears the TUN routes down.
+        self.restart_required = false;
         self.cancel_auto_reconnect();
         match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
             DisconnectPlan::Stop => {
@@ -289,8 +291,10 @@ impl App {
             DisconnectPlan::Release => {
                 self.reconnect_pending = false;
                 self.health_failover.reconnect_pending = false;
-                self.apply_state(&ProcessState::Stopped);
+                // Release first: the probe gate must report an owned state
+                // straight through Stopped while routes are still parked.
                 self.release_tun_session(sender);
+                self.apply_state(&ProcessState::Stopped);
             }
             DisconnectPlan::Nothing => {
                 self.reconnect_pending = false;
@@ -301,8 +305,9 @@ impl App {
     }
 
     // Deliberately leaves `reconnect_pending` alone: restart flows set it right
-    // before dispatching Disconnect, and both Disconnect and the stopped-state
-    // handler run this cleanup before the flag is consumed.
+    // before dispatching Disconnect, and the stopped-state handler runs this
+    // cleanup before the flag is consumed. It runs only on terminal states so
+    // probes stay gated while routes tear down.
     fn clear_restart_flow(&mut self) {
         self.runtime_snapshot = None;
         self.restart_required = false;
@@ -350,18 +355,42 @@ impl App {
             return;
         }
         self.tun_release_in_flight = true;
+        self.sync_tun_probe_gate();
         let paths = self.paths.clone();
         let lifecycle = self.tun_lifecycle.clone();
         let s = sender.input_sender().clone();
         tokio::spawn(async move {
             let _lifecycle = lifecycle.lock().await;
-            if let Err(failure) =
-                recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await
-            {
+            let released = recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await;
+            if let Err(failure) = &released {
                 s.emit(AppMsg::ShowToast(failure.toast()));
             }
-            s.emit(AppMsg::TunReleased);
+            s.emit(AppMsg::TunReleased(released.is_ok()));
         });
+    }
+
+    /// True while leftover fail-closed routes are parked with no live
+    /// session: the only state where a declined or aborted connect may
+    /// release them.
+    fn parked_tun_idle(&self) -> bool {
+        parked_tun_release(&self.process_state, self.tun_marker_present())
+    }
+
+    fn release_parked_tun_if_idle(&mut self, sender: &ComponentSender<Self>) {
+        if self.parked_tun_idle() {
+            self.release_tun_session(sender);
+        }
+    }
+
+    fn sync_tun_probe_gate(&mut self) {
+        let tun_active = tun_active_for(
+            &self.process_state,
+            self.runtime_snapshot.as_ref(),
+            self.tun_release_in_flight,
+            self.tun_marker_present(),
+        );
+        self.subscriptions_page
+            .emit(SubscriptionsMsg::SetTunActive(tun_active));
     }
 
     fn quit(&mut self, sender: &ComponentSender<Self>, signal: bool) {
@@ -645,7 +674,14 @@ impl App {
         sender: &ComponentSender<Self>,
     ) -> Result<(), String> {
         let binary_path = match &self.settings.backend.binary_path {
-            Some(p) => p.clone(),
+            Some(p) if p.exists() => p.clone(),
+            Some(p) => {
+                self.show_toast(&format!(
+                    "Backend binary not found at {} — check Preferences",
+                    p.display()
+                ));
+                return Err("backend binary missing".into());
+            }
             None => {
                 self.show_toast("No backend binary configured — check Preferences");
                 return Err("no backend binary configured".into());
@@ -1361,7 +1397,34 @@ impl SimpleComponent for App {
                     self.deferred_connect = Some(DeferredConnect::Plan(origin));
                     return;
                 }
-                if self.process_handle.is_some() || self.tun_release_in_flight {
+                if self.process_handle.is_some() {
+                    return;
+                }
+                if self.tun_release_in_flight {
+                    // Route release owns the host right now; replay the
+                    // request once it finishes cleanly.
+                    if cancels_auto_reconnect(origin) {
+                        self.cancel_auto_reconnect();
+                    }
+                    self.deferred_connect = Some(DeferredConnect::Plan(origin));
+                    return;
+                }
+                // A connect that cannot reuse the parked fail-closed journal
+                // must not start over parked routes: a non-TUN connect or a
+                // differently configured TUN connect releases first and
+                // replays after success.
+                if self.parked_tun_idle()
+                    && (!connect_carries_tun(&self.settings)
+                        || parked_tun_conflicts(
+                            &self.settings,
+                            v2ray_rs_core::persistence::load_tun_session(&self.paths).as_ref(),
+                        ))
+                {
+                    if cancels_auto_reconnect(origin) {
+                        self.cancel_auto_reconnect();
+                    }
+                    self.deferred_connect = Some(DeferredConnect::Plan(origin));
+                    self.release_tun_session(&sender);
                     return;
                 }
 
@@ -1369,6 +1432,7 @@ impl SimpleComponent for App {
                     Ok(subscriptions) => subscriptions,
                     Err(err) => {
                         self.show_toast(&format!("Failed to load subscriptions: {err}"));
+                        self.release_parked_tun_if_idle(&sender);
                         return;
                     }
                 };
@@ -1376,6 +1440,7 @@ impl SimpleComponent for App {
                     Ok(manual_nodes) => manual_nodes,
                     Err(err) => {
                         self.show_toast(&format!("Failed to load manual nodes: {err}"));
+                        self.release_parked_tun_if_idle(&sender);
                         return;
                     }
                 };
@@ -1401,20 +1466,26 @@ impl SimpleComponent for App {
                     self.show_toast(
                         "No enabled proxy nodes — add a subscription or manual node first",
                     );
+                    self.release_parked_tun_if_idle(&sender);
                     return;
                 }
 
                 if cancels_auto_reconnect(origin) {
                     self.cancel_auto_reconnect();
                 }
-                let _ = self.start_connection(
-                    origin,
-                    false,
-                    candidates,
-                    subscriptions,
-                    manual_nodes,
-                    &sender,
-                );
+                if self
+                    .start_connection(
+                        origin,
+                        false,
+                        candidates,
+                        subscriptions,
+                        manual_nodes,
+                        &sender,
+                    )
+                    .is_err()
+                {
+                    self.release_parked_tun_if_idle(&sender);
+                }
                 self.session_target = None;
             }
             AppMsg::ConnectToNode(target, origin) => {
@@ -1423,6 +1494,12 @@ impl SimpleComponent for App {
                     return;
                 }
                 if self.tun_release_in_flight {
+                    // Route release owns the host right now; replay the
+                    // request once it finishes cleanly.
+                    if cancels_auto_reconnect(origin) {
+                        self.cancel_auto_reconnect();
+                    }
+                    self.deferred_connect = Some(DeferredConnect::Node(target, origin));
                     return;
                 }
                 // Resolve the requested node before touching any connection state.
@@ -1432,6 +1509,7 @@ impl SimpleComponent for App {
                     Ok(subscriptions) => subscriptions,
                     Err(err) => {
                         self.show_toast(&format!("Failed to load subscriptions: {err}"));
+                        self.release_parked_tun_if_idle(&sender);
                         return;
                     }
                 };
@@ -1439,6 +1517,7 @@ impl SimpleComponent for App {
                     Ok(manual_nodes) => manual_nodes,
                     Err(err) => {
                         self.show_toast(&format!("Failed to load manual nodes: {err}"));
+                        self.release_parked_tun_if_idle(&sender);
                         return;
                     }
                 };
@@ -1456,6 +1535,7 @@ impl SimpleComponent for App {
                         sender.input(AppMsg::Connect(origin));
                     } else {
                         self.show_toast("Node not available or disabled");
+                        self.release_parked_tun_if_idle(&sender);
                     }
                     return;
                 };
@@ -1478,17 +1558,34 @@ impl SimpleComponent for App {
                 }
                 self.reconnect_pending = false;
 
-                self.session_target = self
-                    .start_connection(
-                        origin,
-                        true,
-                        vec![candidate],
-                        subscriptions,
-                        manual_nodes,
-                        &sender,
-                    )
-                    .ok()
-                    .map(|_| direct_session(target, origin));
+                // A direct connect that cannot reuse the parked fail-closed
+                // journal must not start over parked routes: release first,
+                // replay on success.
+                if self.parked_tun_idle()
+                    && (!connect_carries_tun(&self.settings)
+                        || parked_tun_conflicts(
+                            &self.settings,
+                            v2ray_rs_core::persistence::load_tun_session(&self.paths).as_ref(),
+                        ))
+                {
+                    self.deferred_connect = Some(DeferredConnect::Node(target, origin));
+                    self.release_tun_session(&sender);
+                    return;
+                }
+                self.session_target = match self.start_connection(
+                    origin,
+                    true,
+                    vec![candidate],
+                    subscriptions,
+                    manual_nodes,
+                    &sender,
+                ) {
+                    Ok(()) => Some(direct_session(target, origin)),
+                    Err(_) => {
+                        self.release_parked_tun_if_idle(&sender);
+                        None
+                    }
+                };
             }
             AppMsg::Disconnect => {
                 self.health_failover.cancel();
@@ -1625,11 +1722,22 @@ impl SimpleComponent for App {
                     ));
                 }
             }
-            AppMsg::TunReleased => {
+            AppMsg::TunReleased(released) => {
                 self.tun_release_in_flight = false;
+                self.sync_tun_probe_gate();
                 if self.pending_exit {
                     self.pending_exit = false;
                     self.window.destroy();
+                    return;
+                }
+                if released {
+                    if let Some(deferred) = self.deferred_connect.take() {
+                        sender.input(deferred.into_msg());
+                    }
+                } else {
+                    // Parked routes remain: a queued connect must not start
+                    // over them, so drop it after the failure toast.
+                    self.deferred_connect = None;
                 }
             }
             AppMsg::TunGrantRequired(generation) => {
@@ -2053,32 +2161,139 @@ mod tests {
 
     #[test]
     fn tun_active_follows_launched_snapshot() {
+        let states = [
+            ProcessState::Starting,
+            ProcessState::Running,
+            ProcessState::Stopping,
+        ];
+        for state in &states {
+            assert!(tun_active_for(
+                state,
+                Some(&snapshot(BackendType::Xray, true)),
+                false,
+                false
+            ));
+            assert!(!tun_active_for(
+                state,
+                Some(&snapshot(BackendType::Xray, false)),
+                false,
+                false
+            ));
+            assert!(!tun_active_for(
+                state,
+                Some(&snapshot(BackendType::V2ray, true)),
+                false,
+                false
+            ));
+            assert!(!tun_active_for(state, None, false, false));
+        }
+    }
+
+    #[test]
+    fn tun_active_covers_release_in_flight_and_parked_journal() {
+        let tun_snap = snapshot(BackendType::Xray, true);
+        let states = [
+            ProcessState::Starting,
+            ProcessState::Running,
+            ProcessState::Stopping,
+            ProcessState::Stopped,
+            ProcessState::Error("boom".into()),
+        ];
+        // A release in flight suppresses probes in every phase.
+        for state in &states {
+            assert!(tun_active_for(state, Some(&tun_snap), true, false));
+            assert!(tun_active_for(state, None, true, false));
+        }
+        // The marker exists exactly while the journal may hold installed
+        // routes, so it gates every state: fail-closed parking in `Error`, a
+        // failed release that keeps the journal in `Stopped`, and startup
+        // recovery.
+        for state in &states {
+            assert!(tun_active_for(state, Some(&tun_snap), false, true));
+            assert!(tun_active_for(state, None, false, true));
+        }
+        // Without a marker a plain Error does not own routing.
         assert!(!tun_active_for(
-            &ProcessState::Running,
-            Some(&snapshot(BackendType::Xray, false))
+            &ProcessState::Error("boom".into()),
+            Some(&tun_snap),
+            false,
+            false
         ));
-        assert!(tun_active_for(
-            &ProcessState::Running,
-            Some(&snapshot(BackendType::Xray, true))
-        ));
+        // A clean stop retires the journal; Stopped without it is un-gated.
         assert!(!tun_active_for(
-            &ProcessState::Running,
-            Some(&snapshot(BackendType::V2ray, true))
+            &ProcessState::Stopped,
+            Some(&tun_snap),
+            false,
+            false
         ));
     }
 
     #[test]
-    fn tun_active_false_outside_running() {
-        let snap = snapshot(BackendType::Xray, true);
+    fn parked_tun_release_only_from_terminal_idle_states() {
+        assert!(parked_tun_release(
+            &ProcessState::Error("boom".into()),
+            true
+        ));
+        assert!(parked_tun_release(&ProcessState::Stopped, true));
+        assert!(!parked_tun_release(
+            &ProcessState::Error("boom".into()),
+            false
+        ));
+        assert!(!parked_tun_release(&ProcessState::Stopped, false));
         for state in [
             ProcessState::Starting,
+            ProcessState::Running,
             ProcessState::Stopping,
-            ProcessState::Stopped,
-            ProcessState::Error("boom".into()),
         ] {
-            assert!(!tun_active_for(&state, Some(&snap)));
+            assert!(!parked_tun_release(&state, true));
         }
-        assert!(!tun_active_for(&ProcessState::Running, None));
+    }
+
+    #[test]
+    fn parked_tun_conflicts_only_on_backend_or_interface_change() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "utun".into();
+        let journal = |backend: BackendType, iface: &str| {
+            v2ray_rs_core::persistence::TunSession {
+                backend,
+                iface: iface.to_owned(),
+                ownership: None,
+            }
+        };
+
+        // Same backend and interface reuses the parked session.
+        assert!(!parked_tun_conflicts(
+            &settings,
+            Some(&journal(BackendType::Xray, "utun"))
+        ));
+        // A different backend or interface cannot reuse it.
+        assert!(parked_tun_conflicts(
+            &settings,
+            Some(&journal(BackendType::SingBox, "utun"))
+        ));
+        assert!(parked_tun_conflicts(
+            &settings,
+            Some(&journal(BackendType::Xray, "utun9"))
+        ));
+        // No journal means nothing is parked to conflict with.
+        assert!(!parked_tun_conflicts(&settings, None));
+    }
+
+    #[test]
+    fn connect_carries_tun_follows_backend_support() {
+        let mut settings = AppSettings::default();
+        settings.tun.enabled = true;
+        settings.backend.backend_type = BackendType::Xray;
+        assert!(connect_carries_tun(&settings));
+        settings.backend.backend_type = BackendType::SingBox;
+        assert!(connect_carries_tun(&settings));
+        settings.backend.backend_type = BackendType::V2ray;
+        assert!(!connect_carries_tun(&settings));
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.enabled = false;
+        assert!(!connect_carries_tun(&settings));
     }
 
     #[test]

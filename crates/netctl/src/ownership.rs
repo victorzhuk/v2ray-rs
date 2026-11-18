@@ -9,7 +9,7 @@ use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkInfo, LinkMessa
 use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage, RouteMessageBuffer};
 use rtnetlink::packet_route::rule::{RuleAttribute, RuleMessage, RuleMessageBuffer};
 use rtnetlink::{Handle, IpVersion, LinkDummy, LinkUnspec, RouteMessageBuilder};
-use v2ray_rs_tun_session::{Ownership, Phase, RESERVATION_NAME, Resource, Session};
+use v2ray_rs_tun_session::{Ownership, Phase, Resource, Session, RESERVATION_NAME};
 
 use crate::net;
 
@@ -281,11 +281,27 @@ impl Owner {
     }
 
     pub async fn remove_exclusions(&mut self, handle: &Handle) -> Result<(), String> {
+        self.remove_rules_at_priority(handle, net::RULE_PREF_EXCLUDE, None)
+            .await
+    }
+
+    /// Removes owned rules at `priority` from the kernel and the journal,
+    /// keeping only rules whose UID range is exactly `keep_uid` when one is
+    /// given. Journal entries at `priority` whose rule is already absent from
+    /// the kernel are pruned too, so an absent-flag rerun leaves neither a
+    /// kernel rule nor a stale ownership record. Idempotent: an absent rule
+    /// leaves the deletion satisfied, and a kept rule stays journaled.
+    pub async fn remove_rules_at_priority(
+        &mut self,
+        handle: &Handle,
+        priority: u32,
+        keep_uid: Option<u32>,
+    ) -> Result<(), String> {
         let live = self.verify_resources(handle).await?;
         for resource in live {
             if let Resource::Rule(bytes) = &resource {
                 let rule = decode_rule(bytes)?;
-                if net::rule_priority(&rule) == Some(net::RULE_PREF_EXCLUDE) {
+                if rule_matches_removal(&rule, priority, keep_uid) {
                     remove(handle, &resource).await?;
                     self.state_mut()
                         .resources
@@ -293,6 +309,25 @@ impl Owner {
                     self.save()?;
                 }
             }
+        }
+        // The loop above removed every live rule matching the removal
+        // predicate, so a journal entry still matching it claims kernel state
+        // that no longer exists; dropping those keeps reruns converged instead
+        // of accumulating unreachable ownership records.
+        let mut stale = Vec::new();
+        for owned in &self.state().resources {
+            let Resource::Rule(bytes) = owned else {
+                continue;
+            };
+            if rule_matches_removal(&decode_rule(bytes)?, priority, keep_uid) {
+                stale.push(owned.clone());
+            }
+        }
+        if !stale.is_empty() {
+            self.state_mut()
+                .resources
+                .retain(|owned| !stale.contains(owned));
+            self.save()?;
         }
         Ok(())
     }
@@ -395,6 +430,13 @@ pub fn encode(message: &impl Emitable) -> Vec<u8> {
 fn decode_rule(bytes: &[u8]) -> Result<RuleMessage, String> {
     RuleMessage::parse(&RuleMessageBuffer::new_checked(&bytes).map_err(|e| e.to_string())?)
         .map_err(|e| e.to_string())
+}
+
+/// Whether a rule at `priority` is due for deletion: it matches the priority
+/// and, when `keep_uid` is set, carries a different (or wider) UID range.
+fn rule_matches_removal(rule: &RuleMessage, priority: u32, keep_uid: Option<u32>) -> bool {
+    net::rule_priority(rule) == Some(priority)
+        && keep_uid.is_none_or(|uid| net::rule_uid(rule) != Some(uid))
 }
 
 fn decode_route(bytes: &[u8]) -> Result<RouteMessage, String> {
@@ -613,13 +655,11 @@ mod tests {
         // Interrupted tagging: the dummy link carries no alias at all.
         assert!(owner.verify_marker(&marker(None)).is_err());
         // A live alias from another session is equally refused.
-        assert!(
-            owner
-                .verify_marker(&marker(Some(
-                    "v2ray-rs:00000000-0000-0000-0000-000000000000"
-                )))
-                .is_err()
-        );
+        assert!(owner
+            .verify_marker(&marker(Some(
+                "v2ray-rs:00000000-0000-0000-0000-000000000000"
+            )))
+            .is_err());
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 

@@ -183,6 +183,10 @@ pub async fn xray_up(
 
     add_default_route_v4(handle, index).await?;
     add_xray_rules(handle, AddressFamily::Inet).await?;
+    // Reconcile before installing: with an owner, an identical rule is skipped
+    // as already-present, so stale rules from an earlier invocation must be
+    // gone first or a dropped flag or changed UID would leave them installed.
+    reconcile_optional_rules(handle, bypass_uid, capture_dns).await?;
     let v6_rules = v6_rules_needed(v6.is_some(), strict, host_has_ipv6());
     if capture_dns {
         add_dns_capture_rules(handle, AddressFamily::Inet).await?;
@@ -211,6 +215,46 @@ pub async fn xray_up(
         }
     }
 
+    Ok(())
+}
+
+/// Optional-priority reconciliation for one [`xray_up`] invocation: each `Some`
+/// entry deletes every rule at its priority whose UID is not exactly the kept
+/// one, and a `None` keep-UID removes every rule at that priority. An absent
+/// flag must remove what an earlier invocation left behind, and a changed UID
+/// must not stack beside the old rule: with an owner, installing an identical
+/// rule is skipped as already-present.
+fn optional_reconcile_plan(
+    bypass_uid: Option<u32>,
+    capture_dns: bool,
+) -> [Option<(u32, Option<u32>)>; 2] {
+    [
+        Some((RULE_PREF_BYPASS_UID, bypass_uid)),
+        (!capture_dns).then_some((RULE_PREF_DNS, None)),
+    ]
+}
+
+/// Aligns the optional policy rules with this invocation's flags before any
+/// optional rule is installed; [`RULE_PREF_EXCLUDE`] stays owned by
+/// [`replace_exclusions`]. Owned sessions only: `--force-legacy` runs have no
+/// journal to verify rule ownership against, so they keep the historical
+/// behavior and never delete by priority here.
+async fn reconcile_optional_rules(
+    handle: &mut Context,
+    bypass_uid: Option<u32>,
+    capture_dns: bool,
+) -> Result<(), String> {
+    let Some(owner) = handle.owner.as_mut() else {
+        return Ok(());
+    };
+    for (priority, keep_uid) in optional_reconcile_plan(bypass_uid, capture_dns)
+        .into_iter()
+        .flatten()
+    {
+        owner
+            .remove_rules_at_priority(&handle.handle, priority, keep_uid)
+            .await?;
+    }
     Ok(())
 }
 
@@ -544,6 +588,16 @@ pub(crate) fn rule_priority(rule: &RuleMessage) -> Option<u32> {
     })
 }
 
+/// UID a bypass rule diverts to `main`; [`add_bypass_uid_rule`] installs
+/// single-UID ranges only, so a wider range reports `None` and reconciles as
+/// stale.
+pub(crate) fn rule_uid(rule: &RuleMessage) -> Option<u32> {
+    rule.attributes.iter().find_map(|attr| match attr {
+        RuleAttribute::UidRange(range) if range.start == range.end => Some(range.start),
+        _ => None,
+    })
+}
+
 async fn flush_table_rules(handle: &Handle, table: u32) -> Result<(), String> {
     let mut results = Vec::new();
     for version in [IpVersion::V4, IpVersion::V6] {
@@ -646,7 +700,8 @@ mod tests {
     use std::net::IpAddr;
 
     use super::{
-        RULE_PREF_EXCLUDE, XRAY_FWMARK, XRAY_RULE_PREFS, exclusion_installable, ipv6_dns_capture,
+        RULE_PREF_BYPASS_UID, RULE_PREF_DNS, RULE_PREF_EXCLUDE, XRAY_FWMARK, XRAY_RULE_PREFS,
+        exclusion_installable, ipv6_dns_capture, optional_reconcile_plan, rule_uid,
         v6_rules_needed,
     };
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
@@ -732,6 +787,69 @@ mod tests {
             assert!(RULE_PREF_EXCLUDE < *pref, "pref={pref}");
         }
     }
+
+    /// The reconcile decision must track the invocation flags exactly: a flag
+    /// that is present keeps only identical rules at its priority, and one that
+    /// is absent reconciles its whole priority away.
+    #[test]
+    fn optional_reconcile_plan_tracks_invocation_flags() {
+        let cases = [
+            (
+                None,
+                false,
+                [
+                    Some((RULE_PREF_BYPASS_UID, None)),
+                    Some((RULE_PREF_DNS, None)),
+                ],
+            ),
+            (None, true, [Some((RULE_PREF_BYPASS_UID, None)), None]),
+            (
+                Some(999990),
+                false,
+                [
+                    Some((RULE_PREF_BYPASS_UID, Some(999990))),
+                    Some((RULE_PREF_DNS, None)),
+                ],
+            ),
+            (
+                Some(999990),
+                true,
+                [Some((RULE_PREF_BYPASS_UID, Some(999990))), None],
+            ),
+        ];
+        for (bypass_uid, capture_dns, want) in cases {
+            assert_eq!(
+                optional_reconcile_plan(bypass_uid, capture_dns),
+                want,
+                "bypass_uid={bypass_uid:?} capture_dns={capture_dns}"
+            );
+        }
+    }
+
+    /// Journal reconciliation compares the UID a rule bypasses, and only the
+    /// single-UID ranges the helper installs count as kept.
+    #[test]
+    fn rule_uid_reads_single_uid_ranges_only() {
+        use rtnetlink::packet_route::rule::{RuleAttribute, RuleMessage, RuleUidRange};
+
+        let rule = |range: Option<RuleUidRange>| {
+            let mut msg = RuleMessage::default();
+            msg.attributes = range
+                .map(|r| vec![RuleAttribute::UidRange(r)])
+                .unwrap_or_default();
+            msg
+        };
+        assert_eq!(
+            rule_uid(&rule(Some(RuleUidRange { start: 7, end: 7 }))),
+            Some(7)
+        );
+        assert_eq!(
+            rule_uid(&rule(Some(RuleUidRange { start: 7, end: 9 }))),
+            None
+        );
+        assert_eq!(rule_uid(&rule(None)), None);
+    }
+
     #[test]
     #[cfg(feature = "privileged-tests")]
     fn journaled_route_mutations_in_private_namespace() {

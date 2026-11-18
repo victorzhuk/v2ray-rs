@@ -898,7 +898,7 @@ fn journaled_ownership_contract() {
             .unwrap()
             .namespace_inode
     );
-    use v2ray_rs_tun_session::{Ownership, Phase, RESERVATION_NAME, Resource, Session};
+    use v2ray_rs_tun_session::{Ownership, Phase, Resource, Session, RESERVATION_NAME};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("session.json");
     let mut session = Session {
@@ -989,14 +989,12 @@ fn journaled_ownership_contract() {
             .success()
     );
     assert_eq!(baseline, rules());
-    assert!(
-        v2ray_rs_tun_session::read::<String>(&path)
-            .unwrap()
-            .ownership
-            .unwrap()
-            .pending
-            .is_some()
-    );
+    assert!(v2ray_rs_tun_session::read::<String>(&path)
+        .unwrap()
+        .ownership
+        .unwrap()
+        .pending
+        .is_some());
     assert!(run(
         "ip",
         &[
@@ -1057,15 +1055,13 @@ fn journaled_ownership_contract() {
             .success()
     );
     assert!(run("ip", &["link", "del", RESERVATION_NAME]));
-    assert!(
-        !owned_command(
-            &path,
-            &replacement_id,
-            &["recover", "--xray", "--iface", IFACE]
-        )
-        .status
-        .success()
-    );
+    assert!(!owned_command(
+        &path,
+        &replacement_id,
+        &["recover", "--xray", "--iface", IFACE]
+    )
+    .status
+    .success());
 }
 
 #[test]
@@ -1094,7 +1090,7 @@ fn journal_reservation_cli_without_tun() {
         assert!(status.success(), "private namespace CLI acceptance failed");
         return;
     }
-    use v2ray_rs_tun_session::{Epoch, Ownership, Phase, RESERVATION_NAME, Session};
+    use v2ray_rs_tun_session::{Epoch, Ownership, Phase, Session, RESERVATION_NAME};
     let parent: u64 = std::env::var("V2RAY_RS_RESERVATION_PARENT_NS")
         .unwrap()
         .parse()
@@ -1145,11 +1141,9 @@ fn journal_reservation_cli_without_tun() {
     };
     let other_id = other.ownership.as_ref().unwrap().session_id.to_string();
     v2ray_rs_tun_session::write(&other_path, &other).unwrap();
-    assert!(
-        !owned_command(&other_path, &other_id, &reserve)
-            .status
-            .success()
-    );
+    assert!(!owned_command(&other_path, &other_id, &reserve)
+        .status
+        .success());
     success(&identity, &recover);
     success(&identity, &recover);
     assert!(!run("ip", &["link", "show", RESERVATION_NAME]));
@@ -1173,4 +1167,243 @@ fn journal_reservation_cli_without_tun() {
     let failure = owned_command(&path, &other_id, &recover);
     assert!(!failure.status.success());
     assert!(String::from_utf8_lossy(&failure.stderr).contains("reservation is missing"));
+}
+
+/// Journaled `xray-up` reruns converge the optional rules: a changed UID while
+/// the earlier rule is still installed replaces rather than stacks, and a rerun
+/// without `--capture-dns`/`--bypass-uid` removes the optional rules from the
+/// kernel and the journal even when the kernel rule is already gone out-of-band.
+#[test]
+fn journaled_rerun_without_optional_flags_removes_stale_rules() {
+    const CHILD: &str = "V2RAY_RS_RECONCILE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        if !std::path::Path::new("/dev/net/tun").exists() {
+            assert!(
+                std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+                "required TUN device is missing"
+            );
+            return;
+        }
+        let namespace = format!("nctl-reconcile-{}", std::process::id());
+        if !run("ip", &["netns", "add", &namespace]) {
+            assert!(
+                std::env::var_os("V2RAY_RS_REQUIRE_NETNS").is_none(),
+                "required network namespace is unavailable"
+            );
+            return;
+        }
+        let _guard = NsGuard(&namespace);
+        let result = Command::new("timeout")
+            .arg("90s")
+            .args(["ip", "netns", "exec", &namespace])
+            .arg(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "journaled_rerun_without_optional_flags_removes_stale_rules",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env(
+                "V2RAY_RS_RECONCILE_PARENT_NS",
+                v2ray_rs_tun_session::Epoch::current()
+                    .unwrap()
+                    .namespace_inode
+                    .to_string(),
+            )
+            .status()
+            .unwrap();
+        assert!(
+            result.success(),
+            "optional-rule reconcile acceptance failed"
+        );
+        return;
+    }
+    let parent: u64 = std::env::var("V2RAY_RS_RECONCILE_PARENT_NS")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_ne!(
+        parent,
+        v2ray_rs_tun_session::Epoch::current()
+            .unwrap()
+            .namespace_inode
+    );
+    use rtnetlink::packet_core::Parseable;
+    use rtnetlink::packet_route::rule::{RuleAttribute, RuleMessage, RuleMessageBuffer};
+    use v2ray_rs_tun_session::{Ownership, Phase, Resource, Session};
+
+    // The child already runs inside the namespace, so `ip` needs no netns exec.
+    let kernel_rules = || -> Vec<String> {
+        ["-4", "-6"]
+            .iter()
+            .flat_map(|family| {
+                String::from_utf8_lossy(
+                    &Command::new("ip")
+                        .args([family, "rule", "show"])
+                        .output()
+                        .unwrap()
+                        .stdout,
+                )
+                .lines()
+                .map(|line| format!("{family} {line}"))
+                .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let journaled_rules = |path: &std::path::Path| -> Vec<(u32, Option<u32>)> {
+        v2ray_rs_tun_session::read::<String>(path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                let Resource::Rule(bytes) = resource else {
+                    return None;
+                };
+                let rule =
+                    RuleMessage::parse(&RuleMessageBuffer::new_checked(bytes).unwrap()).unwrap();
+                let priority = rule.attributes.iter().find_map(|a| match a {
+                    RuleAttribute::Priority(p) => Some(*p),
+                    _ => None,
+                });
+                let uid = rule.attributes.iter().find_map(|a| match a {
+                    RuleAttribute::UidRange(range) if range.start == range.end => Some(range.start),
+                    _ => None,
+                });
+                priority.map(|priority| (priority, uid))
+            })
+            .collect()
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("session.json");
+    let session = Session {
+        backend: "xray".to_string(),
+        iface: IFACE.to_string(),
+        ownership: Some(Ownership::new().unwrap()),
+    };
+    let identity = session.ownership.as_ref().unwrap().session_id.to_string();
+    v2ray_rs_tun_session::write(&path, &session).unwrap();
+    let owned = |args: &[&str]| {
+        let result = owned_command(&path, &identity, args);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    assert!(run("ip", &["tuntap", "add", "dev", IFACE, "mode", "tun"]));
+    let index = std::fs::read_to_string(format!("/sys/class/net/{IFACE}/ifindex")).unwrap();
+    let index = index.trim();
+
+    owned(&["reserve", "--iface", IFACE]);
+    owned(&[
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--ifindex",
+        index,
+        "--capture-dns",
+        "--bypass-uid",
+        "999990",
+    ]);
+    let journaled = journaled_rules(&path);
+    assert!(
+        journaled.contains(&(8998, Some(999990))) && journaled.contains(&(8999, None)),
+        "optional rules missing from the journal after the first up: {journaled:?}"
+    );
+    assert!(
+        kernel_rules()
+            .iter()
+            .any(|line| line.contains("8998:") && line.contains("999990")),
+        "999990 bypass-uid rule missing from the kernel after the first up"
+    );
+
+    // Changed UID while the earlier rule is still installed: the rerun must
+    // replace it, not stack beside it.
+    owned(&[
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--ifindex",
+        index,
+        "--bypass-uid",
+        "999991",
+    ]);
+    let live = kernel_rules();
+    assert_eq!(
+        live.iter().filter(|line| line.contains("8998:")).count(),
+        1,
+        "changed bypass UID stacked kernel rules: {live:?}"
+    );
+    assert!(
+        live.iter()
+            .any(|line| line.contains("8998:") && line.contains("999991")),
+        "999991 bypass-uid rule missing after the changed-UID rerun: {live:?}"
+    );
+    let journaled = journaled_rules(&path);
+    assert_eq!(
+        journaled
+            .iter()
+            .filter(|rule| *rule == &(8998, Some(999991)))
+            .count(),
+        1,
+        "changed bypass UID stacked journal entries: {journaled:?}"
+    );
+
+    // The kernel rule is gone while the journal still claims it; the next run
+    // must converge the stale record along with the optional rules.
+    assert!(run("ip", &["rule", "del", "pref", "8998"]));
+
+    owned(&[
+        "xray-up",
+        "--iface",
+        IFACE,
+        "--addr",
+        ADDR,
+        "--ifindex",
+        index,
+    ]);
+    let live = kernel_rules();
+    assert!(
+        !live.iter().any(|line| line.contains("8998:")),
+        "bypass-uid rule survived re-up without --bypass-uid: {live:?}"
+    );
+    assert!(
+        !live.iter().any(|line| line.contains("8999:")),
+        "DNS capture rule survived re-up without --capture-dns: {live:?}"
+    );
+    assert!(
+        live.iter().any(|line| line.contains("9000:")),
+        "core policy rules lost during reconcile: {live:?}"
+    );
+    let journaled = journaled_rules(&path);
+    assert!(
+        !journaled
+            .iter()
+            .any(|&(priority, _)| priority == 8998 || priority == 8999),
+        "stale optional rules kept in the journal: {journaled:?}"
+    );
+    assert!(
+        journaled.contains(&(9000, None))
+            && journaled.contains(&(9001, None))
+            && journaled.contains(&(9002, None)),
+        "core rules missing from the journal after reconcile: {journaled:?}"
+    );
+
+    owned(&["xray-down", "--iface", IFACE, "--ifindex", index]);
+    assert_eq!(
+        v2ray_rs_tun_session::read::<String>(&path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .phase,
+        Phase::Complete
+    );
 }

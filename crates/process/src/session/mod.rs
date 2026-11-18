@@ -598,8 +598,17 @@ fn spawn_with(
                 Ok(()) => {
                     // The new candidate owns the kernel state now; the parked
                     // manager's tunnel (if any) is stale and must not outlive
-                    // its replacement.
+                    // its replacement. When the replacement adopted the parked
+                    // session's identity, disarming the stale runtime keeps
+                    // xray-down, journal completion, and sing-box absence
+                    // checks off the live tunnel; any other target keeps the
+                    // full teardown.
                     if let Some(mut stale) = parked.take() {
+                        if mgr.tun_identity().is_some()
+                            && mgr.tun_identity() == stale.tun_identity()
+                        {
+                            stale.abandon_superseded_tun();
+                        }
                         stale.shutdown_with(StopReason::NodeSwitch).await;
                     }
                     // A Disconnect clicked while the start was in flight sits
@@ -2954,6 +2963,183 @@ exit 1"#,
                 "hijack=hijack capture_dns=true strict=false nodes_pinned=true profile=app"
             ),
             "{contents}"
+        );
+    }
+
+    /// Fake `netctl` that records every subcommand, so tests can prove no
+    /// teardown ran against the live session.
+    fn recording_helper(dir: &std::path::Path) -> (PathBuf, PathBuf) {
+        let calls = dir.join("helper-calls");
+        let helper = dir.join("v2ray-rs-netctl");
+        std::fs::write(
+            &helper,
+            format!("#!/bin/sh\necho \"$1\" >> {}\nexit 0\n", calls.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (helper, calls)
+    }
+
+    /// Wiring shared by the failover tests: capability-verdict probe plus a
+    /// recording helper, TUN on a device that exists without privileges, and
+    /// a SOCKS listener so the replacement candidate passes the ready probe.
+    fn tun_failover_probe() -> (tempfile::TempDir, crate::HostProbe, PathBuf) {
+        let host = tempfile::tempdir().unwrap();
+        let getcap = host.path().join("getcap");
+        std::fs::write(&getcap, "#!/bin/sh\necho \"$1 cap_net_admin=ep\"\n").unwrap();
+        std::fs::set_permissions(&getcap, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (helper, calls) = recording_helper(host.path());
+        let probe = crate::HostProbe {
+            getcap,
+            helper,
+            helper_access: Some(crate::HelperAccess::Ready),
+        };
+        (host, probe, calls)
+    }
+
+    fn ready_port(settings: &mut AppSettings) -> std::net::TcpListener {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        settings.socks_port = listener.local_addr().unwrap().port();
+        listener
+    }
+
+    async fn wait_for_running(rx: &mut mpsc::UnboundedReceiver<SessionEvent>) {
+        loop {
+            let (state, _) = next_state(rx).await;
+            if matches!(state, ProcessState::Running) {
+                break;
+            }
+            assert!(relays(&state), "failover reported {state:?}");
+        }
+    }
+
+    async fn stop_and_wait_stopped(
+        handle: &SessionHandle,
+        rx: &mut mpsc::UnboundedReceiver<SessionEvent>,
+    ) {
+        handle.stop(StopReason::UserStop);
+        loop {
+            let (state, _) = next_state(rx).await;
+            if matches!(state, ProcessState::Stopped) {
+                break;
+            }
+            assert!(relays(&state), "stop reported {state:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_keeps_the_adopted_tun_session_after_a_post_device_failure() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+        );
+        let (_host, probe, calls) = tun_failover_probe();
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        // `lo` exists on every Linux host, so the fake xray-up runs against a
+        // live device without kernel privileges.
+        settings.tun.interface_name = "lo".into();
+        settings.tun.strict_route = false;
+        let _listener = ready_port(&mut settings);
+        let (handle, mut rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        wait_for_running(&mut rx).await;
+
+        let contents = std::fs::read_to_string(&calls).unwrap_or_default();
+        // Positive control: both candidates drove the fake helper, so the
+        // absence below means the mechanism, not a broken fixture.
+        assert_eq!(contents.matches("reserve").count(), 2, "{contents}");
+        assert_eq!(contents.matches("xray-up").count(), 2, "{contents}");
+        // Candidate 2 adopted candidate 1's journal, so the parked manager
+        // must drop without touching the live session. Pre-change this
+        // failed: the parked shutdown ran xray-down against the replacement.
+        assert!(!contents.contains("xray-down"), "{contents}");
+        let session = load_tun_session(&stub.paths).expect("journal present");
+        assert_eq!(session.backend, BackendType::Xray);
+        assert_eq!(session.iface, "lo");
+        assert_ne!(
+            session.ownership.expect("ownership").phase,
+            v2ray_rs_core::persistence::TunPhase::Complete
+        );
+
+        // Only the replacement's own stop may tear the session down.
+        stop_and_wait_stopped(&handle, &mut rx).await;
+        let contents = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(contents.matches("xray-down").count(), 1, "{contents}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failover_keeps_the_adopted_tun_session_after_a_pre_device_failure() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "Xray 26.6.27" && exit 0; [ "$2" = -test ] && grep -q 203.0.113.1 "$3" && exit 1; [ "$2" = -test ] && exit 0; exec sleep 30"#,
+        );
+        let (_host, probe, calls) = tun_failover_probe();
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.tun.interface_name = "lo".into();
+        settings.tun.strict_route = false;
+        let _listener = ready_port(&mut settings);
+        let (handle, mut rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        wait_for_running(&mut rx).await;
+
+        let contents = std::fs::read_to_string(&calls).unwrap_or_default();
+        // Candidate 1 was rejected in the config check, before the helper ran:
+        // only candidate 2's launch appears.
+        assert_eq!(contents.matches("reserve").count(), 1, "{contents}");
+        assert_eq!(contents.matches("xray-up").count(), 1, "{contents}");
+        assert!(!contents.contains("xray-down"), "{contents}");
+        let session = load_tun_session(&stub.paths).expect("journal present");
+        assert_eq!(session.iface, "lo");
+        assert_ne!(
+            session.ownership.expect("ownership").phase,
+            v2ray_rs_core::persistence::TunPhase::Complete
+        );
+
+        stop_and_wait_stopped(&handle, &mut rx).await;
+        let contents = std::fs::read_to_string(&calls).unwrap_or_default();
+        assert_eq!(contents.matches("xray-down").count(), 1, "{contents}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn singbox_failover_keeps_the_replacement_journal_uncompleted() {
+        let stub = stub(
+            r#"[ "$1" = version ] && echo "sing-box version 1.13.0" && exit 0; [ "$1" = check ] && exit 0; grep -q 203.0.113.1 "$3" && exit 1; exec sleep 30"#,
+        );
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::SingBox;
+        settings.tun.interface_name = "v2rstest6".into();
+        let _listener = ready_port(&mut settings);
+        let (_host, probe, _calls) = tun_failover_probe();
+        let (_handle, mut rx) = connect_with(
+            &stub,
+            settings,
+            vec![candidate("203.0.113.1"), candidate("203.0.113.2")],
+            move |mgr| mgr.with_host_probe(probe.clone()),
+        );
+
+        wait_for_running(&mut rx).await;
+
+        // Candidate 2 adopted candidate 1's journal (phase Applying), so the
+        // parked manager must drop without running the sing-box absence check
+        // or completing the live session's journal. Pre-change this failed:
+        // the parked shutdown verified the absent interface and completed the
+        // replacement's journal.
+        let session = load_tun_session(&stub.paths).expect("journal present");
+        assert_eq!(session.backend, BackendType::SingBox);
+        assert_eq!(session.iface, "v2rstest6");
+        assert_ne!(
+            session.ownership.expect("ownership").phase,
+            v2ray_rs_core::persistence::TunPhase::Complete
         );
     }
 
