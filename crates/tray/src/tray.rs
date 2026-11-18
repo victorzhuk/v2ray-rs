@@ -466,7 +466,7 @@ mod tests {
             tray_id: "com.github.v2ray-rs.dev".into(),
             process_state: ProcessState::Stopped,
             connection: None,
-            on_action: Arc::new(|action: TrayAction| drop(action)),
+            on_action: Arc::new(|_action: TrayAction| {}),
             _icon_theme_dir: None,
             icon_theme_path: String::new(),
         };

@@ -8,8 +8,8 @@ use super::common::strip_suffix_wildcard;
 use crate::config::dns_plan::ResolvedDnsPlan;
 use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
-    AppSettings, BackendType, DnsProtocol, DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
-    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG,
+    AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol,
+    DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,9 +695,9 @@ impl EffectiveDns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
-    use crate::config::v2ray::{generate_v2ray_family_config, V2rayFamilyBackend};
     use crate::config::SingboxGenerator;
+    use crate::config::test_fixtures::fixtures::{default_settings, vless_node};
+    use crate::config::v2ray::{V2rayFamilyBackend, generate_v2ray_family_config};
     use crate::models::{
         ConnectionNodeRef, DnsConfig, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy,
         HostOverride, ImportedProfile, ProxyNode, Subscription,
@@ -791,10 +791,12 @@ mod tests {
         assert_eq!(summary.entries()[0].scope, DnsScope::All);
         assert_eq!(summary.entries()[1].address, FALLBACK_DNS_SECONDARY);
         assert_eq!(summary.entries()[1].source, DnsSource::Fallback);
-        assert!(!summary
-            .entries()
-            .iter()
-            .any(|e| e.address == "1.0.0.1" || e.address.starts_with("https://1.0.0.1")));
+        assert!(
+            !summary
+                .entries()
+                .iter()
+                .any(|e| e.address == "1.0.0.1" || e.address.starts_with("https://1.0.0.1"))
+        );
         assert!(summary.uses_fallback());
         assert!(!summary.system_resolver());
     }
@@ -808,10 +810,12 @@ mod tests {
 
         let summary = effective_dns(BackendType::Xray, &settings, &[], &[node.address()]);
 
-        assert!(summary
-            .entries()
-            .iter()
-            .all(|e| e.source != DnsSource::Bootstrap));
+        assert!(
+            summary
+                .entries()
+                .iter()
+                .all(|e| e.source != DnsSource::Bootstrap)
+        );
     }
 
     #[test]
@@ -841,10 +845,12 @@ mod tests {
         let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
 
         assert!(!summary.uses_fallback());
-        assert!(summary
-            .entries()
-            .iter()
-            .any(|e| e.source == DnsSource::User && e.scope == DnsScope::All));
+        assert!(
+            summary
+                .entries()
+                .iter()
+                .any(|e| e.source == DnsSource::User && e.scope == DnsScope::All)
+        );
     }
 
     #[test]
@@ -1223,10 +1229,12 @@ mod tests {
             DnsScope::Domains(vec!["router.local".into()])
         );
         assert_eq!(statics[1].address, "nas.local");
-        assert!(!summary
-            .log_lines()
-            .iter()
-            .any(|l| l.contains("router.local")));
+        assert!(
+            !summary
+                .log_lines()
+                .iter()
+                .any(|l| l.contains("router.local"))
+        );
     }
 
     #[test]
@@ -1318,10 +1326,12 @@ mod tests {
             .find(|e| e.address == "https://doh.provider.example/dns-query")
             .unwrap();
         assert_eq!(user.source, DnsSource::Profile);
-        assert!(summary
-            .entries()
-            .iter()
-            .all(|e| e.source != DnsSource::User));
+        assert!(
+            summary
+                .entries()
+                .iter()
+                .all(|e| e.source != DnsSource::User)
+        );
     }
 
     #[test]
@@ -1392,12 +1402,17 @@ mod tests {
         assert!(lines.contains(&format!(
             "server={FALLBACK_DNS} path=direct source=bootstrap scope=example.com"
         )));
-        assert!(lines
-            .contains(&"server=77.88.8.8:53 path=direct source=user scope=domain:ru".to_string()));
+        assert!(
+            lines.contains(
+                &"server=77.88.8.8:53 path=direct source=user scope=domain:ru".to_string()
+            )
+        );
         assert!(lines.iter().any(|l| l.contains("source=fallback")));
-        assert!(lines
-            .iter()
-            .all(|l| !l.contains("pinned.local") && !l.contains("source=static")));
+        assert!(
+            lines
+                .iter()
+                .all(|l| !l.contains("pinned.local") && !l.contains("source=static"))
+        );
     }
 
     /// The summary stores sing-box addresses raw (`1.1.1.1`) while the derived
@@ -1708,10 +1723,12 @@ mod tests {
 
             // Static entries are not resolvers: absent from log lines and from
             // the generated server address set, which still matches exactly.
-            assert!(summary
-                .log_lines()
-                .iter()
-                .all(|l| { !l.contains("router.local") && !l.contains("nas.local") }));
+            assert!(
+                summary
+                    .log_lines()
+                    .iter()
+                    .all(|l| { !l.contains("router.local") && !l.contains("nas.local") })
+            );
             assert_cross_check(&config, &summary, backend, "hosts cell");
         }
     }

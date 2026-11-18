@@ -898,7 +898,7 @@ fn journaled_ownership_contract() {
             .unwrap()
             .namespace_inode
     );
-    use v2ray_rs_tun_session::{Ownership, Phase, Resource, Session, RESERVATION_NAME};
+    use v2ray_rs_tun_session::{Ownership, Phase, RESERVATION_NAME, Resource, Session};
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("session.json");
     let mut session = Session {
@@ -989,12 +989,14 @@ fn journaled_ownership_contract() {
             .success()
     );
     assert_eq!(baseline, rules());
-    assert!(v2ray_rs_tun_session::read::<String>(&path)
-        .unwrap()
-        .ownership
-        .unwrap()
-        .pending
-        .is_some());
+    assert!(
+        v2ray_rs_tun_session::read::<String>(&path)
+            .unwrap()
+            .ownership
+            .unwrap()
+            .pending
+            .is_some()
+    );
     assert!(run(
         "ip",
         &[
@@ -1055,13 +1057,15 @@ fn journaled_ownership_contract() {
             .success()
     );
     assert!(run("ip", &["link", "del", RESERVATION_NAME]));
-    assert!(!owned_command(
-        &path,
-        &replacement_id,
-        &["recover", "--xray", "--iface", IFACE]
-    )
-    .status
-    .success());
+    assert!(
+        !owned_command(
+            &path,
+            &replacement_id,
+            &["recover", "--xray", "--iface", IFACE]
+        )
+        .status
+        .success()
+    );
 }
 
 #[test]
@@ -1090,7 +1094,7 @@ fn journal_reservation_cli_without_tun() {
         assert!(status.success(), "private namespace CLI acceptance failed");
         return;
     }
-    use v2ray_rs_tun_session::{Epoch, Ownership, Phase, Session, RESERVATION_NAME};
+    use v2ray_rs_tun_session::{Epoch, Ownership, Phase, RESERVATION_NAME, Session};
     let parent: u64 = std::env::var("V2RAY_RS_RESERVATION_PARENT_NS")
         .unwrap()
         .parse()
@@ -1141,9 +1145,11 @@ fn journal_reservation_cli_without_tun() {
     };
     let other_id = other.ownership.as_ref().unwrap().session_id.to_string();
     v2ray_rs_tun_session::write(&other_path, &other).unwrap();
-    assert!(!owned_command(&other_path, &other_id, &reserve)
-        .status
-        .success());
+    assert!(
+        !owned_command(&other_path, &other_id, &reserve)
+            .status
+            .success()
+    );
     success(&identity, &recover);
     success(&identity, &recover);
     assert!(!run("ip", &["link", "show", RESERVATION_NAME]));

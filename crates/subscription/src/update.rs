@@ -642,9 +642,9 @@ mod tests {
     impl reqwest::dns::Resolve for RebindResolver {
         fn resolve(&self, _name: reqwest::dns::Name) -> reqwest::dns::Resolving {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(std::future::ready(Ok(Box::new(
-                vec![self.addr].into_iter(),
-            ) as reqwest::dns::Addrs)))
+            Box::pin(std::future::ready(Ok(
+                Box::new(vec![self.addr].into_iter()) as reqwest::dns::Addrs,
+            )))
         }
     }
 

@@ -3,7 +3,7 @@ use std::fs;
 use crate::fs::atomic_write;
 use crate::models::Preset;
 
-use super::{create_dir_with_permissions, read_file, AppPaths, PersistenceError};
+use super::{AppPaths, PersistenceError, create_dir_with_permissions, read_file};
 
 fn fnv1a_64(bytes: &[u8]) -> u64 {
     let mut hash: u64 = 0xcbf29ce484222325;

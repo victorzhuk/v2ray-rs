@@ -231,10 +231,10 @@ fn read_stamp_holder_pid(paths: &AppPaths) -> Result<u32, InstanceError> {
 /// The companion file is authoritative because it travels with the lock; the
 /// instance stamp is the fallback for holders written before it existed.
 fn read_holder_pid(paths: &AppPaths) -> Option<u32> {
-    if let Ok(content) = std_fs::read_to_string(holder_pid_path(&paths.instance_lock_path())) {
-        if let Ok(pid) = content.trim().parse::<u32>() {
-            return Some(pid);
-        }
+    if let Ok(content) = std_fs::read_to_string(holder_pid_path(&paths.instance_lock_path()))
+        && let Ok(pid) = content.trim().parse::<u32>()
+    {
+        return Some(pid);
     }
     read_stamp_holder_pid(paths).ok()
 }

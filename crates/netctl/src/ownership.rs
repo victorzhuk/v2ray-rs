@@ -9,7 +9,7 @@ use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkInfo, LinkMessa
 use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage, RouteMessageBuffer};
 use rtnetlink::packet_route::rule::{RuleAttribute, RuleMessage, RuleMessageBuffer};
 use rtnetlink::{Handle, IpVersion, LinkDummy, LinkUnspec, RouteMessageBuilder};
-use v2ray_rs_tun_session::{Ownership, Phase, Resource, Session, RESERVATION_NAME};
+use v2ray_rs_tun_session::{Ownership, Phase, RESERVATION_NAME, Resource, Session};
 
 use crate::net;
 
@@ -655,11 +655,13 @@ mod tests {
         // Interrupted tagging: the dummy link carries no alias at all.
         assert!(owner.verify_marker(&marker(None)).is_err());
         // A live alias from another session is equally refused.
-        assert!(owner
-            .verify_marker(&marker(Some(
-                "v2ray-rs:00000000-0000-0000-0000-000000000000"
-            )))
-            .is_err());
+        assert!(
+            owner
+                .verify_marker(&marker(Some(
+                    "v2ray-rs:00000000-0000-0000-0000-000000000000"
+                )))
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), original);
     }
 

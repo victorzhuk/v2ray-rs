@@ -1,12 +1,12 @@
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Once;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use v2ray_rs_core::models::SubscriptionSource;
 use v2ray_rs_subscription::{
-    subscription_url_is_public, FetchError, SubscriptionError, SubscriptionService, UpdateError,
+    FetchError, SubscriptionError, SubscriptionService, UpdateError, subscription_url_is_public,
 };
 
 fn install_crypto_provider() {
@@ -24,20 +24,22 @@ fn serve_subscription_once() -> (String, Arc<AtomicUsize>) {
     let connections = Arc::new(AtomicUsize::new(0));
     let counted = connections.clone();
     std::thread::spawn(move || {
-        for stream in listener.incoming() {
-            counted.fetch_add(1, Ordering::SeqCst);
-            let Ok(mut stream) = stream else { break };
-            let mut buf = [0u8; 4096];
-            let _ = stream.read(&mut buf);
-            let body = "vless://fixture-uuid@node.example.com:443#Loopback\r\n";
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes());
-            let _ = stream.flush();
-            break;
-        }
+        let Some(stream) = listener.incoming().next() else {
+            return;
+        };
+        counted.fetch_add(1, Ordering::SeqCst);
+        let Ok(mut stream) = stream else {
+            return;
+        };
+        let mut buf = [0u8; 4096];
+        let _ = stream.read(&mut buf);
+        let body = "vless://fixture-uuid@node.example.com:443#Loopback\r\n";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
     });
     (format!("http://{addr}/sub"), connections)
 }

@@ -1,10 +1,10 @@
 use std::sync::Once;
 
 use v2ray_rs_core::models::Subscription;
-use v2ray_rs_core::persistence::{load_subscriptions, save_subscriptions, AppPaths};
+use v2ray_rs_core::persistence::{AppPaths, load_subscriptions, save_subscriptions};
 use v2ray_rs_core::profile::AppProfile;
 use v2ray_rs_subscription::{
-    SubscriptionError, SubscriptionService, UpdateError, MAX_SUBSCRIPTION_NODES,
+    MAX_SUBSCRIPTION_NODES, SubscriptionError, SubscriptionService, UpdateError,
 };
 
 fn install_crypto_provider() {

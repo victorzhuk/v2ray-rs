@@ -103,8 +103,9 @@ impl Resolve for TokioLookup {
     fn resolve(&self, name: Name) -> Resolving {
         Box::pin(async move {
             let host = name.as_str().to_owned();
-            let addrs: Vec<SocketAddr> =
-                tokio::net::lookup_host((host.as_str(), 0u16)).await?.collect();
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0u16))
+                .await?
+                .collect();
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
@@ -777,9 +778,7 @@ mod tests {
     impl Resolve for StaticResolver {
         fn resolve(&self, _name: Name) -> Resolving {
             let addrs = self.addrs.clone();
-            Box::pin(std::future::ready(Ok(
-                Box::new(addrs.into_iter()) as Addrs
-            )))
+            Box::pin(std::future::ready(Ok(Box::new(addrs.into_iter()) as Addrs)))
         }
     }
 

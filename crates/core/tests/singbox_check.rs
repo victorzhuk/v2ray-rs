@@ -865,10 +865,12 @@ fn loopback_proxy_roundtrip_succeeds_with_default_dns() {
         return;
     }
 
-    let mut settings = AppSettings::default();
-    settings.dns = DnsConfig {
-        enabled: true,
-        ..DnsConfig::default()
+    let settings = AppSettings {
+        dns: DnsConfig {
+            enabled: true,
+            ..DnsConfig::default()
+        },
+        ..Default::default()
     };
     let ports = ephemeral_ports(4);
     let mixed_port = ports[0];

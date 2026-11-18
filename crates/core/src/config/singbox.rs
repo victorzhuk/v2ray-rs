@@ -2273,7 +2273,9 @@ mod tests {
             let bootstrap = servers
                 .iter()
                 .find(|s| s["tag"] == BOOTSTRAP_RESOLVER_TAG)
-                .expect("bootstrap resolver must be emitted when every IP server detours via proxy");
+                .expect(
+                    "bootstrap resolver must be emitted when every IP server detours via proxy",
+                );
             assert_eq!(bootstrap["type"], bootstrap_type);
             assert!(
                 bootstrap.get("detour").is_none(),

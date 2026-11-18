@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 use v2ray_rs_core::models::{Subscription, SubscriptionSource};
 
 use crate::fetch::{
-    redirect_policy, PublicTargetsResolver, CONNECT_TIMEOUT, REDIRECT_CAP, REQUEST_TIMEOUT,
-    USER_AGENT,
+    CONNECT_TIMEOUT, PublicTargetsResolver, REDIRECT_CAP, REQUEST_TIMEOUT, USER_AGENT,
+    redirect_policy,
 };
 use crate::update::{self, UpdateError, UpdateResult};
 
