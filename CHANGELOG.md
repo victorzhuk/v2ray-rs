@@ -43,6 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound local subscription imports and exclude HTTP response bodies from routine errors.
 - Preserve generated configuration when saved routing rules cannot be loaded.
 - Reset cached latency samples when a subscription's connection settings change.
+- Validate DNS rule matchers consistently across core, JSON import, and Preferences UI, reject wildcards in exact `Domain Full` rules, support `*.` wildcards in `Domain Suffix` rules, and show accurate matcher prefixes and `sing-box` TUN exclusions in Effective DNS scopes.
 - Retire a finished TUN journal from a previous boot instead of blocking every later start, and keep an unfinished journal across an unrelated clean stop.
 - Require display-backed CI tests, installed proxy backends, and isolated routing acceptance before release publication.
 - Pin backend and packaging downloads and verify their SHA-256 digests before use.

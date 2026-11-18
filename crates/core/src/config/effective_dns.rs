@@ -4,7 +4,9 @@
 //! resolver into an ordered list of entries with address, transport, routing
 //! path, provenance and scope.
 
+use super::common::strip_suffix_wildcard;
 use crate::config::dns_plan::ResolvedDnsPlan;
+use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol,
     DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
@@ -289,7 +291,7 @@ fn user_dns_entries(
                         DnsRuleMatch::DomainSuffix { suffix } => {
                             format!("domain:{}", strip_suffix_wildcard(suffix))
                         }
-                        DnsRuleMatch::DomainKeyword { keyword } => keyword.clone(),
+                        DnsRuleMatch::DomainKeyword { keyword } => format!("keyword:{keyword}"),
                         DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
                     })
                     .collect();
@@ -419,7 +421,7 @@ fn collect_routing_domains(
             RuleMatch::Domain { pattern } => {
                 Some(format!("domain:{}", strip_suffix_wildcard(pattern)))
             }
-            RuleMatch::DomainKeyword { keyword } => Some(keyword.clone()),
+            RuleMatch::DomainKeyword { keyword } => Some(format!("keyword:{keyword}")),
             RuleMatch::DomainFull { domain } => Some(format!("full:{domain}")),
             _ => None,
         };
@@ -439,10 +441,6 @@ fn scope_from(domains: Vec<String>) -> DnsScope {
     } else {
         DnsScope::Domains(domains)
     }
-}
-
-fn strip_suffix_wildcard(pattern: &str) -> &str {
-    pattern.strip_prefix("*.").unwrap_or(pattern)
 }
 
 /// xray answers a hosts hit authoritatively, so a domain only earns a static
@@ -490,16 +488,18 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
         ));
     } else {
         let final_tag = plan.first_tag();
+        let split_horizon_tag = plan.split_horizon_server().map(|s| s.tag.as_str());
         for server in &plan.servers {
             let path = if server.detour.as_deref().is_none_or(|d| d == "direct") {
                 DnsPath::Direct
             } else {
                 DnsPath::Proxy
             };
-            let mut scope = server_scope_singbox(settings, rules, &server.tag);
-            if Some(server.tag.as_str()) == final_tag {
-                scope = DnsScope::All;
-            }
+            let scope = if Some(server.tag.as_str()) == final_tag {
+                DnsScope::All
+            } else {
+                server_scope_singbox(settings, rules, &server.tag, split_horizon_tag)
+            };
             entries.push(entry(
                 server.address.clone(),
                 Some(server.protocol),
@@ -546,20 +546,38 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
     }
 }
 
-fn server_scope_singbox(settings: &AppSettings, rules: &[RoutingRule], tag: &str) -> DnsScope {
+fn server_scope_singbox(
+    settings: &AppSettings,
+    rules: &[RoutingRule],
+    tag: &str,
+    split_horizon_tag: Option<&str>,
+) -> DnsScope {
     let mut domains: Vec<String> = Vec::new();
+    if settings.tun.enabled && Some(tag) == split_horizon_tag {
+        for domain in &settings.tun.exclude_domains {
+            domains.push(format!("domain:{}", strip_suffix_wildcard(domain)));
+        }
+    }
     if settings.dns.use_custom_rules {
         for rule in &settings.dns.rules {
             if rule.server_tag != tag {
                 continue;
             }
             match &rule.match_condition {
-                DnsRuleMatch::GeoSite { category } => domains.push(format!("geosite-{category}")),
-                DnsRuleMatch::DomainSuffix { suffix } => {
-                    domains.push(strip_suffix_wildcard(suffix).to_string())
+                DnsRuleMatch::GeoSite { category } => {
+                    if let Some(tag) = canonical_rule_set_tag(&format!("geosite-{category}")) {
+                        domains.push(tag);
+                    }
                 }
-                DnsRuleMatch::DomainKeyword { keyword } => domains.push(keyword.clone()),
-                DnsRuleMatch::DomainFull { domain } => domains.push(domain.clone()),
+                DnsRuleMatch::DomainSuffix { suffix } => {
+                    domains.push(format!("domain:{}", strip_suffix_wildcard(suffix)));
+                }
+                DnsRuleMatch::DomainKeyword { keyword } => {
+                    domains.push(format!("keyword:{keyword}"));
+                }
+                DnsRuleMatch::DomainFull { domain } => {
+                    domains.push(format!("full:{domain}"));
+                }
             }
         }
     } else {
@@ -567,10 +585,14 @@ fn server_scope_singbox(settings: &AppSettings, rules: &[RoutingRule], tag: &str
         let mut domestic: Vec<String> = Vec::new();
         for rule in rules.iter().filter(|r| r.enabled) {
             let domain = match &rule.match_condition {
-                RuleMatch::GeoSite { category } => Some(format!("geosite-{category}")),
-                RuleMatch::Domain { pattern } => Some(strip_suffix_wildcard(pattern).to_string()),
-                RuleMatch::DomainKeyword { keyword } => Some(keyword.clone()),
-                RuleMatch::DomainFull { domain } => Some(domain.clone()),
+                RuleMatch::GeoSite { category } => {
+                    canonical_rule_set_tag(&format!("geosite-{category}"))
+                }
+                RuleMatch::Domain { pattern } => {
+                    Some(format!("domain:{}", strip_suffix_wildcard(pattern)))
+                }
+                RuleMatch::DomainKeyword { keyword } => Some(format!("keyword:{keyword}")),
+                RuleMatch::DomainFull { domain } => Some(format!("full:{domain}")),
                 _ => None,
             };
             if let Some(domain) = domain {
@@ -1646,6 +1668,211 @@ mod tests {
                     .all(|l| { !l.contains("router.local") && !l.contains("nas.local") })
             );
             assert_cross_check(&config, &summary, backend, "hosts cell");
+        }
+    }
+
+    #[test]
+    fn singbox_custom_and_auto_derived_scopes_preserve_matcher_prefixes() {
+        let mut custom = default_settings();
+        custom.dns.enabled = true;
+        custom.dns.use_custom_rules = true;
+        custom.dns.servers = vec![
+            scoped_server("remote", DnsProtocol::Doh, "1.1.1.1", "proxy"),
+            scoped_server("domestic", DnsProtocol::Udp, "77.88.8.8", "direct"),
+        ];
+        custom.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "category-ru".into(),
+                },
+                server_tag: "domestic".into(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: "*.example.ru".into(),
+                },
+                server_tag: "domestic".into(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainKeyword {
+                    keyword: "yandex".into(),
+                },
+                server_tag: "domestic".into(),
+            },
+            DnsRule {
+                match_condition: DnsRuleMatch::DomainFull {
+                    domain: "api.example.ru".into(),
+                },
+                server_tag: "domestic".into(),
+            },
+        ];
+
+        let summary = effective_dns(BackendType::SingBox, &custom, &[], &["203.0.113.10"]);
+        let domestic = summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "77.88.8.8")
+            .unwrap();
+        assert_eq!(
+            domestic.scope,
+            DnsScope::Domains(vec![
+                "geosite-category-ru".into(),
+                "domain:example.ru".into(),
+                "keyword:yandex".into(),
+                "full:api.example.ru".into(),
+            ])
+        );
+
+        let mut auto = default_settings();
+        auto.dns.enabled = true;
+        auto.dns.servers = custom.dns.servers.clone();
+        let routing_rules = vec![
+            RoutingRule {
+                id: Uuid::new_v4(),
+                match_condition: RuleMatch::GeoSite {
+                    category: "category-ru".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: Uuid::new_v4(),
+                match_condition: RuleMatch::Domain {
+                    pattern: "*.example.ru".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: Uuid::new_v4(),
+                match_condition: RuleMatch::DomainKeyword {
+                    keyword: "yandex".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+            RoutingRule {
+                id: Uuid::new_v4(),
+                match_condition: RuleMatch::DomainFull {
+                    domain: "api.example.ru".into(),
+                },
+                action: RuleAction::Direct,
+                enabled: true,
+                group: None,
+                via_node: None,
+            },
+        ];
+
+        let auto_summary = effective_dns(
+            BackendType::SingBox,
+            &auto,
+            &routing_rules,
+            &["203.0.113.10"],
+        );
+        let auto_domestic = auto_summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "77.88.8.8")
+            .unwrap();
+        assert_eq!(
+            auto_domestic.scope,
+            DnsScope::Domains(vec![
+                "geosite-category-ru".into(),
+                "domain:example.ru".into(),
+                "keyword:yandex".into(),
+                "full:api.example.ru".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn singbox_unrepresentable_geosite_tag_omitted_from_scope() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![
+            scoped_server("remote", DnsProtocol::Doh, "1.1.1.1", "proxy"),
+            scoped_server("domestic", DnsProtocol::Udp, "77.88.8.8", "direct"),
+        ];
+        settings.dns.rules = vec![
+            DnsRule {
+                match_condition: DnsRuleMatch::GeoSite {
+                    category: "geolocation-!cn".into(),
+                },
+                server_tag: "domestic".into(),
+            },
+            dns_rule("cn", "domestic"),
+        ];
+
+        let summary = effective_dns(BackendType::SingBox, &settings, &[], &["203.0.113.10"]);
+        let domestic = summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "77.88.8.8")
+            .unwrap();
+        assert_eq!(domestic.scope, DnsScope::Domains(vec!["domain:cn".into()]));
+    }
+
+    #[test]
+    fn singbox_tun_excluded_domains_appear_in_non_final_split_horizon_scope() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.exclude_domains = vec!["*.corp.example.com".into()];
+        settings.dns.enabled = true;
+        settings.dns.servers = vec![
+            scoped_server("remote", DnsProtocol::Doh, "1.1.1.1", "proxy"),
+            scoped_server("domestic", DnsProtocol::Udp, "77.88.8.8", "direct"),
+        ];
+
+        let summary = effective_dns(BackendType::SingBox, &settings, &[], &["203.0.113.10"]);
+        let remote = summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "1.1.1.1")
+            .unwrap();
+        assert_eq!(remote.scope, DnsScope::All);
+        let domestic = summary
+            .entries()
+            .iter()
+            .find(|e| e.address == "77.88.8.8")
+            .unwrap();
+        assert_eq!(
+            domestic.scope,
+            DnsScope::Domains(vec!["domain:corp.example.com".into()])
+        );
+    }
+
+    #[test]
+    fn v2ray_and_xray_keyword_scope_is_prefixed() {
+        let mut settings = default_settings();
+        settings.dns.enabled = true;
+        settings.dns.use_custom_rules = true;
+        settings.dns.servers = vec![server("domestic", DnsProtocol::Udp, "77.88.8.8")];
+        settings.dns.rules = vec![DnsRule {
+            match_condition: DnsRuleMatch::DomainKeyword {
+                keyword: "yandex".into(),
+            },
+            server_tag: "domestic".into(),
+        }];
+
+        for backend in [BackendType::V2ray, BackendType::Xray] {
+            let summary = effective_dns(backend, &settings, &[], &["203.0.113.10"]);
+            let domestic = summary
+                .entries()
+                .iter()
+                .find(|e| e.address == "77.88.8.8:53")
+                .unwrap();
+            assert_eq!(
+                domestic.scope,
+                DnsScope::Domains(vec!["keyword:yandex".into()]),
+                "{backend:?}"
+            );
         }
     }
 }

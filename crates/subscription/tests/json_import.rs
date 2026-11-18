@@ -384,3 +384,88 @@ fn xray_local_dns_schemes_and_pseudo_servers_import_accurately() {
         );
     }
 }
+
+#[test]
+fn wildcard_full_domain_is_skipped_and_wildcard_or_tld_dns_suffix_accepted() {
+    use v2ray_rs_core::models::{DnsRuleMatch, RuleMatch};
+
+    let bundle = serde_json::json!({
+        "remarks": "Matchers",
+        "outbounds": [
+            vless_outbound(
+                "proxy",
+                "match.example.net",
+                serde_json::json!({"network": "tcp"})
+            ),
+            {"tag": "direct", "protocol": "freedom", "settings": {}}
+        ],
+        "dns": {
+            "servers": [
+                {
+                    "address": "1.1.1.1",
+                    "domains": [
+                        "domain:*.example.com",
+                        "domain:cn",
+                        "full:*.example.com",
+                        "full:api.example.com"
+                    ]
+                }
+            ]
+        },
+        "routing": {
+            "rules": [
+                {
+                    "type": "field",
+                    "outboundTag": "proxy",
+                    "domain": ["full:*.example.com", "full:exact.example.com"]
+                }
+            ]
+        }
+    });
+
+    let import = parse_json_subscription(&bundle.to_string()).expect("bundle detected");
+    let profile = import.profile.expect("profile extracted");
+    assert_eq!(profile.rules.len(), 1, "{:?}", profile.rules);
+    assert_eq!(
+        profile.rules[0].match_condition,
+        RuleMatch::DomainFull {
+            domain: "exact.example.com".into()
+        }
+    );
+    assert!(
+        profile
+            .skipped
+            .iter()
+            .any(|w| w.contains("routing rule 0") && w.contains("*.example.com")),
+        "{:?}",
+        profile.skipped
+    );
+
+    let dns = profile.dns.expect("dns profile kept");
+    dns.validate().expect("imported dns profile must validate");
+    assert_eq!(
+        dns.rules
+            .iter()
+            .map(|r| &r.match_condition)
+            .collect::<Vec<_>>(),
+        vec![
+            &DnsRuleMatch::DomainSuffix {
+                suffix: "*.example.com".into()
+            },
+            &DnsRuleMatch::DomainSuffix {
+                suffix: "cn".into()
+            },
+            &DnsRuleMatch::DomainFull {
+                domain: "api.example.com".into()
+            },
+        ]
+    );
+    assert!(
+        profile
+            .skipped
+            .iter()
+            .any(|w| w.contains("dns server 0") && w.contains("full:*.example.com")),
+        "{:?}",
+        profile.skipped
+    );
+}

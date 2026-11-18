@@ -4,9 +4,7 @@ use std::collections::HashSet;
 use std::net::IpAddr;
 
 use super::settings::BackendType;
-use super::validation::{
-    validate_domain_keyword, validate_domain_pattern, validate_geosite_category,
-};
+use super::validation::validate_dns_rule_match;
 
 /// Server tags the auto-split DNS plane attaches derived domain lists to.
 pub const AUTO_SPLIT_REMOTE_TAG: &str = "remote";
@@ -484,8 +482,8 @@ impl DnsConfig {
                     rule.server_tag.clone(),
                 ));
             }
-            if let Some(reason) = dns_rule_match_error(&rule.match_condition) {
-                return Err(DnsValidationError::InvalidRuleMatch(reason));
+            if let Err(error) = validate_dns_rule_match(&rule.match_condition) {
+                return Err(DnsValidationError::InvalidRuleMatch(error.to_string()));
             }
         }
 
@@ -613,26 +611,6 @@ fn valid_host_domain(domain: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })
-}
-
-fn dns_rule_match_error(m: &DnsRuleMatch) -> Option<String> {
-    match m {
-        DnsRuleMatch::GeoSite { category } => validate_geosite_category(category).err(),
-        DnsRuleMatch::DomainSuffix { suffix } => {
-            if suffix.is_empty()
-                || suffix.starts_with('.')
-                || !suffix
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-            {
-                return Some(format!("invalid domain suffix: {suffix}"));
-            }
-            None
-        }
-        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword).err(),
-        DnsRuleMatch::DomainFull { domain } => validate_domain_pattern(domain).err(),
-    }
-    .map(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -1235,6 +1213,59 @@ server_tag = "google"
         assert!(matches!(
             bad_suffix.validate().unwrap_err(),
             DnsValidationError::InvalidRuleMatch(_)
+        ));
+
+        let wildcard_suffix = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            rules: vec![
+                DnsRule {
+                    match_condition: DnsRuleMatch::DomainSuffix {
+                        suffix: "*.example.com".to_string(),
+                    },
+                    server_tag: "remote".to_string(),
+                },
+                DnsRule {
+                    match_condition: DnsRuleMatch::DomainSuffix {
+                        suffix: "ru".to_string(),
+                    },
+                    server_tag: "remote".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(wildcard_suffix.validate().is_ok());
+
+        let leading_dot_suffix = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: ".ru".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            leading_dot_suffix.validate().unwrap_err(),
+            DnsValidationError::InvalidRuleMatch(_)
+        ));
+
+        let wildcard_full = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::DomainFull {
+                    domain: "*.example.com".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            wildcard_full.validate().unwrap_err(),
+            DnsValidationError::InvalidRuleMatch(msg) if msg.contains("*.example.com")
         ));
 
         let bad_host = DnsConfig {

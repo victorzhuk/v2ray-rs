@@ -1,5 +1,5 @@
-use super::RuleMatch;
 use super::tun::MAX_EXCLUDE_ROUTES;
+use super::{DnsRuleMatch, RuleMatch};
 use ipnet::IpNet;
 use thiserror::Error;
 
@@ -11,12 +11,18 @@ pub enum ValidationError {
     InvalidIpCidr(String),
     #[error("invalid domain pattern: {0}")]
     InvalidDomainPattern(String),
+    #[error("invalid domain suffix: {0}")]
+    InvalidDomainSuffix(String),
     #[error("invalid domain keyword: {0}")]
     InvalidDomainKeyword(String),
     #[error(
         "invalid domain keyword '{0}': a keyword is a plain substring and cannot contain '*'; use the Domain rule type for wildcard suffixes like '*.example.com'"
     )]
     WildcardDomainKeyword(String),
+    #[error(
+        "invalid full domain '{0}': full-domain rules match an exact host and cannot contain '*', use Domain or Domain Suffix instead"
+    )]
+    WildcardDomainFull(String),
     #[error("invalid geosite category: {0}")]
     InvalidGeoSiteCategory(String),
     #[error("invalid protocol name: {0}")]
@@ -212,6 +218,29 @@ pub fn validate_domain_pattern(pattern: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// Validates a DNS domain suffix: an optional single leading `*.` followed by
+/// one or more ASCII alphanumeric or hyphenated labels (allowing single-label
+/// TLD suffixes like `ru`).
+pub fn validate_domain_suffix(suffix: &str) -> Result<(), ValidationError> {
+    let rest = suffix.strip_prefix("*.").unwrap_or(suffix);
+    if rest.is_empty()
+        || !rest.split('.').all(|label| {
+            !label.is_empty() && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+    {
+        return Err(ValidationError::InvalidDomainSuffix(suffix.to_string()));
+    }
+    Ok(())
+}
+
+/// Validates a full-domain matcher: an exact multi-label domain without `*`.
+pub fn validate_domain_full(domain: &str) -> Result<(), ValidationError> {
+    if domain.contains('*') {
+        return Err(ValidationError::WildcardDomainFull(domain.to_string()));
+    }
+    validate_domain_pattern(domain)
+}
+
 /// Validates a domain keyword: a plain substring match — non-empty, no
 /// whitespace, no `*` (wildcard suffixes belong to [`validate_domain_pattern`]
 /// and the `Domain` rule type).
@@ -301,11 +330,20 @@ pub fn validate_rule_match(m: &RuleMatch) -> Result<(), ValidationError> {
         RuleMatch::GeoSite { category } => validate_geosite_category(category),
         RuleMatch::Domain { pattern } => validate_domain_pattern(pattern),
         RuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword),
-        RuleMatch::DomainFull { domain } => validate_domain_pattern(domain),
+        RuleMatch::DomainFull { domain } => validate_domain_full(domain),
         RuleMatch::IpCidr { .. } => Ok(()),
         RuleMatch::Protocol { name } => validate_protocol_name(name),
         RuleMatch::Port { spec } => validate_port_spec(spec),
         RuleMatch::Network { spec } => validate_network_spec(spec),
+    }
+}
+
+pub fn validate_dns_rule_match(m: &DnsRuleMatch) -> Result<(), ValidationError> {
+    match m {
+        DnsRuleMatch::GeoSite { category } => validate_geosite_category(category),
+        DnsRuleMatch::DomainSuffix { suffix } => validate_domain_suffix(suffix),
+        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword),
+        DnsRuleMatch::DomainFull { domain } => validate_domain_full(domain),
     }
 }
 
@@ -602,6 +640,9 @@ mod tests {
             RuleMatch::DomainFull {
                 domain: ".example.com".to_string(),
             },
+            RuleMatch::DomainFull {
+                domain: "*.example.com".to_string(),
+            },
             RuleMatch::Protocol {
                 name: "socks".to_string(),
             },
@@ -660,5 +701,99 @@ mod tests {
                 "expected invalid test URL: {invalid:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_validate_domain_full() {
+        assert_eq!(validate_domain_full("api.example.com"), Ok(()));
+        assert_eq!(
+            validate_domain_full("*.example.com"),
+            Err(ValidationError::WildcardDomainFull("*.example.com".into()))
+        );
+        assert_eq!(
+            validate_domain_full("foo*bar.com"),
+            Err(ValidationError::WildcardDomainFull("foo*bar.com".into()))
+        );
+        assert!(matches!(
+            validate_domain_full("localhost"),
+            Err(ValidationError::InvalidDomainPattern(_))
+        ));
+    }
+
+    #[test]
+    fn test_validate_domain_suffix() {
+        for valid in [
+            "example.com",
+            "*.example.com",
+            "ru",
+            "*.ru",
+            "sub-1.example.org",
+        ] {
+            assert_eq!(validate_domain_suffix(valid), Ok(()), "suffix={valid}");
+        }
+        for invalid in [
+            "",
+            "*.",
+            ".ru",
+            "ru.",
+            "a..b",
+            "*.*.example.com",
+            "foo*bar.com",
+            "bad_domain.com",
+        ] {
+            assert_eq!(
+                validate_domain_suffix(invalid),
+                Err(ValidationError::InvalidDomainSuffix(invalid.to_string())),
+                "suffix={invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_dns_rule_match() {
+        for valid in [
+            DnsRuleMatch::GeoSite {
+                category: "category-ru".into(),
+            },
+            DnsRuleMatch::DomainSuffix {
+                suffix: "*.example.com".into(),
+            },
+            DnsRuleMatch::DomainSuffix {
+                suffix: "ru".into(),
+            },
+            DnsRuleMatch::DomainKeyword {
+                keyword: "yandex".into(),
+            },
+            DnsRuleMatch::DomainFull {
+                domain: "api.example.com".into(),
+            },
+        ] {
+            assert!(validate_dns_rule_match(&valid).is_ok(), "{valid:?}");
+        }
+
+        assert!(matches!(
+            validate_dns_rule_match(&DnsRuleMatch::DomainSuffix {
+                suffix: ".ru".into(),
+            }),
+            Err(ValidationError::InvalidDomainSuffix(_))
+        ));
+        assert!(matches!(
+            validate_dns_rule_match(&DnsRuleMatch::DomainFull {
+                domain: "*.example.com".into(),
+            }),
+            Err(ValidationError::WildcardDomainFull(_))
+        ));
+        assert!(matches!(
+            validate_dns_rule_match(&DnsRuleMatch::DomainKeyword {
+                keyword: "*.ru".into(),
+            }),
+            Err(ValidationError::WildcardDomainKeyword(_))
+        ));
+        assert!(matches!(
+            validate_dns_rule_match(&DnsRuleMatch::GeoSite {
+                category: "GOOGLE".into(),
+            }),
+            Err(ValidationError::InvalidGeoSiteCategory(_))
+        ));
     }
 }

@@ -1105,6 +1105,22 @@ mod routing_row_tests {
     }
 
     #[test]
+    fn rule_row_validation_error_flags_wildcard_domain_full() {
+        let msg = rule_row_validation_error(&rule(RuleMatch::DomainFull {
+            domain: "*.example.com".to_string(),
+        }))
+        .expect("wildcard full domain must be flagged");
+        assert!(msg.contains("cannot contain '*'"), "msg: {msg}");
+
+        assert_eq!(
+            rule_row_validation_error(&rule(RuleMatch::DomainFull {
+                domain: "api.example.com".to_string(),
+            })),
+            None
+        );
+    }
+
+    #[test]
     fn rule_row_validation_error_passes_valid_rules() {
         assert_eq!(
             rule_row_validation_error(&rule(RuleMatch::DomainKeyword {

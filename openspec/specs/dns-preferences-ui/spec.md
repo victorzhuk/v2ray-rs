@@ -313,3 +313,14 @@ Opening the DNS server editor on a server with `port = None` SHALL initialize th
 #### Scenario: Editing one IP of a multi-address host override keeps siblings and rejects duplicates
 - **WHEN** `dns.hosts` contains `("api.example.com", "1.2.3.4")` and `("api.example.com", "2001:db8::1")` and the user edits `1.2.3.4` to `1.2.3.5`
 - **THEN** only `("api.example.com", "1.2.3.4")` SHALL become `("api.example.com", "1.2.3.5")`, `("api.example.com", "2001:db8::1")` SHALL remain intact, and attempting to edit it to `2001:db8::1` SHALL be rejected inline
+
+### Requirement: DNS rule dialog and list validate every matcher type
+The DNS rule dialog SHALL validate GeoSite, Domain Suffix, Domain Keyword, and Domain Full values inline before save, regardless of whether the DNS master toggle is enabled, rejecting invalid values and enabling save for valid values including `*.example.com` and `ru` on Domain Suffix. Stored DNS rules with invalid values of any matcher type SHALL load unchanged, and their rows SHALL apply error styling and show the validation message as their subtitle.
+
+#### Scenario: Wildcard suffix accepted and wildcard full-domain rejected in DNS dialog
+- **WHEN** the user enters `*.example.com` in the DNS rule dialog
+- **THEN** selecting Domain Suffix SHALL pass inline validation, and switching to Domain Full SHALL show an inline error and disable save even while DNS is disabled
+
+#### Scenario: Stored invalid DNS suffix, GeoSite, or full-domain row badged on load
+- **WHEN** stored settings contain custom DNS rules with Domain Suffix `.ru`, GeoSite `GOOGLE`, or Domain Full `*.example.com`
+- **THEN** settings SHALL load unchanged and each invalid rule row SHALL carry error styling and show its validation error as the subtitle

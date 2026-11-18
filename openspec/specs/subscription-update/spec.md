@@ -142,6 +142,14 @@ Imported profile DNS servers, DNS rules, static host overrides, and routing rule
 - **WHEN** an imported JSON profile contains a malformed CIDR, invalid domain pattern, invalid DNS server address, or reserved server tag
 - **THEN** the importer SHALL drop or reject the invalid profile element with a warning, and runtime config generation SHALL validate active imported profiles with the same rules as user settings
 
+#### Scenario: Imported wildcard full-domain rule is skipped with warning
+- **WHEN** an imported Xray JSON profile contains `"full:*.example.com"` in a routing rule or DNS server `domains` list
+- **THEN** the importer SHALL skip that matcher entry and record a warning without aborting valid rules
+
+#### Scenario: Imported wildcard or TLD DNS suffix rule is accepted
+- **WHEN** an imported Xray JSON profile contains `"domain:*.example.com"` or `"domain:cn"` in a DNS server `domains` list
+- **THEN** the importer SHALL keep those DNS suffix rules and runtime validation SHALL accept the imported DNS config
+
 ### Requirement: URI and VMess parsers support XHTTP and reject unknown transports
 Subscription URI and VMess JSON parsers SHALL parse `xhttp` and `splithttp` transports into `TransportSettings::Xhttp` (carrying `path`, `host`, and `mode` defaulting to `auto`) and SHALL return a parse error for unknown transport types instead of falling back to TCP.
 

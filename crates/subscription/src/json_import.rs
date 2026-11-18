@@ -9,8 +9,7 @@ use v2ray_rs_core::models::{
     DnsConfig, DnsProtocol, DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, GrpcSettings,
     H2Settings, HostOverride, ImportedProfile, ProxyNode, RoutingRule, RuleAction, RuleMatch,
     ShadowsocksConfig, SubscriptionNode, TlsSettings, TransportSettings, TrojanConfig, VlessConfig,
-    VmessConfig, WsSettings, XhttpSettings, validate_domain_keyword, validate_domain_pattern,
-    validate_geosite_category, validate_rule_match,
+    VmessConfig, WsSettings, XhttpSettings, validate_dns_rule_match, validate_rule_match,
 };
 
 use crate::parser::{ImportResult, ParseError};
@@ -723,13 +722,15 @@ fn map_dns_config(dns: &Value) -> (Option<DnsConfig>, Vec<String>) {
 
         for d in &domains {
             match dns_domain_rule_match(d) {
-                Some(m) if dns_rule_match_valid(&m) => rules.push(DnsRule {
-                    match_condition: m,
-                    server_tag: tag.clone(),
-                }),
-                Some(_) => skipped.push(format!(
-                    "dns server {i}: invalid domain matcher '{d}', ignored"
-                )),
+                Some(m) => match validate_dns_rule_match(&m) {
+                    Ok(()) => rules.push(DnsRule {
+                        match_condition: m,
+                        server_tag: tag.clone(),
+                    }),
+                    Err(e) => skipped.push(format!(
+                        "dns server {i}: invalid domain matcher '{d}': {e}, ignored"
+                    )),
+                },
                 None => skipped.push(format!(
                     "dns server {i}: unsupported domain matcher '{d}', ignored"
                 )),
@@ -907,21 +908,4 @@ fn valid_host_domain(domain: &str) -> bool {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     })
-}
-
-fn valid_domain_suffix(suffix: &str) -> bool {
-    !suffix.is_empty()
-        && !suffix.starts_with('.')
-        && suffix
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-')
-}
-
-fn dns_rule_match_valid(m: &DnsRuleMatch) -> bool {
-    match m {
-        DnsRuleMatch::GeoSite { category } => validate_geosite_category(category).is_ok(),
-        DnsRuleMatch::DomainSuffix { suffix } => valid_domain_suffix(suffix),
-        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword).is_ok(),
-        DnsRuleMatch::DomainFull { domain } => validate_domain_pattern(domain).is_ok(),
-    }
 }

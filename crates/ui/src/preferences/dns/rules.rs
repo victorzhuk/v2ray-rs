@@ -22,12 +22,7 @@ pub(super) fn upsert_dns_rule(
 }
 
 pub(super) fn dns_rule_match_validation_error(m: &DnsRuleMatch) -> Option<String> {
-    match m {
-        DnsRuleMatch::DomainKeyword { keyword } => validate_domain_keyword(keyword)
-            .err()
-            .map(|e| e.to_string()),
-        _ => None,
-    }
+    validate_dns_rule_match(m).err().map(|e| e.to_string())
 }
 
 pub(super) fn dns_rule_from_inputs(

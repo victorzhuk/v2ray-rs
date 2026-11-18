@@ -11,7 +11,7 @@ use v2ray_rs_core::config::effective_dns::{DnsSource, EffectiveDns, effective_dn
 use v2ray_rs_core::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol, DnsRule,
     DnsRuleMatch, DnsServerConfig, DnsStrategy, HostOverride, ManualNode, RoutingRuleSet,
-    Subscription, builtin_dns_presets, validate_domain_keyword,
+    Subscription, builtin_dns_presets, validate_dns_rule_match,
 };
 
 use crate::i18n::tr;
@@ -1157,14 +1157,17 @@ mod tests {
     }
 
     #[test]
-    fn dns_rule_match_validation_error_passes_plain_keyword_and_other_matches() {
+    fn dns_rule_match_validation_error_passes_valid_variants() {
         assert_eq!(
             dns_rule_match_validation_error(&dns_rule_with_keyword("sina")),
             None
         );
         for m in [
             DnsRuleMatch::DomainSuffix {
-                suffix: ".ru".to_string(),
+                suffix: "*.ru".to_string(),
+            },
+            DnsRuleMatch::DomainSuffix {
+                suffix: "ru".to_string(),
             },
             DnsRuleMatch::GeoSite {
                 category: "google".to_string(),
@@ -1174,6 +1177,32 @@ mod tests {
             },
         ] {
             assert_eq!(dns_rule_match_validation_error(&m), None, "{m:?}");
+        }
+    }
+
+    #[test]
+    fn dns_rule_match_validation_error_rejects_invalid_variants() {
+        for m in [
+            DnsRuleMatch::GeoSite {
+                category: "bad category!".to_string(),
+            },
+            DnsRuleMatch::DomainSuffix {
+                suffix: ".ru".to_string(),
+            },
+            DnsRuleMatch::DomainSuffix {
+                suffix: "*.".to_string(),
+            },
+            DnsRuleMatch::DomainKeyword {
+                keyword: "*.ru".to_string(),
+            },
+            DnsRuleMatch::DomainFull {
+                domain: "*.example.com".to_string(),
+            },
+        ] {
+            assert!(
+                dns_rule_match_validation_error(&m).is_some(),
+                "expected error for {m:?}"
+            );
         }
     }
 
