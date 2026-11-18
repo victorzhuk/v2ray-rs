@@ -92,3 +92,19 @@ assertion. The CI runner uses a writable root. Netctl ran 37 unit tests; its
 privileged scenarios compile with `--features privileged-tests` but were not
 executed here. OpenSpec strict validation, actionlint, and `git diff --check`
 passed.
+
+## Host and Docker acceptance
+
+- Full workspace suite with real backends and Xvfb (`V2RAY_RS_REQUIRE_BACKENDS=1 V2RAY_RS_REQUIRE_DISPLAY=1 xvfb-run -a dbus-run-session -- make test CARGO_FLAGS="-j 4 --no-fail-fast" TEST_TIMEOUT=10m TEST_THREADS=4`): 0 failures across all workspace crates, including `v2ray-rs-process` capability-gate tests and 190 `v2ray-rs-ui` tests.
+- Host unprivileged private-namespace `netctl` checks: `net::tests::journaled_route_mutations_in_private_namespace` and `journal_reservation_cli_without_tun` both passed.
+- Privileged Docker `archlinux:base` container (`/dev/net/tun` present, host kernel `ipv6.disable=1`):
+  - `singbox_routing` against pinned `sing-box 1.13.14` (`--skip positive_control_without_automatic_exclusions`): 5/5 passed. `positive_control_without_automatic_exclusions` fails on `1.13.14` because `1.13.14` already inserts `lookup 2022 suppress_prefixlength 0` and the host kernel disables IPv6.
+  - `net::tests::journaled_route_mutations_in_private_namespace`: 1/1 passed.
+  - `v2ray-rs-netctl` `privileged` suite (`V2RAY_RS_REQUIRE_NETNS=1`): 7/10 passed, including `journaled_ownership_contract` (real `/dev/net/tun`, `ip netns add`, `reserve`, `xray-up`, foreign rule/device alias refusal, and `recover`). The 3 IPv6 tests (`reup_across_recreated_device_leaves_one_copy`, `strict_up_installs_fallback_routes_and_v6_rules`, `up_down_is_idempotent_in_namespace`) failed with `os error 95` / missing `-6` rules because the host kernel has `ipv6.disable=1`.
+- Release tarball and installer smoke (`make dist` + `scripts/gen-installer.sh`, musl `v2ray-rs-netctl` and `v2ray-rs-run` verified with `readelf -d` to have zero `NEEDED` shared libraries):
+  - Initial Docker `install.sh` + `xvfb-run` smoke uncovered a startup bug in `crates/ui/src/app/bootstrap.rs` where `app.register()` emitted `startup` before `RelmApp::from_app(app).run()` attached its handler, causing the app to exit `0` without opening a window.
+  - Fixed `bootstrap.rs` to probe D-Bus `NameHasOwner` with a separate temporary `gio::Application` only when a primary instance already owns the name.
+  - Rebuilt `dist/v2ray-rs-x86_64-linux.tar.gz` and `dist/install.sh` (`0.20.3`, `sha256 0c0adb9a66268640d5631f8971f54d811e70fa6f3719791234bf5a2d9db2c5ac`) and re-ran the Docker `archlinux:base` smoke: `install.sh` -> `--version` / `--help` -> `xvfb-run -a dbus-run-session` observed `"V2Ray Manager"` via `xwininfo -root -tree` -> second launch exited `0` (activated running instance) -> `SIGTERM` exited `0` -> `install.sh --uninstall` removed installed binaries.
+  - Re-ran `cargo fmt -- --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings`, and `V2RAY_RS_REQUIRE_DISPLAY=1 xvfb-run -a dbus-run-session -- cargo test -p v2ray-rs-ui -j 2 -- --test-threads=2` (190 passed, 0 failed) on the final source.
+- Scope limits: `sing-box 1.13.0`, IPv6-enabled kernel `netctl` tests, and the full interactive polkit/FUSE AppImage VM matrix in `docs/TUN_ACCEPTANCE.md` remain unexecuted on this IPv6-disabled non-VM workstation.
+

@@ -1,4 +1,4 @@
-## ADDED Requirements
+## MODIFIED Requirements
 ### Requirement: Failed recovery remains pending
 The system SHALL retain the TUN recovery marker when cleanup fails or times out and SHALL report the failure. Cleanup SHALL propagate enumeration and mutation failures while attempting independent cleanup operations.
 #### Scenario: Recovery retry

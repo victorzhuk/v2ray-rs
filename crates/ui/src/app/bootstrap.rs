@@ -381,6 +381,43 @@ pub(super) fn remove_dir_contents_except(
     Ok(())
 }
 
+pub(super) fn try_activate_running_instance(app_id: &str) -> bool {
+    let Ok(connection) =
+        gtk::gio::bus_get_sync(gtk::gio::BusType::Session, None::<&gtk::gio::Cancellable>)
+    else {
+        return false;
+    };
+    let Ok(reply) = connection.call_sync(
+        Some("org.freedesktop.DBus"),
+        "/org/freedesktop/DBus",
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        Some(&(app_id,).to_variant()),
+        Some(glib::VariantTy::new("(b)").expect("valid variant type")),
+        gtk::gio::DBusCallFlags::NONE,
+        1_000,
+        None::<&gtk::gio::Cancellable>,
+    ) else {
+        return false;
+    };
+    let Some((true,)) = reply.get::<(bool,)>() else {
+        return false;
+    };
+
+    let probe = gtk::gio::Application::new(Some(app_id), gtk::gio::ApplicationFlags::default());
+    match probe.register(None::<&gtk::gio::Cancellable>) {
+        Ok(()) if probe.is_remote() => {
+            probe.run_with_args::<&str>(&[]);
+            true
+        }
+        Ok(()) => false,
+        Err(err) => {
+            log::warn!("session-bus registration failed, using the instance lock: {err}");
+            false
+        }
+    }
+}
+
 pub(super) fn try_run() -> Result<(), String> {
     // clap sends --help/--version to stdout with exit code 0 and real errors to
     // stderr; `print` and `exit_code` already know which. Routing the stdout
@@ -424,22 +461,15 @@ pub(super) fn try_run() -> Result<(), String> {
     crate::i18n::init_process_locale(settings.language);
 
     let app_id = profile.app_id();
-    let app = adw::Application::builder().application_id(&app_id).build();
     // Default profile paths can rely on GApplication's session-bus uniqueness:
-    // a second launch activates the primary window and exits 0. Directory
-    // overrides need the per-profile lock instead because the application ID
-    // alone does not identify the directory set.
-    if !overrides.has_directory_overrides() {
-        match app.register(None::<&gtk::gio::Cancellable>) {
-            Ok(()) if app.is_remote() => {
-                app.run_with_args::<&str>(&[]);
-                return Ok(());
-            }
-            Ok(()) => {}
-            Err(err) => {
-                log::warn!("session-bus registration failed, using the instance lock: {err}");
-            }
-        }
+    // a second launch activates the primary window and exits 0. Probe via a
+    // separate Application only when the D-Bus name already has an owner so
+    // `register()` never fires `startup` on the main Application before
+    // `RelmApp::run()` attaches its handler. Directory overrides need the
+    // per-profile lock instead because the application ID alone does not
+    // identify the directory set.
+    if !overrides.has_directory_overrides() && try_activate_running_instance(&app_id) {
+        return Ok(());
     }
 
     let _lock = InstanceLock::acquire(&paths).map_err(|e| {
@@ -552,6 +582,8 @@ pub(super) fn try_run() -> Result<(), String> {
     let resource = gtk::gio::Resource::from_data(&resource_bytes)
         .map_err(|err| format!("failed to load icon resource: {err}"))?;
     gtk::gio::resources_register(&resource);
+
+    let app = adw::Application::builder().application_id(&app_id).build();
 
     // Register our CLI options with GTK so it doesn't complain about "unknown options"
     app.add_main_option(

@@ -58,6 +58,27 @@ When a connect candidate's failure is classified as REALITY auth rejection and t
 #### Scenario: Classification on a manual node offers nothing
 - **WHEN** a REALITY auth rejection is classified on a manual node with no owning subscription
 - **THEN** the failure report SHALL show the classification without a refresh offer
+
+### Requirement: Safe subscription imports
+The system SHALL exclude arbitrary HTTP error bodies from routine errors and SHALL bound regular local-file imports to 10 MiB without blocking asynchronous workers.
+#### Scenario: Oversized local source
+- **WHEN** a local source exceeds 10 MiB or is not a regular file
+- **THEN** the import SHALL fail without replacing existing subscription data
+#### Scenario: Server rejects a refresh
+- **WHEN** the subscription server returns an HTTP error with a response body
+- **THEN** the reported fetch error SHALL omit the body and the existing subscription SHALL remain intact
+
+### Requirement: Connection identity reconciliation
+The system SHALL match unchanged connection settings before endpoint fallbacks, ignoring remarks. Endpoint fallback SHALL apply only to unique unmatched pairs. Changed connection settings SHALL invalidate latency samples.
+#### Scenario: Reordered endpoint duplicates
+- **WHEN** distinct connection configurations sharing an endpoint are reordered
+- **THEN** each configuration SHALL retain its own identity and enabled state
+
+#### Scenario: A changed connection has an outstanding measurement
+- **WHEN** unique endpoint fallback retains a node identity after its connection settings change
+- **THEN** the system SHALL invalidate saved latency samples for the old settings
+- **AND** a probe started with the old settings SHALL NOT restore a stale sample when it finishes
+
 ### Requirement: Subscription HTTP redirects block private and local targets
 Subscription HTTP fetches SHALL evaluate each redirect hop and reject redirects to loopback, link-local, RFC 1918 private, RFC 6598 shared address space (`100.64.0.0/10`), RFC 2544 benchmarking (`198.18.0.0/15`), unique-local, unspecified, or broadcast IP literals (including IPv4-mapped IPv6 forms), or `localhost` hostnames.
 
@@ -120,6 +141,7 @@ Imported profile DNS servers, DNS rules, static host overrides, and routing rule
 #### Scenario: Invalid imported routing rule or DNS server is rejected
 - **WHEN** an imported JSON profile contains a malformed CIDR, invalid domain pattern, invalid DNS server address, or reserved server tag
 - **THEN** the importer SHALL drop or reject the invalid profile element with a warning, and runtime config generation SHALL validate active imported profiles with the same rules as user settings
+
 ### Requirement: URI and VMess parsers support XHTTP and reject unknown transports
 Subscription URI and VMess JSON parsers SHALL parse `xhttp` and `splithttp` transports into `TransportSettings::Xhttp` (carrying `path`, `host`, and `mode` defaulting to `auto`) and SHALL return a parse error for unknown transport types instead of falling back to TCP.
 

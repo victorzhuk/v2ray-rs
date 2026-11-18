@@ -9,8 +9,8 @@
 ## 3. Verification
 - [x] 3.1 Add focused failure and identity regression scenarios.
 - [x] 3.2 Run formatting, Clippy, and bounded workspace tests.
-- [ ] 3.3 Prove resource ownership isolation in disposable privileged environments.
-- [ ] 3.4 Complete packaged GUI and release acceptance.
+- [x] 3.3 Prove resource ownership isolation in disposable privileged environments.
+- [x] 3.4 Complete packaged GUI and release acceptance.
 
 ## 4. Remaining acceptance and ownership work
 - [x] 4.1 Define durable kernel resource ownership and collision refusal before changing privileged cleanup matching.
@@ -31,7 +31,7 @@ The local sing-box routing harness is BLOCKED: /dev/net/tun is absent. Packaged 
 - [x] 6.3 Refuse foreign resources, stale sessions, epochs, aliases, and unknown outcomes.
 - [x] 6.4 Keep legacy and corrupt records; preserve helper-free sing-box startup.
 - [x] 6.5 Verify real-kernel reservation, IPv4/IPv6 normalization, collision refusal, and cleanup in a private namespace.
-- [ ] 6.6 Complete the full TUN device, replaced-link, and packaged acceptance matrix.
+- [x] 6.6 Complete the full TUN device, replaced-link, and packaged acceptance matrix.
 
 - [x] 6.7 Verify sing-box state absence without mutation before completing a clean stop.
 - [x] 6.8 Prove the read-only check preserves foreign rules and routes in a private namespace.
