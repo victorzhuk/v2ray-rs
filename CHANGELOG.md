@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-19
+
+### Added
+- Confirmed in-app operator recovery for leftover TUN state, with elevated forced cleanup and journal removal only on success.
+- TUN sessions without an IPv6 tunnel address resolve IPv4 only, so the tunnel never selects an IPv6 egress.
+
+### Fixed
+- DNS suffixes stored in sing-box leading-dot form no longer abort config generation; imported profiles are healed on load.
+- Xray DNS servers are emitted as a bare host with a separate port, and DoT/DoQ downgrade to DoH, matching how xray parses DNS addresses.
+- Recreated TUN device indexes are named in the refusal, and reserve failures include the operator recovery command.
+- Forced TUN recovery also clears the `v2ray-rs-own` reservation dummy.
+- The provider-profile row title renders its ampersand.
+
 ## [0.20.13] - 2026-11-19
 
 ### Fixed
@@ -973,7 +986,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.13...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.13...v0.21.0
 [0.20.13]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.12...v0.20.13
 [0.20.12]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.11...v0.20.12
 [0.20.11]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.10...v0.20.11
