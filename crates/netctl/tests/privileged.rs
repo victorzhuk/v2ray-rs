@@ -1074,8 +1074,11 @@ fn journaled_ownership_contract() {
 fn journal_reservation_cli_without_tun() {
     const CHILD: &str = "V2RAY_RS_RESERVATION_CLI_CHILD";
     if std::env::var_os(CHILD).is_none() {
+        // SAFETY: geteuid takes no arguments and reads the current effective UID.
+        let effective_uid = unsafe { libc::geteuid() };
+        let namespace_flags = if effective_uid == 0 { "-n" } else { "-rn" };
         let status = Command::new("timeout")
-            .args(["60s", "unshare", "-rn", "--"])
+            .args(["60s", "unshare", namespace_flags, "--"])
             .arg(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -1296,17 +1299,22 @@ fn journaled_rerun_without_optional_flags_removes_stale_rules() {
     v2ray_rs_tun_session::write(&path, &session).unwrap();
     let owned = |args: &[&str]| {
         let result = owned_command(&path, &identity, args);
-        assert!(
-            result.status.success(),
-            "{}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+        if !result.status.success() {
+            let pending = v2ray_rs_tun_session::read::<String>(&path)
+                .ok()
+                .and_then(|session| session.ownership)
+                .and_then(|ownership| ownership.pending);
+            panic!(
+                "{args:?}: {} (pending: {pending:?})",
+                String::from_utf8_lossy(&result.stderr).trim()
+            );
+        }
     };
+    owned(&["reserve", "--iface", IFACE]);
     assert!(run("ip", &["tuntap", "add", "dev", IFACE, "mode", "tun"]));
     let index = std::fs::read_to_string(format!("/sys/class/net/{IFACE}/ifindex")).unwrap();
     let index = index.trim();
 
-    owned(&["reserve", "--iface", IFACE]);
     owned(&[
         "xray-up",
         "--iface",

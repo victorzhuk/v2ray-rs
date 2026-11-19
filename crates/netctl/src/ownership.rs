@@ -458,7 +458,17 @@ fn matches_intent(intent: &Resource, live: &Resource) -> bool {
                 && a.attributes
                     .iter()
                     .filter(|a| !matches!(a, RuleAttribute::Table(_)))
-                    .all(|attribute| b.attributes.contains(attribute))
+                    .all(|attribute| {
+                        b.attributes.contains(attribute)
+                            // Linux can omit a zero mark while still reporting its mask.
+                            || (*attribute == RuleAttribute::FwMark(0)
+                                && a.attributes.iter().any(
+                                    |attr| matches!(attr, RuleAttribute::FwMask(mask) if *mask != 0),
+                                )
+                                && !b.attributes.iter().any(
+                                    |attr| matches!(attr, RuleAttribute::FwMark(_)),
+                                ))
+                    })
         }
         (Resource::Route(a), Resource::Route(b)) => {
             let (Ok(a), Ok(b)) = (decode_route(a), decode_route(b)) else {
@@ -620,6 +630,26 @@ mod tests {
         let a = Resource::Rule(encode(&first));
         let b = Resource::Rule(encode(&second));
         assert!(verify_inventory(&[a], &[b]).is_err());
+    }
+
+    #[test]
+    fn rule_intent_accepts_omitted_zero_mark_only_with_matching_mask() {
+        let mut requested = RuleMessage::default();
+        requested.attributes = vec![RuleAttribute::FwMark(0), RuleAttribute::FwMask(255)];
+        let intent = Resource::Rule(encode(&requested));
+
+        let mut reported = requested;
+        reported.attributes = vec![RuleAttribute::FwMask(255)];
+        assert!(matches_intent(&intent, &Resource::Rule(encode(&reported))));
+
+        reported.attributes.push(RuleAttribute::FwMark(1));
+        assert!(!matches_intent(&intent, &Resource::Rule(encode(&reported))));
+
+        reported.attributes = vec![RuleAttribute::FwMask(127)];
+        assert!(!matches_intent(&intent, &Resource::Rule(encode(&reported))));
+
+        reported.attributes.clear();
+        assert!(!matches_intent(&intent, &Resource::Rule(encode(&reported))));
     }
 
     #[test]
