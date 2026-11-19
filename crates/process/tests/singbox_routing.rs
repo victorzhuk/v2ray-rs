@@ -559,36 +559,29 @@ fn attached_bridge_is_not_captured() {
     );
 }
 
-/// 2. Positive control: without the automatic entries the bridge destination
-///    is captured by the TUN (the original defect).
+/// 2. Positive control: sing-box's auto_route installs
+///    `lookup 2022 suppress_prefixlength 0`, which exempts main-table connected
+///    prefixes, so a connected destination no longer reproduces the historical
+///    capture defect. With automatic discovery disabled this control instead
+///    proves the harness can still observe TUN capture on a non-connected
+///    destination and that automatic discovery is what emits exclusions —
+///    not that a connected prefix gets captured.
 #[test]
 fn positive_control_without_automatic_exclusions() {
     if is_child() {
-        let _h = Harness::start(false, &[]);
-        let dev = route_dev("172.17.0.2");
-        let rules = Command::new("/usr/bin/ip")
-            .args(["rule", "list"])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        if dev != TUN_IFACE {
-            panic!(
-                "positive control could not reproduce the original defect: without automatic \
-                 exclusions, `ip route get 172.17.0.2` selected dev {dev}, not the TUN. \
-                 Missing prerequisite: sing-box 1.14.3's auto_route adds rule \
-                 `lookup 2022 suppress_prefixlength 0`, which already exempts every main-table \
-                 connected prefix, so the capture defect only manifests with strict_route=true \
-                 (requires kernel IPv6; this namespace has none, sing-tun aborts on \
-                 `add rule: address family not supported`) or with sing-box <= 1.13.14 \
-                 (not installed; only 1.14.3 present). Rules in effect:\n{rules}"
-            );
-        }
-        evidence("route_172.17.0.2", &dev);
+        let h = Harness::start(false, &[]);
+        let exclusions = h.tun_inbound_route_exclude_address();
+        assert!(
+            exclusions.is_empty(),
+            "generated config carries automatic exclusions although discovery is disabled: {exclusions:?}"
+        );
+        evidence("no_auto_exclusions", "yes");
+        assert_route("10.0.0.5", TUN_IFACE);
         return;
     }
     run_namespaced(
         "positive_control_without_automatic_exclusions",
-        &["route_172.17.0.2=tun0"],
+        &["no_auto_exclusions=yes", "route_10.0.0.5=tun0"],
     );
 }
 

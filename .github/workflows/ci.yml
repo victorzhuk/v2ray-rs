@@ -45,9 +45,10 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus
+          pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus gzip sed
           echo 'ru_RU.UTF-8 UTF-8' >>/etc/locale.gen
           locale-gen
+          locale -a | grep -qi '^ru_RU.utf8$' || { echo '::error::ru_RU.UTF-8 locale was not generated'; locale -a; exit 1; }
       - name: Install pinned proxy backends
         run: |
           set -euo pipefail
