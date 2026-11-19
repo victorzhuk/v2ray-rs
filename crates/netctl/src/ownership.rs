@@ -342,6 +342,14 @@ impl Owner {
                 && self.state().pending.is_none()
                 && self.state().device_ifindex.is_none()
             {
+                if !snapshot(handle).await?.is_empty()
+                    || link(handle, &self.session.iface).await?.is_some()
+                {
+                    return Err(
+                        "unowned TUN routing state is present; explicit operator recovery is required"
+                            .into(),
+                    );
+                }
                 self.state_mut().phase = Phase::Complete;
                 return self.save();
             }

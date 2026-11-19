@@ -1130,6 +1130,13 @@ fn journal_reservation_cli_without_tun() {
     assert!(!failure.status.success());
     assert!(String::from_utf8_lossy(&failure.stderr).contains("already in use"));
     assert_eq!(std::fs::read(&path).unwrap(), original);
+    let recovery = owned_command(&path, &identity, &recover);
+    assert!(!recovery.status.success());
+    assert!(
+        String::from_utf8_lossy(&recovery.stderr)
+            .contains("explicit operator recovery is required")
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), original);
     assert!(run("ip", &["rule", "del", "pref", "9001", "table", "main"]));
     success(&identity, &reserve);
     success(&identity, &reserve);

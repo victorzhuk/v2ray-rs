@@ -755,7 +755,7 @@ pub async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> He
     .flatten()
     .collect();
 
-    let (result, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
+    let (mut result, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(Ok(status)) if status.success() => (Ok(()), false),
         Ok(Ok(status)) => (Err(format!("{verb} exited with {status}")), false),
         Ok(Err(e)) => (Err(format!("{verb}: {e}")), false),
@@ -775,6 +775,12 @@ pub async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> He
         }
     }
     let output = std::mem::take(&mut *output.lock().unwrap_or_else(|e| e.into_inner()));
+    if let Err(message) = &mut result
+        && let Some(line) = output.iter().rev().find(|line| !line.trim().is_empty())
+    {
+        message.push_str(": ");
+        message.push_str(line.trim());
+    }
     HelperRun {
         output,
         result,
@@ -1288,6 +1294,7 @@ mod tests {
         );
         let err = run.result.expect_err("a non-zero exit must fail");
         assert!(err.contains("exit status"), "{err}");
+        assert!(err.contains("netctl: boom"), "{err}");
         assert!(!run.timed_out);
     }
 
