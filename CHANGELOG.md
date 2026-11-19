@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.8] - 2026-11-19
+
+### Fixed
+- Install precompiled Russian locales in CI and correct the namespace setup and sing-box capture checks used for routing acceptance.
+
 ## [0.20.7] - 2026-11-19
 
 ### Fixed
@@ -941,7 +946,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.7...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.8...HEAD
+[0.20.8]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.4...v0.20.5
