@@ -44,7 +44,10 @@ jobs:
     container: archlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus
+        run: |
+          pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus
+          echo 'ru_RU.UTF-8 UTF-8' >>/etc/locale.gen
+          locale-gen
       - name: Install pinned proxy backends
         run: |
           set -euo pipefail
@@ -68,6 +71,14 @@ jobs:
           echo '6bbb8aee65a57d0b12599b4b7c842b3ad0daca4436e661d94015c447cb31b4fa  v2ray.zip' | sha256sum -c -
           unzip -p v2ray.zip v2ray > /usr/local/bin/v2ray
           chmod 0755 /usr/local/bin/v2ray
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/v2fly/geoip/releases/download/202611080027/geoip.dat \
+            -o /usr/local/bin/geoip.dat
+          echo 'eedb24b3b9fcba27e06b92c0428dab90d9496083091ae4cf39e11387fd99d0e2  /usr/local/bin/geoip.dat' | sha256sum -c -
+          curl --fail --location --retry 3 --max-time 120 \
+            https://github.com/v2fly/domain-list-community/releases/download/20261118141523/dlc.dat \
+            -o /usr/local/bin/geosite.dat
+          echo 'a033da583af17f15c9743f0b29aa5c073e9c1b8018a99ab4e69bc9ed5248a086  /usr/local/bin/geosite.dat' | sha256sum -c -
           sing-box version
           xray version
           v2ray version
@@ -102,6 +113,8 @@ jobs:
           set -euo pipefail
           sudo apt-get update
           sudo apt-get install -y protobuf-compiler iproute2
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          unshare -rn true
           sudo modprobe tun
           test -c /dev/net/tun
           curl --fail --location --retry 3 --max-time 120 \
