@@ -125,9 +125,12 @@ docker run --rm -v "$PWD:/w" -w /w -e APPIMAGE_EXTRACT_AND_RUN=1 \
   apt-get update -qq &&
   apt-get install -y -qq libgtk-4-1 libadwaita-1-0 xvfb xauth x11-utils &&
   ./v2ray-rs-x86_64.AppImage --help &&
+  export APPIMAGE="$PWD/v2ray-rs-x86_64.AppImage" &&
+  cd "$(mktemp -d)" &&
+  "$APPIMAGE" --appimage-extract >/dev/null &&
   xvfb-run --auto-servernum timeout 35s bash <<'"'"'SMOKE'"'"'
   set -euo pipefail
-  ./v2ray-rs-x86_64.AppImage --profile development &
+  ./squashfs-root/AppRun --profile development &
   app_pid=$!
   trap "kill -KILL $app_pid 2>/dev/null || true" EXIT
   ready=0
@@ -167,9 +170,9 @@ it proves the bundled loader resolves every library the bundle provides, and
 nothing more. Only the `xvfb-run` step opens a window, exercising the pixbuf
 loaders, GSettings schemas and the icon theme, which is where GTK4 bundling
 actually breaks. The windowed step polls `xwininfo` for the `V2Ray Manager`
-window and requires a clean exit after SIGTERM within its deadline, so a
-bundle that never shows a window or fails to shut down fails the check; the
-same observable gate is the `appimage-smoke` job in
+window and requires a clean exit after SIGTERM within its deadline. It starts
+the extracted `AppRun` directly so the signal reaches the application process.
+The same gate runs in the `appimage-smoke` job in
 `.github/workflows/release.yml`.
 
 Re-running either installer must be idempotent, and `--uninstall` on either one

@@ -267,9 +267,13 @@ jobs:
           # --help exits before GTK init, but the loader has already resolved
           # every bundled library by then, so this is the link check.
           ./v2ray-rs-x86_64.AppImage --help
+          # Extract-and-run waits in a parent process that does not forward SIGTERM.
+          export APPIMAGE="$PWD/v2ray-rs-x86_64.AppImage"
+          cd "$(mktemp -d)"
+          "$APPIMAGE" --appimage-extract >/dev/null
           xvfb-run --auto-servernum timeout 35s bash <<'SMOKE'
           set -euo pipefail
-          ./v2ray-rs-x86_64.AppImage --profile development &
+          ./squashfs-root/AppRun --profile development &
           app_pid=$!
           trap 'kill -KILL "$app_pid" 2>/dev/null || true' EXIT
           ready=0
