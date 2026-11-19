@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.7] - 2026-11-19
+
+### Fixed
+- Release gates fixed for the CI environment: the test container installs gzip so ru_RU.UTF-8 actually generates, pinned geoip and geosite data sit beside xray for rule checks, unprivileged user namespaces are enabled and asserted for routing acceptance, and the routing positive control asserts the invariants current sing-box still guarantees.
+
 ## [0.20.6] - 2026-11-19
 
 ### Fixed
@@ -936,7 +941,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.6...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.7...HEAD
+[0.20.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.3...v0.20.4
