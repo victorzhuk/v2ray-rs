@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.6] - 2026-11-19
+
+### Fixed
+- The release gates now run with the environment they need: the test container generates the Russian locale, pinned `geoip.dat` and `geosite.dat` are verified and installed beside xray so rule checks load, and the routing acceptance job lifts the unprivileged-user-namespace restriction and asserts it works. No user-visible behavior change.
+
 ## [0.20.5] - 2026-11-19
 
 ### Fixed
@@ -931,7 +936,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.5...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.6...HEAD
+[0.20.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.5...v0.20.6
 [0.20.5]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.4...v0.20.5
 [0.20.4]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.3...v0.20.4
 [0.20.3]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.2...v0.20.3
