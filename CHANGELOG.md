@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.9] - 2026-11-19
+
+### Fixed
+- Fix xray TUN startup with DNS capture when Linux omits the zero firewall mark from its rule dump.
+- Run the reservation CLI test in a fresh network namespace and make the route reconciliation test reserve ownership before creating its TUN device.
+
 ## [0.20.8] - 2026-11-19
 
 ### Fixed
@@ -946,7 +952,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.8...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.9...HEAD
+[0.20.9]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.8...v0.20.9
 [0.20.8]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.7...v0.20.8
 [0.20.7]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.6...v0.20.7
 [0.20.6]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.5...v0.20.6
