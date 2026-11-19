@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use uuid::Uuid;
 
 use crate::fs::atomic_write;
-use crate::models::{Subscription, SubscriptionSource};
+use crate::models::{DnsRuleMatch, Subscription, SubscriptionSource, normalize_domain_suffix};
 
 use super::{AppPaths, PersistenceError, json_uuid, read_file};
 
@@ -25,11 +25,34 @@ pub fn load_subscriptions(paths: &AppPaths) -> Result<Vec<Subscription>, Persist
     let contents = read_file(&path)?;
     let mut raw: JsonValue = serde_json::from_str(&contents)?;
     let migrated = migrate_subscription_node_ids(&mut raw);
-    let subs: Vec<Subscription> = serde_json::from_value(raw)?;
-    if migrated {
+    let mut subs: Vec<Subscription> = serde_json::from_value(raw)?;
+    let healed = heal_dns_suffixes(&mut subs);
+    if migrated || healed {
         save_subscriptions(paths, &subs)?;
     }
     Ok(subs)
+}
+
+/// Rewrites sing-box leading-dot DNS suffixes (`.ru`) stored before the
+/// notation was normalized to the canonical bare form (`ru`); returns whether
+/// anything changed.
+fn heal_dns_suffixes(subs: &mut [Subscription]) -> bool {
+    let mut healed = false;
+    for sub in subs {
+        let Some(dns) = sub.imported_profile.as_mut().and_then(|p| p.dns.as_mut()) else {
+            continue;
+        };
+        for rule in &mut dns.rules {
+            if let DnsRuleMatch::DomainSuffix { suffix } = &mut rule.match_condition {
+                let normalized = normalize_domain_suffix(suffix);
+                if normalized != suffix.as_str() {
+                    *suffix = normalized.to_string();
+                    healed = true;
+                }
+            }
+        }
+    }
+    healed
 }
 
 pub fn add_subscription(

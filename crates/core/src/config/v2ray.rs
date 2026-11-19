@@ -6,7 +6,7 @@ use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
     DnsHijackMode, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, LoggingSettings, ProxyNode,
     RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings, TrojanConfig,
-    TunConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings,
+    TunConfig, VlessConfig, VmessConfig, WsSettings, XhttpSettings, normalize_domain_suffix,
 };
 
 pub struct V2rayGenerator;
@@ -868,7 +868,10 @@ fn build_user_dns_servers(
                 .map(|rule| match &rule.match_condition {
                     DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
                     DnsRuleMatch::DomainSuffix { suffix } => {
-                        format!("domain:{}", super::common::strip_suffix_wildcard(suffix))
+                        format!(
+                            "domain:{}",
+                            super::common::strip_suffix_wildcard(normalize_domain_suffix(suffix))
+                        )
                     }
                     DnsRuleMatch::DomainKeyword { keyword } => keyword.clone(),
                     DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
@@ -2241,7 +2244,7 @@ mod tests {
         assert_eq!(domestic["address"], "udp://223.5.5.5:53");
         let domestic_domains = domestic["domains"].as_array().unwrap();
         assert_eq!(domestic_domains.len(), 1);
-        assert_eq!(domestic_domains[0], "domain:.cn");
+        assert_eq!(domestic_domains[0], "domain:cn");
     }
 
     #[test]

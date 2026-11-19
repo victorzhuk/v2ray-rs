@@ -1247,8 +1247,21 @@ server_tag = "google"
             }],
             ..Default::default()
         };
+        assert!(leading_dot_suffix.validate().is_ok());
+
+        let double_leading_dot_suffix = DnsConfig {
+            enabled: true,
+            servers: vec![server.clone()],
+            rules: vec![DnsRule {
+                match_condition: DnsRuleMatch::DomainSuffix {
+                    suffix: "..ru".to_string(),
+                },
+                server_tag: "remote".to_string(),
+            }],
+            ..Default::default()
+        };
         assert!(matches!(
-            leading_dot_suffix.validate().unwrap_err(),
+            double_leading_dot_suffix.validate().unwrap_err(),
             DnsValidationError::InvalidRuleMatch(_)
         ));
 

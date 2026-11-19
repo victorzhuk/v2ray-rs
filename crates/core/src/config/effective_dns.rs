@@ -9,7 +9,7 @@ use crate::config::dns_plan::ResolvedDnsPlan;
 use crate::geodata::canonical_rule_set_tag;
 use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, DnsProtocol,
-    DnsRuleMatch, RoutingRule, RuleAction, RuleMatch,
+    DnsRuleMatch, RoutingRule, RuleAction, RuleMatch, normalize_domain_suffix,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,7 +289,10 @@ fn user_dns_entries(
                     .map(|rule| match &rule.match_condition {
                         DnsRuleMatch::GeoSite { category } => format!("geosite:{category}"),
                         DnsRuleMatch::DomainSuffix { suffix } => {
-                            format!("domain:{}", strip_suffix_wildcard(suffix))
+                            format!(
+                                "domain:{}",
+                                strip_suffix_wildcard(normalize_domain_suffix(suffix))
+                            )
                         }
                         DnsRuleMatch::DomainKeyword { keyword } => format!("keyword:{keyword}"),
                         DnsRuleMatch::DomainFull { domain } => format!("full:{domain}"),
@@ -583,7 +586,10 @@ fn server_scope_singbox(
                     }
                 }
                 DnsRuleMatch::DomainSuffix { suffix } => {
-                    domains.push(format!("domain:{}", strip_suffix_wildcard(suffix)));
+                    domains.push(format!(
+                        "domain:{}",
+                        strip_suffix_wildcard(normalize_domain_suffix(suffix))
+                    ));
                 }
                 DnsRuleMatch::DomainKeyword { keyword } => {
                     domains.push(format!("keyword:{keyword}"));

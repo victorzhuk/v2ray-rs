@@ -9,7 +9,7 @@ use crate::models::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, AppSettings, BackendType, ConnectionNodeRef,
     DnsHijackMode, DnsProtocol, DnsRuleMatch, DnsStrategy, GrpcSettings, H2Settings, HostOverride,
     ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TransportSettings,
-    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings,
+    TrojanConfig, TunConfig, VlessConfig, VmessConfig, WsSettings, normalize_domain_suffix,
 };
 
 const GEOIP_RULESET_URL: &str = "https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set";
@@ -617,7 +617,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
                     })
                 }),
                 DnsRuleMatch::DomainSuffix { suffix } => Some(json!({
-                    "domain_suffix": [strip_suffix_wildcard(suffix)],
+                    "domain_suffix": [strip_suffix_wildcard(normalize_domain_suffix(suffix))],
                     "server": rule.server_tag,
                 })),
                 DnsRuleMatch::DomainKeyword { keyword } => Some(json!({
@@ -2583,7 +2583,7 @@ mod tests {
         assert_eq!(rules[0]["rule_set"], json!(["geosite-cn"]));
         assert_eq!(rules[0]["server"], "remote");
 
-        assert_eq!(rules[1]["domain_suffix"], json!([".google.com"]));
+        assert_eq!(rules[1]["domain_suffix"], json!(["google.com"]));
         assert_eq!(rules[1]["server"], "domestic");
     }
 

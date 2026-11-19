@@ -218,10 +218,18 @@ pub fn validate_domain_pattern(pattern: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-/// Validates a DNS domain suffix: an optional single leading `*.` followed by
-/// one or more ASCII alphanumeric or hyphenated labels (allowing single-label
-/// TLD suffixes like `ru`).
+/// Removes a single leading `.` from a domain suffix (sing-box `.ru` notation),
+/// leaving the rest intact. `..ru` keeps one dot and stays invalid.
+pub fn normalize_domain_suffix(suffix: &str) -> &str {
+    suffix.strip_prefix('.').unwrap_or(suffix)
+}
+
+/// Validates a DNS domain suffix: an optional single leading `.` (sing-box
+/// suffix notation, normalized away) or `*.`, followed by one or more ASCII
+/// alphanumeric or hyphenated labels (allowing single-label TLD suffixes like
+/// `ru`). The error payload carries the normalized value.
 pub fn validate_domain_suffix(suffix: &str) -> Result<(), ValidationError> {
+    let suffix = normalize_domain_suffix(suffix);
     let rest = suffix.strip_prefix("*.").unwrap_or(suffix);
     if rest.is_empty()
         || !rest.split('.').all(|label| {
@@ -727,6 +735,7 @@ mod tests {
             "*.example.com",
             "ru",
             "*.ru",
+            ".ru",
             "sub-1.example.org",
         ] {
             assert_eq!(validate_domain_suffix(valid), Ok(()), "suffix={valid}");
@@ -734,7 +743,8 @@ mod tests {
         for invalid in [
             "",
             "*.",
-            ".ru",
+            ".",
+            "..ru",
             "ru.",
             "a..b",
             "*.*.example.com",
@@ -743,10 +753,21 @@ mod tests {
         ] {
             assert_eq!(
                 validate_domain_suffix(invalid),
-                Err(ValidationError::InvalidDomainSuffix(invalid.to_string())),
+                Err(ValidationError::InvalidDomainSuffix(
+                    normalize_domain_suffix(invalid).to_string()
+                )),
                 "suffix={invalid}"
             );
         }
+    }
+
+    #[test]
+    fn test_normalize_domain_suffix() {
+        assert_eq!(normalize_domain_suffix(".ru"), "ru");
+        assert_eq!(normalize_domain_suffix("ru"), "ru");
+        assert_eq!(normalize_domain_suffix("*.ru"), "*.ru");
+        assert_eq!(normalize_domain_suffix("..ru"), ".ru");
+        assert_eq!(normalize_domain_suffix(""), "");
     }
 
     #[test]
@@ -761,6 +782,9 @@ mod tests {
             DnsRuleMatch::DomainSuffix {
                 suffix: "ru".into(),
             },
+            DnsRuleMatch::DomainSuffix {
+                suffix: ".ru".into(),
+            },
             DnsRuleMatch::DomainKeyword {
                 keyword: "yandex".into(),
             },
@@ -773,7 +797,7 @@ mod tests {
 
         assert!(matches!(
             validate_dns_rule_match(&DnsRuleMatch::DomainSuffix {
-                suffix: ".ru".into(),
+                suffix: "..ru".into(),
             }),
             Err(ValidationError::InvalidDomainSuffix(_))
         ));

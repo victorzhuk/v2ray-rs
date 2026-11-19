@@ -3,9 +3,9 @@ use std::process::Command;
 
 use v2ray_rs_core::config::XrayGenerator;
 use v2ray_rs_core::models::{
-    AppSettings, BackendLogLevel, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsServerConfig,
-    HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch, ShadowsocksConfig, TlsSettings,
-    TransportSettings, VlessConfig, WsSettings,
+    AppSettings, BackendLogLevel, ConnectionNodeRef, DnsHijackMode, DnsProtocol, DnsRule,
+    DnsRuleMatch, DnsServerConfig, HostOverride, ProxyNode, RoutingRule, RuleAction, RuleMatch,
+    ShadowsocksConfig, TlsSettings, TransportSettings, VlessConfig, WsSettings,
 };
 
 fn xray_available() -> bool {
@@ -392,4 +392,49 @@ fn new_rule_kinds_pass_xray_test() {
     ];
 
     check_with_rules("new-rule-kinds", &AppSettings::default(), &rules);
+}
+
+#[test]
+fn leading_dot_dns_suffix_generates_canonical_matcher() {
+    if !xray_available() {
+        eprintln!("xray not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns.enabled = true;
+    settings.dns.use_custom_rules = true;
+    settings.dns.servers = vec![DnsServerConfig {
+        tag: "domestic".to_string(),
+        protocol: DnsProtocol::Udp,
+        address: "77.88.8.8".to_string(),
+        port: None,
+        detour: None,
+    }];
+    settings.dns.rules = vec![DnsRule {
+        match_condition: DnsRuleMatch::DomainSuffix {
+            suffix: ".ru".to_string(),
+        },
+        server_tag: "domestic".to_string(),
+    }];
+
+    let config = XrayGenerator
+        .generate(&[ss_node()], &[], &settings)
+        .unwrap_or_else(|err| panic!("leading-dot suffix: generate failed: {err}"));
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(
+        json.contains("\"domain:ru\""),
+        "expected canonical domain:ru matcher\nconfig: {json}"
+    );
+    assert!(
+        !json.contains("domain:.ru"),
+        "leading dot leaked into matcher\nconfig: {json}"
+    );
+
+    check_with_nodes(
+        "dns-custom-rules-leading-dot-suffix",
+        &settings,
+        &[],
+        &[ss_node()],
+    );
 }
