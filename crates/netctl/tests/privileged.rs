@@ -381,7 +381,7 @@ fn strict_up_installs_fallback_routes_and_v6_rules() {
         );
     }
 
-    // No --addr6: the IPv6 table holds only the fallback, never a device route.
+    // No --addr6: the IPv6 table never gains a device route.
     let v6_table = ip_in_output(NS_STRICT, &["-6", "route", "show", "table", "2023"]);
     assert!(
         !v6_table.contains(IFACE),
@@ -395,10 +395,12 @@ fn strict_up_installs_fallback_routes_and_v6_rules() {
             "IPv6 rule {pref} missing under --strict: {v6_rules}"
         );
     }
-    assert!(
-        !v6_rules.contains("8999:"),
-        "IPv6 dns capture rule present without --addr6: {v6_rules}"
-    );
+    for proto in ["ipproto udp dport 53", "ipproto tcp dport 53"] {
+        assert!(
+            v6_rules.contains(proto),
+            "IPv6 dns capture rule missing under --strict --capture-dns ({proto}): {v6_rules}"
+        );
+    }
     let v4_rules = ip_in_output(NS_STRICT, &["rule", "show"]);
     assert!(
         v4_rules.contains("8999:"),

@@ -45,12 +45,9 @@ jobs:
     steps:
       - name: Install dependencies
         run: |
-          pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus gzip sed
-          echo 'ru_RU.UTF-8 UTF-8' >>/etc/locale.gen
+          pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus
           pacman -S --noconfirm glibc-locales
-          ls /usr/share/i18n/locales/ru_RU
-          locale-gen
-          locale -a | grep -qi '^ru_RU.utf8$' || { echo '::error::ru_RU.UTF-8 locale was not generated'; locale -a; exit 1; }
+          locale -a | grep -qi '^ru_RU.utf8$' || { echo '::error::ru_RU.UTF-8 locale is unavailable'; locale -a; exit 1; }
       - name: Install pinned proxy backends
         run: |
           set -euo pipefail
@@ -134,6 +131,8 @@ jobs:
           timeout 3m cargo test --locked -j 2 -p v2ray-rs-netctl --features privileged-tests --bin v2ray-rs-netctl --test privileged --no-run --message-format=json > routing-artifacts.jsonl
           python3 - <<'PYTHON'
           import json
+          import os
+          import shutil
           import subprocess
           from pathlib import Path
           binaries = {entry["target"]["name"]: entry["executable"]
@@ -147,9 +146,16 @@ jobs:
           scenario = "net::tests::journaled_route_mutations_in_private_namespace"
           if scenario + ": test" not in listing.stdout:
               raise SystemExit("required journal scenario is missing")
-          subprocess.run(["timeout", "2m", native, "--exact", scenario, "--test-threads=1"],
+          tmp = os.environ.get("RUNNER_TEMP", "/tmp")
+          unit_bin = os.path.join(tmp, "netctl-unit")
+          priv_bin = os.path.join(tmp, "netctl-privileged")
+          shutil.copy2(native, unit_bin)
+          os.chmod(unit_bin, 0o755)
+          shutil.copy2(binaries["privileged"], priv_bin)
+          os.chmod(priv_bin, 0o755)
+          subprocess.run(["timeout", "2m", unit_bin, "--exact", scenario, "--test-threads=1"],
                          check=True, timeout=130)
-          subprocess.run(["sudo", "env", "V2RAY_RS_REQUIRE_NETNS=1", "timeout", "3m", binaries["privileged"],
+          subprocess.run(["sudo", "env", "V2RAY_RS_REQUIRE_NETNS=1", "timeout", "3m", priv_bin,
                           "--test-threads=1"], check=True, timeout=190)
           PYTHON
 
