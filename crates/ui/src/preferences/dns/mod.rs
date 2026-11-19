@@ -1167,6 +1167,9 @@ mod tests {
                 suffix: "*.ru".to_string(),
             },
             DnsRuleMatch::DomainSuffix {
+                suffix: ".ru".to_string(),
+            },
+            DnsRuleMatch::DomainSuffix {
                 suffix: "ru".to_string(),
             },
             DnsRuleMatch::GeoSite {
@@ -1187,7 +1190,7 @@ mod tests {
                 category: "bad category!".to_string(),
             },
             DnsRuleMatch::DomainSuffix {
-                suffix: ".ru".to_string(),
+                suffix: "..ru".to_string(),
             },
             DnsRuleMatch::DomainSuffix {
                 suffix: "*.".to_string(),

@@ -712,21 +712,82 @@ pub(crate) fn xray_down_args(rt: &TunRuntime) -> Vec<String> {
     args
 }
 
+/// Arguments for the explicit `netctl recover --force-legacy` escape hatch:
+/// it clears the TUN device, its policy rules, and the fail-closed routes by
+/// name, without ownership verification. Only for a confirmed operator action.
+pub fn operator_recover_args(iface: &str, backend: BackendType) -> Vec<String> {
+    let flag = if backend == BackendType::SingBox {
+        "--singbox"
+    } else {
+        "--xray"
+    };
+    vec![
+        "recover".to_string(),
+        "--iface".to_string(),
+        iface.to_string(),
+        flag.to_string(),
+        "--force-legacy".to_string(),
+    ]
+}
+
+/// Explicit operator recovery of leftover TUN state. Runs the route helper
+/// elevated (pkexec) with --force-legacy, bypassing ownership verification.
+/// Caller must confirm.
+pub async fn operator_recover(helper: &Path, iface: &str, backend: BackendType) -> HelperRun {
+    let args = operator_recover_args(iface, backend);
+    run_elevated_helper(helper, &args, OPERATOR_RECOVERY_POLKIT_TIMEOUT).await
+}
+
+/// Operator recovery waits behind an interactive polkit authentication
+/// prompt, so its budget must cover a human typing a password, not just the
+/// helper run itself.
+const OPERATOR_RECOVERY_POLKIT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs `helper` through `pkexec`, satisfying helpers that require euid 0.
+async fn run_elevated_helper(helper: &Path, args: &[String], timeout: Duration) -> HelperRun {
+    let verb = args.first().map_or("helper", String::as_str);
+    run_command(
+        || {
+            let mut cmd = Command::new("pkexec");
+            cmd.arg(helper)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            cmd
+        },
+        verb,
+        timeout,
+    )
+    .await
+}
+
 /// Runs the route helper with its output captured and its lifetime bounded.
 /// `kill_on_drop` covers a caller that abandons the future mid-run; the
 /// timeout covers a helper wedged in a netlink call.
 pub async fn run_helper(helper: &Path, args: &[String], timeout: Duration) -> HelperRun {
     let verb = args.first().map_or("helper", String::as_str);
-    let spawned = crate::spawn::spawn_with_etxtbsy_retry(|| {
-        let mut cmd = Command::new(helper);
-        cmd.args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        cmd
-    })
-    .await;
+    run_command(
+        || {
+            let mut cmd = Command::new(helper);
+            cmd.args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true);
+            cmd
+        },
+        verb,
+        timeout,
+    )
+    .await
+}
+
+/// Shared spawn/reader/timeout body for every helper run. `build` is invoked
+/// once per spawn attempt, so ETXTBSY retries construct a fresh `Command`.
+async fn run_command(build: impl FnMut() -> Command, verb: &str, timeout: Duration) -> HelperRun {
+    let spawned = crate::spawn::spawn_with_etxtbsy_retry(build).await;
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
@@ -809,6 +870,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_recover_args_matches_backend_flag() {
+        assert_eq!(
+            operator_recover_args("tun9", BackendType::Xray),
+            ["recover", "--iface", "tun9", "--xray", "--force-legacy"]
+                .map(String::from)
+                .to_vec()
+        );
+        assert_eq!(
+            operator_recover_args("tun9", BackendType::SingBox),
+            ["recover", "--iface", "tun9", "--singbox", "--force-legacy"]
+                .map(String::from)
+                .to_vec()
+        );
+    }
 
     #[tokio::test]
     async fn wait_for_existing_device_returns_immediately() {

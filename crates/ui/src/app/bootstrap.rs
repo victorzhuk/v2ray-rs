@@ -257,6 +257,38 @@ pub(super) async fn recover_tun_session(
     }
 }
 
+/// Records a confirmed operator recovery attempt and, only after the helper
+/// exited 0, retires the journal so the next connect prepares a fresh session.
+/// A failed recovery keeps the journal: it is the remaining evidence of the
+/// leaked kernel state. Never touches kernel state itself.
+pub(super) fn finish_operator_recovery(
+    paths: &AppPaths,
+    iface: &str,
+    run: v2ray_rs_process::HelperRun,
+) -> Result<(), String> {
+    let outcome = match &run.result {
+        Ok(()) => "recover ok".to_string(),
+        Err(err) => err.clone(),
+    };
+    match RotatingFileWriter::open(paths.logs_dir().join("backend.log"), DEFAULT_MAX_BYTES) {
+        Ok(log) => {
+            for line in &run.output {
+                log.append_line("helper", line);
+            }
+            log.append_line("helper", &outcome);
+        }
+        Err(err) => log::warn!("open backend log: {err}"),
+    }
+    log::info!("operator recovery for {iface}: {outcome}");
+    match run.result {
+        Ok(()) => v2ray_rs_core::persistence::clear_tun_session(paths).map_err(|err| {
+            log::warn!("clear operator-recovered TUN session: {err}");
+            err.to_string()
+        }),
+        Err(err) => Err(err),
+    }
+}
+
 pub(super) fn install_icon_for_compositor(profile: &AppProfile) {
     let data_dir = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)

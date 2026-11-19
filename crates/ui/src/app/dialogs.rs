@@ -52,6 +52,38 @@ pub(super) fn error_toast_action(
     (grant_generation == Some(generation)).then_some(ToastAction::GrantTun)
 }
 
+/// Confirmed escape hatch for leftover TUN state the ownership checks refuse
+/// to touch: the elevated helper force-removes the device and its routing
+/// rules. Runs only on the explicit "recover" response.
+pub(super) fn show_recover_tun_dialog(
+    window: &adw::ApplicationWindow,
+    iface: &str,
+    sender: &ComponentSender<App>,
+) {
+    let sender = sender.clone();
+    let dialog = adw::AlertDialog::builder()
+        .heading("Recover TUN routes")
+        .body(format!(
+            "Force-remove the TUN device {iface} and its routing rules? \
+             Use this only when no v2ray-rs tunnel is active."
+        ))
+        .build();
+
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("recover", "Recover");
+    dialog.set_response_appearance("recover", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+
+    dialog.connect_response(None, move |_, response| {
+        if response == "recover" {
+            sender.input(AppMsg::RecoverTunOperator);
+        }
+    });
+
+    dialog.present(Some(window));
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum DisconnectPlan {
     Stop,

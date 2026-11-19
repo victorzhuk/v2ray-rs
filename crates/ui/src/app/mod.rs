@@ -114,6 +114,7 @@ pub struct App {
     health_failover: HealthFailover,
     reconnect_generation: u32,
     tun_release_in_flight: bool,
+    tun_operator_in_flight: bool,
     regen: RegenScheduler,
     _signal_sources: Vec<glib::SourceId>,
 }
@@ -192,11 +193,35 @@ pub enum AppMsg {
     },
     /// The user activated the offered refresh action.
     RefreshSubscription(uuid::Uuid),
+    /// A failed TUN release or startup recovery offers the operator recovery
+    /// action instead of only naming the CLI escape hatch.
+    ShowRecoveryToast(String),
+    /// The user activated the offered operator recovery action.
+    ConfirmRecoverTunOperator,
+    /// The confirmed dialog handed off: run the elevated recovery helper.
+    RecoverTunOperator,
+    /// The confirmed operator recovery finished; the flag reports whether the
+    /// journal was cleared.
+    TunOperatorRecovered(bool),
 }
 
 impl App {
     fn show_toast(&self, msg: &str) {
         self.toast_overlay.add_toast(adw::Toast::new(msg));
+    }
+
+    /// The dead-end recovery toast carries the operator recovery action: a
+    /// plain toast would leave the leaked TUN state unfixable from the app.
+    fn show_recovery_toast(&self, message: &str, sender: &ComponentSender<Self>) {
+        let toast = adw::Toast::builder()
+            .title(message)
+            .button_label("Recover TUN routes")
+            .build();
+        let s = sender.input_sender().clone();
+        toast.connect_button_clicked(move |_| {
+            s.emit(AppMsg::ConfirmRecoverTunOperator);
+        });
+        self.toast_overlay.add_toast(toast);
     }
 
     fn apply_state(&mut self, state: &ProcessState) {
@@ -347,6 +372,18 @@ impl App {
         })
     }
 
+    /// Iface and backend an operator recovery must clear: the journal records
+    /// what leaked; without one the current settings name the target.
+    fn operator_recovery_target(&self) -> (String, BackendType) {
+        match v2ray_rs_core::persistence::load_tun_session(&self.paths) {
+            Some(session) => (session.iface, session.backend),
+            None => (
+                self.settings.tun.interface_name.clone(),
+                self.settings.backend.backend_type,
+            ),
+        }
+    }
+
     /// Releases TUN routes left installed by a session that ended without a
     /// clean stop. Takes the lifecycle lock like the startup pass so it cannot
     /// flush routes from under a connection that is starting.
@@ -363,7 +400,7 @@ impl App {
             let _lifecycle = lifecycle.lock().await;
             let released = recover_tun_session(&paths, &v2ray_rs_process::helper_path()).await;
             if let Err(failure) = &released {
-                s.emit(AppMsg::ShowToast(failure.toast()));
+                s.emit(AppMsg::ShowRecoveryToast(failure.toast()));
             }
             s.emit(AppMsg::TunReleased(released.is_ok()));
         });
@@ -386,7 +423,7 @@ impl App {
         let tun_active = tun_active_for(
             &self.process_state,
             self.runtime_snapshot.as_ref(),
-            self.tun_release_in_flight,
+            self.tun_release_in_flight || self.tun_operator_in_flight,
             self.tun_marker_present(),
         );
         self.subscriptions_page
@@ -400,7 +437,7 @@ impl App {
         }
         self.cancel_auto_reconnect();
         self.flush_pending_settings(sender);
-        if self.tun_release_in_flight {
+        if self.tun_release_in_flight || self.tun_operator_in_flight {
             self.pending_exit = true;
             return;
         }
@@ -1121,7 +1158,7 @@ impl SimpleComponent for App {
                 if let Err(failure) =
                     recover_tun_session(&bg_paths, &v2ray_rs_process::helper_path()).await
                 {
-                    s.emit(AppMsg::ShowToast(failure.toast()));
+                    s.emit(AppMsg::ShowRecoveryToast(failure.toast()));
                 }
             });
         }
@@ -1255,6 +1292,7 @@ impl SimpleComponent for App {
             connection_origin: ConnectOrigin::User,
             reconnect_generation: 0,
             tun_release_in_flight: false,
+            tun_operator_in_flight: false,
             regen: RegenScheduler::default(),
             _signal_sources: signal_sources,
         };
@@ -1368,6 +1406,72 @@ impl SimpleComponent for App {
                 self.subscriptions_page
                     .emit(SubscriptionsMsg::UpdateSubscription(subscription_id));
             }
+            AppMsg::ShowRecoveryToast(message) => {
+                self.show_recovery_toast(&message, &sender);
+            }
+            AppMsg::ConfirmRecoverTunOperator => {
+                let (iface, _) = self.operator_recovery_target();
+                if self.tun_release_in_flight
+                    || self.tun_operator_in_flight
+                    || self.process_handle.is_some()
+                {
+                    self.show_toast("Stop the connection before recovering TUN routes");
+                    return;
+                }
+                show_recover_tun_dialog(&self.window, &iface, &sender);
+            }
+            AppMsg::RecoverTunOperator => {
+                if self.tun_release_in_flight
+                    || self.tun_operator_in_flight
+                    || self.process_handle.is_some()
+                {
+                    self.show_toast("Stop the connection before recovering TUN routes");
+                    return;
+                }
+                let (iface, backend) = self.operator_recovery_target();
+                self.tun_operator_in_flight = true;
+                self.sync_tun_probe_gate();
+                let paths = self.paths.clone();
+                let lifecycle = self.tun_lifecycle.clone();
+                let s = sender.input_sender().clone();
+                tokio::spawn(async move {
+                    // Operator recovery flushes routing state wholesale, so it
+                    // serializes behind any session lifecycle like the startup
+                    // recovery pass does.
+                    let _lifecycle = lifecycle.lock().await;
+                    let run = v2ray_rs_process::operator_recover(
+                        &v2ray_rs_process::helper_path(),
+                        &iface,
+                        backend,
+                    )
+                    .await;
+                    let result = finish_operator_recovery(&paths, &iface, run);
+                    let recovered = result.is_ok();
+                    match result {
+                        Ok(()) => s.emit(AppMsg::ShowToast("TUN routes recovered".into())),
+                        Err(error) => s.emit(AppMsg::ShowToast(error)),
+                    }
+                    s.emit(AppMsg::TunOperatorRecovered(recovered));
+                });
+            }
+            AppMsg::TunOperatorRecovered(recovered) => {
+                self.tun_operator_in_flight = false;
+                self.sync_tun_probe_gate();
+                if self.pending_exit {
+                    self.pending_exit = false;
+                    self.window.destroy();
+                    return;
+                }
+                if recovered {
+                    if let Some(deferred) = self.deferred_connect.take() {
+                        sender.input(deferred.into_msg());
+                    }
+                } else {
+                    // The journal survives a failed recovery: a queued connect
+                    // must not start over the leaked state.
+                    self.deferred_connect = None;
+                }
+            }
             AppMsg::DownloadGeodata => {
                 let paths = self.paths.clone();
                 let backend = self.settings.backend.backend_type;
@@ -1400,9 +1504,9 @@ impl SimpleComponent for App {
                 if self.process_handle.is_some() {
                     return;
                 }
-                if self.tun_release_in_flight {
-                    // Route release owns the host right now; replay the
-                    // request once it finishes cleanly.
+                if self.tun_release_in_flight || self.tun_operator_in_flight {
+                    // Route release or operator recovery owns the host right
+                    // now; replay the request once it finishes cleanly.
                     if cancels_auto_reconnect(origin) {
                         self.cancel_auto_reconnect();
                     }
@@ -1493,9 +1597,9 @@ impl SimpleComponent for App {
                     self.deferred_connect = Some(DeferredConnect::Node(target, origin));
                     return;
                 }
-                if self.tun_release_in_flight {
-                    // Route release owns the host right now; replay the
-                    // request once it finishes cleanly.
+                if self.tun_release_in_flight || self.tun_operator_in_flight {
+                    // Route release or operator recovery owns the host right
+                    // now; replay the request once it finishes cleanly.
                     if cancels_auto_reconnect(origin) {
                         self.cancel_auto_reconnect();
                     }
@@ -3164,6 +3268,52 @@ mod tests {
             assert_eq!(paths.tun_session_path().exists(), retained, "{phase:?}");
             assert!(!called.exists());
         }
+    }
+
+    #[tokio::test]
+    async fn operator_recovery_success_clears_marker_and_prepares_fresh_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let args = tmp.path().join("args");
+        let helper = stub_helper(&tmp, &format!("echo \"$@\" > {}", args.display()));
+
+        let run = v2ray_rs_process::run_helper(
+            &helper,
+            &v2ray_rs_process::operator_recover_args("tun9", BackendType::Xray),
+            v2ray_rs_process::HELPER_TIMEOUT,
+        )
+        .await;
+        assert!(finish_operator_recovery(&paths, "tun9", run).is_ok());
+
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_none());
+        let session =
+            v2ray_rs_core::persistence::prepare_tun_session(&paths, BackendType::Xray, "tun9")
+                .unwrap();
+        assert_eq!(
+            session.ownership.unwrap().phase,
+            v2ray_rs_core::persistence::TunPhase::Prepared
+        );
+        let recorded = std::fs::read_to_string(&args).unwrap();
+        assert!(recorded.contains("--force-legacy"), "{recorded}");
+    }
+
+    #[tokio::test]
+    async fn operator_recovery_failure_keeps_marker_and_logs_helper_output() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_with_marker(&tmp);
+        let helper = stub_helper(&tmp, "echo busy; exit 1");
+
+        let run = v2ray_rs_process::run_helper(
+            &helper,
+            &v2ray_rs_process::operator_recover_args("tun9", BackendType::Xray),
+            v2ray_rs_process::HELPER_TIMEOUT,
+        )
+        .await;
+        assert!(finish_operator_recovery(&paths, "tun9", run).is_err());
+
+        assert!(v2ray_rs_core::persistence::load_tun_session(&paths).is_some());
+        let logged = std::fs::read_to_string(paths.logs_dir().join("backend.log")).unwrap();
+        assert!(logged.contains("helper busy"), "{logged}");
     }
 
     #[test]
