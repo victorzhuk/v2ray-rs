@@ -6,7 +6,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::models::{
-    AutoResolveStrategy, DnsConfig, LastSuccessMetadata, TunConfig, ValidationError,
+    AutoResolveStrategy, DnsConfig, DnsStrategy, LastSuccessMetadata, TunConfig, ValidationError,
     validate_test_url,
 };
 
@@ -284,6 +284,18 @@ impl AppSettings {
         }
         Ok(())
     }
+
+    /// Resolution family used by generated configs. A TUN session with no IPv6
+    /// tunnel address resolves IPv4 only: an AAAA answer selects an egress the
+    /// tunnel cannot carry, and destinations geo-block on that egress family.
+    /// An explicit `tun.address_v6` keeps the configured policy.
+    pub fn effective_dns_strategy(&self) -> DnsStrategy {
+        if self.tun.enabled && self.tun.address_v6.is_none() {
+            DnsStrategy::Ipv4Only
+        } else {
+            self.dns.strategy
+        }
+    }
 }
 
 fn deserialize_auto_resolve_strategy<'de, D>(
@@ -360,6 +372,22 @@ mod tests {
         assert_eq!(backend.backend_type, BackendType::Xray);
         assert!(backend.binary_path.is_none());
         assert!(backend.config_output_dir.is_none());
+    }
+
+    #[test]
+    fn effective_dns_strategy_follows_tun_address_v6() {
+        let mut settings = AppSettings::default();
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+        assert_eq!(settings.effective_dns_strategy(), DnsStrategy::PreferIpv6);
+
+        settings.tun.enabled = true;
+        assert_eq!(settings.effective_dns_strategy(), DnsStrategy::Ipv4Only);
+
+        settings.tun.address_v6 = Some("fd12::1/126".to_string());
+        assert_eq!(settings.effective_dns_strategy(), DnsStrategy::PreferIpv6);
+
+        settings.dns.strategy = DnsStrategy::Ipv4Only;
+        assert_eq!(settings.effective_dns_strategy(), DnsStrategy::Ipv4Only);
     }
 
     #[test]

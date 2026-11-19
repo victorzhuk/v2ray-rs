@@ -1176,7 +1176,7 @@ fn unpinned_host<'a>(settings: &AppSettings, nodes: &'a [ProxyNode]) -> Option<&
                 .dns
                 .hosts
                 .iter()
-                .any(|h| h.domain == *host && h.matches_strategy(settings.dns.strategy))
+                .any(|h| h.domain == *host && h.matches_strategy(settings.effective_dns_strategy()))
     })
 }
 
@@ -4582,5 +4582,26 @@ exit 1"#,
             Some("proxy.example.com"),
             "an override of the wrong family is an empty answer, not a pin"
         );
+    }
+
+    #[test]
+    fn prefer_ipv6_pin_needs_a_tunnel_v6_address() {
+        let mut settings = tun_settings();
+        settings.backend.backend_type = BackendType::Xray;
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+        settings.dns.hosts.push(HostOverride {
+            domain: "proxy.example.com".into(),
+            ip: "2001:db8::1".into(),
+        });
+
+        let nodes = [node("proxy.example.com")];
+        assert_eq!(
+            unpinned_host(&settings, &nodes),
+            Some("proxy.example.com"),
+            "without tun.address_v6 the session resolves IPv4 only: a v6-only pin is an empty answer"
+        );
+
+        settings.tun.address_v6 = Some("fd12::1/126".into());
+        assert_eq!(unpinned_host(&settings, &nodes), None);
     }
 }

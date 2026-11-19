@@ -721,7 +721,7 @@ fn build_dns_for_backend(
 
     dns_config["servers"] = json!(servers);
 
-    dns_config["queryStrategy"] = json!(query_strategy_str(settings.dns.strategy));
+    dns_config["queryStrategy"] = json!(query_strategy_str(settings.effective_dns_strategy()));
 
     if let Some(hosts) = hosts_for_strategy(settings) {
         dns_config["hosts"] = hosts;
@@ -798,7 +798,7 @@ fn hosts_for_strategy(settings: &AppSettings) -> Option<Value> {
         if !named.contains(&host.domain.as_str()) {
             named.push(&host.domain);
         }
-        if !host.matches_strategy(settings.dns.strategy) {
+        if !host.matches_strategy(settings.effective_dns_strategy()) {
             continue;
         }
 
@@ -3149,6 +3149,11 @@ mod tests {
             let mut settings = default_settings();
             settings.tun.enabled = true;
             settings.dns.strategy = strategy;
+            // A v6 tunnel address keeps the configured policy in force; the
+            // IPv4-only no-address default has its own test below.
+            if matches!(strategy, DnsStrategy::PreferIpv6 | DnsStrategy::Ipv6Only) {
+                settings.tun.address_v6 = Some("fd12::1/126".into());
+            }
 
             let config = crate::config::xray::XrayGenerator
                 .generate(&[ss_node()], &[], &settings)
@@ -3166,6 +3171,69 @@ mod tests {
             );
             assert!(freedom["settings"].get("domainStrategy").is_none());
         }
+    }
+
+    #[test]
+    fn test_xray_tun_without_address_v6_resolves_ipv4_only() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let config = crate::config::xray::XrayGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert_eq!(config["dns"]["queryStrategy"], "UseIPv4");
+        let freedom = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert_eq!(
+            freedom["streamSettings"]["sockopt"]["domainStrategy"], "UseIPv4",
+            "no tun.address_v6 means IPv4-only resolution: an AAAA answer selects an egress the tunnel cannot carry"
+        );
+    }
+
+    #[test]
+    fn test_xray_tun_address_v6_keeps_configured_strategy() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.address_v6 = Some("fd12::1/126".into());
+        settings.dns.enabled = true;
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+        settings.dns.servers = vec![DnsServerConfig {
+            tag: "test".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: None,
+            detour: None,
+        }];
+
+        let config = crate::config::xray::XrayGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+
+        assert_eq!(config["dns"]["queryStrategy"], "UseIPv6");
+        let freedom = config["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["protocol"] == "freedom")
+            .unwrap();
+        assert_eq!(
+            freedom["streamSettings"]["sockopt"]["domainStrategy"],
+            "UseIPv6"
+        );
     }
 
     #[test]

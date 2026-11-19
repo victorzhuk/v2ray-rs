@@ -108,7 +108,7 @@ fn derived_tun_dns(settings: &AppSettings, first_proxy_tag: &str) -> Value {
     servers.push(doh);
 
     let mut dns_config = json!({
-        "strategy": strategy_str(settings.dns.strategy),
+        "strategy": strategy_str(settings.effective_dns_strategy()),
         "servers": servers,
         "rules": rules,
         "final": DERIVED_DNS_TAG,
@@ -137,7 +137,7 @@ fn hosts_server(settings: &AppSettings) -> Option<Value> {
 
     let mut predefined = serde_json::Map::new();
     for host in &settings.dns.hosts {
-        if !host_matches_singbox_strategy(host, settings.dns.strategy) {
+        if !host_matches_singbox_strategy(host, settings.effective_dns_strategy()) {
             continue;
         }
         predefined
@@ -162,7 +162,7 @@ fn hosts_server(settings: &AppSettings) -> Option<Value> {
 fn hosts_rule(settings: &AppSettings) -> Option<Value> {
     let mut domains: Vec<&str> = Vec::new();
     for host in &settings.dns.hosts {
-        if !host_matches_singbox_strategy(host, settings.dns.strategy) {
+        if !host_matches_singbox_strategy(host, settings.effective_dns_strategy()) {
             continue;
         }
         if !domains.contains(&host.domain.as_str()) {
@@ -178,11 +178,9 @@ fn hosts_rule(settings: &AppSettings) -> Option<Value> {
 fn pinned_by_hosts(settings: &AppSettings, host: &str) -> bool {
     (settings.dns.enabled || settings.tun.enabled)
         && host.parse::<std::net::IpAddr>().is_err()
-        && settings
-            .dns
-            .hosts
-            .iter()
-            .any(|h| h.domain == host && host_matches_singbox_strategy(h, settings.dns.strategy))
+        && settings.dns.hosts.iter().any(|h| {
+            h.domain == host && host_matches_singbox_strategy(h, settings.effective_dns_strategy())
+        })
 }
 
 fn strategy_str(strategy: DnsStrategy) -> &'static str {
@@ -468,7 +466,7 @@ fn build_dns(rules: &[RoutingRule], settings: &AppSettings, first_proxy_tag: &st
     plan.warn_compat();
     let mut dns_config = json!({});
 
-    dns_config["strategy"] = json!(strategy_str(settings.dns.strategy));
+    dns_config["strategy"] = json!(strategy_str(settings.effective_dns_strategy()));
 
     let mut servers: Vec<Value> = Vec::new();
 
@@ -2481,6 +2479,33 @@ mod tests {
     }
 
     #[test]
+    fn test_singbox_tun_without_address_v6_resolves_ipv4_only() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.dns.enabled = true;
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+        assert_eq!(config["dns"]["strategy"], "ipv4_only");
+    }
+
+    #[test]
+    fn test_singbox_tun_address_v6_keeps_configured_strategy() {
+        let mut settings = default_settings();
+        settings.tun.enabled = true;
+        settings.tun.address_v6 = Some("fd12::1/126".into());
+        settings.dns.enabled = true;
+        settings.dns.strategy = DnsStrategy::PreferIpv6;
+
+        let config = SingboxGenerator
+            .generate(&[ss_node()], &[], &settings)
+            .unwrap();
+        assert_eq!(config["dns"]["strategy"], "prefer_ipv6");
+    }
+
+    #[test]
     fn test_dns_fakeip_config() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
@@ -3503,6 +3528,9 @@ mod tests {
         let mut settings = default_settings();
         settings.tun.enabled = true;
         settings.dns.strategy = DnsStrategy::PreferIpv4;
+        // Dual-stack hosts output needs the configured PreferIpv4 in force: a
+        // session without tun.address_v6 resolves IPv4 only.
+        settings.tun.address_v6 = Some("fd12::1/126".into());
         settings.dns.hosts = vec![
             HostOverride {
                 domain: "ss.example.com".into(),
@@ -3548,6 +3576,9 @@ mod tests {
             settings.tun.enabled = true;
             settings.dns.enabled = true;
             settings.dns.strategy = strategy;
+            // The configured single-family policy must stay in force for this
+            // test: a session without tun.address_v6 resolves IPv4 only.
+            settings.tun.address_v6 = Some("fd12::1/126".into());
             settings.dns.hosts = vec![HostOverride {
                 domain: "ss.example.com".into(),
                 ip: pin_ip.into(),

@@ -192,7 +192,7 @@ fn apply_xray_vless_extensions(outbound: &mut Value, c: &VlessConfig) {
 /// `Use*` rather than `Force*`: a node whose address family the resolver cannot
 /// satisfy should still be dialled as-is instead of failing the connection.
 fn tun_domain_strategy(settings: &AppSettings) -> &'static str {
-    match settings.dns.strategy {
+    match settings.effective_dns_strategy() {
         crate::models::DnsStrategy::Ipv6Only | crate::models::DnsStrategy::PreferIpv6 => "UseIPv6",
         _ => "UseIPv4",
     }

@@ -79,7 +79,7 @@ impl ResolvedDnsPlan {
             backend,
             enabled: settings.dns.enabled,
             tun_enabled: settings.tun.enabled,
-            strategy: settings.dns.strategy,
+            strategy: settings.effective_dns_strategy(),
             servers,
             bootstrap_domains: bootstrap_domains(settings, node_hosts),
             hosts: settings.dns.hosts.clone(),

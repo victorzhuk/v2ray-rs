@@ -455,7 +455,7 @@ fn static_entries_v2ray(settings: &AppSettings) -> Option<Vec<EffectiveDnsEntry>
     let mut entries = Vec::new();
     let mut named: Vec<String> = Vec::new();
     for host in &settings.dns.hosts {
-        if !host.matches_strategy(settings.dns.strategy) {
+        if !host.matches_strategy(settings.effective_dns_strategy()) {
             continue;
         }
         if !named.contains(&host.domain) {
@@ -539,7 +539,10 @@ fn singbox_dns(settings: &AppSettings, rules: &[RoutingRule]) -> EffectiveDns {
     if !settings.dns.hosts.is_empty() {
         let mut seen: Vec<String> = Vec::new();
         for host in &settings.dns.hosts {
-            if !super::singbox::host_matches_singbox_strategy(host, settings.dns.strategy) {
+            if !super::singbox::host_matches_singbox_strategy(
+                host,
+                settings.effective_dns_strategy(),
+            ) {
                 continue;
             }
             if !seen.contains(&host.domain) {
@@ -1244,6 +1247,47 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("router.local"))
         );
+    }
+
+    #[test]
+    fn tun_without_address_v6_reports_ipv4_only_resolution() {
+        for backend in [BackendType::Xray, BackendType::SingBox] {
+            let mut settings = default_settings();
+            settings.tun.enabled = true;
+            settings.dns.enabled = true;
+            settings.dns.strategy = DnsStrategy::PreferIpv6;
+            settings.dns.servers = vec![server("main", DnsProtocol::Udp, "9.9.9.9")];
+            settings.dns.hosts = vec![
+                host("v4.example.com", "192.0.2.10"),
+                host("v6.example.com", "2001:db8::10"),
+            ];
+
+            let summary = effective_dns(backend, &settings, &[], &["203.0.113.10"]);
+            let statics: Vec<&str> = summary
+                .entries()
+                .iter()
+                .filter(|e| e.path == DnsPath::Static)
+                .map(|e| e.address.as_str())
+                .collect();
+            assert_eq!(statics, vec!["v4.example.com"], "{backend:?}");
+
+            settings.tun.address_v6 = Some("fd12::1/126".into());
+            let summary = effective_dns(backend, &settings, &[], &["203.0.113.10"]);
+            let mut statics: Vec<&str> = summary
+                .entries()
+                .iter()
+                .filter(|e| e.path == DnsPath::Static)
+                .map(|e| e.address.as_str())
+                .collect();
+            statics.sort_unstable();
+            let expected: Vec<&str> = match backend {
+                // sing-box Prefer* keeps every parseable address; xray collapses
+                // Prefer* to one family, here the v6 one.
+                BackendType::SingBox => vec!["v4.example.com", "v6.example.com"],
+                _ => vec!["v6.example.com"],
+            };
+            assert_eq!(statics, expected, "{backend:?}");
+        }
     }
 
     #[test]
