@@ -559,13 +559,13 @@ fn attached_bridge_is_not_captured() {
     );
 }
 
-/// 2. Positive control: sing-box's auto_route installs
-///    `lookup 2022 suppress_prefixlength 0`, which exempts main-table connected
-///    prefixes, so a connected destination no longer reproduces the historical
-///    capture defect. With automatic discovery disabled this control instead
-///    proves the harness can still observe TUN capture on a non-connected
+/// 2. Positive control: with automatic discovery disabled the generated config
+///    carries no `route_exclude_address`, so sing-box's auto_route installs
+///    `lookup 2022 suppress_prefixlength 0`, which exempts every non-default
+///    main-table route and captures only default-destined traffic. This
+///    control therefore proves capture is observable on a default-destined
 ///    destination and that automatic discovery is what emits exclusions —
-///    not that a connected prefix gets captured.
+///    not that a main-table-routed prefix gets captured.
 #[test]
 fn positive_control_without_automatic_exclusions() {
     if is_child() {
@@ -576,12 +576,29 @@ fn positive_control_without_automatic_exclusions() {
             "generated config carries automatic exclusions although discovery is disabled: {exclusions:?}"
         );
         evidence("no_auto_exclusions", "yes");
-        assert_route("10.0.0.5", TUN_IFACE);
+        for cmd in [
+            ["rule", "list"].as_slice(),
+            ["route", "show", "table", "2022"].as_slice(),
+        ] {
+            let dump = Command::new("/usr/bin/ip")
+                .args(cmd)
+                .output()
+                .map(|o| {
+                    format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&o.stdout),
+                        String::from_utf8_lossy(&o.stderr)
+                    )
+                })
+                .unwrap_or_else(|e| format!("ip {:?} failed: {e}", cmd));
+            eprintln!("== ip {:?} ==\n{dump}", cmd);
+        }
+        assert_route("203.0.113.10", TUN_IFACE);
         return;
     }
     run_namespaced(
         "positive_control_without_automatic_exclusions",
-        &["no_auto_exclusions=yes", "route_10.0.0.5=tun0"],
+        &["no_auto_exclusions=yes", "route_203.0.113.10=tun0"],
     );
 }
 

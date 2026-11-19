@@ -47,6 +47,8 @@ jobs:
         run: |
           pacman -Syu --noconfirm base-devel pkgconf gtk4 libadwaita gettext protobuf curl unzip xorg-server-xvfb xorg-xauth dbus gzip sed
           echo 'ru_RU.UTF-8 UTF-8' >>/etc/locale.gen
+          test -f /usr/share/i18n/locales/ru_RU || pacman -S --noconfirm glibc
+          ls /usr/share/i18n/locales/ru_RU
           locale-gen
           locale -a | grep -qi '^ru_RU.utf8$' || { echo '::error::ru_RU.UTF-8 locale was not generated'; locale -a; exit 1; }
       - name: Install pinned proxy backends
