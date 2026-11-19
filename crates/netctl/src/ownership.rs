@@ -102,20 +102,35 @@ impl Owner {
             self.state_mut().resources = live;
             self.state_mut().pending = None;
         } else {
+            let iface = &self.session.iface;
+            let flag = if self.session.backend == "sing-box" {
+                "--singbox"
+            } else {
+                "--xray"
+            };
             if self.state().phase != Phase::Prepared
                 || !self.state().resources.is_empty()
                 || self.state().pending.is_some()
             {
-                return Err(
-                    "TUN kernel reservation is missing; explicit operator recovery is required"
-                        .into(),
-                );
+                return Err(format!(
+                    "TUN kernel reservation is missing; explicit operator recovery is required; \
+                     run `v2ray-rs-netctl recover --iface {iface} {flag} --force-legacy` as root, \
+                     or use Recover TUN routes in the app"
+                ));
             }
             if !snapshot(handle).await?.is_empty() {
-                return Err("xray routing table or rule priorities are already in use".into());
+                return Err(format!(
+                    "xray routing table or rule priorities are already in use; run operator \
+                     recovery (Recover TUN routes in the app, or `v2ray-rs-netctl recover \
+                     --iface {iface} {flag} --force-legacy` as root)"
+                ));
             }
             if link(handle, &self.session.iface).await?.is_some() {
-                return Err("TUN interface name is already in use".into());
+                return Err(format!(
+                    "TUN interface name is already in use; run operator recovery (Recover TUN \
+                     routes in the app, or `v2ray-rs-netctl recover --iface {iface} {flag} \
+                     --force-legacy` as root)"
+                ));
             }
             handle
                 .link()
@@ -188,14 +203,15 @@ impl Owner {
                 Err("TUN device is absent".into())
             };
         };
-        if self.state().device_ifindex != Some(device.header.index)
-            || !device
+        device_identity_error(
+            &self.session.iface,
+            self.state().device_ifindex,
+            device.header.index,
+            device
                 .attributes
-                .contains(&LinkAttribute::IfAlias(self.state().alias()))
-            || !crate::validate::is_tun_device(&self.session.iface)
-        {
-            return Err("TUN device identity changed; refusing to touch networking".into());
-        }
+                .contains(&LinkAttribute::IfAlias(self.state().alias())),
+            crate::validate::is_tun_device(&self.session.iface),
+        )?;
         Ok(Some(device.header.index))
     }
 
@@ -405,6 +421,30 @@ impl Owner {
         self.state_mut().pending = None;
         self.save()
     }
+}
+
+/// Splits the TUN device identity refusal so a recreated ifindex names both
+/// indexes: the operator must be able to tell an orphaned session's device
+/// from a hijacked alias before reaching for recovery. Pure so tests cover
+/// the decision without a netlink handle.
+fn device_identity_error(
+    iface: &str,
+    recorded: Option<u32>,
+    live: u32,
+    alias_ok: bool,
+    tun_ok: bool,
+) -> Result<(), String> {
+    if !alias_ok || !tun_ok {
+        return Err("TUN device identity changed; refusing to touch networking".into());
+    }
+    if recorded != Some(live) {
+        let recorded = recorded.map_or("none".to_string(), |index| index.to_string());
+        return Err(format!(
+            "TUN device {iface} was recreated (ifindex {live} != recorded {recorded}); \
+             the previous session's device is gone - operator recovery required"
+        ));
+    }
+    Ok(())
 }
 
 /// A crash respawn may resume from any pre-cleanup phase, but a journal left
@@ -738,5 +778,28 @@ mod tests {
         }
         assert!(check_reserve_phase(Phase::Cleaning).is_err());
         assert!(check_reserve_phase(Phase::Complete).is_err());
+    }
+
+    #[test]
+    fn device_identity_error_names_recreated_indexes_and_keeps_other_refusals() {
+        let recreated = device_identity_error("tun0", Some(38), 34, true, true).unwrap_err();
+        assert!(recreated.contains("recreated"), "{recreated}");
+        assert!(recreated.contains("38"), "{recreated}");
+        assert!(recreated.contains("34"), "{recreated}");
+
+        assert!(device_identity_error("tun0", Some(34), 34, true, true).is_ok());
+
+        let identity = "TUN device identity changed; refusing to touch networking";
+        assert_eq!(
+            device_identity_error("tun0", Some(38), 34, false, true).unwrap_err(),
+            identity
+        );
+        assert_eq!(
+            device_identity_error("tun0", Some(34), 34, true, false).unwrap_err(),
+            identity
+        );
+
+        let unrecorded = device_identity_error("tun0", None, 34, true, true).unwrap_err();
+        assert!(unrecorded.contains("recorded none"), "{unrecorded}");
     }
 }
