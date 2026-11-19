@@ -241,11 +241,17 @@ jobs:
     container: ubuntu:24.04
     steps:
       - name: Install runtime dependencies
+        timeout-minutes: 5
+        env:
+          DEBIAN_FRONTEND: noninteractive
         run: |
-          apt-get update
+          sed -i -e 's|http://archive.ubuntu.com/ubuntu/|http://azure.archive.ubuntu.com/ubuntu/|g' \
+            -e 's|http://security.ubuntu.com/ubuntu/|http://azure.archive.ubuntu.com/ubuntu/|g' \
+            -e 's/^Components:.*/Components: main universe/' /etc/apt/sources.list.d/ubuntu.sources
+          apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=2 update
           # Only the base runtime stack the user-facing docs require, never
           # build deps: a broken bundle must fail against this container.
-          apt-get install -y --no-install-recommends \
+          apt-get -o Acquire::http::Timeout=20 -o Acquire::Retries=2 install -y --no-install-recommends \
             libgtk-4-1 libadwaita-1-0 xvfb xauth x11-utils libfuse2t64 fuse3
       - uses: actions/download-artifact@v4
         with:
