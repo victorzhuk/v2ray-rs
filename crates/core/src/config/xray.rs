@@ -555,7 +555,7 @@ mod tests {
     }
 
     #[test]
-    fn test_xray_dns_accepts_dot_and_doq_and_falls_back_from_h3() {
+    fn test_xray_dns_downgrades_dot_doq_and_h3_to_doh() {
         let generator = XrayGenerator;
         let mut settings = AppSettings::default();
         settings.dns.enabled = true;
@@ -588,8 +588,11 @@ mod tests {
             .unwrap();
 
         let servers = config["dns"]["servers"].as_array().unwrap();
-        assert_eq!(servers[0].as_str(), Some("tls://dns.google"));
-        assert_eq!(servers[1].as_str(), Some("quic://dns.adguard.com"));
+        assert_eq!(servers[0].as_str(), Some("https://dns.google/dns-query"));
+        assert_eq!(
+            servers[1].as_str(),
+            Some("https://dns.adguard.com/dns-query")
+        );
         assert_eq!(
             servers[2].as_str(),
             Some("https://cloudflare-dns.com/dns-query")
@@ -737,7 +740,7 @@ mod tests {
                     enabled: true,
                     ..DnsConfig::default()
                 },
-                "udp://223.5.5.5:53",
+                "223.5.5.5",
             ),
             (
                 {
@@ -745,7 +748,7 @@ mod tests {
                     d.apply_dns_preset(&builtin_dns_presets()[0]);
                     d
                 },
-                "udp://1.0.0.1:53",
+                "1.0.0.1",
             ),
         ] {
             let mut settings = AppSettings::default();
@@ -787,7 +790,7 @@ mod tests {
         assert!(
             servers
                 .iter()
-                .all(|s| s["address"] != "udp://9.9.9.9:53" || s.get("tag").is_none())
+                .all(|s| s["address"] != "9.9.9.9" || s.get("tag").is_none())
         );
     }
 }

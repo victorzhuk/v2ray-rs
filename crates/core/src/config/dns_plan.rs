@@ -36,14 +36,18 @@ impl ResolvedDnsServer {
         self.protocol.server_address(&self.address, port)
     }
 
-    pub fn v2ray_address(&self) -> String {
-        let address = self.transport_address();
-        // Xray and v2ray parse a bare `host:port` UDP address as a URL and
-        // reject it; the explicit scheme is what makes the port acceptable.
+    /// Address and optional port for a v2ray-family DNS server entry. Plain UDP
+    /// uses a bare host plus the separate `port` field: xray 26.11.9 parses
+    /// `udp://host:port` as a domain name. Other protocols keep the URL form.
+    pub fn v2ray_endpoint(&self) -> (String, Option<u16>) {
         if self.protocol == DnsProtocol::Udp {
-            format!("udp://{address}")
+            let port = (self.protocol == self.requested_protocol)
+                .then_some(self.port)
+                .flatten()
+                .filter(|port| *port != DnsProtocol::Udp.default_port());
+            (self.address.clone(), port)
         } else {
-            address
+            (self.transport_address(), None)
         }
     }
 }
@@ -190,22 +194,32 @@ mod tests {
     }
 
     #[test]
-    fn v2ray_udp_addresses_carry_the_explicit_scheme() {
+    fn v2ray_udp_entries_use_a_bare_host_and_optional_port() {
+        let plain = server("udp", DnsProtocol::Udp, "9.9.9.9");
+        let mut custom = server("udp-custom", DnsProtocol::Udp, "8.8.8.8");
+        custom.port = Some(5353);
         let plan = ResolvedDnsPlan {
             backend: BackendType::Xray,
             enabled: true,
             tun_enabled: false,
             strategy: DnsStrategy::default(),
-            servers: vec![resolve_server(
-                &server("udp", DnsProtocol::Udp, "9.9.9.9"),
-                BackendType::Xray,
-                false,
-            )],
+            servers: vec![
+                resolve_server(&plain, BackendType::Xray, false),
+                resolve_server(&custom, BackendType::Xray, false),
+            ],
             bootstrap_domains: Vec::new(),
             hosts: Vec::new(),
         };
 
-        assert_eq!(plan.servers[0].v2ray_address(), "udp://9.9.9.9:53");
+        assert_eq!(
+            plan.servers[0].v2ray_endpoint(),
+            ("9.9.9.9".to_string(), None),
+            "port 53 is the UDP default and must be omitted"
+        );
+        assert_eq!(
+            plan.servers[1].v2ray_endpoint(),
+            ("8.8.8.8".to_string(), Some(5353))
+        );
         assert_eq!(plan.servers[0].transport_address(), "9.9.9.9:53");
     }
 
@@ -219,8 +233,8 @@ mod tests {
         assert_eq!(resolved.requested_protocol, DnsProtocol::H3);
         assert_eq!(resolved.protocol, DnsProtocol::Doh);
         assert_eq!(
-            resolved.v2ray_address(),
-            "https://dns.example.com/dns-query"
+            resolved.v2ray_endpoint(),
+            ("https://dns.example.com/dns-query".to_string(), None)
         );
     }
 

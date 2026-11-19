@@ -1077,15 +1077,18 @@ mod tests {
     }
 
     #[test]
-    fn xray_keeps_supported_transport_and_port() {
+    fn xray_downgrades_dot_to_doh() {
         let mut settings = default_settings();
         settings.dns.enabled = true;
         settings.dns.servers = vec![server("dot", DnsProtocol::Dot, "dns.adguard.com")];
 
         let summary = effective_dns(BackendType::Xray, &settings, &[], &["203.0.113.10"]);
 
-        assert_eq!(summary.entries()[0].transport, Some(DnsProtocol::Dot));
-        assert_eq!(summary.entries()[0].address, "tls://dns.adguard.com");
+        assert_eq!(summary.entries()[0].transport, Some(DnsProtocol::Doh));
+        assert_eq!(
+            summary.entries()[0].address,
+            "https://dns.adguard.com/dns-query"
+        );
     }
 
     #[test]
@@ -1427,14 +1430,14 @@ mod tests {
     /// sides share for the same logical resolver.
     fn canonical_address(address: &str) -> String {
         if let Some(rest) = address.strip_prefix("udp://") {
-            return rest.to_string();
+            return rest.strip_suffix(":53").unwrap_or(rest).to_string();
         }
         for scheme in ["https://", "h3://", "tls://", "quic://", "tcp://"] {
             if let Some(rest) = address.strip_prefix(scheme) {
                 return rest.split(['/', ':']).next().unwrap_or(rest).to_string();
             }
         }
-        address.to_string()
+        address.strip_suffix(":53").unwrap_or(address).to_string()
     }
 
     /// (address set, has-system-resolver) as the generated config carries them.
@@ -1452,12 +1455,15 @@ mod tests {
         for server in dns["servers"].as_array().expect("dns.servers array") {
             match backend {
                 BackendType::V2ray | BackendType::Xray => {
-                    let address = server.as_str().map(str::to_string).unwrap_or_else(|| {
+                    let mut address = server.as_str().map(str::to_string).unwrap_or_else(|| {
                         server["address"]
                             .as_str()
                             .expect("server address")
                             .to_string()
                     });
+                    if let Some(port) = server.get("port").and_then(|p| p.as_u64()) {
+                        address = format!("{address}:{port}");
+                    }
                     if address == "localhost" {
                         system = true;
                     }

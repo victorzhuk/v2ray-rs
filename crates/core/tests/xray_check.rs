@@ -438,3 +438,54 @@ fn leading_dot_dns_suffix_generates_canonical_matcher() {
         &[ss_node()],
     );
 }
+
+#[test]
+fn udp_dns_servers_use_bare_host_and_optional_port() {
+    if !xray_available() {
+        eprintln!("xray not found in PATH, skipping");
+        return;
+    }
+
+    let mut settings = AppSettings::default();
+    settings.dns.enabled = true;
+    settings.dns.servers = vec![
+        DnsServerConfig {
+            tag: "domestic".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "77.88.8.8".to_string(),
+            port: None,
+            detour: None,
+        },
+        DnsServerConfig {
+            tag: "alt".to_string(),
+            protocol: DnsProtocol::Udp,
+            address: "8.8.8.8".to_string(),
+            port: Some(5353),
+            detour: None,
+        },
+    ];
+
+    let config = XrayGenerator
+        .generate(&[ss_node()], &[], &settings)
+        .unwrap_or_else(|err| panic!("udp dns: generate failed: {err}"));
+    let servers = config["dns"]["servers"].as_array().unwrap();
+    assert!(
+        servers
+            .iter()
+            .any(|s| s.as_str() == Some("77.88.8.8") || s["address"] == "77.88.8.8"),
+        "default-port UDP entry must be a bare host without a port field: {servers:?}"
+    );
+    assert!(
+        servers
+            .iter()
+            .any(|s| s["address"] == "8.8.8.8" && s["port"] == serde_json::json!(5353)),
+        "non-default UDP port must ride the separate port field: {servers:?}"
+    );
+    let json = serde_json::to_string(&config).unwrap();
+    assert!(
+        !json.contains("udp://"),
+        "xray 26.11.9 parses udp:// as a domain name\nconfig: {json}"
+    );
+
+    check_with_nodes("udp-dns-bare-host-endpoint", &settings, &[], &[ss_node()]);
+}

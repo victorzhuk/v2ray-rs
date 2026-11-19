@@ -878,9 +878,10 @@ fn build_user_dns_servers(
                 })
                 .collect();
 
+            let (address, port) = server.v2ray_endpoint();
             servers.push(dns_server_entry(
-                server.v2ray_address(),
-                None,
+                address,
+                port,
                 (!domains.is_empty()).then_some(domains),
                 direct_detour(server, tun_xray),
             ));
@@ -928,9 +929,10 @@ fn build_user_dns_servers(
                 }
                 _ => None,
             };
+            let (address, port) = server.v2ray_endpoint();
             servers.push(dns_server_entry(
-                server.v2ray_address(),
-                None,
+                address,
+                port,
                 domains,
                 direct_detour(server, tun_xray),
             ));
@@ -970,7 +972,7 @@ fn attach_exclude_domains(
         }));
         return;
     };
-    let target_addr = target.v2ray_address();
+    let (target_addr, target_port) = target.v2ray_endpoint();
 
     let Some(index) = servers.iter().position(|s| {
         s.as_str().map(|a| a == target_addr).unwrap_or_else(|| {
@@ -996,6 +998,9 @@ fn attach_exclude_domains(
         dedicated = json!({ "address": dedicated });
     }
     dedicated["address"] = json!(target_addr);
+    if let Some(port) = target_port {
+        dedicated["port"] = json!(port);
+    }
     dedicated["domains"] = json!(&exclude_domains);
     dedicated["skipFallback"] = json!(true);
     servers.insert(index + 1, dedicated);
@@ -1005,7 +1010,10 @@ fn attach_exclude_domains(
 use crate::models::DnsServerConfig;
 
 #[cfg(test)]
-fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamilyBackend) -> String {
+fn dns_server_endpoint_for_backend(
+    server: &DnsServerConfig,
+    backend: V2rayFamilyBackend,
+) -> (String, Option<u16>) {
     let protocol = server
         .protocol
         .effective_for_backend(backend.backend_type());
@@ -1018,7 +1026,7 @@ fn dns_server_address_for_backend(server: &DnsServerConfig, backend: V2rayFamily
         detour: server.detour.clone(),
         resolves_private: false,
     }
-    .v2ray_address()
+    .v2ray_endpoint()
 }
 
 #[cfg(test)]
@@ -1281,7 +1289,8 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         let scoped = &servers[0];
-        assert_eq!(scoped["address"], "udp://192.0.2.1:53");
+        assert_eq!(scoped["address"], "192.0.2.1");
+        assert!(scoped.get("port").is_none());
         assert_eq!(scoped["skipFallback"], true);
         assert_eq!(
             servers.last().unwrap(),
@@ -1300,7 +1309,7 @@ mod tests {
 
         let servers = config["dns"]["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 1, "no catch-all needed: {servers:?}");
-        assert_eq!(servers[0], "udp://192.0.2.1:53");
+        assert_eq!(servers[0], "192.0.2.1");
     }
 
     #[test]
@@ -2010,7 +2019,8 @@ mod tests {
         let servers = dns["servers"].as_array().unwrap();
         assert_eq!(servers.len(), 2);
         assert_eq!(servers[0].as_str(), Some("https://1.1.1.1/dns-query"));
-        assert_eq!(servers[1].as_str(), Some("udp://8.8.8.8:5353"));
+        assert_eq!(servers[1]["address"], "8.8.8.8");
+        assert_eq!(servers[1]["port"], json!(5353));
     }
 
     #[test]
@@ -2076,7 +2086,7 @@ mod tests {
         let protocols = vec![
             (DnsProtocol::Doh, "https://1.1.1.1/dns-query"),
             (DnsProtocol::Tcp, "tcp://1.1.1.1:53"),
-            (DnsProtocol::Udp, "udp://1.1.1.1:53"),
+            (DnsProtocol::Udp, "1.1.1.1"),
         ];
 
         for (protocol, expected_address) in protocols {
@@ -2131,18 +2141,32 @@ mod tests {
         };
 
         assert_eq!(
-            dns_server_address_for_backend(
+            dns_server_endpoint_for_backend(
                 &server(DnsProtocol::Dot, Some(853)),
                 V2rayFamilyBackend::V2ray
             ),
-            "https://dns.google/dns-query"
+            ("https://dns.google/dns-query".to_string(), None)
         );
         assert_eq!(
-            dns_server_address_for_backend(
+            dns_server_endpoint_for_backend(
+                &server(DnsProtocol::Dot, Some(8530)),
+                V2rayFamilyBackend::Xray
+            ),
+            ("https://dns.google/dns-query".to_string(), None)
+        );
+        assert_eq!(
+            dns_server_endpoint_for_backend(
+                &server(DnsProtocol::Doq, Some(784)),
+                V2rayFamilyBackend::Xray
+            ),
+            ("https://dns.google/dns-query".to_string(), None)
+        );
+        assert_eq!(
+            dns_server_endpoint_for_backend(
                 &server(DnsProtocol::H3, Some(8443)),
                 V2rayFamilyBackend::Xray
             ),
-            "https://dns.google/dns-query"
+            ("https://dns.google/dns-query".to_string(), None)
         );
     }
 
@@ -2157,19 +2181,8 @@ mod tests {
         };
 
         assert_eq!(
-            dns_server_address_for_backend(&server, V2rayFamilyBackend::V2ray),
-            "https://doh.example.com:8443/dns-query"
-        );
-        let dot_native = DnsServerConfig {
-            tag: "test".to_string(),
-            protocol: DnsProtocol::Dot,
-            address: "dns.google".to_string(),
-            port: Some(8530),
-            detour: None,
-        };
-        assert_eq!(
-            dns_server_address_for_backend(&dot_native, V2rayFamilyBackend::Xray),
-            "tls://dns.google:8530"
+            dns_server_endpoint_for_backend(&server, V2rayFamilyBackend::V2ray),
+            ("https://doh.example.com:8443/dns-query".to_string(), None)
         );
     }
 
@@ -2241,7 +2254,7 @@ mod tests {
         assert_eq!(remote_domains[0], "geosite:google");
 
         let domestic = &servers[1];
-        assert_eq!(domestic["address"], "udp://223.5.5.5:53");
+        assert_eq!(domestic["address"], "223.5.5.5");
         let domestic_domains = domestic["domains"].as_array().unwrap();
         assert_eq!(domestic_domains.len(), 1);
         assert_eq!(domestic_domains[0], "domain:cn");
@@ -2661,7 +2674,7 @@ mod tests {
             .iter()
             .find(|s| s.get("domains").is_none())
             .expect("the unrestricted server must survive");
-        assert_eq!(unrestricted["address"], "udp://1.1.1.1:53");
+        assert_eq!(unrestricted["address"], "1.1.1.1");
         assert!(unrestricted.get("skipFallback").is_none());
 
         let dedicated = servers
@@ -2672,7 +2685,7 @@ mod tests {
                     .is_some_and(|d| d.contains(&json!("domain:corp.example.com")))
             })
             .expect("excluded domains need their own server entry");
-        assert_eq!(dedicated["address"], "udp://1.1.1.1:53");
+        assert_eq!(dedicated["address"], "1.1.1.1");
         assert_eq!(dedicated["skipFallback"], true);
         assert_eq!(dedicated["tag"], DNS_DIRECT_TAG);
     }
@@ -2713,7 +2726,7 @@ mod tests {
                     .is_some_and(|d| d.contains(&json!("domain:corp.example")))
             })
             .expect("no server answers the excluded domain");
-        assert_eq!(answering["address"], "udp://77.88.8.8:53");
+        assert_eq!(answering["address"], "77.88.8.8");
         assert_eq!(answering["tag"], DNS_DIRECT_TAG);
         assert!(
             !servers.iter().any(|s| s["address"] == "localhost"),
@@ -3082,7 +3095,7 @@ mod tests {
             .filter(|s| s["tag"] == json!("dns-direct"))
             .collect();
         assert!(
-            tagged.iter().any(|s| s["address"] == "udp://77.88.8.8:53"),
+            tagged.iter().any(|s| s["address"] == "77.88.8.8"),
             "a direct detour must reach the direct outbound"
         );
     }
@@ -3236,7 +3249,7 @@ mod tests {
         assert!(
             servers
                 .iter()
-                .any(|s| s == "udp://127.0.0.1:53" || s["address"] == "udp://127.0.0.1:53"),
+                .any(|s| s == "127.0.0.1" || s["address"] == "127.0.0.1"),
             "flagged server must survive generation: {servers:?}"
         );
     }

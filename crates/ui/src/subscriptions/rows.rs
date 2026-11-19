@@ -350,7 +350,7 @@ pub(super) fn attach_profile_toggle(
 
     let dns_servers = profile.dns.as_ref().map(|d| d.servers.len()).unwrap_or(0);
     let row = adw::SwitchRow::builder()
-        .title("Use Provider Routing & DNS")
+        .title("Use Provider Routing &amp; DNS")
         .subtitle(format!(
             "{} rule(s), {} DNS server(s) from this subscription",
             profile.rules.len(),

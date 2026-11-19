@@ -78,7 +78,11 @@ impl DnsProtocol {
             (BackendType::V2ray, DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3) => {
                 Some(DnsProtocol::Doh)
             }
-            (BackendType::Xray, DnsProtocol::H3) => Some(DnsProtocol::Doh),
+            // xray 26.11.9 has no DoT or DoQ: `tls://` and `quic://` addresses
+            // are parsed as literal domains, so only DoH stays reachable.
+            (BackendType::Xray, DnsProtocol::Dot | DnsProtocol::Doq | DnsProtocol::H3) => {
+                Some(DnsProtocol::Doh)
+            }
             _ => None,
         }
     }
@@ -857,8 +861,18 @@ mod tests {
             (DnsProtocol::Udp, BackendType::Xray, None, DnsProtocol::Udp),
             (DnsProtocol::Tcp, BackendType::Xray, None, DnsProtocol::Tcp),
             (DnsProtocol::Doh, BackendType::Xray, None, DnsProtocol::Doh),
-            (DnsProtocol::Dot, BackendType::Xray, None, DnsProtocol::Dot),
-            (DnsProtocol::Doq, BackendType::Xray, None, DnsProtocol::Doq),
+            (
+                DnsProtocol::Dot,
+                BackendType::Xray,
+                Some(DnsProtocol::Doh),
+                DnsProtocol::Doh,
+            ),
+            (
+                DnsProtocol::Doq,
+                BackendType::Xray,
+                Some(DnsProtocol::Doh),
+                DnsProtocol::Doh,
+            ),
             (
                 DnsProtocol::H3,
                 BackendType::Xray,
