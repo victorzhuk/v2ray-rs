@@ -245,7 +245,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             if backend.singbox {
                 net::recover_singbox(&handle, &iface).await
             } else {
-                net::recover_xray(&handle, &iface).await
+                // Sing-box sessions never hold a reservation dummy; the xray
+                // legacy path also clears one left by a journal-less session.
+                let xray = net::recover_xray(&handle, &iface).await;
+                let reservation = net::recover_reservation(&handle).await;
+                net::combine_cleanup([xray, reservation])
             }
         }
     }

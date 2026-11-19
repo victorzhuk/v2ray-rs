@@ -64,8 +64,8 @@ pub(super) fn show_recover_tun_dialog(
     let dialog = adw::AlertDialog::builder()
         .heading("Recover TUN routes")
         .body(format!(
-            "Force-remove the TUN device {iface} and its routing rules? \
-             Use this only when no v2ray-rs tunnel is active."
+            "Force-remove the TUN device {iface}, its routing rules, and the \
+             routing reservation? Use this only when no v2ray-rs tunnel is active."
         ))
         .build();
 

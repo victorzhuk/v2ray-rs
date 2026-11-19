@@ -3,6 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use futures::stream::TryStreamExt;
 use rtnetlink::packet_route::AddressFamily;
 use rtnetlink::packet_route::IpProtocol;
+use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkInfo, LinkMessage};
 use rtnetlink::packet_route::route::{RouteAttribute, RouteMessage, RouteScope, RouteType};
 use rtnetlink::packet_route::rule::{
     RuleAction, RuleAttribute, RuleMessage, RulePortRange, RuleUidRange,
@@ -81,7 +82,7 @@ impl Context {
 
 /// Route table sing-box uses for its `auto_route` policy routing. Used by the
 /// recovery pass to flush rules/routes left behind after a SIGKILL.
-use v2ray_rs_tun_session::SINGBOX_ROUTE_TABLE;
+use v2ray_rs_tun_session::{ALIAS_PREFIX, RESERVATION_NAME, SINGBOX_ROUTE_TABLE};
 
 /// Dedicated table holding xray's TUN default route. Kept out of `main` so that
 /// marked packets (xray's own sockets) can still reach the real default via
@@ -351,7 +352,58 @@ pub async fn recover_singbox(handle: &Handle, iface: &str) -> Result<(), String>
     combine_cleanup([down, rules, routes])
 }
 
-fn combine_cleanup(results: impl IntoIterator<Item = Result<(), String>>) -> Result<(), String> {
+/// Removes the `v2ray-rs-own` reservation dummy left by a session with no
+/// journal. Never touches a link that is not a dummy carrying our alias
+/// prefix. Idempotent when the reservation is already gone.
+pub async fn recover_reservation(handle: &Handle) -> Result<(), String> {
+    let mut links = handle
+        .link()
+        .get()
+        .match_name(RESERVATION_NAME.to_owned())
+        .execute();
+    let link = match links.try_next().await {
+        Ok(Some(link)) => link,
+        Ok(None) => return Ok(()),
+        // A name-filtered link lookup answers with ENODEV, not an empty dump,
+        // when the device is absent.
+        Err(error) if is_no_such_device(&error) => return Ok(()),
+        Err(error) => return Err(format!("read link {RESERVATION_NAME}: {error}")),
+    };
+    if !owned_reservation(&link) {
+        return Err(format!(
+            "refusing to delete {RESERVATION_NAME} (ifindex {}): not a v2ray-rs reservation dummy",
+            link.header.index
+        ));
+    }
+    handle
+        .link()
+        .del(link.header.index)
+        .execute()
+        .await
+        .map_err(|error| format!("delete link {RESERVATION_NAME}: {error}"))
+}
+
+/// Pure reservation predicate: a dummy link whose alias carries our session
+/// prefix. Anything else must never be deleted by recovery.
+fn owned_reservation(link: &LinkMessage) -> bool {
+    let is_dummy = link.attributes.iter().any(|attribute| {
+        matches!(
+            attribute,
+            LinkAttribute::LinkInfo(info) if info.contains(&LinkInfo::Kind(InfoKind::Dummy))
+        )
+    });
+    let carries_our_alias = link.attributes.iter().any(|attribute| {
+        matches!(
+            attribute,
+            LinkAttribute::IfAlias(alias) if alias.starts_with(ALIAS_PREFIX)
+        )
+    });
+    is_dummy && carries_our_alias
+}
+
+pub fn combine_cleanup(
+    results: impl IntoIterator<Item = Result<(), String>>,
+) -> Result<(), String> {
     let errors: Vec<_> = results.into_iter().filter_map(Result::err).collect();
     if errors.is_empty() {
         Ok(())
@@ -704,6 +756,7 @@ mod tests {
         exclusion_installable, ipv6_dns_capture, optional_reconcile_plan, rule_uid,
         v6_rules_needed,
     };
+    use rtnetlink::packet_route::link::{InfoKind, LinkAttribute, LinkInfo, LinkMessage};
     use v2ray_rs_core::config::XRAY_TUN_FWMARK;
 
     #[test]
@@ -1068,5 +1121,52 @@ mod tests {
                     Phase::Complete
                 );
             });
+    }
+
+    #[test]
+    fn owned_reservation_requires_dummy_with_our_alias_prefix() {
+        const ALIAS: &str = "v2ray-rs:0f0e9d8c-7b6a-4958-a732-112233445566";
+
+        fn reservation_link(alias: Option<&str>, kind: Option<InfoKind>) -> LinkMessage {
+            let mut message = LinkMessage::default();
+            message.attributes.push(LinkAttribute::IfName(
+                v2ray_rs_tun_session::RESERVATION_NAME.to_string(),
+            ));
+            if let Some(kind) = kind {
+                message
+                    .attributes
+                    .push(LinkAttribute::LinkInfo(vec![LinkInfo::Kind(kind)]));
+            }
+            if let Some(alias) = alias {
+                message
+                    .attributes
+                    .push(LinkAttribute::IfAlias(alias.to_owned()));
+            }
+            message
+        }
+
+        // A dummy carrying a `v2ray-rs:<uuid>` alias is ours.
+        assert!(super::owned_reservation(&reservation_link(
+            Some(ALIAS),
+            Some(InfoKind::Dummy)
+        )));
+
+        // Interrupted tagging: a dummy with no alias is never ours.
+        assert!(!super::owned_reservation(&reservation_link(
+            None,
+            Some(InfoKind::Dummy)
+        )));
+
+        // A foreign alias on a dummy is never ours.
+        assert!(!super::owned_reservation(&reservation_link(
+            Some("lan-bridge"),
+            Some(InfoKind::Dummy)
+        )));
+
+        // Our alias on a non-dummy link is never deleted by recovery.
+        assert!(!super::owned_reservation(&reservation_link(
+            Some(ALIAS),
+            Some(InfoKind::Bridge)
+        )));
     }
 }

@@ -7,6 +7,7 @@ use uuid::Uuid;
 pub const JOURNAL_VERSION: u32 = 1;
 pub const SINGBOX_ROUTE_TABLE: u32 = 2022;
 pub const RESERVATION_NAME: &str = "v2ray-rs-own";
+pub const ALIAS_PREFIX: &str = "v2ray-rs:";
 const MAX_JOURNAL_BYTES: u64 = 4 * 1024 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session<B> {
@@ -111,7 +112,7 @@ impl Ownership {
     }
 
     pub fn alias(&self) -> String {
-        format!("v2ray-rs:{}", self.session_id)
+        format!("{ALIAS_PREFIX}{}", self.session_id)
     }
     pub fn verify_epoch(&self) -> io::Result<()> {
         if self.version != JOURNAL_VERSION {
