@@ -100,7 +100,10 @@ fn parse_url_transport(params: &HashMap<String, String>) -> Result<TransportSett
     Ok(transport)
 }
 
-fn parse_url_tls(params: &HashMap<String, String>) -> Result<Option<TlsSettings>, ParseError> {
+fn parse_url_tls(
+    params: &HashMap<String, String>,
+    implicit_tls: bool,
+) -> Result<Option<TlsSettings>, ParseError> {
     if params
         .get("allowInsecure")
         .is_some_and(|value| value == "1" || value.eq_ignore_ascii_case("true"))
@@ -110,30 +113,34 @@ fn parse_url_tls(params: &HashMap<String, String>) -> Result<Option<TlsSettings>
         ));
     }
     match params.get("security").map(|s| s.as_str()) {
-        Some("tls") | Some("reality") => {
-            let reality = params.get("security").map(|s| s.as_str()) == Some("reality");
-            let server_name = params.get("sni").cloned();
-            let alpn = params
-                .get("alpn")
-                .map(|a| a.split(',').map(|s| s.to_owned()).collect())
-                .unwrap_or_default();
-            let fingerprint = params.get("fp").cloned();
-            let public_key = params.get("pbk").cloned();
-            let short_id = params.get("sid").cloned();
-            let spider_x = params.get("spx").cloned();
-            Ok(Some(TlsSettings {
-                server_name,
-                alpn,
-                verify: true,
-                fingerprint,
-                reality,
-                public_key,
-                short_id,
-                spider_x,
-            }))
-        }
+        Some("tls") | Some("reality") => build_url_tls(params),
+        Some("none") => Ok(None),
+        None | Some("") if implicit_tls => build_url_tls(params),
         _ => Ok(None),
     }
+}
+
+fn build_url_tls(params: &HashMap<String, String>) -> Result<Option<TlsSettings>, ParseError> {
+    let reality = params.get("security").map(|s| s.as_str()) == Some("reality");
+    let server_name = params.get("sni").cloned();
+    let alpn = params
+        .get("alpn")
+        .map(|a| a.split(',').map(|s| s.to_owned()).collect())
+        .unwrap_or_default();
+    let fingerprint = params.get("fp").cloned();
+    let public_key = params.get("pbk").cloned();
+    let short_id = params.get("sid").cloned();
+    let spider_x = params.get("spx").cloned();
+    Ok(Some(TlsSettings {
+        server_name,
+        alpn,
+        verify: true,
+        fingerprint,
+        reality,
+        public_key,
+        short_id,
+        spider_x,
+    }))
 }
 
 fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
@@ -162,7 +169,7 @@ fn parse_vless(uri: &str) -> Result<ProxyNode, ParseError> {
         .collect();
 
     let transport = parse_url_transport(&params)?;
-    let tls = parse_url_tls(&params)?;
+    let tls = parse_url_tls(&params, false)?;
 
     let flow = params.get("flow").cloned();
     let encryption = params.get("encryption").cloned();
@@ -374,13 +381,23 @@ fn parse_trojan(uri: &str) -> Result<ProxyNode, ParseError> {
         .collect();
 
     let transport = parse_url_transport(&params)?;
-    let tls = match params.get("security").map(String::as_str) {
+    let security = params.get("security").map(String::as_str);
+    let implicit_tls = matches!(security, None | Some(""));
+    let tls = match security {
         Some("none") => None,
-        Some("tls") | Some("reality") => parse_url_tls(&params)?,
-        _ => Some(TlsSettings {
-            server_name: Some(address.clone()),
-            ..Default::default()
-        }),
+        Some("tls") | Some("reality") | None | Some("") => {
+            let mut tls =
+                parse_url_tls(&params, implicit_tls)?.expect("implicit tls yields settings");
+            if tls.server_name.is_none() {
+                tls.server_name = Some(address.clone());
+            }
+            Some(tls)
+        }
+        Some(other) => {
+            return Err(ParseError::InvalidFormat(format!(
+                "unknown security value: {other}"
+            )));
+        }
     };
 
     Ok(ProxyNode::Trojan(TrojanConfig {
@@ -710,6 +727,75 @@ mod tests {
         let err = parse_uri("trojan://pass@host:443?security=tls&allowInsecure=1")
             .expect_err("allowInsecure must be rejected");
         assert!(err.to_string().contains("allowInsecure"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_trojan_omitted_security_preserves_tls_params() {
+        let ProxyNode::Trojan(cfg) = parse_uri(
+            "trojan://pass@example.com:443?sni=sni.example.com&alpn=h2,http/1.1&fp=chrome#node",
+        )
+        .unwrap() else {
+            panic!("expected Trojan")
+        };
+        let tls = cfg.tls.expect("implicit TLS for Trojan");
+        assert!(!tls.reality);
+        assert_eq!(tls.server_name.as_deref(), Some("sni.example.com"));
+        assert_eq!(tls.alpn, vec!["h2".to_string(), "http/1.1".to_string()]);
+        assert_eq!(tls.fingerprint.as_deref(), Some("chrome"));
+    }
+
+    #[test]
+    fn test_parse_trojan_omitted_security_rejects_allow_insecure() {
+        let err = parse_uri("trojan://pass@host:443?allowInsecure=1")
+            .expect_err("implicit TLS with allowInsecure must be rejected");
+        assert!(err.to_string().contains("allowInsecure"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_trojan_omitted_security_defaults_server_name() {
+        let ProxyNode::Trojan(cfg) = parse_uri("trojan://pass@example.com:443").unwrap() else {
+            panic!("expected Trojan")
+        };
+        let tls = cfg.tls.expect("implicit TLS for Trojan");
+        assert_eq!(tls.server_name.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn test_parse_trojan_unknown_security_is_rejected() {
+        let err = parse_uri("trojan://pass@host:443?security=bogus")
+            .expect_err("unknown security must be rejected");
+        assert!(err.to_string().contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_trojan_security_none_yields_no_tls() {
+        let ProxyNode::Trojan(cfg) =
+            parse_uri("trojan://pass@example.com:443?security=none").unwrap()
+        else {
+            panic!("expected Trojan")
+        };
+        assert!(cfg.tls.is_none());
+    }
+
+    #[test]
+    fn test_parse_vless_security_none_yields_no_tls() {
+        let ProxyNode::Vless(cfg) =
+            parse_uri("vless://uuid@example.com:443?security=none").unwrap()
+        else {
+            panic!("expected VLESS")
+        };
+        assert!(cfg.tls.is_none());
+    }
+
+    #[test]
+    fn test_parse_trojan_explicit_tls_defaults_server_name() {
+        let ProxyNode::Trojan(cfg) =
+            parse_uri("trojan://pass@example.com:443?security=tls").unwrap()
+        else {
+            panic!("expected Trojan")
+        };
+        let tls = cfg.tls.expect("explicit tls yields settings");
+        assert_eq!(tls.server_name, Some("example.com".to_string()));
     }
 
     #[test]

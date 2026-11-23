@@ -16,11 +16,19 @@ sed "s|/usr/bin/v2ray-rs-|$root/case/usr/bin/v2ray-rs-|g" \
     "$repo/pkg/archlinux/v2ray-rs.install" >"$root/case/hook.sh"
 
 if ! unshare -rm true 2>/dev/null; then
+    if [ "${V2RAY_RS_REQUIRE_NETNS:-0}" = 1 ]; then
+        printf 'FAIL: user namespaces are unavailable and V2RAY_RS_REQUIRE_NETNS=1\n' >&2
+        exit 1
+    fi
     printf 'skip: user namespaces are unavailable\n'
     exit 0
 fi
 # shellcheck disable=SC2016  # $1 belongs to the inner shell
 if ! unshare -rm bash -c 'mkdir -p "$1" && mount -t tmpfs tmpfs "$1"' _ "$work/probe" 2>/dev/null; then
+    if [ "${V2RAY_RS_REQUIRE_NETNS:-0}" = 1 ]; then
+        printf 'FAIL: namespaced tmpfs mounts are unavailable and V2RAY_RS_REQUIRE_NETNS=1\n' >&2
+        exit 1
+    fi
     printf 'skip: namespaced tmpfs mounts are unavailable\n'
     exit 0
 fi
@@ -38,25 +46,36 @@ mount --bind "$root/etc/passwd" /etc/passwd
 mount -t tmpfs tmpfs "$root/case/usr/bin"
 netctl="$root/case/usr/bin/v2ray-rs-netctl"
 run="$root/case/usr/bin/v2ray-rs-run"
+antidpi="$root/case/usr/bin/v2ray-rs-antidpi"
 printf "#!/bin/sh\nexit 0\n" >"$netctl"
 printf "#!/bin/sh\nexit 0\n" >"$run"
-chmod 0755 "$netctl" "$run"
+printf "#!/bin/sh\nexit 0\n" >"$antidpi"
+chmod 0755 "$netctl" "$run" "$antidpi"
 . "$root/case/hook.sh"
 post_install
 [ "$(stat -c %U:%G "$netctl")" = root:v2ray-rs ]
 [ "$(stat -c %a "$netctl")" = 750 ]
 [ "$(stat -c %U:%G "$run")" = root:v2ray-rs ]
 [ "$(stat -c %a "$run")" = 4750 ]
+[ "$(stat -c %U:%G "$antidpi")" = root:v2ray-rs ]
+[ "$(stat -c %a "$antidpi")" = 750 ]
 getcap "$netctl" | grep -q cap_net_admin
+getcap "$antidpi" | grep -q 'cap_net_admin,cap_net_raw'
 pre_remove
 if getcap "$netctl" | grep -q cap_net_admin; then
     echo "capability survived removal" >&2
     exit 1
 fi
+if getcap "$antidpi" | grep -q cap_net_admin; then
+    echo "anti-DPI capability survived removal" >&2
+    exit 1
+fi
 post_install
 [ "$(stat -c %a "$netctl")" = 750 ]
 [ "$(stat -c %a "$run")" = 4750 ]
+[ "$(stat -c %a "$antidpi")" = 750 ]
 getcap "$netctl" | grep -q cap_net_admin
+getcap "$antidpi" | grep -q 'cap_net_admin,cap_net_raw'
 ' _ "$root"; then
     note "real metadata and reinstall checks passed"
 else

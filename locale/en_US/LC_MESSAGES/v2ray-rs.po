@@ -230,3 +230,81 @@ msgstr "Edit rule"
 
 msgid "Delete rule"
 msgstr "Delete rule"
+
+msgid "Anti-DPI"
+msgstr "Anti-DPI"
+
+msgid "Anti-DPI engine"
+msgstr "Anti-DPI engine"
+
+msgid "Inspects the early TLS and QUIC packets of flows to port 443 on host egress; works with every backend, with or without TUN. The optional hostlist matches TLS SNI or HTTP Host, never QUIC. There is no guarantee that the first packet is covered, and IPv6 traffic passes through unprocessed"
+msgstr "Inspects the early TLS and QUIC packets of flows to port 443 on host egress; works with every backend, with or without TUN. The optional hostlist matches TLS SNI or HTTP Host, never QUIC. There is no guarantee that the first packet is covered, and IPv6 traffic passes through unprocessed"
+
+msgid "Enable anti-DPI"
+msgstr "Enable anti-DPI"
+
+msgid "Applies on next connect"
+msgstr "Applies on next connect"
+
+msgid "NFQUEUE number"
+msgstr "NFQUEUE number"
+
+msgid "Must differ from any other NFQUEUE consumer on this machine"
+msgstr "Must differ from any other NFQUEUE consumer on this machine"
+
+msgid "Failed to save anti-DPI setting"
+msgstr "Failed to save anti-DPI setting"
+
+msgid "The NFQUEUE number must be a whole number from 1 to 65535"
+msgstr "The NFQUEUE number must be a whole number from 1 to 65535"
+
+msgid "Hostlist file"
+msgstr "Hostlist file"
+
+msgid "The hostlist path must not be blank"
+msgstr "The hostlist path must not be blank"
+
+msgid "Strategy chains"
+msgstr "Strategy chains"
+
+msgid "One strategy chain per line; an empty list uses the helper's built-in defaults. Applies on next connect"
+msgstr "One strategy chain per line; an empty list uses the helper's built-in defaults. Applies on next connect"
+
+msgid "Too many strategy chains; the edit was not saved"
+msgstr "Too many strategy chains; the edit was not saved"
+
+msgid "Strategy chains must not contain blank lines"
+msgstr "Strategy chains must not contain blank lines"
+
+msgid "Each strategy chain is limited to 512 characters"
+msgstr "Each strategy chain is limited to 512 characters"
+
+msgid "Failed to save anti-DPI strategies"
+msgstr "Failed to save anti-DPI strategies"
+
+msgid "Privileges"
+msgstr "Privileges"
+
+msgid "Capability status"
+msgstr "Capability status"
+
+msgid "The engine needs cap_net_admin and cap_net_raw; the Grant TUN privileges action on the TUN page covers the anti-DPI helper in the same elevation"
+msgstr "The engine needs cap_net_admin and cap_net_raw; the Grant TUN privileges action on the TUN page covers the anti-DPI helper in the same elevation"
+
+msgid "Anti-DPI helper lacks cap_net_admin or cap_net_raw; grant again"
+msgstr "Anti-DPI helper lacks cap_net_admin or cap_net_raw; grant again"
+
+msgid "The anti-DPI engine inspects outgoing traffic; applies on next connect."
+msgstr "The anti-DPI engine inspects outgoing traffic; applies on next connect."
+
+msgid "Anti-DPI helper is not managed by v2ray-rs; install the distribution package"
+msgstr "Anti-DPI helper is not managed by v2ray-rs; install the distribution package"
+
+msgid "Installed anti-DPI helper is out of date; grant again"
+msgstr "Installed anti-DPI helper is out of date; grant again"
+
+msgid "Cannot read anti-DPI capabilities"
+msgstr "Cannot read anti-DPI capabilities"
+
+msgid "Anti-DPI helper needs installing before the anti-DPI engine can start"
+msgstr "Anti-DPI helper needs installing before the anti-DPI engine can start"

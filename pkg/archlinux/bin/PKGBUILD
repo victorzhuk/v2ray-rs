@@ -23,13 +23,17 @@ package() {
     cd "$_pkgname-$pkgver-$CARCH-linux"
 
     install -Dm755 "bin/v2ray-rs" "$pkgdir/usr/bin/v2ray-rs"
-    # Privileged TUN helpers. The install hook creates the `v2ray-rs` group,
-    # restricts these to it (netctl 0750 + cap_net_admin, run 4750 setuid), and
-    # creates the bypass user. Modes here are the pre-hook defaults.
+    # Privileged helpers. The install hook creates the `v2ray-rs` group,
+    # restricts these to it (netctl 0750 + cap_net_admin, antidpi 0750 +
+    # cap_net_admin,cap_net_raw, run 4750 setuid), and creates the bypass user.
+    # Modes here are the pre-hook defaults.
     install -Dm755 "bin/v2ray-rs-netctl" "$pkgdir/usr/bin/v2ray-rs-netctl"
     # Archives never carry the setuid bit: the install hook applies root:v2ray-rs
     # and 4750 after systemd-sysusers has created the group and bypass user.
     install -Dm755 "bin/v2ray-rs-run" "$pkgdir/usr/bin/v2ray-rs-run"
+    # Anti-DPI engine (NFQUEUE desync strategies): the hook applies the
+    # cap_net_admin,cap_net_raw file capabilities.
+    install -Dm755 "bin/v2ray-rs-antidpi" "$pkgdir/usr/bin/v2ray-rs-antidpi"
 
     install -Dm644 "share/applications/com.github.v2ray-rs.desktop" \
         "$pkgdir/usr/share/applications/com.github.v2ray-rs.desktop"

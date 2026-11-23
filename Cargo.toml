@@ -52,5 +52,7 @@ tonic = { version = "0.12", default-features = false, features = ["channel", "co
 http = "1"
 rtnetlink = "0.21"
 futures = "0.3"
+nfq = "0.2"
+env_logger = "0.11"
 
 v2ray-rs-tun-session = { path = "crates/tun-session" }

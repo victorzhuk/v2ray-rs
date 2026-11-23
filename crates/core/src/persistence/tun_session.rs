@@ -79,6 +79,19 @@ pub fn retirable_tun_session(session: &TunSession) -> bool {
         && (ownership.phase == TunPhase::Complete || unstarted_singbox)
 }
 
+/// Whether the journal at `path` now records a session other than
+/// `expected_id`. Only a record without kernel state is ever replaced
+/// (`retirable_tun_session`, `renew_completed_tun_session`), so a manager
+/// whose session is gone holds nothing to release. An unreadable journal
+/// reports `false`: the teardown's own identity check then decides.
+pub fn tun_session_replaced(path: &std::path::Path, expected_id: &str) -> bool {
+    v2ray_rs_tun_session::read::<BackendType>(path).is_ok_and(|session| {
+        session
+            .ownership
+            .is_some_and(|ownership| ownership.session_id.to_string() != expected_id)
+    })
+}
+
 /// The legacy marker never clears itself, so the error must name the exact
 /// file and the verified-cleanup command the operator has to run.
 fn legacy_recovery_pending_error(paths: &AppPaths, requested_iface: &str) -> std::io::Error {
@@ -390,5 +403,22 @@ mod tests {
             .is_err()
         );
         assert!(!paths.tun_session_path().exists());
+    }
+
+    #[test]
+    fn replaced_session_is_detected_only_for_the_retired_id() {
+        let (_tmp, paths) = super::super::test_paths();
+        let first = prepare_tun_session(&paths, BackendType::SingBox, "tun0").unwrap();
+        let first_id = first.ownership.unwrap().session_id.to_string();
+        assert!(!tun_session_replaced(&paths.tun_session_path(), &first_id));
+
+        // The unstarted sing-box record is retirable, so a fresh prepare
+        // replaces the file with a new session id.
+        prepare_tun_session(&paths, BackendType::SingBox, "tun0").unwrap();
+        assert!(tun_session_replaced(&paths.tun_session_path(), &first_id));
+        assert!(!tun_session_replaced(
+            &paths.tun_session_path().with_extension("missing"),
+            &first_id
+        ));
     }
 }

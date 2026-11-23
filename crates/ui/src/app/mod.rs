@@ -107,7 +107,7 @@ pub struct App {
     deferred_connect: Option<DeferredConnect>,
     session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
-    pending_settings: Option<AppSettings>,
+    pending_settings: Option<(u64, AppSettings)>,
     auto_reconnect_attempts: u32,
     status_prev: ProcessState,
     connection_origin: ConnectOrigin,
@@ -115,6 +115,11 @@ pub struct App {
     reconnect_generation: u32,
     tun_release_in_flight: bool,
     tun_operator_in_flight: bool,
+    cleanup_pending: bool,
+    /// The parked cleanup failure the cleanup banner owns; its error toast
+    /// stays suppressed while pending, and other errors keep toasting.
+    cleanup_error: Option<String>,
+    degraded_generation: Option<u64>,
     regen: RegenScheduler,
     _signal_sources: Vec<glib::SourceId>,
 }
@@ -151,7 +156,9 @@ impl DeferredConnect {
 pub enum AppMsg {
     ConfigRegenerated(Result<std::path::PathBuf, String>),
     OnboardingComplete(AppSettings, Option<(String, SubscriptionSource)>),
-    SettingsChanged(AppSettings),
+    /// Accepted preferences edit tagged with the dialog's monotonic revision,
+    /// so a failed write reconciles only when it is the latest accepted edit.
+    SettingsChanged(u64, AppSettings),
     ToggleConnection,
     Connect(ConnectOrigin),
     ConnectToNode(ConnectionNodeRef, ConnectOrigin),
@@ -177,12 +184,21 @@ pub enum AppMsg {
     ApplyAndRestart,
     SwitchView(usize),
     ShowToast(String),
-    FlushSettings(AppSettings),
+    FlushSettings(u64, AppSettings),
     AutoReconnect(u32),
     /// Route release finished; the flag reports whether routes and the
     /// recovery journal were cleared. A failed release keeps its journal.
     TunReleased(bool),
     TunGrantRequired(u64),
+    /// A manager's cleanup failed: the session holds it parked for a retry,
+    /// so rules may remain and no terminal state arrives until then.
+    CleanupPending(u64, String),
+    /// The anti-DPI engine died after readiness: DPI interception is degraded
+    /// but the proxy connection stays up. Non-fatal, one notice per
+    /// generation.
+    EngineDegraded(u64, String),
+    /// The user activated the offered retry for a failed cleanup.
+    RetryCleanup,
     NodePins(u64, Vec<HostOverride>),
     DownloadGeodata,
     /// A classified connect failure offers a refresh of the subscription that
@@ -231,8 +247,14 @@ impl App {
         if let ProcessState::Error(msg) = state {
             // An armed TUN grant is consumed here; the caller replaces the
             // plain toast with the actionable one while the sender is alive.
+            // A pending cleanup failure is the banner's message instead.
             if error_toast_action(self.connection_generation, self.grant_generation.take())
                 .is_none()
+                && !cleanup_error_toast_suppressed(
+                    self.cleanup_pending,
+                    self.cleanup_error.as_deref(),
+                    msg,
+                )
             {
                 self.show_toast(&format!("Error: {msg}"));
             }
@@ -303,14 +325,19 @@ impl App {
         self.cancel_auto_reconnect();
         match disconnect_plan(self.process_handle.is_some(), self.tun_marker_present()) {
             DisconnectPlan::Stop => {
-                if let Some(handle) = self.process_handle.take() {
-                    self.apply_state(&ProcessState::Stopping);
-                    handle.stop(stop_reason_for(
+                self.apply_state(&ProcessState::Stopping);
+                // The handle stays: a failed cleanup keeps the session task
+                // parked on this generation, and the retry must reach it
+                // without minting a new session identity.
+                if let Some(handle) = self.process_handle.as_ref()
+                    && let Err(err) = handle.stop(stop_reason_for(
                         self.pending_exit,
                         self.health_failover.reconnect_pending,
                         reconnect_pending,
                         self.pending_direct_target.is_some(),
-                    ));
+                    ))
+                {
+                    log::warn!("stop request not delivered: {err:?}");
                 }
             }
             DisconnectPlan::Release => {
@@ -450,8 +477,10 @@ impl App {
         match plan {
             QuitPlan::Stop => {
                 self.pending_exit = true;
-                if let Some(handle) = self.process_handle.take() {
-                    handle.stop(StopReason::AppQuit);
+                if let Some(handle) = self.process_handle.take()
+                    && let Err(err) = handle.stop(StopReason::AppQuit)
+                {
+                    log::warn!("stop request not delivered: {err:?}");
                 }
             }
             QuitPlan::AwaitStopped => self.pending_exit = true,
@@ -471,11 +500,23 @@ impl App {
         Ok(())
     }
 
-    fn commit_settings(&mut self, settings: AppSettings, sender: &ComponentSender<Self>) {
+    fn commit_settings(
+        &mut self,
+        revision: u64,
+        settings: AppSettings,
+        sender: &ComponentSender<Self>,
+    ) {
         let settings = keep_last_success(settings, &self.settings);
         if let Err(err) = self.persist_settings(settings) {
             log::error!("save settings: {err}");
             self.show_toast(&format!("Failed to save settings: {err}"));
+            // The write failed, so the dialog must show the last committed
+            // snapshot again — but only when the rejected write is still the
+            // dialog's latest accepted edit. A newer pending edit is never
+            // overwritten, and only the one error above is reported.
+            if let Some(prefs) = &self.preferences_dialog {
+                prefs.reconcile_settings_if_current(&self.settings, revision);
+            }
             return;
         }
         update_tray_notification_setting(self.settings.notifications_enabled);
@@ -504,8 +545,8 @@ impl App {
         if let Some(id) = self.settings_debounce.take() {
             id.remove();
         }
-        if let Some(settings) = self.pending_settings.take() {
-            self.commit_settings(settings, sender);
+        if let Some((revision, settings)) = self.pending_settings.take() {
+            self.commit_settings(revision, settings, sender);
         }
     }
 
@@ -796,6 +837,7 @@ impl App {
         let connection_manual_nodes = manual_nodes.clone();
         self.connection_generation = self.connection_generation.wrapping_add(1);
         self.grant_generation = None;
+        self.degraded_generation = None;
         let generation = self.connection_generation;
 
         self.runtime_snapshot = Some(RuntimeConfigSnapshot {
@@ -812,6 +854,7 @@ impl App {
             auto_resolve_strategy: self.settings.auto_resolve_strategy,
             use_real_delay_for_lowest_latency: self.settings.real_delay.use_for_lowest_latency,
             tun: self.settings.tun.clone(),
+            antidpi: self.settings.antidpi.clone(),
             idle_timeout_secs: self.settings.idle_timeout_secs,
             ws_heartbeat_secs: self.settings.ws_heartbeat_secs,
             logging: self.settings.logging,
@@ -991,6 +1034,29 @@ impl SimpleComponent for App {
 
                             },
 
+                            gtk::Box {
+                                set_orientation: gtk::Orientation::Horizontal,
+                                set_spacing: 12,
+                                set_margin_top: 6,
+                                set_margin_start: 6,
+                                set_margin_end: 6,
+                                #[watch]
+                                set_visible: model.cleanup_pending,
+
+                                adw::Banner {
+                                    set_hexpand: true,
+                                    set_title: &tr("Cleanup failed; session rules may remain installed"),
+                                    set_button_label: Some(&tr("Retry cleanup")),
+                                    #[watch]
+                                    set_revealed: model.cleanup_pending,
+
+                                    connect_button_clicked[sender] => move |_| {
+                                        sender.input(AppMsg::RetryCleanup);
+                                    },
+                                },
+
+                            },
+
                             gtk::Paned {
                             set_orientation: gtk::Orientation::Vertical,
                             set_vexpand: true,
@@ -1082,7 +1148,9 @@ impl SimpleComponent for App {
                                 set_label: &tr(if model.connected { "Disconnect" } else { "Connect" }),
                             },
                             #[watch]
-                            set_sensitive: model.button_sensitive && (model.connected || model.has_active_nodes),
+                            set_sensitive: model.button_sensitive
+                                && !model.cleanup_pending
+                                && (model.connected || model.has_active_nodes),
                             #[watch]
                             set_tooltip_text: Some(&tr(if !model.connected && !model.has_active_nodes {
                                 "No enabled proxy nodes"
@@ -1259,6 +1327,9 @@ impl SimpleComponent for App {
             wizard,
             window: root.clone(),
             process_handle: None,
+            cleanup_pending: false,
+            cleanup_error: None,
+            degraded_generation: None,
             tun_lifecycle,
             connection_generation: 0,
             grant_generation: None,
@@ -1366,21 +1437,21 @@ impl SimpleComponent for App {
                         .emit(SubscriptionsMsg::AddSubscription(name, source_input));
                 }
             }
-            AppMsg::SettingsChanged(settings) => {
+            AppMsg::SettingsChanged(revision, settings) => {
                 if let Some(id) = self.settings_debounce.take() {
                     id.remove();
                 }
-                self.pending_settings = Some(settings.clone());
+                self.pending_settings = Some((revision, settings.clone()));
                 let s = sender.clone();
                 self.settings_debounce = Some(glib::timeout_add_local_once(
                     std::time::Duration::from_millis(300),
-                    move || s.input(AppMsg::FlushSettings(settings)),
+                    move || s.input(AppMsg::FlushSettings(revision, settings)),
                 ));
             }
-            AppMsg::FlushSettings(settings) => {
+            AppMsg::FlushSettings(revision, settings) => {
                 self.settings_debounce = None;
                 self.pending_settings = None;
-                self.commit_settings(settings, &sender);
+                self.commit_settings(revision, settings, &sender);
             }
             AppMsg::ActiveNodesChanged(_has) => {
                 self.refresh_has_active_nodes();
@@ -1492,6 +1563,9 @@ impl SimpleComponent for App {
             AppMsg::ToggleConnection => {
                 if self.connected {
                     sender.input(AppMsg::Disconnect);
+                } else if cleanup_blocks_new_session(self.cleanup_pending) {
+                    // The retry action owns the parked session until its
+                    // cleanup succeeds.
                 } else {
                     sender.input(AppMsg::Connect(ConnectOrigin::User));
                 }
@@ -1499,6 +1573,9 @@ impl SimpleComponent for App {
             AppMsg::Connect(origin) => {
                 if matches!(self.process_state, ProcessState::Stopping) {
                     self.deferred_connect = Some(DeferredConnect::Plan(origin));
+                    return;
+                }
+                if cleanup_blocks_new_session(self.cleanup_pending) {
                     return;
                 }
                 if self.process_handle.is_some() {
@@ -1593,6 +1670,9 @@ impl SimpleComponent for App {
                 self.session_target = None;
             }
             AppMsg::ConnectToNode(target, origin) => {
+                if cleanup_blocks_new_session(self.cleanup_pending) {
+                    return;
+                }
                 if matches!(self.process_state, ProcessState::Stopping) {
                     self.deferred_connect = Some(DeferredConnect::Node(target, origin));
                     return;
@@ -1710,6 +1790,8 @@ impl SimpleComponent for App {
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
                 if stopped {
                     self.process_handle = None;
+                    self.cleanup_pending = false;
+                    self.cleanup_error = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
                     // Retire the TUN journal only on a clean stop, and only
@@ -1850,6 +1932,42 @@ impl SimpleComponent for App {
                     self.grant_generation = Some(generation);
                 }
             }
+            AppMsg::CleanupPending(generation, message) => {
+                // A superseded session's parked manager arms nothing: its
+                // generation no longer owns the handle slot.
+                if !is_current_generation(generation, self.connection_generation) {
+                    return;
+                }
+                // The banner carries the warning and the retry action, so the
+                // matching error toast stays suppressed in `apply_state`.
+                self.cleanup_pending = true;
+                self.cleanup_error = Some(message.clone());
+                self.apply_state(&ProcessState::Error(message.clone()));
+            }
+            AppMsg::RetryCleanup => {
+                if !cleanup_retry_available(self.cleanup_pending, self.process_handle.is_some()) {
+                    return;
+                }
+                if let Some(handle) = self.process_handle.as_ref()
+                    && let Err(err) = handle.stop(StopReason::UserStop)
+                {
+                    log::warn!("cleanup retry stop not delivered: {err:?}");
+                }
+            }
+            AppMsg::EngineDegraded(generation, detail) => {
+                if !engine_degraded_notice_fires(
+                    self.degraded_generation,
+                    generation,
+                    self.connection_generation,
+                    &self.process_state,
+                ) {
+                    return;
+                }
+                self.degraded_generation = Some(generation);
+                self.show_toast(&format!(
+                    "DPI interception degraded: {detail}. The proxy connection stays up."
+                ));
+            }
             AppMsg::NodePins(generation, pins) => {
                 apply_node_pins(
                     &mut self.last_good_pins,
@@ -1888,6 +2006,7 @@ impl SimpleComponent for App {
                 self.update_status_labels();
                 if unhealthy
                     && self.process_handle.is_some()
+                    && !cleanup_blocks_new_session(self.cleanup_pending)
                     && health_failover_allowed(
                         self.settings.health_check.failover,
                         self.session_target,
@@ -1951,8 +2070,8 @@ impl SimpleComponent for App {
                     &window,
                     &self.store,
                     &settings,
-                    move |new_settings| {
-                        s.emit(AppMsg::SettingsChanged(new_settings));
+                    move |revision, new_settings| {
+                        s.emit(AppMsg::SettingsChanged(revision, new_settings));
                     },
                     move |rules| {
                         s1.emit(AppMsg::RoutingChanged(rules));
@@ -1991,9 +2110,9 @@ impl SimpleComponent for App {
                 dialog.widget().present(Some(&window));
                 self.config_preview = Some(dialog);
             }
-            AppMsg::ResetBrokenSettings => match std::fs::remove_file(self.paths.settings_path()) {
-                Ok(()) => {
-                    self.settings = AppSettings::default();
+            AppMsg::ResetBrokenSettings => match self.store.reset_settings() {
+                Ok(settings) => {
+                    self.settings = (*settings).clone();
                     self.settings_load_error = None;
                     self.show_wizard = true;
                     self.wizard
@@ -2017,15 +2136,6 @@ impl SimpleComponent for App {
                             binary_path: self.settings.backend.binary_path.clone(),
                             real_delay_settings: self.settings.real_delay.clone(),
                         });
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    self.settings = AppSettings::default();
-                    self.settings_load_error = None;
-                    self.show_wizard = true;
-                    self.wizard
-                        .emit(crate::wizard::WizardMsg::ResetSettings(Box::new(
-                            self.settings.clone(),
-                        )));
                 }
                 Err(err) => {
                     self.show_toast(&format!("Failed to reset settings: {err}"));
@@ -2193,7 +2303,7 @@ impl HealthFailover {
 mod tests {
     use super::*;
     use v2ray_rs_core::models::{
-        AutoResolveStrategy, BackendType, DnsConfig, ProxyNode, SubscriptionNode,
+        AntiDpiConfig, AutoResolveStrategy, BackendType, DnsConfig, ProxyNode, SubscriptionNode,
         TransportSettings, TunConfig, VlessConfig,
     };
 
@@ -2238,6 +2348,30 @@ mod tests {
         assert!(!sensitive);
     }
 
+    #[test]
+    fn cleanup_error_toast_suppressed_only_for_the_pending_failure() {
+        assert!(cleanup_error_toast_suppressed(
+            true,
+            Some("rules remain installed"),
+            "rules remain installed"
+        ));
+        assert!(!cleanup_error_toast_suppressed(
+            true,
+            Some("rules remain installed"),
+            "backend died"
+        ));
+        assert!(!cleanup_error_toast_suppressed(
+            false,
+            Some("rules remain installed"),
+            "rules remain installed"
+        ));
+        assert!(!cleanup_error_toast_suppressed(
+            true,
+            None,
+            "rules remain installed"
+        ));
+    }
+
     fn snapshot(backend: BackendType, tun_enabled: bool) -> RuntimeConfigSnapshot {
         RuntimeConfigSnapshot {
             backend_type: backend,
@@ -2256,6 +2390,7 @@ mod tests {
                 enabled: tun_enabled,
                 ..TunConfig::default()
             },
+            antidpi: AntiDpiConfig::default(),
             idle_timeout_secs: 300,
             ws_heartbeat_secs: 30,
             logging: Default::default(),
@@ -2817,6 +2952,49 @@ mod tests {
         assert!(!falls_back_to_planner(ConnectOrigin::User));
         assert!(falls_back_to_planner(ConnectOrigin::Restart));
         assert!(falls_back_to_planner(ConnectOrigin::AutoReconnect));
+    }
+
+    #[test]
+    fn engine_degraded_notice_fires_only_once_per_live_running_generation() {
+        assert!(engine_degraded_notice_fires(
+            None,
+            7,
+            7,
+            &ProcessState::Running
+        ));
+        assert!(!engine_degraded_notice_fires(
+            Some(7),
+            7,
+            7,
+            &ProcessState::Running
+        ));
+        // A queued notice must not claim the proxy stays up after Disconnect
+        // or during teardown.
+        assert!(!engine_degraded_notice_fires(
+            None,
+            7,
+            7,
+            &ProcessState::Stopping
+        ));
+        assert!(!engine_degraded_notice_fires(
+            None,
+            7,
+            7,
+            &ProcessState::Stopped
+        ));
+        // A superseded session's report never reaches the user.
+        assert!(!engine_degraded_notice_fires(
+            None,
+            6,
+            7,
+            &ProcessState::Running
+        ));
+        assert!(!engine_degraded_notice_fires(
+            Some(6),
+            6,
+            7,
+            &ProcessState::Running
+        ));
     }
 
     #[test]

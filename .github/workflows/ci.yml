@@ -35,7 +35,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - name: Compile gated privileged tests
-        run: cargo check --workspace --all-targets --features v2ray-rs-process/privileged-tests,v2ray-rs-netctl/privileged-tests
+        run: cargo check --workspace --all-targets --features v2ray-rs-process/privileged-tests,v2ray-rs-netctl/privileged-tests,v2ray-rs-antidpi/privileged-tests
 
   test:
     name: Test
@@ -158,6 +158,9 @@ jobs:
           subprocess.run(["sudo", "env", "V2RAY_RS_REQUIRE_NETNS=1", "timeout", "3m", priv_bin,
                           "--test-threads=1"], check=True, timeout=190)
           PYTHON
+      - name: Verify Arch hook scriptlet in private namespaces
+        run: |
+          sudo env V2RAY_RS_REQUIRE_NETNS=1 timeout 5m /usr/bin/bash scripts/test-arch-hook-namespace.sh
 
   audit:
     name: Advisory audit

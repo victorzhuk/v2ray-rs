@@ -141,7 +141,7 @@ async fn shutdown_disables_auto_restart() {
     let mut mgr = ProcessManager::new(binary, config, pid_path(&dir), None);
     mgr.start().await.unwrap();
 
-    mgr.shutdown().await;
+    mgr.shutdown().await.unwrap();
     assert_eq!(mgr.state(), ProcessState::Stopped);
 }
 

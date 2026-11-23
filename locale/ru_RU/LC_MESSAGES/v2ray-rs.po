@@ -461,3 +461,81 @@ msgstr "Направлять весь системный трафик через
 
 msgid "Enable TUN"
 msgstr "Включить TUN"
+
+msgid "Anti-DPI"
+msgstr "Анти-DPI"
+
+msgid "Anti-DPI engine"
+msgstr "Движок анти-DPI"
+
+msgid "Inspects the early TLS and QUIC packets of flows to port 443 on host egress; works with every backend, with or without TUN. The optional hostlist matches TLS SNI or HTTP Host, never QUIC. There is no guarantee that the first packet is covered, and IPv6 traffic passes through unprocessed"
+msgstr "Инспектирует ранние пакеты TLS и QUIC потоков на порт 443 в исходящем трафике хоста; работает с любым бэкендом, с TUN и без. Необязательный hostlist сопоставляется с TLS SNI или HTTP Host, а не с QUIC. Нет гарантии, что первый пакет будет обработан; IPv6-трафик проходит без обработки анти-DPI"
+
+msgid "Enable anti-DPI"
+msgstr "Включить анти-DPI"
+
+msgid "Applies on next connect"
+msgstr "Применится при следующем подключении"
+
+msgid "NFQUEUE number"
+msgstr "Номер NFQUEUE"
+
+msgid "Must differ from any other NFQUEUE consumer on this machine"
+msgstr "Не должен совпадать с другими потребителями NFQUEUE на этой машине"
+
+msgid "Failed to save anti-DPI setting"
+msgstr "Не удалось сохранить настройку анти-DPI"
+
+msgid "The NFQUEUE number must be a whole number from 1 to 65535"
+msgstr "Номер NFQUEUE должен быть целым числом от 1 до 65535"
+
+msgid "Hostlist file"
+msgstr "Файл hostlist"
+
+msgid "The hostlist path must not be blank"
+msgstr "Путь к hostlist не должен состоять из одних пробелов"
+
+msgid "Strategy chains"
+msgstr "Цепочки стратегий"
+
+msgid "One strategy chain per line; an empty list uses the helper's built-in defaults. Applies on next connect"
+msgstr "Одна цепочка стратегий на строку; пустой список использует встроенные умолчания хелпера. Применится при следующем подключении"
+
+msgid "Too many strategy chains; the edit was not saved"
+msgstr "Слишком много цепочек стратегий; изменение не сохранено"
+
+msgid "Strategy chains must not contain blank lines"
+msgstr "Цепочки стратегий не должны содержать пустых строк"
+
+msgid "Each strategy chain is limited to 512 characters"
+msgstr "Каждая цепочка стратегий ограничена 512 символами"
+
+msgid "Failed to save anti-DPI strategies"
+msgstr "Не удалось сохранить стратегии анти-DPI"
+
+msgid "Privileges"
+msgstr "Права"
+
+msgid "Capability status"
+msgstr "Состояние возможностей"
+
+msgid "The engine needs cap_net_admin and cap_net_raw; the Grant TUN privileges action on the TUN page covers the anti-DPI helper in the same elevation"
+msgstr "Движку нужны cap_net_admin и cap_net_raw; действие «Grant TUN privileges» на странице TUN выдает их анти-DPI хелперу тем же повышением"
+
+msgid "Anti-DPI helper lacks cap_net_admin or cap_net_raw; grant again"
+msgstr "Хелперу анти-DPI не хватает cap_net_admin или cap_net_raw; выдайте права снова"
+
+msgid "The anti-DPI engine inspects outgoing traffic; applies on next connect."
+msgstr "Движок анти-DPI проверяет исходящий трафик; применится при следующем подключении."
+
+msgid "Anti-DPI helper is not managed by v2ray-rs; install the distribution package"
+msgstr "Хелпер анти-DPI не управляется v2ray-rs; установите пакет дистрибутива"
+
+msgid "Installed anti-DPI helper is out of date; grant again"
+msgstr "Установленный хелпер анти-DPI устарел; выдайте права снова"
+
+msgid "Cannot read anti-DPI capabilities"
+msgstr "Не удалось прочитать возможности анти-DPI"
+
+msgid "Anti-DPI helper needs installing before the anti-DPI engine can start"
+msgstr "Хелпер анти-DPI нужно установить, прежде чем движок анти-DPI сможет запуститься"

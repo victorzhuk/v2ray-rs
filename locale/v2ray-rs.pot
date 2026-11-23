@@ -231,3 +231,81 @@ msgstr ""
 
 msgid "Delete rule"
 msgstr ""
+
+msgid "Anti-DPI"
+msgstr ""
+
+msgid "Anti-DPI engine"
+msgstr ""
+
+msgid "Inspects the early TLS and QUIC packets of flows to port 443 on host egress; works with every backend, with or without TUN. The optional hostlist matches TLS SNI or HTTP Host, never QUIC. There is no guarantee that the first packet is covered, and IPv6 traffic passes through unprocessed"
+msgstr ""
+
+msgid "Enable anti-DPI"
+msgstr ""
+
+msgid "Applies on next connect"
+msgstr ""
+
+msgid "NFQUEUE number"
+msgstr ""
+
+msgid "Must differ from any other NFQUEUE consumer on this machine"
+msgstr ""
+
+msgid "Failed to save anti-DPI setting"
+msgstr ""
+
+msgid "The NFQUEUE number must be a whole number from 1 to 65535"
+msgstr ""
+
+msgid "Hostlist file"
+msgstr ""
+
+msgid "The hostlist path must not be blank"
+msgstr ""
+
+msgid "Strategy chains"
+msgstr ""
+
+msgid "One strategy chain per line; an empty list uses the helper's built-in defaults. Applies on next connect"
+msgstr ""
+
+msgid "Too many strategy chains; the edit was not saved"
+msgstr ""
+
+msgid "Strategy chains must not contain blank lines"
+msgstr ""
+
+msgid "Each strategy chain is limited to 512 characters"
+msgstr ""
+
+msgid "Failed to save anti-DPI strategies"
+msgstr ""
+
+msgid "Privileges"
+msgstr ""
+
+msgid "Capability status"
+msgstr ""
+
+msgid "The engine needs cap_net_admin and cap_net_raw; the Grant TUN privileges action on the TUN page covers the anti-DPI helper in the same elevation"
+msgstr ""
+
+msgid "Anti-DPI helper lacks cap_net_admin or cap_net_raw; grant again"
+msgstr ""
+
+msgid "The anti-DPI engine inspects outgoing traffic; applies on next connect."
+msgstr ""
+
+msgid "Anti-DPI helper is not managed by v2ray-rs; install the distribution package"
+msgstr ""
+
+msgid "Installed anti-DPI helper is out of date; grant again"
+msgstr ""
+
+msgid "Cannot read anti-DPI capabilities"
+msgstr ""
+
+msgid "Anti-DPI helper needs installing before the anti-DPI engine can start"
+msgstr ""

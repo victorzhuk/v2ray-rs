@@ -17,7 +17,7 @@ pub const DEVICE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const HELPER_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_millis(500);
 
-const HELPER_BIN: &str = "v2ray-rs-netctl";
+pub(crate) const HELPER_BIN: &str = "v2ray-rs-netctl";
 const RUN_BIN: &str = "v2ray-rs-run";
 
 /// Where the privileged grant installs helpers when the bundled copies sit on a
@@ -77,14 +77,50 @@ pub fn run_path() -> PathBuf {
     resolve_bin(RUN_BIN)
 }
 
-fn resolve_bin(name: &str) -> PathBuf {
+pub(crate) fn resolve_bin(name: &str) -> PathBuf {
     let bundled = bundled_bin(name);
     let caps_ok = bundled
         .as_deref()
         .and_then(Path::parent)
         .is_none_or(crate::privilege::file_caps_supported);
     let relocated = relocated_bin(name);
-    pick_bin(bundled.as_deref(), caps_ok, relocated.as_deref(), name)
+    let chosen = pick_bin(bundled.as_deref(), caps_ok, relocated.as_deref(), name);
+    // pick_bin returns the bare name only when neither copy exists; that is
+    // where the PATH lookup happens, so the caller still gets an absolute
+    // path whenever an executable copy is actually installed. The bare name
+    // survives only as "nothing found" for a clear spawn-time failure.
+    if chosen == Path::new(name) {
+        find_on_path(name).unwrap_or(chosen)
+    } else {
+        chosen
+    }
+}
+
+/// Absolute path of an executable `name` found on `$PATH`, or `None`.
+///
+/// A relative PATH entry is resolved against the current directory, exactly
+/// as the kernel would resolve it when execing a bare name; without a
+/// readable current directory such entries cannot be inspected absolutely
+/// and are skipped, so the result stays absolute whenever a file is found.
+pub(crate) fn find_on_path(name: &str) -> Option<PathBuf> {
+    let dirs = std::env::var_os("PATH")?;
+    let cwd = std::env::current_dir().ok();
+    std::env::split_paths(&dirs)
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .filter_map(|dir| match dir.is_absolute() {
+            true => Some(dir),
+            false => cwd.as_ref().map(|base| base.join(dir)),
+        })
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    path.is_file()
+        && std::fs::metadata(path)
+            .map(|meta| meta.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
 }
 
 /// Chooses which copy of `name` to run. Pure so the ordering can be tested
@@ -114,13 +150,13 @@ fn pick_bin(
 /// back to a bare filename, so the result is safe to hand to a root-elevated
 /// `setcap`/`chown`/`chmod`, which resolve a relative argument against the
 /// process CWD rather than `$PATH`.
-fn bundled_bin(name: &str) -> Option<PathBuf> {
+pub(crate) fn bundled_bin(name: &str) -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let candidate = exe.parent()?.join(name);
     candidate.exists().then_some(candidate)
 }
 
-fn relocated_bin(name: &str) -> Option<PathBuf> {
+pub(crate) fn relocated_bin(name: &str) -> Option<PathBuf> {
     let candidate = Path::new(RELOCATE_DIR).join(name);
     candidate.exists().then_some(candidate)
 }
@@ -732,10 +768,53 @@ pub fn operator_recover_args(iface: &str, backend: BackendType) -> Vec<String> {
 
 /// Explicit operator recovery of leftover TUN state. Runs the route helper
 /// elevated (pkexec) with --force-legacy, bypassing ownership verification.
-/// Caller must confirm.
+/// Caller must confirm. The helper path is validated against the privilege
+/// module's target checks first: path resolution is not authorization, and
+/// an untrusted target is refused before any elevation is offered.
 pub async fn operator_recover(helper: &Path, iface: &str, backend: BackendType) -> HelperRun {
+    operator_recover_with(helper, iface, backend, run_elevated_helper).await
+}
+
+/// Validate-then-elevate body with an injectable runner, so tests can prove
+/// an untrusted target never reaches elevation.
+async fn operator_recover_with(
+    helper: &Path,
+    iface: &str,
+    backend: BackendType,
+    run: impl AsyncFn(&Path, &[String], Duration) -> HelperRun,
+) -> HelperRun {
+    run_validated(
+        helper,
+        iface,
+        backend,
+        run,
+        crate::privilege::validate_recovery_target,
+    )
+    .await
+}
+
+/// Validation-to-execution seam, injectable for tests: whatever the validator
+/// accepts is canonicalized by the validator, and exactly that path reaches
+/// the elevated run — never the raw caller-supplied name.
+async fn run_validated(
+    helper: &Path,
+    iface: &str,
+    backend: BackendType,
+    run: impl AsyncFn(&Path, &[String], Duration) -> HelperRun,
+    validate: impl Fn(&Path) -> Result<PathBuf, crate::privilege::PrivilegeError>,
+) -> HelperRun {
+    let helper = match validate(helper) {
+        Ok(validated) => validated,
+        Err(err) => {
+            return HelperRun {
+                output: Vec::new(),
+                result: Err(err.to_string()),
+                timed_out: false,
+            };
+        }
+    };
     let args = operator_recover_args(iface, backend);
-    run_elevated_helper(helper, &args, OPERATOR_RECOVERY_POLKIT_TIMEOUT).await
+    run(&helper, &args, OPERATOR_RECOVERY_POLKIT_TIMEOUT).await
 }
 
 /// Operator recovery waits behind an interactive polkit authentication
@@ -870,6 +949,68 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn operator_recover_refuses_untrusted_target_without_elevation() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let planted = dir.path().join("v2ray-rs-netctl");
+        std::fs::write(&planted, b"helper").unwrap();
+        let elevations = std::sync::atomic::AtomicUsize::new(0);
+        let run = async |_helper: &Path, _args: &[String], _timeout: Duration| {
+            elevations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            HelperRun {
+                output: Vec::new(),
+                result: Ok(()),
+                timed_out: false,
+            }
+        };
+        let outcome = operator_recover_with(&planted, "tun9", BackendType::Xray, run).await;
+        // A PATH-only copy is refused on location, and the injected runner
+        // proves refusal happens before any elevation is offered.
+        assert!(
+            outcome
+                .result
+                .err()
+                .is_some_and(|e| e.contains("neither the packaged nor the relocated"))
+        );
+        assert_eq!(elevations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn run_validated_executes_the_validated_canonical_path() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let real_dir = dir.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        let canonical = real_dir.join("v2ray-rs-netctl");
+        std::fs::write(&canonical, b"helper").unwrap();
+        // The caller names the helper through a symlinked parent directory:
+        // the executed argument must be the canonical path, not the alias.
+        let link_dir = dir.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link_dir).unwrap();
+        let caller_path = link_dir.join("v2ray-rs-netctl");
+
+        let executed: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+        let run = async |helper: &Path, _args: &[String], _timeout: Duration| {
+            *executed.lock().unwrap() = Some(helper.to_path_buf());
+            HelperRun {
+                output: Vec::new(),
+                result: Ok(()),
+                timed_out: false,
+            }
+        };
+        // Stub validator standing in for the real target checks (which need
+        // root-owned parents); it returns the canonical path like the real
+        // validator does on success.
+        let validate = |_p: &Path| Ok(canonical.clone());
+
+        run_validated(&caller_path, "tun9", BackendType::Xray, run, validate).await;
+
+        assert_eq!(
+            executed.lock().unwrap().as_deref(),
+            Some(canonical.as_path()),
+            "the elevated run must receive the canonical path, not the caller's alias"
+        );
+    }
 
     #[test]
     fn operator_recover_args_matches_backend_flag() {
@@ -1626,6 +1767,115 @@ mod tests {
             assert!(Query::from(grants(gid().as_raw()).contains(&gid())) == Query::Yes);
             assert!(Query::from(grants(1).contains(&gid())) == Query::No);
         }
+    }
+
+    /// Marker selecting the re-executed child role. The parent spawns this
+    /// test binary with a child-local `PATH` and CWD; no test ever mutates
+    /// its own process-global environment.
+    const FIND_ON_PATH_CHILD_ENV: &str = "V2RAY_RS_FIND_ON_PATH_CHILD";
+    const FIND_ON_PATH_CHILD_NAME: &str = "V2RAY_RS_FIND_ON_PATH_NAME";
+    const FIND_ON_PATH_FIXTURE: &str = "v2ray-rs-findpath-fixture";
+
+    fn find_on_path_child_duty() {
+        let name = std::env::var(FIND_ON_PATH_CHILD_NAME).expect("child fixture name");
+        match find_on_path(&name) {
+            Some(found) => println!("FOUND:{}", found.display()),
+            None => println!("FOUND:"),
+        }
+    }
+
+    fn run_find_on_path_child(test_name: &str, path_env: &str, cwd: &Path) -> String {
+        let exe = std::env::current_exe().unwrap();
+        let output = std::process::Command::new(&exe)
+            // Substring filter, not `--exact`: the harness matches against
+            // the full `tun::tests::` path, which a bare function name never
+            // equals. The name is unique enough that exactly one test runs.
+            .args([test_name, "--nocapture"])
+            .env(FIND_ON_PATH_CHILD_ENV, "1")
+            .env(FIND_ON_PATH_CHILD_NAME, FIND_ON_PATH_FIXTURE)
+            .env("PATH", path_env)
+            .current_dir(cwd)
+            .output()
+            .expect("re-executing the test binary");
+        assert!(
+            output.status.success(),
+            "child harness failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn find_on_path_fixture_dir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let helper = bin.join(FIND_ON_PATH_FIXTURE);
+        std::fs::write(&helper, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn find_on_path_resolves_a_relative_entry_against_the_cwd() {
+        if std::env::var_os(FIND_ON_PATH_CHILD_ENV).is_some() {
+            find_on_path_child_duty();
+            return;
+        }
+        let dir = find_on_path_fixture_dir();
+        let stdout = run_find_on_path_child(
+            "find_on_path_resolves_a_relative_entry_against_the_cwd",
+            "bin",
+            dir.path(),
+        );
+        let found = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FOUND:"))
+            .expect("child printed a find_on_path result");
+        let expected = dir.path().join("bin").join(FIND_ON_PATH_FIXTURE);
+        assert_eq!(Path::new(found), expected);
+        assert!(Path::new(found).is_absolute());
+    }
+
+    #[test]
+    fn find_on_path_skips_empty_entries_and_still_resolves_relative_ones() {
+        if std::env::var_os(FIND_ON_PATH_CHILD_ENV).is_some() {
+            find_on_path_child_duty();
+            return;
+        }
+        let dir = find_on_path_fixture_dir();
+        let stdout = run_find_on_path_child(
+            "find_on_path_skips_empty_entries_and_still_resolves_relative_ones",
+            ":bin:",
+            dir.path(),
+        );
+        let found = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FOUND:"))
+            .expect("child printed a find_on_path result");
+        assert_eq!(
+            Path::new(found),
+            dir.path().join("bin").join(FIND_ON_PATH_FIXTURE)
+        );
+    }
+
+    #[test]
+    fn find_on_path_reports_none_for_a_relative_entry_without_the_file() {
+        if std::env::var_os(FIND_ON_PATH_CHILD_ENV).is_some() {
+            find_on_path_child_duty();
+            return;
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        let stdout = run_find_on_path_child(
+            "find_on_path_reports_none_for_a_relative_entry_without_the_file",
+            "no-such-dir",
+            dir.path(),
+        );
+        let found = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("FOUND:"))
+            .expect("child printed a find_on_path result");
+        assert_eq!(found, "");
     }
 
     #[tokio::test]

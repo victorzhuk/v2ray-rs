@@ -1,3 +1,4 @@
+mod antidpi;
 mod dns;
 mod imported_profile;
 mod manual_node;
@@ -10,6 +11,9 @@ mod subscription;
 mod tun;
 mod validation;
 
+pub use antidpi::{
+    AntiDpiConfig, DEFAULT_ANTIDPI_QUEUE, MAX_ANTIDPI_STRATEGIES, MAX_ANTIDPI_STRATEGY_LEN,
+};
 pub use dns::{
     AUTO_SPLIT_DOMESTIC_TAG, AUTO_SPLIT_REMOTE_TAG, DnsConfig, DnsProtocol, DnsProviderPreset,
     DnsRule, DnsRuleMatch, DnsServerConfig, DnsStrategy, DnsValidationError, FakeIpConfig,

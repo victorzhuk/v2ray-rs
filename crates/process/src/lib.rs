@@ -1,3 +1,4 @@
+mod antidpi;
 mod manager;
 mod pid;
 mod privilege;
@@ -7,12 +8,16 @@ mod spawn;
 mod state;
 mod tun;
 
+pub use antidpi::{
+    ANTIDPI_BIN, AntiDpiRuntime, antidpi_path, bundled_antidpi_path, relocated_antidpi_path,
+};
 #[cfg(any(test, feature = "test-utils"))]
 pub use manager::HostProbe;
 pub use manager::{ProcessError, ProcessManager, StopReason};
 pub use pid::PidFile;
 pub use privilege::{
-    BACKEND_CAPS, HELPER_CAPS, PrivilegeError, ProbeFailure, grant, has_net_admin, manual_command,
+    ANTIDPI_CAPS, BACKEND_CAPS, HELPER_CAPS, PrivilegeError, ProbeFailure, antidpi_grant_eligible,
+    grant, has_antidpi_caps, has_net_admin, manual_command,
 };
 pub use probe::{ProbeError, ProbeRunner};
 pub use state::{ProcessEvent, ProcessState, TransitionError};

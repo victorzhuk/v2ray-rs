@@ -57,6 +57,8 @@ pub enum ValidationError {
     },
     #[error("invalid process name: {0}")]
     InvalidProcessName(String),
+    #[error("invalid anti-DPI configuration: {0}")]
+    InvalidAntiDpiConfig(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,6 +1,6 @@
 use adw::prelude::*;
 use relm4::adw;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use v2ray_rs_core::backend::{DetectedBackend, backend_name};
@@ -9,16 +9,22 @@ use v2ray_rs_core::models::{AppSettings, RoutingRuleSet};
 use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
+mod antidpi;
 mod dns;
 mod network;
 mod routing;
 mod system;
 mod tun;
 
+use antidpi::build_antidpi_page;
 use dns::build_dns_page;
 use network::build_network_page;
 use routing::{build_routing_error_page, build_routing_page};
 use system::build_system_page;
+// Exported for page-targeted navigation (grant toasts, restart banner),
+// mirroring `TUN_PAGE_NAME`; no caller points at the anti-DPI page yet.
+#[allow(unused_imports)]
+pub(crate) use antidpi::ANTIDPI_PAGE_NAME;
 pub(crate) use tun::TUN_PAGE_NAME;
 use tun::build_tun_page;
 
@@ -31,10 +37,26 @@ pub(crate) type RoutingObservers = Rc<RefCell<Vec<Rc<dyn Fn()>>>>;
 
 pub struct PreferencesHandle {
     pub dialog: adw::PreferencesDialog,
+    settings_state: Rc<RefCell<AppSettings>>,
+    settings_observers: SettingsObservers,
     nodes_observers: RoutingObservers,
+    /// Monotonic revision of accepted edits, bumped once per settings emit.
+    settings_revision: Rc<Cell<u64>>,
 }
 
 impl PreferencesHandle {
+    /// Restores the dialog's settings to the last committed snapshot and
+    /// re-renders the rows through the observers, but only when `rejected`
+    /// is still the dialog's latest accepted edit revision: a newer pending
+    /// edit is never overwritten. Returns whether the reconciliation ran.
+    pub fn reconcile_settings_if_current(&self, committed: &AppSettings, rejected: u64) -> bool {
+        if !rejected_write_reconciles(self.settings_revision.get(), rejected) {
+            return false;
+        }
+        reconcile_settings(&self.settings_state, &self.settings_observers, committed);
+        true
+    }
+
     pub fn refresh_nodes(&self) {
         let observers: Vec<_> = self.nodes_observers.borrow().iter().cloned().collect();
         for observer in observers {
@@ -47,7 +69,7 @@ pub fn show_preferences(
     parent: &adw::ApplicationWindow,
     store: &WorkspaceStore,
     settings: &AppSettings,
-    on_settings_changed: impl Fn(AppSettings) + 'static,
+    on_settings_changed: impl Fn(u64, AppSettings) + 'static,
     on_routing_changed: impl Fn(RoutingRuleSet) + 'static,
     on_toast: impl Fn(&str) + 'static,
 ) -> PreferencesHandle {
@@ -56,6 +78,7 @@ pub fn show_preferences(
 
     let settings_state = Rc::new(RefCell::new(settings.clone()));
     let settings_observers: SettingsObservers = Rc::new(RefCell::new(Vec::new()));
+    let settings_revision = Rc::new(Cell::new(0_u64));
     let routing_result = store.load_routing_rules();
     let routing_state = Rc::new(RefCell::new(
         routing_result.as_ref().cloned().unwrap_or_default(),
@@ -64,8 +87,14 @@ pub fn show_preferences(
     let settings_cb: SettingsCallback = {
         let on_settings_changed = on_settings_changed.clone();
         let settings_observers = settings_observers.clone();
+        let settings_revision = settings_revision.clone();
         Rc::new(move |settings| {
-            on_settings_changed(settings.clone());
+            // Tag the accepted edit with the dialog's monotonic revision so
+            // a failed write can be reconciled only when it is still the
+            // latest accepted edit.
+            let revision = settings_revision.get() + 1;
+            settings_revision.set(revision);
+            on_settings_changed(revision, settings.clone());
 
             let observers: Vec<_> = settings_observers.borrow().iter().cloned().collect();
             for observer in observers {
@@ -130,10 +159,44 @@ pub fn show_preferences(
     );
     dialog.add(&tun_page);
 
+    let (antidpi_page, _antidpi_rows) = build_antidpi_page(
+        &settings_state,
+        &settings_cb,
+        &settings_observers,
+        &toast_cb,
+    );
+    dialog.add(&antidpi_page);
+
     dialog.present(Some(parent));
     PreferencesHandle {
         dialog,
+        settings_state,
+        settings_observers,
         nodes_observers,
+        settings_revision,
+    }
+}
+
+/// Whether a failed write may reconcile the dialog's rows: the rejected
+/// write's revision must still be the dialog's latest accepted edit, so a
+/// newer pending edit is never overwritten and no second error is reported.
+pub(crate) fn rejected_write_reconciles(latest_accepted: u64, rejected: u64) -> bool {
+    latest_accepted == rejected
+}
+
+/// Restores the dialog's settings state to the last committed snapshot and
+/// notifies the rows' observers so they re-render. The commit callback is
+/// deliberately not invoked: the failed write already reported one error,
+/// and re-emitting would schedule a second save of the restored snapshot.
+pub(crate) fn reconcile_settings(
+    state: &Rc<RefCell<AppSettings>>,
+    observers: &SettingsObservers,
+    committed: &AppSettings,
+) {
+    *state.borrow_mut() = committed.clone();
+    let list: Vec<_> = observers.borrow().iter().cloned().collect();
+    for observer in list {
+        observer(committed);
     }
 }
 
@@ -300,5 +363,22 @@ pub(crate) fn render_detected_backends(
 
         row.add_suffix(&check);
         group.add(&row);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejected_older_write_with_newer_edit_pending_is_skipped() {
+        // Flush A (revision 2) failed after the dialog already accepted
+        // edit B (revision 3): the dialog must keep B, and no second error
+        // toast is due for the skipped reconciliation.
+        assert!(!rejected_write_reconciles(3, 2));
+        // The rejected write is still the latest accepted edit: reconcile.
+        assert!(rejected_write_reconciles(3, 3));
+        // A failure before any edit is accepted reconciles too.
+        assert!(rejected_write_reconciles(0, 0));
     }
 }

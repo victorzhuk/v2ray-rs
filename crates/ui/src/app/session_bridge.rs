@@ -60,6 +60,30 @@ pub(super) fn auto_reconnect_allowed(pending_exit: bool, attempts: u32) -> bool 
     !pending_exit && attempts < MAX_AUTO_RECONNECTS
 }
 
+/// While a failed cleanup holds the old manager, neither manual connects nor
+/// automatic failover may start: the host may still hold that session's
+/// rules, and the retry action owns it.
+pub(super) fn cleanup_blocks_new_session(cleanup_pending: bool) -> bool {
+    cleanup_pending
+}
+
+/// Retry needs both the pending flag and the retained session handle;
+/// without either there is nothing to retry.
+pub(super) fn cleanup_retry_available(cleanup_pending: bool, has_handle: bool) -> bool {
+    cleanup_pending && has_handle
+}
+
+/// While a failed cleanup owns the UI, its error text is the banner's
+/// message: a matching `apply_state` toast would repeat it. Any other error
+/// still toasts.
+pub(super) fn cleanup_error_toast_suppressed(
+    cleanup_pending: bool,
+    cleanup_message: Option<&str>,
+    error: &str,
+) -> bool {
+    cleanup_pending && cleanup_message == Some(error)
+}
+
 /// Only user- and restart-initiated connects invalidate a pending
 /// auto-reconnect; the timer's own connect must leave the attempt budget
 /// counting toward MAX_AUTO_RECONNECTS.
@@ -92,6 +116,22 @@ pub(super) fn auto_reconnect_fires(message: u32, current: u32, has_handle: bool)
 /// produced them; only the app's current one is live.
 pub(super) fn is_current_generation(message: u64, current: u64) -> bool {
     message == current
+}
+
+/// One degraded-DPI notice per generation, only while that generation is the
+/// live connection and its session is actually `Running`: a superseded
+/// session's report, a repeated report, and a queued notice arriving during
+/// teardown or after Disconnect all stay silent — the proxy no longer stays
+/// up for a stopped session.
+pub(super) fn engine_degraded_notice_fires(
+    seen: Option<u64>,
+    message: u64,
+    current: u64,
+    state: &ProcessState,
+) -> bool {
+    is_current_generation(message, current)
+        && seen != Some(message)
+        && matches!(state, ProcessState::Running)
 }
 
 /// Keeps the addresses the current connection pinned, replacing whatever an

@@ -38,17 +38,18 @@ glib-build-tools.workspace = true
 [package.metadata.deb]
 name = "v2ray-rs"
 maintainer = "Victor Zhuk"
-depends = "libgtk-4-1, libadwaita-1-0, libdbus-1-3, libcap2"
+depends = "libgtk-4-1, libadwaita-1-0, libdbus-1-3, libcap2, libcap2-bin"
 section = "net"
 assets = [
     ["target/release/v2ray-rs-ui", "usr/bin/v2ray-rs", "755"],
     ["target/release/v2ray-rs-netctl", "usr/bin/v2ray-rs-netctl", "755"],
     ["target/release/v2ray-rs-run", "usr/bin/v2ray-rs-run", "755"],
-    ["crates/ui/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg", "usr/share/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg", "644"],
-    ["assets/v2ray-rs.png", "usr/share/icons/hicolor/256x256/apps/com.github.v2ray-rs.png", "644"],
-    ["crates/ui/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "644"],
-    ["assets/com.github.v2ray-rs.desktop", "usr/share/applications/com.github.v2ray-rs.desktop", "644"],
-    ["locale/en_US/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/en_US/LC_MESSAGES/v2ray-rs.mo", "644"],
-    ["locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "644"],
-    ["LICENSE", "usr/share/doc/v2ray-rs/copyright", "644"],
+    ["target/release/v2ray-rs-antidpi", "usr/bin/v2ray-rs-antidpi", "755"],
+    ["icons/hicolor/scalable/apps/com.github.v2ray-rs.svg", "usr/share/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg", "644"],
+    ["../../assets/v2ray-rs.png", "usr/share/icons/hicolor/256x256/apps/com.github.v2ray-rs.png", "644"],
+    ["icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "usr/share/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg", "644"],
+    ["../../assets/com.github.v2ray-rs.desktop", "usr/share/applications/com.github.v2ray-rs.desktop", "644"],
+    ["../../locale/en_US/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/en_US/LC_MESSAGES/v2ray-rs.mo", "644"],
+    ["../../locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "usr/share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo", "644"],
+    ["../../LICENSE", "usr/share/doc/v2ray-rs/copyright", "644"],
 ]

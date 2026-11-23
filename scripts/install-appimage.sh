@@ -371,8 +371,9 @@ uninstall() {
     prune_cache "$PREFIX/share/applications" mimeinfo.cache
     prune_cache "$PREFIX/share/icons/hicolor" icon-theme.cache
     say "done. Shell rc files were not modified; drop the '$PREFIX/env' line if you added one."
-    say "A helper relocated by Grant TUN privileges is deliberately left alone:"
-    say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-netctl   # if you granted it"
+    say "Privileged helpers relocated by a grant are deliberately left alone:"
+    say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-netctl    # route helper, if granted"
+    say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-antidpi   # anti-DPI engine, if granted"
 }
 
 # Removes a generated cache when it is the only thing left under dir, then the
@@ -501,10 +502,10 @@ then log out and back in for the group to take effect.
 
 The setuid bypass wrapper (v2ray-rs-run) does not exist in the AppImage, so
 'Run with bypass' is permanently unavailable from this install. TUN mode works
-through the in-app 'Grant TUN privileges' flow, which relocates the bundled
-helper to /usr/local/lib/$APP_NAME/v2ray-rs-netctl (the squashfs is mounted
-nosuid, so capabilities cannot live inside it). Re-run the grant after every
-AppImage update.
+through the in-app 'Grant TUN privileges' flow, which relocates both bundled
+helpers, v2ray-rs-netctl and v2ray-rs-antidpi, to /usr/local/lib/$APP_NAME/
+(the squashfs is mounted nosuid, so capabilities cannot live inside it).
+Re-run the grant after every AppImage update.
 
 For the supported TUN path, use the system-wide tarball install:
 

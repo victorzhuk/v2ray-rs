@@ -32,6 +32,7 @@ SUBSCRIPTION := v2ray-rs-subscription
 NETCTL := v2ray-rs-netctl
 RUN := v2ray-rs-run
 TUN_SESSION := v2ray-rs-tun-session
+ANTIDPI := v2ray-rs-antidpi
 
 # =============================================================================
 # Default Target
@@ -47,7 +48,7 @@ default: check build test
 
 .PHONY: build build-dev \
         build-core build-ui build-tray build-process build-subscription \
-        build-netctl build-run build-tun-session
+        build-netctl build-run build-tun-session build-antidpi
 
 build:
 	@printf "$(BLUE)Building release...$(RESET)\n"
@@ -89,6 +90,10 @@ build-tun-session:
 	@printf "$(BLUE)Building tun-session crate...$(RESET)\n"
 	$(CARGO) build -p $(TUN_SESSION) --release $(CARGO_FLAGS)
 
+build-antidpi:
+	@printf "$(BLUE)Building antidpi crate...$(RESET)\n"
+	$(CARGO) build -p $(ANTIDPI) --release $(CARGO_FLAGS)
+
 # =============================================================================
 # Check Targets
 # =============================================================================
@@ -120,7 +125,7 @@ fmt-fix:
 # =============================================================================
 
 .PHONY: test test-core test-ui test-tray test-process test-subscription \
-        test-netctl test-run test-tun-session test-installers test-watch
+        test-netctl test-run test-tun-session test-antidpi test-installers test-watch
 
 test:
 	@printf "$(BLUE)Running all tests...$(RESET)\n"
@@ -157,6 +162,10 @@ test-run:
 test-tun-session:
 	@printf "$(BLUE)Testing tun-session crate...$(RESET)\n"
 	$(TEST) -p $(TUN_SESSION) $(CARGO_FLAGS) $(TEST_ARGS)
+
+test-antidpi:
+	@printf "$(BLUE)Testing antidpi crate...$(RESET)\n"
+	$(TEST) -p $(ANTIDPI) $(CARGO_FLAGS) $(TEST_ARGS)
 
 test-installers:
 	@printf "$(BLUE)Testing release installers...$(RESET)\n"
@@ -242,12 +251,13 @@ dist:
 	@printf "$(BLUE)Building dist artifacts for $(VERSION)...$(RESET)\n"
 	$(CARGO) build --release --locked -p v2ray-rs-ui
 	$(CARGO) build --release --locked --target x86_64-unknown-linux-musl \
-		-p v2ray-rs-netctl -p v2ray-rs-run
+		-p v2ray-rs-netctl -p v2ray-rs-run -p v2ray-rs-antidpi
 	scripts/stage-dist.sh \
 		--version "$(VERSION)" \
 		--ui target/release/v2ray-rs-ui \
 		--netctl target/x86_64-unknown-linux-musl/release/v2ray-rs-netctl \
 		--run target/x86_64-unknown-linux-musl/release/v2ray-rs-run \
+		--antidpi target/x86_64-unknown-linux-musl/release/v2ray-rs-antidpi \
 		--out dist
 	tar -C dist -czf dist/v2ray-rs-x86_64-linux.tar.gz \
 		"v2ray-rs-$(VERSION)-x86_64-linux"
@@ -278,6 +288,7 @@ help:
 	@echo "  make build-netctl   Build netctl crate"
 	@echo "  make build-run      Build run crate"
 	@echo "  make build-tun-session Build tun-session crate"
+	@echo "  make build-antidpi  Build antidpi crate"
 	@echo ""
 	@printf "$(BLUE)Check:$(RESET)\n"
 	@echo "  make check          Run cargo check"
@@ -296,6 +307,7 @@ help:
 	@echo "  make test-netctl    Test netctl crate"
 	@echo "  make test-run       Test run crate"
 	@echo "  make test-tun-session Test tun-session crate"
+	@echo "  make test-antidpi   Test antidpi crate"
 	@echo "  make test-installers Test release installers"
 	@echo "  make test-watch     Run tests in watch mode"
 	@echo ""

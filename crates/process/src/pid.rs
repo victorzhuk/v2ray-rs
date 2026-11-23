@@ -1,9 +1,14 @@
 use std::fs;
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use nix::errno::Errno;
-use nix::sys::signal::{Signal, kill};
+#[cfg(test)]
+use nix::sys::signal::kill;
+#[cfg(test)]
 use nix::unistd::Pid;
 use serde::{Deserialize, Serialize};
 
@@ -11,15 +16,151 @@ fn canonicalize_best(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn io_error_from_errno(err: Errno) -> io::Error {
-    io::Error::from_raw_os_error(err as i32)
-}
-
+#[cfg(test)]
 fn process_exists(pid: u32) -> bool {
     matches!(
         kill(Pid::from_raw(pid as i32), None),
         Ok(()) | Err(Errno::EPERM)
     )
+}
+
+/// Time allowed for the pinned process to exit after each signal.
+const TERM_EXIT_TIMEOUT: Duration = Duration::from_secs(1);
+const KILL_EXIT_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Why a `pidfd_open(2)` call did not return a pinning descriptor.
+#[derive(Debug)]
+enum OpenFailure {
+    /// `ESRCH`: the process already exited; nothing is left to clean up.
+    Gone,
+    /// `ENOSYS`: the kernel predates pidfd support. Cleanup cannot be
+    /// performed safely, so the caller must fail closed.
+    Unsupported,
+    /// Any other failure, carrying the OS error.
+    Failed(io::Error),
+}
+
+fn open_disposition(raw_errno: Option<i32>) -> OpenFailure {
+    match raw_errno {
+        Some(nix::libc::ESRCH) => OpenFailure::Gone,
+        Some(nix::libc::ENOSYS) => OpenFailure::Unsupported,
+        _ => OpenFailure::Failed(io::Error::last_os_error()),
+    }
+}
+
+/// Outcome for the ownership record once termination of the pinned process
+/// has been attempted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordDisposition {
+    /// Exit is confirmed; the stale record must be dropped and an orphan
+    /// reported.
+    DropConfirmedExit,
+    /// Exit did not confirm inside the budget; the record must stay so a
+    /// replacement startup remains blocked.
+    KeepUnconfirmed,
+}
+
+/// Pure decision point for the TERM-then-KILL escalation ladder. `kill_exit`
+/// is `None` while the SIGKILL phase has not started; `Some(true)` only after
+/// the pinned process's exit was confirmed in the kill phase.
+fn record_disposition(term_exit_confirmed: bool, kill_exit: Option<bool>) -> RecordDisposition {
+    if term_exit_confirmed || kill_exit == Some(true) {
+        RecordDisposition::DropConfirmedExit
+    } else {
+        RecordDisposition::KeepUnconfirmed
+    }
+}
+
+/// A pidfd pinning one process identity. Signals sent through it can never
+/// reach a different process that reused the PID, and the kernel reports the
+/// pinned process's termination through this descriptor.
+struct PinnedProcess {
+    fd: OwnedFd,
+}
+
+impl PinnedProcess {
+    /// Safety: `SYS_pidfd_open(pid, 0)` returns a pidfd owned by the caller
+    /// on success and -1 with errno on failure; the descriptor is handed to
+    /// `OwnedFd`, which closes it on drop.
+    fn open(pid: u32) -> Result<Self, OpenFailure> {
+        let rc = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_open,
+                pid as nix::libc::pid_t,
+                0 as nix::libc::c_uint,
+            )
+        };
+        if rc >= 0 {
+            // Safety: rc is a fresh, exclusively owned file descriptor.
+            return Ok(Self {
+                fd: unsafe { OwnedFd::from_raw_fd(rc as nix::libc::c_int) },
+            });
+        }
+        Err(open_disposition(io::Error::last_os_error().raw_os_error()))
+    }
+
+    /// `pidfd_send_signal(2)`. `Ok(false)` maps `ESRCH`: the pinned process
+    /// exited and was reaped before the signal landed.
+    fn send_signal(&self, sig: nix::libc::c_int) -> io::Result<bool> {
+        // Safety: the pidfd is a live descriptor owned by `self`; a null
+        // `siginfo_t` and zero flags deliver the plain signal.
+        let rc = unsafe {
+            nix::libc::syscall(
+                nix::libc::SYS_pidfd_send_signal,
+                self.fd.as_raw_fd(),
+                sig,
+                std::ptr::null_mut::<nix::libc::siginfo_t>(),
+                0 as nix::libc::c_uint,
+            )
+        };
+        if rc >= 0 {
+            return Ok(true);
+        }
+        if io::Error::last_os_error().raw_os_error() == Some(nix::libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
+    /// Blocks until the kernel reports the pinned process terminated through
+    /// the pidfd, or the deadline passes. `true` only for confirmed exit.
+    fn wait_exit(&self, timeout: Duration) -> io::Result<bool> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let mut fds = nix::libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: nix::libc::POLLIN,
+                revents: 0,
+            };
+            // Safety: `fds` points at one valid `pollfd` for the duration of
+            // the call.
+            let rc = unsafe {
+                nix::libc::poll(
+                    &mut fds,
+                    1,
+                    (deadline - now).as_millis() as nix::libc::c_int,
+                )
+            };
+            if rc < 0 {
+                let err = io::Error::last_os_error();
+                if err.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(err);
+            }
+            if rc > 0 && fds.revents & nix::libc::POLLIN != 0 {
+                return Ok(true);
+            }
+            if rc > 0 {
+                return Err(io::Error::other("unexpected pidfd readiness"));
+            }
+        }
+    }
 }
 
 enum ExeLookup {
@@ -56,7 +197,7 @@ fn process_config_path(pid: u32) -> Option<PathBuf> {
     Some(PathBuf::from(config_arg))
 }
 
-fn process_start_time(pid: u32) -> io::Result<u64> {
+pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let Some((_, rest)) = stat.rsplit_once(") ") else {
         return Err(io::Error::new(
@@ -75,6 +216,16 @@ fn process_start_time(pid: u32) -> io::Result<u64> {
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))
 }
 
+/// `pid:start_time_ticks` for this process — the owner identity the manager
+/// hands to `v2ray-rs-antidpi --owner`, in the helper's decimal `PID:START`
+/// format. `None` when `/proc` is unreadable; callers then omit the flag and
+/// the helper falls back to its parent process, which is this process anyway.
+pub(crate) fn owner_identity() -> Option<String> {
+    let pid = std::process::id();
+    let start_time = process_start_time(pid).ok()?;
+    Some(format!("{pid}:{start_time}"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PidOwnershipRecord {
     pub pid: u32,
@@ -85,29 +236,22 @@ pub struct PidOwnershipRecord {
 
 fn atomic_write_0600(path: &Path, payload: &[u8]) -> io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
 
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("backend.pid");
-    let tmp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-
-    let result = (|| {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&tmp)?;
-        file.write_all(payload)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        // A bare file name lives in the working directory.
+        _ => Path::new("."),
+    };
+    // A unique temp file per write: two writers in one process cannot
+    // create, overwrite, or remove each other's staging file.
+    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
+    tmp.write_all(payload)?;
+    tmp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|err| err.error)?;
+    Ok(())
 }
 
 enum PidFileEntry {
@@ -116,6 +260,7 @@ enum PidFileEntry {
     Corrupt,
 }
 
+#[derive(Clone)]
 pub struct PidFile {
     path: PathBuf,
 }
@@ -176,52 +321,64 @@ impl PidFile {
             }
         };
 
-        if !process_exists(record.pid) {
-            self.remove()?;
-            return Ok(false);
-        }
+        // Pin the process identity before verifying or signaling: the pidfd
+        // keeps referring to this exact process even across PID reuse.
+        let pinned = match PinnedProcess::open(record.pid) {
+            Ok(pinned) => pinned,
+            Err(OpenFailure::Gone) => {
+                self.remove()?;
+                return Ok(false);
+            }
+            Err(OpenFailure::Unsupported) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "pidfd_open unsupported: cannot safely clean up the recorded process",
+                ));
+            }
+            Err(OpenFailure::Failed(err)) => return Err(err),
+        };
 
+        // Identity mismatch means the pid was already reused before pinning;
+        // leave the replacement process alone and drop the stale record.
         if !process_matches_record(&record) {
             self.remove()?;
             return Ok(false);
         }
 
-        match kill(Pid::from_raw(record.pid as i32), Signal::SIGTERM) {
-            Ok(()) => {
-                for _ in 0..5 {
-                    std::thread::sleep(std::time::Duration::from_millis(200));
-                    if !process_exists(record.pid) {
-                        break;
-                    }
-                }
-                if process_exists(record.pid) {
-                    // The 1s wait is a window for PID reuse: re-verify the
-                    // recorded start time immediately before escalating, or an
-                    // unrelated process could eat the SIGKILL. An unreadable
-                    // start time counts as changed.
-                    if process_start_time(record.pid)
-                        .map(|start| start != record.start_time_ticks)
-                        .unwrap_or(true)
-                    {
-                        self.remove()?;
-                        return Ok(false);
-                    }
-                    let _ = kill(Pid::from_raw(record.pid as i32), Signal::SIGKILL);
-                    for _ in 0..5 {
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        if !process_exists(record.pid) {
-                            break;
-                        }
-                    }
-                }
+        match pinned.send_signal(nix::libc::SIGTERM) {
+            Ok(true) => {}
+            Ok(false) => {
+                self.remove()?;
+                return Ok(true);
+            }
+            Err(err) => return Err(err),
+        }
+
+        let disposition = match pinned.wait_exit(TERM_EXIT_TIMEOUT)? {
+            true => record_disposition(true, None),
+            false => {
+                // Escalate through the pinned identity: a reused PID can
+                // never receive this kill, so the start-time re-check is no
+                // longer needed. The kill itself is not proof of exit: wait
+                // for the pinned process to actually terminate.
+                let kill_exit = match pinned.send_signal(nix::libc::SIGKILL)? {
+                    // ESRCH: the pinned process exited before the kill landed.
+                    false => true,
+                    true => pinned.wait_exit(KILL_EXIT_TIMEOUT)?,
+                };
+                record_disposition(false, Some(kill_exit))
+            }
+        };
+
+        match disposition {
+            RecordDisposition::DropConfirmedExit => {
                 self.remove()?;
                 Ok(true)
             }
-            Err(Errno::ESRCH) => {
-                self.remove()?;
-                Ok(false)
-            }
-            Err(err) => Err(io_error_from_errno(err)),
+            RecordDisposition::KeepUnconfirmed => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "recorded process did not confirm exit; keeping the pid record",
+            )),
         }
     }
 
@@ -311,6 +468,18 @@ mod tests {
 
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn owner_identity_is_the_decimal_pid_start_pair() {
+        let identity = owner_identity().expect("own /proc stat is readable");
+        let (pid, ticks) = identity.split_once(':').expect("pid:ticks shape");
+        assert_eq!(pid, std::process::id().to_string());
+        assert_eq!(
+            ticks,
+            process_start_time(std::process::id()).unwrap().to_string()
+        );
+        assert!(ticks.chars().all(|c| c.is_ascii_digit()));
+    }
 
     fn test_pid_path(dir: &TempDir) -> PathBuf {
         dir.path().join("test.pid")
@@ -469,6 +638,40 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_writes_use_distinct_temp_files() {
+        use std::sync::Barrier;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("backend.pid");
+        let pid = std::process::id();
+        let barrier = std::sync::Arc::new(Barrier::new(4));
+
+        let handles: Vec<_> = (0..4)
+            .map(|_| {
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..25 {
+                        PidFile::new(path.clone())
+                            .write(pid, Path::new("/bin/true"), Path::new("/etc/hosts"))
+                            .expect("concurrent writes must not collide");
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let record = PidFile::new(path.clone()).read().unwrap().unwrap();
+        assert_eq!(record.pid, pid);
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     fn write_overwrites_existing() {
         let dir = TempDir::new().unwrap();
         let pid_file = PidFile::new(test_pid_path(&dir));
@@ -558,11 +761,59 @@ mod tests {
         fs::write(&pid_file.path, serde_json::to_vec(&record).unwrap()).unwrap();
 
         let found_orphan = pid_file.check_and_kill_orphaned().unwrap();
+        let still_alive = child.try_wait().unwrap().is_none();
         child.kill().ok();
         child.wait().ok();
 
         assert!(!found_orphan);
+        assert!(
+            still_alive,
+            "unrelated replacement process must be left alone"
+        );
         assert!(!pid_file.path.exists());
+    }
+
+    #[test]
+    fn record_disposition_confirms_exit_for_each_signal_phase() {
+        assert_eq!(
+            record_disposition(true, None),
+            RecordDisposition::DropConfirmedExit
+        );
+        assert_eq!(
+            record_disposition(false, Some(true)),
+            RecordDisposition::DropConfirmedExit
+        );
+        assert_eq!(
+            record_disposition(true, Some(false)),
+            RecordDisposition::DropConfirmedExit
+        );
+    }
+
+    #[test]
+    fn record_disposition_keeps_record_when_exit_never_confirms() {
+        // TERM timeout followed by an unconfirmed SIGKILL: the record must
+        // stay so replacement startup remains blocked.
+        assert_eq!(
+            record_disposition(false, Some(false)),
+            RecordDisposition::KeepUnconfirmed
+        );
+    }
+
+    #[test]
+    fn open_disposition_maps_gone_unsupported_and_failures() {
+        assert!(matches!(
+            open_disposition(Some(nix::libc::ESRCH)),
+            OpenFailure::Gone
+        ));
+        assert!(matches!(
+            open_disposition(Some(nix::libc::ENOSYS)),
+            OpenFailure::Unsupported
+        ));
+        assert!(matches!(
+            open_disposition(Some(nix::libc::EINVAL)),
+            OpenFailure::Failed(_)
+        ));
+        assert!(matches!(open_disposition(None), OpenFailure::Failed(_)));
     }
 
     #[test]

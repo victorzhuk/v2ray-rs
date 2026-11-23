@@ -29,7 +29,7 @@ mkdir -p "$tar_root/bin" \
     "$tar_root/share/icons/hicolor/256x256/apps" \
     "$tar_root/share/locale/en_US/LC_MESSAGES" \
     "$tar_root/share/locale/ru_RU/LC_MESSAGES"
-for bin in v2ray-rs v2ray-rs-netctl v2ray-rs-run; do
+for bin in v2ray-rs v2ray-rs-netctl v2ray-rs-run v2ray-rs-antidpi; do
     printf '#!/bin/sh\nprintf "%%s\\n" "%s" >>"%s"\nexit 0\n' "$bin" "$marker" >"$tar_root/bin/$bin"
     chmod 0755 "$tar_root/bin/$bin"
 done
@@ -89,6 +89,66 @@ printf 'not-a-digest\n' >"$malformed/v2ray-rs-x86_64.AppImage.sha256"
 zeroes=0000000000000000000000000000000000000000000000000000000000000000
 printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' "$zeroes" >"$mismatch/v2ray-rs-x86_64-linux.tar.gz.sha256"
 printf '%s  v2ray-rs-x86_64.AppImage\n' "$zeroes" >"$mismatch/v2ray-rs-x86_64.AppImage.sha256"
+
+# --- archive completeness fixtures -------------------------------------------
+
+# An older release ships three binaries; the current release ships four.
+old_fixture="$work/old-fixture"
+old_root="$old_fixture/v2ray-rs-0.9.0-x86_64-linux"
+mkdir -p "$old_fixture"
+cp -R "$tar_root" "$old_root"
+rm -f "$old_root/bin/v2ray-rs-antidpi"
+old_tarball="$old_fixture/v2ray-rs-x86_64-linux.tar.gz"
+tar -C "$old_fixture" -czf "$old_tarball" "$(basename "$old_root")"
+old_tarball_sha=$(sha256sum -b "$old_tarball" | awk '{print $1}')
+printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' "$old_tarball_sha" >"$old_tarball.sha256"
+
+# A damaged current release: one required share file is missing.
+damaged_fixture="$work/damaged-fixture"
+damaged_root="$damaged_fixture/v2ray-rs-1.2.3-x86_64-linux"
+mkdir -p "$damaged_fixture"
+cp -R "$tar_root" "$damaged_root"
+rm -f "$damaged_root/share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo"
+damaged_tarball="$damaged_fixture/v2ray-rs-x86_64-linux.tar.gz"
+tar -C "$damaged_fixture" -czf "$damaged_tarball" "$(basename "$damaged_root")"
+damaged_tarball_sha=$(sha256sum -b "$damaged_tarball" | awk '{print $1}')
+printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' "$damaged_tarball_sha" >"$damaged_tarball.sha256"
+
+# Malformed payloads that -f alone accepts: a zero-byte helper, a symlinked
+# binary, and a symlinked payload directory. Each must be refused before the
+# first prefix write.
+malformed_fixture="$work/malformed-payload-fixture"
+mkdir -p "$malformed_fixture"
+empty_root="$malformed_fixture/v2ray-rs-1.2.3-x86_64-linux-empty"
+cp -R "$tar_root" "$empty_root"
+: >"$empty_root/bin/v2ray-rs-netctl"
+mkdir -p "$malformed_fixture/empty"
+empty_tarball="$malformed_fixture/empty/v2ray-rs-x86_64-linux.tar.gz"
+tar -C "$malformed_fixture" -czf "$empty_tarball" "$(basename "$empty_root")"
+printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' \
+    "$(sha256sum -b "$empty_tarball" | awk '{print $1}')" >"$empty_tarball.sha256"
+
+link_root="$malformed_fixture/v2ray-rs-1.2.3-x86_64-linux-links"
+cp -R "$tar_root" "$link_root"
+rm "$link_root/bin/v2ray-rs"
+ln -s /etc/passwd "$link_root/bin/v2ray-rs"
+mkdir -p "$malformed_fixture/links"
+link_tarball="$malformed_fixture/links/v2ray-rs-x86_64-linux.tar.gz"
+tar -C "$malformed_fixture" -czf "$link_tarball" "$(basename "$link_root")"
+printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' \
+    "$(sha256sum -b "$link_tarball" | awk '{print $1}')" >"$link_tarball.sha256"
+
+# The directory symlink alone: the binary symlink above fires first, so the
+# directory case needs its own archive to be reachable.
+dirlink_root="$malformed_fixture/v2ray-rs-1.2.3-x86_64-linux-dirlink"
+cp -R "$tar_root" "$dirlink_root"
+mv "$dirlink_root/share/applications" "$dirlink_root/share/decoy"
+ln -s decoy "$dirlink_root/share/applications"
+mkdir -p "$malformed_fixture/dirlink"
+dirlink_tarball="$malformed_fixture/dirlink/v2ray-rs-x86_64-linux.tar.gz"
+tar -C "$malformed_fixture" -czf "$dirlink_tarball" "$(basename "$dirlink_root")"
+printf '%s  v2ray-rs-x86_64-linux.tar.gz\n' \
+    "$(sha256sum -b "$dirlink_tarball" | awk '{print $1}')" >"$dirlink_tarball.sha256"
 
 # --- helpers ---------------------------------------------------------------
 
@@ -253,6 +313,164 @@ if env V2RAY_RS_VERSION=2.0.0 HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-ta
     pass "tar-alternate-version"
 else
     fail "tar-alternate-version: installer failed: $(tail -n 3 "$work/tar-alt.log" | tr '\n' ' ')"
+fi
+
+# --- tarball uninstaller ----------------------------------------------------
+
+note "tarball uninstaller"
+p_uninstall="$work/p-tar-uninstall"
+seed_prefix "$p_uninstall"
+if env HOME="$work/home" V2RAY_RS_INSTALL_DIR="$p_uninstall" \
+    V2RAY_RS_NO_MODIFY_PATH=1 \
+    sh "$tar_installer" --uninstall >"$work/tar-uninstall.log" 2>&1; then
+    grep -q '/usr/local/lib/v2ray-rs/v2ray-rs-netctl' "$work/tar-uninstall.log" ||
+        fail "tar-uninstall: netctl helper path missing from the output"
+    grep -q '/usr/local/lib/v2ray-rs/v2ray-rs-antidpi' "$work/tar-uninstall.log" ||
+        fail "tar-uninstall: antidpi helper path missing from the output"
+    grep -q 'setcap -r' "$work/tar-uninstall.log" &&
+        fail "tar-uninstall: output still hints at setcap -r"
+    pass "tar-uninstall"
+else
+    fail "tar-uninstall: uninstaller failed: $(tail -n 3 "$work/tar-uninstall.log" | tr '\n' ' ')"
+fi
+
+# --- archive completeness ---------------------------------------------------
+
+note "archive completeness"
+old_pinned="$work/install-pinned-old.sh"
+bash "$repo/scripts/gen-installer.sh" 1.2.3 "$old_tarball" "$old_pinned" >/dev/null ||
+    fail "gen-installer-old failed"
+
+# The pinned installer's own release must ship all four binaries: refusing a
+# damaged current archive beats a partial overwrite of a working install.
+seed_prefix "$work/p-tar-oldpin"
+: >"$marker"
+: >"$work/curl-log"
+if env -u V2RAY_RS_VERSION -u V2RAY_RS_DOWNLOAD_URL \
+    HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-tar-oldpin" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$fakebin:$PATH" \
+    CURL_LOG="$work/curl-log" FIXTURE_TARBALL="$old_tarball" \
+    FIXTURE_TARBALL_SHA="$old_tarball.sha256" \
+    sh "$old_pinned" >"$work/tar-oldpin.log" 2>&1; then
+    fail "tar-current-missing-antidpi: installer exited successfully"
+else
+    grep -q "archive is missing bin/v2ray-rs-antidpi" "$work/tar-oldpin.log" ||
+        fail "tar-current-missing-antidpi: the missing helper was not reported"
+    assert_untouched "$work/p-tar-oldpin" "tar-current-missing-antidpi"
+    pass "tar-current-missing-antidpi"
+fi
+
+# A required share file missing from the archive must also be refused before
+# the first prefix write, whatever the selected version.
+expect_failure "tar-damaged-missing-share" \
+    "archive is missing share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo" \
+    "$tar_installer" "$work/p-tar-dmg" "file://$damaged_fixture/v2ray-rs-x86_64-linux.tar.gz"
+
+# A zero-byte required helper is a malformed archive, not an install.
+expect_failure "tar-empty-helper" \
+    "archive bin/v2ray-rs-netctl is empty" \
+    "$tar_installer" "$work/p-tar-empty" \
+    "file://$malformed_fixture/empty/v2ray-rs-x86_64-linux.tar.gz"
+
+# A symlinked required binary must not be followed into the prefix.
+expect_failure "tar-symlinked-helper" \
+    "archive bin/v2ray-rs is a symlink" \
+    "$tar_installer" "$work/p-tar-link" \
+    "file://$malformed_fixture/links/v2ray-rs-x86_64-linux.tar.gz"
+
+# A symlinked payload directory would scatter files outside the staging tree.
+expect_failure "tar-symlinked-share-dir" \
+    "crosses the symlinked directory share/applications" \
+    "$tar_installer" "$work/p-tar-linkdir" \
+    "file://$malformed_fixture/dirlink/v2ray-rs-x86_64-linux.tar.gz"
+
+# A valid historical override (at or before the pre-anti-DPI baseline) selects
+# a release that legitimately ships three binaries: install it completely, and
+# a downgrade over an existing prefix must not remove anything already there.
+seed_prefix "$work/p-tar-historical"
+printf 'stale helper\n' >"$work/p-tar-historical/bin/v2ray-rs-antidpi"
+: >"$work/curl-log"
+: >"$marker"
+if env V2RAY_RS_VERSION=0.20.0 HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-tar-historical" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$fakebin:$PATH" \
+    CURL_LOG="$work/curl-log" FIXTURE_TARBALL="$old_tarball" \
+    FIXTURE_TARBALL_SHA="$old_tarball.sha256" \
+    sh "$old_pinned" >"$work/tar-historical.log" 2>&1; then
+    for bin in v2ray-rs v2ray-rs-netctl; do
+        [ -x "$work/p-tar-historical/bin/$bin" ] ||
+            fail "tar-historical-install: bin/$bin missing"
+    done
+    if [ "$(id -u)" -eq 0 ]; then
+        [ -x "$work/p-tar-historical/bin/v2ray-rs-run" ] ||
+            fail "tar-historical-install: bin/v2ray-rs-run missing"
+    fi
+    for rel in \
+        share/applications/com.github.v2ray-rs.desktop \
+        share/icons/hicolor/scalable/apps/com.github.v2ray-rs.svg \
+        share/icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg \
+        share/icons/hicolor/256x256/apps/com.github.v2ray-rs.png \
+        share/locale/en_US/LC_MESSAGES/v2ray-rs.mo \
+        share/locale/ru_RU/LC_MESSAGES/v2ray-rs.mo; do
+        [ -f "$work/p-tar-historical/$rel" ] || fail "tar-historical-install: $rel missing"
+    done
+    [ -f "$work/p-tar-historical/share/licenses/v2ray-rs/LICENSE" ] ||
+        fail "tar-historical-install: LICENSE missing"
+    [ "$(cat "$work/p-tar-historical/bin/v2ray-rs-antidpi" 2>/dev/null)" = "stale helper" ] ||
+        fail "tar-historical-install: the downgrade removed a pre-existing file"
+    grep -q "v0.20.0" "$work/curl-log" || fail "tar-historical-install: wrong release URL"
+    pass "tar-historical-install"
+else
+    fail "tar-historical-install: installer failed: $(tail -n 3 "$work/tar-historical.log" | tr '\n' ' ')"
+fi
+
+# Printed guidance follows the selected payload's binary list: a historical
+# install never recommends granting the v2ray-rs-antidpi binary it does not
+# ship, while the four-binary release names the anti-DPI engine.
+if grep -q 'v2ray-rs-antidpi' "$work/tar-historical.log"; then
+    fail "tar-historical-instructions: guidance recommends a binary the payload does not ship"
+else
+    pass "tar-historical-instructions"
+fi
+if grep -q 'anti-DPI' "$work/tar-sidecar-install.log"; then
+    pass "tar-current-instructions"
+else
+    fail "tar-current-instructions: anti-DPI guidance missing for the four-binary release"
+fi
+
+# An override naming the pinned release itself keeps the four-binary layout:
+# the same damaged archive must be refused before any prefix write.
+seed_prefix "$work/p-tar-pinover"
+: >"$marker"
+: >"$work/curl-log"
+if env V2RAY_RS_VERSION=1.2.3 HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-tar-pinover" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$fakebin:$PATH" \
+    CURL_LOG="$work/curl-log" FIXTURE_TARBALL="$old_tarball" \
+    FIXTURE_TARBALL_SHA="$old_tarball.sha256" \
+    sh "$old_pinned" >"$work/tar-pinover.log" 2>&1; then
+    fail "tar-pinned-override-missing-antidpi: installer exited successfully"
+else
+    grep -q "archive is missing bin/v2ray-rs-antidpi" "$work/tar-pinover.log" ||
+        fail "tar-pinned-override-missing-antidpi: the missing helper was not reported"
+    assert_untouched "$work/p-tar-pinover" "tar-pinned-override-missing-antidpi"
+    pass "tar-pinned-override-missing-antidpi"
+fi
+
+# A newer override also keeps the four-binary layout: a payload without the
+# helper is refused before any prefix write.
+seed_prefix "$work/p-tar-newermiss"
+: >"$marker"
+: >"$work/curl-log"
+if env V2RAY_RS_VERSION=2.0.0 HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-tar-newermiss" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$fakebin:$PATH" \
+    CURL_LOG="$work/curl-log" FIXTURE_TARBALL="$old_tarball" \
+    FIXTURE_TARBALL_SHA="$old_tarball.sha256" \
+    sh "$old_pinned" >"$work/tar-newermiss.log" 2>&1; then
+    fail "tar-newer-missing-antidpi: installer exited successfully"
+else
+    grep -q "archive is missing bin/v2ray-rs-antidpi" "$work/tar-newermiss.log" ||
+        fail "tar-newer-missing-antidpi: the missing helper was not reported"
+    assert_untouched "$work/p-tar-newermiss" "tar-newer-missing-antidpi"
+    pass "tar-newer-missing-antidpi"
 fi
 
 # --- AppImage installer ----------------------------------------------------

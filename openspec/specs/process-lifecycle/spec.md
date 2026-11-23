@@ -120,7 +120,7 @@ The system SHALL ensure the backend process is terminated when the application e
 - **THEN** the system SHALL run a route-recovery pass for the relevant backend that removes any leftover TUN device and flushes stale routing rules and tables
 
 ### Requirement: Capture launched runtime snapshot
-The system SHALL capture an immutable snapshot of the restart-relevant settings and routing rules that were actually used for the current connection attempt. Restart-relevant settings SHALL include every setting that changes the generated backend config, including the TUN settings and the connection idle-timeout and WebSocket-heartbeat settings. While connected, UI state derived from those settings SHALL follow the snapshot rather than the edited settings.
+The system SHALL capture an immutable snapshot of the restart-relevant settings and routing rules that were actually used for the current connection attempt. Restart-relevant settings SHALL include every setting that changes the generated backend config or the session's helper processes, including the TUN settings, the anti-DPI settings, and the connection idle-timeout and WebSocket-heartbeat settings. While connected, UI state derived from those settings SHALL follow the snapshot rather than the edited settings.
 
 #### Scenario: Snapshot captured before launch
 - **WHEN** the app prepares the config inputs for `Connect`
@@ -129,6 +129,10 @@ The system SHALL capture an immutable snapshot of the restart-relevant settings 
 #### Scenario: TUN indicators follow the running session
 - **WHEN** TUN is enabled in settings while a session launched without TUN is running
 - **THEN** the app SHALL keep treating the session as non-TUN — background latency probes continue and no TUN recovery marker is written — until the session is restarted with the new settings
+
+#### Scenario: Anti-DPI indicators follow the running session
+- **WHEN** anti-DPI is enabled in settings while a session launched without the engine is running
+- **THEN** the app SHALL keep treating the session as engine-less until the session is restarted with the new settings
 
 ### Requirement: Apply pending runtime changes by restart
 The system SHALL apply pending runtime configuration changes by reusing the normal disconnect/reconnect flow. When the running session was started by a direct connection to a chosen node, the reconnect SHALL target that node as the sole candidate.
@@ -146,7 +150,7 @@ The system SHALL apply pending runtime configuration changes by reusing the norm
 - **THEN** the system SHALL notify the user and reconnect using the configured strategy
 
 #### Scenario: TUN edit raises the restart banner
-- **WHEN** the user changes any TUN setting, the idle timeout, or the WebSocket heartbeat while connected
+- **WHEN** the user changes any TUN setting, any anti-DPI setting, the idle timeout, or the WebSocket heartbeat while connected
 - **THEN** the restart-required banner SHALL appear
 
 ### Requirement: Single-instance lock per profile
@@ -332,3 +336,36 @@ Backend stdout/stderr readers and route-helper output readers SHALL cap per-line
 #### Scenario: Newline-free backend output does not grow heap unboundedly
 - **WHEN** a spawned backend or route helper writes a continuous 1 MiB stream of bytes with no newline character
 - **THEN** the reader SHALL emit bounded segments of at most 16 KiB each without allocating a single multi-megabyte line buffer
+
+### Requirement: Lossless advisory channel compiles and delivers to subscribers
+`ProcessManager::subscribe_advisories` SHALL return a lossless `mpsc::UnboundedReceiver<ProcessAdvisory>` backed by multi-subscriber fan-out, delivering engine degradation notices even when the log broadcast lags.
+
+#### Scenario: Advisory arrives while log broadcast lags
+- **WHEN** rapid backend output causes `subscribe_logs()` to return `Lagged` and the anti-DPI engine exits unexpectedly
+- **THEN** every active `subscribe_advisories()` receiver SHALL receive `ProcessAdvisory::AntidpiDegraded` exactly once
+
+### Requirement: Failover preserves parked TUN managers and drains orphaned cleanups
+On candidate failure, crash give-up, `Stop`, or `prepare_tun_session` error, the session supervisor SHALL keep the active `parked` manager until superseded or stopped and SHALL always drain `orphaned` managers before reporting `Stopped` or terminal `Error`.
+
+#### Scenario: Candidate 1 stays parked across candidate 2 failover
+- **WHEN** candidate 1 fails with an active TUN kill-switch and candidate 2 begins starting
+- **THEN** candidate 1 SHALL remain in `parked` (`probe_allowed` stays `false`) until candidate 2 adopts the same TUN identity or teardown releases candidate 1
+
+#### Scenario: Orphaned cleanup failure blocks Stopped even when active manager stops cleanly
+- **WHEN** a superseded manager sits in `orphaned` and the user clicks Stop while the active manager stops cleanly
+- **THEN** the supervisor SHALL drain `orphaned` into `retry_cleanup` rather than emitting `ProcessState::Stopped`
+
+#### Scenario: Preflight cancellation cleans up a prepared Xray TUN journal
+- **WHEN** `Stop` cancels a start after `prepare_tun_session` wrote `Phase::Prepared`
+- **THEN** teardown SHALL clear or complete the prepared journal so later connections and backend switches are not blocked
+
+### Requirement: Session stop is non-blocking and PID file writes are race-free
+`SessionHandle::stop` SHALL never block the calling thread or panic inside a Tokio runtime, `PidFile::write` SHALL use a unique temp file per write, and blocking NSS or `fsync` operations in async paths SHALL run via `spawn_blocking`.
+
+#### Scenario: Repeated stop calls never block or panic
+- **WHEN** `SessionHandle::stop` is invoked more than 4 times from a Tokio worker or GTK thread while teardown is in flight
+- **THEN** every call SHALL return immediately without blocking or panicking
+
+#### Scenario: Concurrent PID writes never delete each other's temp file
+- **WHEN** two tasks in the same process invoke `PidFile::write` concurrently
+- **THEN** each writer SHALL use a distinct temp file via `NamedTempFile::new_in` and leave a valid 0600 PID file

@@ -1,9 +1,7 @@
-use std::path::Path;
 use std::sync::Arc;
 
 use ksni::menu::{MenuItem, StandardItem};
 use ksni::{Handle, Tray, TrayMethods};
-use tempfile::TempDir;
 use tokio::sync::broadcast;
 use v2ray_rs_core::models::ConnectionMetadata;
 use v2ray_rs_core::state::{ProcessEvent, ProcessState};
@@ -47,8 +45,6 @@ struct AppTray {
     process_state: ProcessState,
     connection: Option<ConnectionMetadata>,
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
-    _icon_theme_dir: Option<TempDir>,
-    icon_theme_path: String,
 }
 
 impl Tray for AppTray {
@@ -63,10 +59,6 @@ impl Tray for AppTray {
     fn icon_name(&self) -> String {
         // Some hosts ignore IconThemePath; use pixmap for consistent rendering.
         String::new()
-    }
-
-    fn icon_theme_path(&self) -> String {
-        self.icon_theme_path.clone()
     }
 
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
@@ -332,56 +324,11 @@ impl TrayService {
     ) -> Result<TrayHandle, ksni::Error> {
         let on_action = Arc::new(on_action);
 
-        let icon_theme_dir = icons::setup_icon_theme();
-        let icon_theme_path = icon_theme_dir
-            .as_ref()
-            .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
-            .unwrap_or_default();
-
         let tray = AppTray {
             tray_id,
             process_state: ProcessState::Stopped,
             connection: None,
             on_action,
-            _icon_theme_dir: icon_theme_dir,
-            icon_theme_path,
-        };
-
-        let handle = tray.spawn().await?;
-        let listener = spawn_listener(event_rx, handle.clone(), notifier.clone());
-
-        Ok(TrayHandle {
-            handle,
-            listener,
-            notifier,
-        })
-    }
-
-    pub async fn spawn_with_data_dir(
-        event_rx: broadcast::Receiver<ProcessEvent>,
-        notifier: Notifier,
-        on_action: impl Fn(TrayAction) + Send + Sync + 'static,
-        data_dir: &Path,
-        tray_id: String,
-    ) -> Result<TrayHandle, ksni::Error> {
-        let on_action = Arc::new(on_action);
-
-        let icon_theme_dir = icons::setup_icon_theme();
-        let icon_theme_path = icon_theme_dir
-            .as_ref()
-            .map(|d| d.path().join("hicolor").to_string_lossy().into_owned())
-            .unwrap_or_default();
-
-        let install_dir = data_dir.to_path_buf();
-        let _ = tokio::task::spawn_blocking(move || icons::install_icons(&install_dir)).await;
-
-        let tray = AppTray {
-            tray_id,
-            process_state: ProcessState::Stopped,
-            connection: None,
-            on_action,
-            _icon_theme_dir: icon_theme_dir,
-            icon_theme_path,
         };
 
         let handle = tray.spawn().await?;
@@ -467,8 +414,6 @@ mod tests {
             process_state: ProcessState::Stopped,
             connection: None,
             on_action: Arc::new(|_action: TrayAction| {}),
-            _icon_theme_dir: None,
-            icon_theme_path: String::new(),
         };
         assert_eq!(Tray::id(&tray), "com.github.v2ray-rs.dev");
     }

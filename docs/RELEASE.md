@@ -4,10 +4,10 @@
 
 | Artifact | Built by | Notes |
 | --- | --- | --- |
-| `v2ray-rs-x86_64-linux.tar.gz` | `tarball` job | GUI + both helpers + desktop entry, icons, translations |
+| `v2ray-rs-x86_64-linux.tar.gz` | `tarball` job | GUI + all three helpers + desktop entry, icons, translations |
 | `v2ray-rs-x86_64-linux.tar.gz.sha256` | `tarball` job | fallback digest when the installer's baked one does not apply |
 | `install.sh` | `tarball` job | `scripts/install.sh` with the version and digest substituted |
-| `v2ray-rs-x86_64.AppImage` | `appimage` job | bundles GTK 4.18, libadwaita, and `v2ray-rs-netctl` |
+| `v2ray-rs-x86_64.AppImage` | `appimage` job | bundles GTK 4.18, libadwaita, `v2ray-rs-netctl`, and `v2ray-rs-antidpi` (the anti-DPI engine) |
 | `v2ray-rs-x86_64.AppImage.sha256` | `appimage` job | |
 | `install-appimage.sh` | `appimage` job | `scripts/install-appimage.sh` with the version substituted; installs the AppImage into a user prefix |
 | `PKGBUILD`, `PKGBUILD-bin` | `release` job | copies of the two Arch recipes with the release SHA-256 digests stamped into `sha256sums` — never `SKIP`; the tracked repo copies keep `SKIP` for the AUR `updpkgsums` flow |
@@ -15,7 +15,7 @@
 
 ## Linkage
 
-Only the two helpers are static. The GUI cannot be:
+Only the helpers are static. The GUI cannot be:
 `relm4`'s `gnome_48` feature requires GTK 4.18 and libadwaita 1.7, and GTK4
 `dlopen`s pixbuf loaders and GIO modules, which a `-static` musl binary cannot do.
 
@@ -24,6 +24,7 @@ Only the two helpers are static. The GUI cannot be:
 | `v2ray-rs` | `x86_64-unknown-linux-gnu` on `debian:trixie` | glibc 2.41, GTK dynamic |
 | `v2ray-rs-netctl` | `x86_64-unknown-linux-musl` | static |
 | `v2ray-rs-run` | `x86_64-unknown-linux-musl` | static |
+| `v2ray-rs-antidpi` | `x86_64-unknown-linux-musl` | static |
 
 `debian:trixie` is the oldest image carrying GTK 4.18.6, libadwaita 1.7, and
 glibc 2.41 — exactly the floor `gnome_48` demands, so it maximises the set of
@@ -180,11 +181,12 @@ must leave no files behind under the prefix.
 
 ## AppImage payload
 
-The AppImage bundles `v2ray-rs-netctl` but **not** `v2ray-rs-run`. The wrapper
+The AppImage bundles `v2ray-rs-netctl` and `v2ray-rs-antidpi` (the anti-DPI
+engine) but **not** `v2ray-rs-run`. The wrapper
 drops to the `v2ray-rs-bypass` system user, which only a distribution package
-creates, so a setuid-root copy shipped in an AppImage could not work. The
-bundled `netctl` is inert where it sits — the squashfs is `nosuid` — and exists
-only as the source the privileged grant copies to `/usr/local/lib/v2ray-rs/`.
+creates, so a setuid-root copy shipped in an AppImage could not work. Both
+helpers are inert where they sit — the squashfs is `nosuid` — and exist only
+as the source the privileged grant copies to `/usr/local/lib/v2ray-rs/`.
 See the TUN section of `docs/ARCHITECTURE.md`.
 
 The AppImage is not self-contained. It bundles GTK 4.18, libadwaita 1.7 and the
@@ -215,14 +217,16 @@ usual one-sided arrangement for a `-bin` sibling — so only one can be installe
 Both share `pkg/archlinux/v2ray-rs.install`, which creates the `v2ray-rs` group
 and `v2ray-rs-bypass` user and applies the helper capabilities.
 
-Provisioning starts from group-restricted helpers. The hook verifies that both
-helpers exist, applies `root:v2ray-rs` ownership and mode 0750, verifies that
-baseline, then grants `CAP_NET_ADMIN` to netctl and the setuid bit to run. It
-verifies the final state — netctl 0750 with `cap_net_admin`, run 4750, both
-owned by `root:v2ray-rs` — and on any failure reports the affected helper,
-removes a partially applied capability or setuid bit, and leaves TUN disabled
-until an operator repairs permissions. Removal strips the capability but keeps
-the `v2ray-rs` group and `v2ray-rs-bypass` user, so a reinstall preserves their
+Provisioning starts from group-restricted helpers. The hook verifies that all
+three helpers exist, applies `root:v2ray-rs` ownership and mode 0750, verifies
+that baseline, then grants `CAP_NET_ADMIN` to netctl, the
+`cap_net_admin,cap_net_raw` pair to the anti-DPI helper, and the setuid bit to
+run. It verifies the final state — netctl 0750 with `cap_net_admin`, antidpi
+0750 with `cap_net_admin,cap_net_raw`, run 4750, all owned by `root:v2ray-rs` —
+and on any failure reports the affected helper, removes a partially applied
+capability or setuid bit, and leaves TUN and the anti-DPI engine disabled until
+an operator repairs permissions. Removal strips the capability but keeps the
+`v2ray-rs` group and `v2ray-rs-bypass` user, so a reinstall preserves their
 UID, GID, and memberships. `make test-installers` exercises install, upgrade,
 induced failure, removal, and reinstall against a temporary helper tree.
 

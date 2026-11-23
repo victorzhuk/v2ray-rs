@@ -1,0 +1,37 @@
+[package]
+name = "v2ray-rs-antidpi"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+description = "DPI-circumvention packet helper: NFQUEUE-based desync strategies"
+
+[[bin]]
+name = "v2ray-rs-antidpi"
+path = "src/main.rs"
+
+[[bin]]
+name = "v2ray-rs-antidpi-censor"
+path = "src/censor.rs"
+
+[[bin]]
+name = "v2ray-rs-antidpi-probe"
+path = "src/probe.rs"
+
+[dependencies]
+clap.workspace = true
+log.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+serde = { workspace = true }
+serde_json = { workspace = true }
+env_logger.workspace = true
+nfq.workspace = true
+uuid.workspace = true
+v2ray-rs-tun-session.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[features]
+# Integration tests drive real kernel NFQUEUE inside `ip netns` namespaces.
+privileged-tests = []

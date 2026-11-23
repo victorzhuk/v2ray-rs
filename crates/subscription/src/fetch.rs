@@ -161,6 +161,9 @@ fn ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
             let octets = v4.octets();
             let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
             let is_benchmarking = octets[0] == 198 && (octets[1] & 0xfe) == 18;
+            let is_this_network = octets[0] == 0;
+            let is_multicast = octets[0] & 0xf0 == 224;
+            let is_reserved = octets[0] >= 240;
             v4.is_loopback()
                 || v4.is_private()
                 || v4.is_link_local()
@@ -168,15 +171,30 @@ fn ip_is_private_or_local(ip: std::net::IpAddr) -> bool {
                 || v4.is_broadcast()
                 || is_cgnat
                 || is_benchmarking
+                || is_this_network
+                || is_multicast
+                || is_reserved
         }
         std::net::IpAddr::V6(v6) => {
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return ip_is_private_or_local(std::net::IpAddr::V4(v4));
             }
+            let segments = v6.segments();
+            let is_nat64 = segments[..6] == [0x0064, 0xff9b, 0, 0, 0, 0];
+            if is_nat64 {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segments[6] >> 8) as u8,
+                    segments[6] as u8,
+                    (segments[7] >> 8) as u8,
+                    segments[7] as u8,
+                );
+                return ip_is_private_or_local(std::net::IpAddr::V4(v4));
+            }
             v6.is_loopback()
                 || v6.is_unspecified()
                 || v6.is_unicast_link_local()
-                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xfe00) == 0xfc00
+                || (segments[0] & 0xff00) == 0xff00
         }
     }
 }
@@ -364,7 +382,45 @@ pub fn decode_subscription_content(raw: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::IpAddr;
     use std::sync::Once;
+
+    #[test]
+    fn test_ip_guard_rejects_special_ranges() {
+        for ip in [
+            "0.0.0.1",
+            "0.255.255.255",
+            "224.0.0.1",
+            "240.0.0.1",
+            "ff02::1",
+            "64:ff9b::7f00:1",
+        ] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(
+                ip_is_private_or_local(ip),
+                "{ip} must be rejected as private or local"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ip_guard_allows_public_addresses() {
+        for ip in ["1.1.1.1", "2606:4700:4700::1111", "64:ff9b::808:808"] {
+            let ip: IpAddr = ip.parse().unwrap();
+            assert!(
+                !ip_is_private_or_local(ip),
+                "{ip} must not be rejected as private or local"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ip_guard_nat64_embeds_ipv4_rules() {
+        let nat64_loopback: IpAddr = "64:ff9b::7f00:1".parse().unwrap();
+        assert!(ip_is_private_or_local(nat64_loopback));
+        let nat64_public: IpAddr = "64:ff9b::808:808".parse().unwrap();
+        assert!(!ip_is_private_or_local(nat64_public));
+    }
 
     fn test_client() -> reqwest::Client {
         static RUSTLS_PROVIDER: Once = Once::new();

@@ -6,7 +6,7 @@ This file provides guidance to coding agents working in this repository.
 
 A Linux desktop GUI wrapper for v2ray/xray/sing-box CLI proxy tools. The app manages subscriptions, generates config files, handles process lifecycle, and provides geo-routing rules — all without implementing any protocol logic. The protocol work is delegated entirely to the system-installed CLI binaries.
 
-UI: Relm4 (GTK4) with libadwaita. Eight crates: core, subscription, process, netctl, tray, ui, run, tun-session.
+UI: Relm4 (GTK4) with libadwaita. Nine crates: core, subscription, process, netctl, tray, ui, run, tun-session, antidpi.
 
 ## Commands
 
@@ -22,7 +22,7 @@ cargo test -p v2ray-rs-core -- test_name # run a single test by name
 
 ## Architecture
 
-Rust workspace with eight crates:
+Rust workspace with nine crates:
 
 ### `crates/core` (`v2ray-rs-core`)
 
@@ -62,7 +62,7 @@ Domain models and infrastructure:
 
 ### `crates/subscription` (`v2ray-rs-subscription`)
 
-Depends on `v2ray-rs-core`. Handles subscription fetching and URI parsing:
+Depends on `v2ray-rs-core` and `v2ray-rs-process`, which manages ephemeral backends for Real Delay and availability probing. Handles subscription fetching and URI parsing:
 
 - **`fetch.rs`** — HTTP fetching (reqwest with rustls-tls, 30s connect / 60s total timeout) and local file reading. `decode_subscription_content()` handles both base64-encoded and plaintext subscription responses, splitting into individual URI lines.
 
@@ -101,13 +101,17 @@ Minimal privileged route helper binary (deps: `rtnetlink`, `tokio`, `clap`, `fut
 
 Shared versioned TUN journal schema and bounded owner-only atomic I/O. Used by core and netctl so the privileged helper does not depend on the full domain crate. Recovery verifies session, boot, network namespace, device identity, and exact recorded route/rule objects. Unknown or legacy ownership requires operator recovery.
 
+### `crates/antidpi` (`v2ray-rs-antidpi`)
+
+Standalone DPI-circumvention engine binary (NFQUEUE desync strategies; deps: `nfq`, `clap`; L3/L4 packet parsing is hand-rolled in `src/packet.rs`). Subcommands: `check --strategy …` (parses strategy chains, then probes capabilities), `run --queue N --strategy … [--hosts F] [--no-fw]` (installs firewall rules, runs the NFQUEUE loop, removes rules on SIGTERM; `--no-fw` when rules are managed externally), and one-shot `install-rules --queue N` / `remove-rules [--sweep]`. The process crate drives it as an external binary — never a crate dependency: `install-rules` before the backend spawn, the long-lived engine child after route setup, `remove-rules` on stop (`crates/process/src/antidpi.rs`). Settings live in `[antidpi]` of `settings.toml`; an empty strategy list delegates to the crate's built-in `DEFAULT_CHAINS`. Technique catalog and strategy DSL: `docs/antidpi-registry.md`. It is `setcap`'d with `cap_net_admin,cap_net_raw`, restricted to the `v2ray-rs` group with `root:v2ray-rs` ownership and mode `0750`. Privileged netns tests are gated behind the `privileged-tests` feature.
+
 ### `crates/tray` (`v2ray-rs-tray`)
 
 System tray integration via ksni (StatusNotifierItem protocol):
 
-- **`tray.rs`** — `AppTray` implements `ksni::Tray`. Uses `icon_name()` + `icon_theme_path()` for FreeDesktop theme-aware symbolic icons (DE handles `currentColor` recoloring), with `icon_pixmap()` as ARGB32 fallback. Menu items: Connect/Disconnect toggle, status label, Open Main Window, Quit. `TrayService::spawn()` calls `setup_icon_theme()` and listens for process state events.
+- **`tray.rs`** — `AppTray` implements `ksni::Tray`. `icon_name()` returns an empty string, and `icon_pixmap()` supplies state-specific ARGB32 icons. Menu items: Connect/Disconnect toggle, status label, Open Main Window, Quit. `TrayService::spawn()` listens for process state events without setting up an icon theme.
 
-- **`icons.rs`** — Embeds 3 symbolic SVGs (disconnected/connected/error). `setup_icon_theme()` creates a temporary FreeDesktop hicolor icon theme directory with the SVGs preserving `currentColor` for theme-aware rendering. `icon_name_for_state()` maps `ProcessState` to icon names. Pixmap rendering (`render_svg()`) replaces `currentColor` with `#DEDDDA` as fallback for DEs without theme lookup.
+- **`icons.rs`** — Embeds 3 symbolic SVGs (disconnected/connected/error). `render_svg()` replaces `currentColor` with `#DEDDDA` and renders ARGB32 pixmaps. Startup does not install icons or update an icon cache.
 
 - **`notification.rs`** — Desktop notifications via `notify-rust` for state changes.
 

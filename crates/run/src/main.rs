@@ -1,4 +1,6 @@
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsString};
+#[cfg(test)]
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 
 use libc::{c_char, gid_t, uid_t};
@@ -41,7 +43,7 @@ fn main() {
     if let Err(e) = drop_privileges(user.uid, user.gid) {
         die(e);
     }
-    let sanitized = sanitize_env(&std::env::vars().collect::<Vec<_>>(), &user);
+    let sanitized = sanitize_env(&std::env::vars_os().collect::<Vec<_>>(), &user);
     apply_env(&sanitized);
     close_inherited_fds();
     exec_command(&command);
@@ -123,28 +125,31 @@ fn drop_privileges(uid: uid_t, gid: gid_t) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn sanitize_env(input: &[(String, String)], user: &BypassUser) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = input
+fn sanitize_env(input: &[(OsString, OsString)], user: &BypassUser) -> Vec<(OsString, OsString)> {
+    let mut out: Vec<(OsString, OsString)> = input
         .iter()
         .filter(|(k, _)| {
+            // Only a UTF-8 key can match the allowlist; any other key is
+            // dropped and its value bytes are never inspected.
+            let name = k.to_str();
             k != "PATH"
                 && k != "HOME"
                 && k != "USER"
                 && k != "LOGNAME"
-                && (ALLOWED_ENV.contains(&k.as_str()) || k.starts_with("LC_"))
+                && name.is_some_and(|name| ALLOWED_ENV.contains(&name) || name.starts_with("LC_"))
         })
         .cloned()
         .collect();
-    out.push(("PATH".to_owned(), SAFE_PATH.to_owned()));
+    out.push((OsString::from("PATH"), OsString::from(SAFE_PATH)));
     if let Some(home) = &user.home {
-        out.push(("HOME".to_owned(), home.clone()));
+        out.push((OsString::from("HOME"), OsString::from(home)));
     }
-    out.push(("USER".to_owned(), BYPASS_USER.to_owned()));
-    out.push(("LOGNAME".to_owned(), BYPASS_USER.to_owned()));
+    out.push((OsString::from("USER"), OsString::from(BYPASS_USER)));
+    out.push((OsString::from("LOGNAME"), OsString::from(BYPASS_USER)));
     out
 }
 
-fn apply_env(sanitized: &[(String, String)]) {
+fn apply_env(sanitized: &[(OsString, OsString)]) {
     let keys: Vec<std::ffi::OsString> = std::env::vars_os().map(|(k, _)| k).collect();
     unsafe {
         for k in keys {
@@ -254,7 +259,7 @@ mod tests {
             gid: 12345,
             home: Some("/nonexistent".to_owned()),
         };
-        let input: Vec<(String, String)> = [
+        let input: Vec<(OsString, OsString)> = [
             ("PYTHONPATH", "/evil"),
             ("LD_AUDIT", "/evil.so"),
             ("LD_PRELOAD", "/evil.so"),
@@ -277,11 +282,11 @@ mod tests {
             ("TERM", "xterm-256color"),
         ]
         .into_iter()
-        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .map(|(k, v)| (OsString::from(k), OsString::from(v)))
         .collect();
 
         let out = sanitize_env(&input, &user);
-        let keys: Vec<&str> = out.iter().map(|(k, _)| k.as_str()).collect();
+        let keys: Vec<&str> = out.iter().map(|(k, _)| k.to_str().unwrap()).collect();
 
         for stripped in [
             "PYTHONPATH",
@@ -311,7 +316,7 @@ mod tests {
         let value = |key: &str| {
             out.iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
+                .map(|(_, v)| v.to_str().unwrap())
                 .unwrap()
         };
         assert_eq!(value("PATH"), SAFE_PATH);
@@ -323,6 +328,39 @@ mod tests {
             1,
             "exactly one PATH entry"
         );
+    }
+
+    #[test]
+    fn sanitize_env_drops_non_utf8_keys_without_inspecting_values() {
+        let user = BypassUser {
+            uid: 12345,
+            gid: 12345,
+            home: None,
+        };
+        let input = vec![
+            (
+                OsString::from_vec(vec![b'B', 0xff]),
+                OsString::from_vec(vec![0x80]),
+            ),
+            (
+                OsString::from("LC_CTYPE"),
+                OsString::from_vec(vec![b'x', 0xfe]),
+            ),
+        ];
+
+        let out = sanitize_env(&input, &user);
+
+        for (k, _) in &out {
+            assert!(
+                !k.as_bytes().contains(&0xff),
+                "non-UTF-8 key must be dropped"
+            );
+        }
+        let lc = out
+            .iter()
+            .find(|(k, _)| k.as_bytes() == b"LC_CTYPE")
+            .expect("LC_CTYPE must be preserved");
+        assert_eq!(lc.1.as_bytes(), b"x\xfe");
     }
 
     #[test]

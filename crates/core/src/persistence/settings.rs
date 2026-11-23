@@ -9,9 +9,21 @@ use crate::models::AppSettings;
 use super::{AppPaths, PersistenceError, RefMigration, read_file};
 
 pub fn save_settings(paths: &AppPaths, settings: &AppSettings) -> Result<(), PersistenceError> {
+    validate_antidpi(settings)?;
     paths.ensure_dirs()?;
     let toml_str = toml::to_string_pretty(settings)?;
     atomic_write(&paths.settings_path(), toml_str.as_bytes()).map_err(PersistenceError::Io)
+}
+
+/// Runs before any filesystem effect (directory creation, serialization write)
+/// so a rejected save leaves the existing file byte-identical. Only the
+/// anti-DPI section is shape-checked here; the other sections are validated by
+/// their own editors before they reach persistence.
+fn validate_antidpi(settings: &AppSettings) -> Result<(), PersistenceError> {
+    settings
+        .antidpi
+        .validate()
+        .map_err(|e| PersistenceError::InvalidSettings(e.to_string()))
 }
 
 pub fn load_settings(paths: &AppPaths) -> Result<AppSettings, PersistenceError> {
@@ -29,7 +41,11 @@ pub fn load_settings(paths: &AppPaths) -> Result<AppSettings, PersistenceError> 
     match raw.try_into() {
         Ok(settings) => {
             if migrated {
-                save_settings(paths, &settings)?;
+                if let Err(e) = validate_antidpi(&settings) {
+                    log::warn!("{e}; keeping the settings file unchanged");
+                } else {
+                    save_settings(paths, &settings)?;
+                }
             }
             Ok(settings)
         }
@@ -256,7 +272,7 @@ address = "1.1.1.1"
             })),
         ];
         let expected_node_id = subscription.nodes[1].id;
-        super::super::save_subscriptions(&paths, &[subscription.clone()]).unwrap();
+        super::super::save_subscriptions(&paths, std::slice::from_ref(&subscription)).unwrap();
 
         let settings = format!(
             "version = 1\nsocks_port = 1080\nhttp_port = 1081\nauto_update_subscriptions = true\nsubscription_update_interval_secs = 86400\nauto_update_geodata = true\ngeodata_update_interval_secs = 604800\nlanguage = \"english\"\nminimize_to_tray = true\nnotifications_enabled = true\nonboarding_complete = false\nauto_resolve_strategy = \"last-successful\"\n[backend]\nbackend_type = \"xray\"\n[dns]\nenabled = false\n[last_success]\nconnected_at = 2025-01-01T00:00:00Z\n[last_success.node_ref]\ntype = \"subscription\"\nsubscription_id = \"{}\"\nnode_index = 1\n",
@@ -279,5 +295,158 @@ address = "1.1.1.1"
                     .unwrap(),
             })
         );
+    }
+
+    fn migration_subscription() -> Subscription {
+        let mut subscription =
+            crate::models::Subscription::new_from_url("Migrated", "https://example.com/sub");
+        subscription.nodes = vec![
+            SubscriptionNode::new(ProxyNode::Vless(VlessConfig {
+                address: "one.example.com".into(),
+                port: 443,
+                uuid: "node-1".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: None,
+            })),
+            SubscriptionNode::new(ProxyNode::Vless(VlessConfig {
+                address: "two.example.com".into(),
+                port: 443,
+                uuid: "node-2".into(),
+                encryption: None,
+                flow: None,
+                transport: TransportSettings::Tcp,
+                tls: None,
+                remark: None,
+            })),
+        ];
+        subscription
+    }
+
+    fn legacy_settings_toml(subscription: &Subscription, extra_sections: &str) -> String {
+        format!(
+            "version = 1\n\
+             socks_port = 1080\n\
+             http_port = 1081\n\
+             auto_update_subscriptions = true\n\
+             subscription_update_interval_secs = 86400\n\
+             auto_update_geodata = true\n\
+             geodata_update_interval_secs = 604800\n\
+             language = \"english\"\n\
+             minimize_to_tray = true\n\
+             notifications_enabled = true\n\
+             onboarding_complete = false\n\
+             [backend]\n\
+             backend_type = \"xray\"\n\
+             [dns]\n\
+             enabled = false\n\
+             [last_success]\n\
+             connected_at = 2025-01-01T00:00:00Z\n\
+             [last_success.node_ref]\n\
+             type = \"subscription\"\n\
+             subscription_id = \"{}\"\n\
+             node_index = 1\n\
+             {}",
+            subscription.id, extra_sections
+        )
+    }
+
+    #[test]
+    fn test_save_settings_rejects_invalid_antidpi_and_keeps_file() {
+        let (_tmp, paths) = super::super::test_paths();
+        paths.ensure_dirs().unwrap();
+        let original = "version = 1\nsocks_port = 1080\n";
+        fs::write(paths.settings_path(), original).unwrap();
+
+        let prefix = "fake:sni=";
+        let long_chain = format!(
+            "{prefix}{}",
+            "a".repeat(MAX_ANTIDPI_STRATEGY_LEN + 1 - prefix.len())
+        );
+        let settings = AppSettings {
+            antidpi: AntiDpiConfig {
+                enabled: true,
+                queue: 0,
+                strategies: (0..MAX_ANTIDPI_STRATEGIES)
+                    .map(|i| format!("disorder:pos={i}"))
+                    .chain(std::iter::once(long_chain))
+                    .collect(),
+                hostlist_path: Some("   ".into()),
+            },
+            ..AppSettings::default()
+        };
+
+        let PersistenceError::InvalidSettings(msg) = save_settings(&paths, &settings).unwrap_err()
+        else {
+            panic!("expected InvalidSettings");
+        };
+        assert!(msg.contains("queue must be between 1 and 65535"), "{msg}");
+        assert_eq!(fs::read_to_string(paths.settings_path()).unwrap(), original);
+
+        // On untouched paths the rejection must precede directory creation.
+        let (_tmp_fresh, fresh) = super::super::test_paths();
+        let err = save_settings(&fresh, &settings).unwrap_err();
+        assert!(matches!(err, PersistenceError::InvalidSettings(_)));
+        assert!(!fresh.config_dir().exists());
+    }
+
+    #[test]
+    fn test_save_settings_valid_antidpi_round_trips() {
+        let (_tmp, paths) = super::super::test_paths();
+        let settings = AppSettings {
+            antidpi: AntiDpiConfig {
+                enabled: true,
+                queue: u16::MAX,
+                strategies: (0..MAX_ANTIDPI_STRATEGIES)
+                    .map(|i| format!("fake:blob=tls:sni=h{i}.example.com:tcp_seq=10000"))
+                    .collect(),
+                hostlist_path: Some("/etc/v2ray-rs/hosts.txt".into()),
+            },
+            ..AppSettings::default()
+        };
+
+        save_settings(&paths, &settings).unwrap();
+        let loaded = load_settings(&paths).unwrap();
+        assert_eq!(loaded.antidpi, settings.antidpi);
+    }
+
+    #[test]
+    fn test_load_settings_keeps_file_when_migrated_antidpi_is_invalid() {
+        let (_tmp, paths) = super::super::test_paths();
+        let subscription = migration_subscription();
+        super::super::save_subscriptions(&paths, std::slice::from_ref(&subscription)).unwrap();
+
+        let legacy =
+            legacy_settings_toml(&subscription, "\n[antidpi]\nenabled = true\nqueue = 0\n");
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.settings_path(), &legacy).unwrap();
+
+        let loaded = load_settings(&paths).unwrap();
+        assert_eq!(loaded.antidpi.queue, 0);
+        assert!(loaded.last_success.is_some());
+        assert_eq!(fs::read_to_string(paths.settings_path()).unwrap(), legacy);
+    }
+
+    #[test]
+    fn test_load_settings_rewrites_migrated_file_once() {
+        let (_tmp, paths) = super::super::test_paths();
+        let subscription = migration_subscription();
+        super::super::save_subscriptions(&paths, std::slice::from_ref(&subscription)).unwrap();
+
+        let legacy = legacy_settings_toml(&subscription, "");
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.settings_path(), &legacy).unwrap();
+
+        let first = load_settings(&paths).unwrap();
+        assert!(first.last_success.is_some());
+        let rewritten = fs::read_to_string(paths.settings_path()).unwrap();
+        assert_ne!(rewritten, legacy, "migrated file must be rewritten");
+        assert!(rewritten.contains("node_id = \""));
+
+        load_settings(&paths).unwrap();
+        let after_second_load = fs::read_to_string(paths.settings_path()).unwrap();
+        assert_eq!(after_second_load, rewritten, "second load must not rewrite");
     }
 }

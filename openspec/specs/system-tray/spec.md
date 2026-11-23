@@ -93,11 +93,15 @@ The system SHALL support optional desktop notifications for tray-visible connect
 - **THEN** the tray integration SHALL emit a desktop notification describing the state change
 
 ### Requirement: Tray listener resyncs on lag, escapes notifications, and cleans icon resources
-`TrayService` SHALL resync tray state from `StateManager` when its broadcast receiver reports `Lagged`, abort its listener task on `shutdown()`, honor the `notifications` enabled flag while escaping dynamic markup in `Notifier`, and remove temporary icon directories on exit while running `gtk-update-icon-cache` asynchronously off the GTK thread.
+`TrayService` SHALL resync tray state from `StateManager` when its broadcast receiver reports `Lagged`, abort its listener task on `shutdown()`, honor the `notifications` enabled flag while escaping dynamic markup in `Notifier`, and avoid creating temporary icon theme directories or spawning `gtk-update-icon-cache` during normal pixmap-only startup.
 
 #### Scenario: Broadcast lag resyncs tray icon to current state
 - **WHEN** rapid log events cause `RecvError::Lagged` on the tray broadcast receiver across a state transition to `Running`
 - **THEN** the tray listener SHALL read the current state snapshot and update the tray icon and menu to `Connected`
+
+#### Scenario: Pixmap-only startup creates no temp icon theme
+- **WHEN** `TrayService::spawn` starts with `icon_name()` returning an empty string
+- **THEN** it SHALL render icons via `icon_pixmap()` without creating a temp hicolor directory or invoking `gtk-update-icon-cache`
 
 ### Requirement: System tray item identity is scoped to the active profile
 The StatusNotifierItem identifier published to the system tray SHALL incorporate the active runtime profile identifier so concurrent profile instances register distinct tray items on the session bus.

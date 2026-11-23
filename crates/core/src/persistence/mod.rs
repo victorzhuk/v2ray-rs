@@ -32,7 +32,7 @@ pub use tun_session::{
     SINGBOX_ROUTE_TABLE, TunEpoch, TunOwnership, TunPhase, TunSession, clear_tun_session,
     complete_tun_session, load_tun_session, load_tun_session_result, prepare_tun_session,
     record_singbox_launch, renew_completed_tun_session, retirable_tun_session, save_tun_session,
-    tun_session_pending,
+    tun_session_pending, tun_session_replaced,
 };
 
 #[derive(Error, Debug)]
@@ -49,6 +49,8 @@ pub enum PersistenceError {
     Json(#[from] serde_json::Error),
     #[error("corrupt config file, using defaults: {0}")]
     CorruptConfig(String),
+    #[error("invalid settings: {0}")]
+    InvalidSettings(String),
     #[error("invalid override path for {field}: {path} — must be an absolute path")]
     InvalidOverridePath { field: String, path: PathBuf },
 }

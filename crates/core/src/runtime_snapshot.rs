@@ -1,8 +1,8 @@
 use std::path::PathBuf;
 
 use crate::models::{
-    AppSettings, AutoResolveStrategy, BackendType, DnsConfig, LoggingSettings, ManualNode,
-    RoutingRuleSet, Subscription, TunConfig,
+    AntiDpiConfig, AppSettings, AutoResolveStrategy, BackendType, DnsConfig, LoggingSettings,
+    ManualNode, RoutingRuleSet, Subscription, TunConfig,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -20,6 +20,7 @@ pub struct RuntimeConfigSnapshot {
     pub auto_resolve_strategy: AutoResolveStrategy,
     pub use_real_delay_for_lowest_latency: bool,
     pub tun: TunConfig,
+    pub antidpi: AntiDpiConfig,
     pub idle_timeout_secs: u32,
     pub ws_heartbeat_secs: u32,
     pub logging: LoggingSettings,
@@ -47,6 +48,7 @@ impl RuntimeConfigSnapshot {
             || self.auto_resolve_strategy != settings.auto_resolve_strategy
             || self.use_real_delay_for_lowest_latency != settings.real_delay.use_for_lowest_latency
             || self.tun != settings.tun
+            || self.antidpi != settings.antidpi
             || self.idle_timeout_secs != settings.idle_timeout_secs
             || self.ws_heartbeat_secs != settings.ws_heartbeat_secs
             || self.logging != settings.logging
@@ -63,6 +65,7 @@ impl RuntimeConfigSnapshot {
         settings.auto_resolve_strategy = self.auto_resolve_strategy;
         settings.real_delay.use_for_lowest_latency = self.use_real_delay_for_lowest_latency;
         settings.tun = self.tun.clone();
+        settings.antidpi = self.antidpi.clone();
         settings.idle_timeout_secs = self.idle_timeout_secs;
         settings.ws_heartbeat_secs = self.ws_heartbeat_secs;
         settings.logging = self.logging;
@@ -105,6 +108,7 @@ mod tests {
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
             tun: TunConfig::default(),
+            antidpi: AntiDpiConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
             logging: LoggingSettings::default(),
@@ -198,6 +202,7 @@ mod tests {
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
             tun: TunConfig::default(),
+            antidpi: AntiDpiConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
             logging: LoggingSettings::default(),
@@ -309,6 +314,7 @@ mod tests {
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
             tun: TunConfig::default(),
+            antidpi: AntiDpiConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
             logging: LoggingSettings::default(),
@@ -382,6 +388,7 @@ mod tests {
             auto_resolve_strategy: AutoResolveStrategy::default(),
             use_real_delay_for_lowest_latency: false,
             tun: TunConfig::default(),
+            antidpi: AntiDpiConfig::default(),
             idle_timeout_secs: AppSettings::default().idle_timeout_secs,
             ws_heartbeat_secs: 0,
             logging: LoggingSettings::default(),
@@ -415,6 +422,54 @@ mod tests {
         settings.tun = TunConfig::default();
         settings.tun.strict_route = false;
         assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_detects_antidpi_divergence() {
+        let snapshot = make_snapshot(BackendType::Xray, "/usr/bin/xray");
+        let mut settings = AppSettings {
+            backend: crate::models::BackendConfig {
+                backend_type: BackendType::Xray,
+                binary_path: Some(PathBuf::from("/usr/bin/xray")),
+                ..crate::models::BackendConfig::default()
+            },
+            ..AppSettings::default()
+        };
+
+        assert!(!snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.antidpi.enabled = true;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.antidpi = AntiDpiConfig::default();
+        settings.antidpi.queue = snapshot.antidpi.queue + 1;
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.antidpi = AntiDpiConfig::default();
+        settings.antidpi.strategies = vec!["multisplit:pos=midsld".to_string()];
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+
+        settings.antidpi.strategies = vec!["multisplit:pos=2".to_string()];
+        assert!(snapshot.diverges_from(&settings, &RoutingRuleSet::new(), &[], &[]));
+    }
+
+    #[test]
+    fn test_runtime_config_snapshot_restores_antidpi() {
+        let antidpi = AntiDpiConfig {
+            enabled: true,
+            queue: 7,
+            strategies: vec!["fake:blob=quic:repeats=11".to_string()],
+            hostlist_path: Some("/etc/v2ray-rs/hosts.txt".to_string()),
+        };
+        let snapshot = RuntimeConfigSnapshot {
+            antidpi: antidpi.clone(),
+            ..make_snapshot(BackendType::Xray, "/usr/bin/xray")
+        };
+
+        let mut settings = AppSettings::default();
+        snapshot.restore_settings(&mut settings);
+
+        assert_eq!(settings.antidpi, antidpi);
     }
 
     #[test]

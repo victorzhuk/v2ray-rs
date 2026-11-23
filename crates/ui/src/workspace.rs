@@ -248,6 +248,20 @@ impl WorkspaceStore {
         self.persist_routing_rules(RoutingRuleSet::new())
     }
 
+    /// Removes `settings.toml` on the writer thread and seeds the snapshot
+    /// with defaults, so every later reader sees the reset. A missing file
+    /// resets identically to a present one. Returns the defaults callers
+    /// should adopt.
+    pub fn reset_settings(&self) -> Result<Arc<AppSettings>, PersistenceError> {
+        let _guard = self.lock();
+        self.writer.persist(|paths| {
+            remove_if_exists(paths.settings_path()).map_err(PersistenceError::from)
+        })?;
+        let settings = Arc::new(AppSettings::default());
+        self.write_snapshot(|snapshot| snapshot.settings = Some(settings.clone()));
+        Ok(settings)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ()> {
         self.lock.lock().unwrap_or_else(|error| error.into_inner())
     }
@@ -518,5 +532,56 @@ mod tests {
             .load_routing_rules()
             .unwrap();
         assert!(reloaded.rules().is_empty());
+    }
+
+    #[test]
+    fn reset_settings_recovers_from_a_corrupt_file() {
+        let (_tmp, store) = store();
+        let settings = AppSettings {
+            http_port: 2091,
+            ..Default::default()
+        };
+        store.save_settings(&settings).unwrap();
+        std::fs::write(store.paths().settings_path(), b"not toml [").unwrap();
+        assert!(persistence::load_settings(store.paths()).is_err());
+
+        let reset = store.reset_settings().unwrap();
+
+        assert_eq!(*reset, AppSettings::default());
+        assert_eq!(*store.settings_snapshot().unwrap(), AppSettings::default());
+        assert!(!store.paths().settings_path().exists());
+
+        let reloaded = WorkspaceStore::new(store.paths().clone())
+            .load_settings()
+            .unwrap();
+        assert_eq!(reloaded, AppSettings::default());
+    }
+
+    #[test]
+    fn reset_settings_treats_a_missing_file_like_a_present_one() {
+        let (_tmp, store) = store();
+
+        let reset = store.reset_settings().unwrap();
+
+        assert_eq!(*reset, AppSettings::default());
+        assert!(!store.paths().settings_path().exists());
+    }
+
+    #[test]
+    fn reset_settings_replaces_a_stale_cache_when_the_file_is_gone() {
+        let (_tmp, store) = store();
+        let settings = AppSettings {
+            http_port: 2091,
+            ..Default::default()
+        };
+        store.save_settings(&settings).unwrap();
+        std::fs::remove_file(store.paths().settings_path()).unwrap();
+        assert_eq!(store.settings_snapshot().unwrap().http_port, 2091);
+
+        let reset = store.reset_settings().unwrap();
+
+        assert_eq!(*reset, AppSettings::default());
+        assert_eq!(*store.settings_snapshot().unwrap(), AppSettings::default());
+        assert!(!store.paths().settings_path().exists());
     }
 }

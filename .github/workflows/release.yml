@@ -40,18 +40,23 @@ jobs:
       - name: Build
         run: |
           cargo build --release --locked --target x86_64-unknown-linux-musl \
-            -p v2ray-rs-netctl -p v2ray-rs-run
+            -p v2ray-rs-netctl -p v2ray-rs-run -p v2ray-rs-antidpi
       - name: Assert static
         run: |
           # A NEEDED entry is the only definitive proof of a runtime dependency.
           # musl produces static-pie, which `ldd` reports as "statically linked"
           # rather than "not a dynamic executable", so match on neither string.
-          for bin in v2ray-rs-netctl v2ray-rs-run; do
+          for bin in v2ray-rs-netctl v2ray-rs-run v2ray-rs-antidpi; do
             path="target/x86_64-unknown-linux-musl/release/$bin"
             file "$path"
-            if readelf -d "$path" | grep -q 'NEEDED'; then
+            # A broken ELF must fail the gate, not pass an empty NEEDED check.
+            if ! readelf_out=$(readelf -d "$path"); then
+              echo "::error::readelf -d failed for $bin; the ELF is broken or unreadable"
+              exit 1
+            fi
+            if printf '%s\n' "$readelf_out" | grep -q 'NEEDED'; then
               echo "::error::$bin links shared libraries"
-              readelf -d "$path"
+              printf '%s\n' "$readelf_out"
               exit 1
             fi
           done
@@ -61,6 +66,7 @@ jobs:
           path: |
             target/x86_64-unknown-linux-musl/release/v2ray-rs-netctl
             target/x86_64-unknown-linux-musl/release/v2ray-rs-run
+            target/x86_64-unknown-linux-musl/release/v2ray-rs-antidpi
           if-no-files-found: error
 
   tarball:
@@ -114,12 +120,13 @@ jobs:
           echo "version=$version" >>"$GITHUB_OUTPUT"
       - name: Stage and pack
         run: |
-          chmod +x helpers/v2ray-rs-netctl helpers/v2ray-rs-run
+          chmod +x helpers/v2ray-rs-netctl helpers/v2ray-rs-run helpers/v2ray-rs-antidpi
           scripts/stage-dist.sh \
             --version "${{ steps.meta.outputs.version }}" \
             --ui target/release/v2ray-rs-ui \
             --netctl helpers/v2ray-rs-netctl \
             --run helpers/v2ray-rs-run \
+            --antidpi helpers/v2ray-rs-antidpi \
             --out dist
           tar -C dist -czf "v2ray-rs-x86_64-linux.tar.gz" \
             "v2ray-rs-${{ steps.meta.outputs.version }}-x86_64-linux"
@@ -219,6 +226,9 @@ jobs:
           if [ ! -e AppDir/usr/bin/v2ray-rs-netctl ]; then
             missing="$missing v2ray-rs-netctl"
           fi
+          if [ ! -e AppDir/usr/bin/v2ray-rs-antidpi ]; then
+            missing="$missing v2ray-rs-antidpi"
+          fi
           if [ -n "$missing" ]; then
             echo "::error::AppImage bundle incomplete, missing:$missing"
             exit 1
@@ -271,6 +281,20 @@ jobs:
           export APPIMAGE="$PWD/v2ray-rs-x86_64.AppImage"
           cd "$(mktemp -d)"
           "$APPIMAGE" --appimage-extract >/dev/null
+          # The shipped image itself must carry executable helpers and must not
+          # carry the setuid wrapper removed at staging time.
+          missing=""
+          for helper in v2ray-rs-netctl v2ray-rs-antidpi; do
+            [ -x "squashfs-root/usr/bin/$helper" ] || missing="$missing $helper"
+          done
+          if [ -e squashfs-root/usr/bin/v2ray-rs-run ]; then
+            echo "::error::extracted AppImage contains the setuid wrapper v2ray-rs-run"
+            exit 1
+          fi
+          if [ -n "$missing" ]; then
+            echo "::error::extracted AppImage missing executable helpers:$missing"
+            exit 1
+          fi
           xvfb-run --auto-servernum timeout 35s bash <<'SMOKE'
           set -euo pipefail
           ./squashfs-root/AppRun --profile development &

@@ -45,7 +45,7 @@ PRINT_QUIET=0
 PRINT_VERBOSE=0
 DO_UNINSTALL=0
 
-BINS="v2ray-rs v2ray-rs-netctl v2ray-rs-run"
+BINS="v2ray-rs v2ray-rs-netctl v2ray-rs-run v2ray-rs-antidpi"
 SHARE_FILES="applications/com.github.v2ray-rs.desktop
 icons/hicolor/scalable/apps/com.github.v2ray-rs.svg
 icons/hicolor/symbolic/apps/com.github.v2ray-rs-symbolic.svg
@@ -58,7 +58,7 @@ usage() {
 $APP_NAME installer
 
 Downloads the current $APP_NAME release and installs it under a prefix,
-defaulting to \$HOME/.local. Installs three binaries, a desktop entry, icons,
+defaulting to \$HOME/.local. Installs four binaries, a desktop entry, icons,
 and translations.
 
 USAGE:
@@ -215,6 +215,98 @@ is_pinned_version() {
     esac
 }
 
+# The version this install actually targets: an explicit override wins, then
+# the baked release pin.
+selected_version() {
+    if [ -n "${V2RAY_RS_VERSION:-}" ]; then
+        printf '%s\n' "$V2RAY_RS_VERSION"
+    else
+        printf '%s\n' "$APP_VERSION"
+    fi
+}
+
+# Last release that shipped the three-binary layout (v2ray-rs, v2ray-rs-netctl,
+# v2ray-rs-run). Everything newer, and the unversioned development tree,
+# carries v2ray-rs-antidpi as well.
+ANTIDPI_BASELINE="0.21.0"
+
+# Strips leading zeros so a numeric comparison cannot read a field as octal.
+version_field() {
+    local _f="$1"
+    while [ "$_f" != "${_f#0}" ]; do
+        _f=${_f#0}
+    done
+    [ -n "$_f" ] || _f=0
+    printf '%s\n' "$_f"
+}
+
+# True when $1 is a stable MAJOR.MINOR.PATCH release at or before
+# $ANTIDPI_BASELINE. Newer releases, "latest", pre-release suffixes, and
+# anything unparseable return false and keep the current four-binary layout.
+is_historical_version() {
+    local _ver="$1" _f _i _v1 _v2 _v3 _l1 _l2 _l3
+
+    case "$_ver" in
+        "" | *[!0-9.]* | *.*.*.*) return 1 ;;
+    esac
+    case "$_ver" in
+        *.*.*) ;;
+        *) return 1 ;;
+    esac
+
+    _i=${_ver#*.}
+    _v1=${_ver%%.*} _v2=${_i%%.*} _v3=${_i#*.}
+    for _f in "$_v1" "$_v2" "$_v3"; do
+        case "$_f" in
+            "" | *[!0-9]*) return 1 ;;
+        esac
+    done
+
+    _i=${ANTIDPI_BASELINE#*.}
+    _l1=${ANTIDPI_BASELINE%%.*} _l2=${_i%%.*} _l3=${_i#*.}
+
+    _v1=$(version_field "$_v1") _v2=$(version_field "$_v2") _v3=$(version_field "$_v3")
+    _l1=$(version_field "$_l1") _l2=$(version_field "$_l2") _l3=$(version_field "$_l3")
+
+    [ "$_v1" -lt "$_l1" ] && return 0
+    [ "$_v1" -gt "$_l1" ] && return 1
+    [ "$_v2" -lt "$_l2" ] && return 0
+    [ "$_v2" -gt "$_l2" ] && return 1
+    [ "$_v3" -le "$_l3" ]
+}
+
+# Which binaries the selected release must ship. The current release, and the
+# unversioned development tree tracking latest, always ships the anti-DPI
+# helper; only an explicitly selected release at or before $ANTIDPI_BASELINE
+# ships three binaries. Requiring the complete set up front keeps a damaged or
+# version-mismatched archive from overwriting a working install and then
+# failing halfway.
+required_bins() {
+    echo "v2ray-rs v2ray-rs-netctl v2ray-rs-run"
+
+    local _sel
+    _sel=$(selected_version)
+
+    # The target is the pin itself: no override, or an override naming the
+    # pinned release.
+    if is_pinned_version && [ "$_sel" = "$APP_VERSION" ]; then
+        echo "v2ray-rs-antidpi"
+        return 0
+    fi
+    # The unversioned development default resolves to "latest".
+    if ! is_pinned_version && [ -z "${V2RAY_RS_VERSION:-}" ]; then
+        echo "v2ray-rs-antidpi"
+        return 0
+    fi
+
+    # An explicit selection that differs from the pin: historical releases
+    # keep the three-binary layout, everything else the four-binary one.
+    if is_historical_version "$_sel"; then
+        return 0
+    fi
+    echo "v2ray-rs-antidpi"
+}
+
 # A substituted digest is exactly 64 lowercase hex characters.
 is_pinned_sha256() {
     case "$ARTIFACT_SHA256" in
@@ -287,14 +379,54 @@ verify_checksum() {
     fi
 }
 
+# Rejects symlinked directories on the way to $1 (a path relative to the
+# extracted payload): install -D follows them, so a corrupted or hostile
+# archive could scatter files outside the staging tree.
+reject_payload_symlinks() {
+    local _src="$1" _file="$2" _dir
+
+    _dir=$(dirname "$_file")
+    while [ "$_dir" != . ]; do
+        if [ -L "$_src/$_dir" ]; then
+            err "archive path $_file crosses the symlinked directory $_dir; refusing to follow it"
+        fi
+        _dir=$(dirname "$_dir")
+    done
+}
+
+# Rejects a required payload file that is missing, a symlink, unreadable, or
+# zero bytes: install -D would follow the link or copy an empty binary, and
+# -f alone accepts several malformed archives.
+require_payload_file() {
+    local _src="$1" _rel="$2" _path="$_src/$2"
+
+    [ -e "$_path" ] || [ -L "$_path" ] || err "archive is missing $_rel"
+    [ ! -L "$_path" ] || err "archive $_rel is a symlink; refusing to install it"
+    [ -f "$_path" ] || err "archive $_rel is not a regular file"
+    [ -r "$_path" ] || err "archive $_rel is unreadable; refusing a partial install"
+    [ -s "$_path" ] || err "archive $_rel is empty; refusing a partial install"
+    reject_payload_symlinks "$_src" "$_rel"
+}
+
 install_tree() {
-    local _src="$1" _bin _rel _is_root=0
+    local _src="$1" _bin _rel _is_root=0 _bins
 
     [ "$(id -u)" -eq 0 ] && _is_root=1
+    _bins=$(required_bins)
+
+    # Validate the complete planned set for the selected version before the
+    # first write to the prefix: a damaged or pre-feature archive must leave
+    # an existing install untouched instead of failing halfway through.
+    for _bin in $_bins; do
+        require_payload_file "$_src" "bin/$_bin"
+    done
+    for _rel in $SHARE_FILES; do
+        require_payload_file "$_src" "share/$_rel"
+    done
+    require_payload_file "$_src" "LICENSE"
 
     say "installing to $PREFIX"
-    for _bin in $BINS; do
-        [ -f "$_src/bin/$_bin" ] || err "archive is missing bin/$_bin"
+    for _bin in $_bins; do
         # A user-owned setuid copy is a no-op and a misleading half-install;
         # leave the wrapper out unless this install can actually own it as root.
         if [ "$_bin" = "v2ray-rs-run" ] && [ "$_is_root" -eq 0 ]; then
@@ -306,7 +438,6 @@ install_tree() {
     done
 
     for _rel in $SHARE_FILES; do
-        [ -f "$_src/share/$_rel" ] || err "archive is missing share/$_rel"
         ensure install -Dm644 "$_src/share/$_rel" "$PREFIX/share/$_rel"
     done
 
@@ -334,8 +465,10 @@ uninstall() {
     prune_cache "$PREFIX/share/applications" mimeinfo.cache
     prune_cache "$PREFIX/share/icons/hicolor" icon-theme.cache
     say "done. Shell rc files were not modified; drop the '$PREFIX/env' line if you added one."
-    say "Privileged helpers, if you granted them, are unaffected:"
-    say "    sudo setcap -r $PREFIX/bin/v2ray-rs-netctl   # before this uninstall"
+    say "Privileged helpers relocated by a grant are deliberately left alone;"
+    say "they only exist if a grant ran:"
+    say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-netctl    # route helper, if granted"
+    say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-antidpi   # anti-DPI engine, if granted"
 }
 
 # Removes a generated cache when it is the only thing left under dir, then the
@@ -443,13 +576,33 @@ replace_home() {
     fi
 }
 
+# Guidance follows the selected release's binary list, never the prefix
+# contents: a historical install must not recommend granting a stale
+# v2ray-rs-antidpi binary that the payload does not even ship.
 print_tun_instructions() {
     local _bindir="$PREFIX/bin"
+    local _chgrp _chmod _setcap _features="TUN mode"
+
+    case " $(required_bins | tr '\n' ' ') " in
+        *" v2ray-rs-antidpi "*)
+            _features="TUN mode and the anti-DPI engine"
+            _chgrp="    chgrp v2ray-rs $_bindir/v2ray-rs-netctl $_bindir/v2ray-rs-run $_bindir/v2ray-rs-antidpi
+    chmod 0750 $_bindir/v2ray-rs-antidpi
+    setcap 'cap_net_admin,cap_net_raw+ep' $_bindir/v2ray-rs-antidpi"
+            ;;
+        *)
+            _chgrp="    chgrp v2ray-rs $_bindir/v2ray-rs-netctl $_bindir/v2ray-rs-run"
+            ;;
+    esac
+    _chmod="    chmod 0750 $_bindir/v2ray-rs-netctl
+    chmod 4750 $_bindir/v2ray-rs-run
+    setcap 'cap_net_admin+ep' $_bindir/v2ray-rs-netctl"
 
     if is_nosuid "$_bindir"; then
         insist "$_bindir is on a filesystem mounted nosuid. File capabilities and
-         the setuid bit are ignored there, so TUN mode cannot work from this
-         prefix. Use a prefix on a normal mount, or a distribution package."
+         the setuid bit are ignored there, so $_features
+         cannot work from this prefix. Use a prefix on a normal mount, or a
+         distribution package."
         return 0
     fi
 
@@ -459,10 +612,11 @@ print_tun_instructions() {
     if [ "$(id -u)" -ne 0 ]; then
         cat <<EOF
 
-Installed for your user. Everything except TUN mode works as-is.
+Installed for your user. Everything except $_features
+works as-is.
 
-TUN mode needs helpers owned by root, which a home-directory install cannot
-provide. For it, either install system-wide:
+$_features need helpers owned by root, which a
+home-directory install cannot provide. For them, either install system-wide:
 
     curl -fsSL $INSTALL_URL | sudo env V2RAY_RS_INSTALL_DIR=/usr/local sh
 
@@ -476,14 +630,12 @@ EOF
 
     cat <<EOF
 
-Installed system-wide. To finish enabling TUN mode, run:
+Installed system-wide. To finish enabling $_features, run:
 
     groupadd --system v2ray-rs
     useradd --system --no-create-home --shell /usr/sbin/nologin v2ray-rs-bypass
-    chgrp v2ray-rs $_bindir/v2ray-rs-netctl $_bindir/v2ray-rs-run
-    chmod 0750 $_bindir/v2ray-rs-netctl
-    chmod 4750 $_bindir/v2ray-rs-run
-    setcap 'cap_net_admin+ep' $_bindir/v2ray-rs-netctl
+$_chgrp
+$_chmod
     usermod -aG v2ray-rs <your-user>
 
 Log out and back in for the group to take effect.

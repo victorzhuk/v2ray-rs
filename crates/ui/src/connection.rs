@@ -33,6 +33,12 @@ fn to_app_msg(event: SessionEvent) -> AppMsg {
         SessionEvent::Health(generation, health) => AppMsg::ConnectionHealth(generation, health),
         SessionEvent::DnsHealth(generation, failing) => AppMsg::DnsHealth(generation, failing),
         SessionEvent::TunGrantRequired(generation) => AppMsg::TunGrantRequired(generation),
+        SessionEvent::CleanupPending(generation, message) => {
+            AppMsg::CleanupPending(generation, message)
+        }
+        SessionEvent::EngineDegraded { generation, detail } => {
+            AppMsg::EngineDegraded(generation, detail)
+        }
         SessionEvent::NodePins(generation, pins) => AppMsg::NodePins(generation, pins),
         SessionEvent::OfferSubscriptionRefresh {
             subscription_id,

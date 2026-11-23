@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Anti-DPI engine integration: an `[antidpi]` settings section (enabled, NFQUEUE number, strategy chains, hostlist), an Anti-DPI preferences page, engine lifecycle wired into the connection (rules installed before the backend starts, engine stopped and rules removed on disconnect, restart required on setting changes), and the `v2ray-rs-antidpi` helper shipped in every package and provisioned with `cap_net_admin,cap_net_raw` by the same install hook and privilege grant as the route helper.
+
+### Fixed
+- Verify TUN privilege grants against relocated helper paths on AppImage and `nosuid` mounts.
+- Keep Retry cleanup available and disable Connect while session cleanup is pending.
+- Reset cached settings when repairing a broken settings file, even if the file is already gone.
+- Keep saved anti-DPI strategies when an edit contains multiple blank lines, and translate the remaining capability messages.
+- Save NFQUEUE number changes made with the spinner controls.
+
 ## [0.21.0] - 2026-11-19
 
 ### Added

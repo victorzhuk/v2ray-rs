@@ -25,6 +25,14 @@ fn sing_box_available() -> bool {
     available
 }
 
+/// Serializes the tests that actually bind ports. Both reserve ports by
+/// bind-and-release before a spawned `sing-box` binds them; run in parallel,
+/// the other test can grab a released port in between, and whichever instance
+/// loses the race FATALs on startup or serves the port the other test then
+/// talks to. Holding the lock across each test's whole lifecycle removes the
+/// window without touching any assertion.
+static SERVER_PORT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn ss_node() -> ProxyNode {
     ProxyNode::Shadowsocks(ShadowsocksConfig {
         address: "ss.example.com".into(),
@@ -93,16 +101,22 @@ fn check_with_rules(
 /// empty direct outbound is one. This starts the real thing and fails on any
 /// FATAL. The TUN inbound is dropped because creating the device needs
 /// CAP_NET_ADMIN, which the test runner does not have; everything the DNS plane
-/// is built from survives that edit.
-fn check_starts(name: &str, settings: &AppSettings, slot: u16) {
+/// is built from survives that edit. Inbound ports are reserved dynamically:
+/// a fixed block fails whenever anything else on the machine - a leftover
+/// test process from an aborted run, a parallel CI job - holds one of them.
+fn check_starts(name: &str, settings: &AppSettings) {
     let mut config = SingboxGenerator
         .generate(&[ss_node()], &[], settings)
         .unwrap_or_else(|err| panic!("{name}: generate failed: {err}"));
 
     if let Some(inbounds) = config["inbounds"].as_array_mut() {
         inbounds.retain(|i| i["type"] != "tun");
-        for (i, inbound) in inbounds.iter_mut().enumerate() {
-            inbound["listen_port"] = serde_json::json!(38000 + slot * 10 + i as u16);
+        // One reservation pass: every listener is held before any is
+        // released, so the OS cannot hand the same port out twice within
+        // the batch.
+        let ports = ephemeral_ports(inbounds.len());
+        for (inbound, port) in inbounds.iter_mut().zip(ports) {
+            inbound["listen_port"] = serde_json::json!(port);
         }
     }
     let json = serde_json::to_string_pretty(&config).unwrap();
@@ -142,6 +156,7 @@ fn generated_singbox_configs_start() {
         eprintln!("sing-box not found in PATH, skipping");
         return;
     }
+    let _port_guard = SERVER_PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut cases: Vec<(&str, AppSettings)> = Vec::new();
 
@@ -192,8 +207,8 @@ fn generated_singbox_configs_start() {
     tun_dns.dns.servers = dns_servers();
     cases.push(("tun-dns", tun_dns));
 
-    for (slot, (name, settings)) in cases.iter().enumerate() {
-        check_starts(name, settings, slot as u16);
+    for (name, settings) in cases.iter() {
+        check_starts(name, settings);
     }
 }
 
@@ -852,6 +867,121 @@ fn proxied_get(proxy_port: u16, target: &str, deadline: Instant) -> Result<Strin
     Ok(String::from_utf8_lossy(&response).into_owned())
 }
 
+/// Answers every A query with 127.0.0.1 and everything else with an empty
+/// NOERROR. The loopback regression test resolves a hostname-addressed node
+/// through the direct `domestic` transport; pointing that transport at a
+/// public resolver would make the test depend on how the resolver treats
+/// `localhost` (RFC 6761 lets it answer NXDOMAIN), so the transport runs
+/// right here and the resolution path - a real DNS query, not a hosts-file
+/// shortcut - stays exercised deterministically. The test owns this guard:
+/// `Drop` sets the shutdown flag and joins the thread, so teardown is
+/// bounded and the port provably free.
+struct LocalDnsResponder {
+    port: u16,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl LocalDnsResponder {
+    fn spawn() -> Self {
+        let socket = std::net::UdpSocket::bind(("127.0.0.1", 0)).expect("bind local DNS responder");
+        let port = socket.local_addr().expect("responder local address").port();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("set responder receive timeout");
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread = {
+            let shutdown = std::sync::Arc::clone(&shutdown);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 512];
+                // One reply to a querier that already closed its socket can
+                // surface as an ICMP-triggered error here; only a streak
+                // this long means the socket itself is failing.
+                let mut error_streak = 0u32;
+                loop {
+                    if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
+                    let (len, src) = match socket.recv_from(&mut buf) {
+                        Ok(received) => {
+                            error_streak = 0;
+                            received
+                        }
+                        Err(err)
+                            if err.kind() == std::io::ErrorKind::WouldBlock
+                                || err.kind() == std::io::ErrorKind::TimedOut =>
+                        {
+                            // Idle window: loop back around to the
+                            // shutdown check.
+                            continue;
+                        }
+                        Err(_) => {
+                            error_streak += 1;
+                            if error_streak >= 8 {
+                                break;
+                            }
+                            continue;
+                        }
+                    };
+                    let query = &buf[..len];
+                    let Some(qtype_pos) = dns_qtype_offset(query) else {
+                        continue;
+                    };
+                    let qtype = u16::from_be_bytes([query[qtype_pos], query[qtype_pos + 1]]);
+                    let mut response = query[..qtype_pos + 4].to_vec();
+                    response[2] = 0x81; // QR=1, RD preserved
+                    response[3] = 0x80; // RA=1
+                    if qtype == 1 {
+                        // One A answer pointing at the question name (offset 12).
+                        response[6] = 0;
+                        response[7] = 1;
+                        response.extend_from_slice(&[
+                            0xC0, 0x0C, // NAME pointer
+                            0, 1, // TYPE A
+                            0, 1, // CLASS IN
+                            0, 0, 0, 1, // TTL
+                            0, 4, // RDLENGTH
+                            127, 0, 0, 1,
+                        ]);
+                    } else {
+                        response[6] = 0;
+                        response[7] = 0; // empty NOERROR
+                    }
+                    let _ = socket.send_to(&response, src);
+                }
+            })
+        };
+        Self {
+            port,
+            shutdown,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for LocalDnsResponder {
+    fn drop(&mut self) {
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Offset of the QTYPE field in a plain (uncompressed) DNS query: after the
+/// 12-byte header and the zero-terminated label sequence.
+fn dns_qtype_offset(query: &[u8]) -> Option<usize> {
+    let mut i = 12;
+    loop {
+        let len = *query.get(i)?;
+        if len == 0 {
+            return (i + 5 <= query.len()).then_some(i + 1);
+        }
+        i += 1 + usize::from(len);
+    }
+}
+
 /// The regression this DNS plane exists to prevent: with DNS enabled and TUN
 /// off, a hostname-addressed proxy node ("localhost" here) used to be resolved
 /// through the proxy-detoured DoH server itself - the "remote" -> "proxy-0"
@@ -864,10 +994,23 @@ fn loopback_proxy_roundtrip_succeeds_with_default_dns() {
         eprintln!("sing-box or python3 not found in PATH, skipping");
         return;
     }
+    let _port_guard = SERVER_PORT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
 
+    let responder = LocalDnsResponder::spawn();
+    let dns_port = responder.port;
     let settings = AppSettings {
         dns: DnsConfig {
             enabled: true,
+            // The `domestic` transport is the test-local responder: the node's
+            // hostname keeps being resolved through a real direct-transport
+            // DNS query, deterministically.
+            servers: vec![DnsServerConfig {
+                tag: "domestic".to_string(),
+                protocol: DnsProtocol::Udp,
+                address: "127.0.0.1".to_string(),
+                port: Some(dns_port),
+                detour: None,
+            }],
             ..DnsConfig::default()
         },
         ..Default::default()
@@ -993,4 +1136,11 @@ fn loopback_proxy_roundtrip_succeeds_with_default_dns() {
             panic!("proxied round-trip failed: {err}\nsing-box log: {logs}\nconfig: {json}");
         }
     }
+
+    // Teardown proof: with the guard dropped, the responder thread is
+    // joined and its socket closed, so the same port must be bindable
+    // again.
+    drop(responder);
+    std::net::UdpSocket::bind(("127.0.0.1", dns_port))
+        .expect("rebind responder port after responder teardown");
 }
