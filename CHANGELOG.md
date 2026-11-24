@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-24
+
+### Changed
+- Update Cargo dependencies within existing version constraints and the Rust 1.93 minimum.
+
+### Fixed
+- Provision the non-root CI builder's private runtime directory so firewall tests can acquire the transaction lock.
+
+### Security
+- Require `url` 2.5.9 or later to fix [RUSTSEC-2026-0592](https://rustsec.org/advisories/RUSTSEC-2026-0592).
+
 ## [0.22.0] - 2026-11-24
 
 ### Added
@@ -1007,7 +1018,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/victorzhuk/v2ray-rs/releases/tag/v0.22.1
 [0.22.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.13...v0.21.0
 [0.20.13]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.12...v0.20.13

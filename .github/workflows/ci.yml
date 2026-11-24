@@ -90,6 +90,10 @@ jobs:
       - name: Create non-root builder user
         run: |
           useradd -m -s /bin/bash builder
+          uid="$(id -u builder)"
+          gid="$(id -g builder)"
+          # No logind in the container: the anti-DPI lock requires a caller-owned 0700 runtime directory.
+          install -d -o "$uid" -g "$gid" -m 0700 "/run/user/$uid"
           chown -R builder:builder "$GITHUB_WORKSPACE" /github/home
       - name: Test
         run: |
