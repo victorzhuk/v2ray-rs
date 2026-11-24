@@ -1,4 +1,5 @@
-use std::sync::Mutex;
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 use adw::prelude::*;
 use clap::Parser;
@@ -6,7 +7,6 @@ use gtk::glib;
 use nix::sys::signal::Signal;
 use relm4::adw;
 use relm4::prelude::*;
-use tokio::sync::broadcast;
 
 use crate::cli::CliArgs;
 use crate::i18n::tr;
@@ -29,20 +29,24 @@ use v2ray_rs_core::resolve::{
 };
 use v2ray_rs_core::rotating_log::{DEFAULT_MAX_BYTES, RotatingFileWriter};
 use v2ray_rs_core::runtime_snapshot::RuntimeConfigSnapshot;
-use v2ray_rs_process::{PidFile, ProcessEvent, ProcessState, StopReason};
-use v2ray_rs_tray::{TrayAction, TrayHandle};
+use v2ray_rs_process::{PidFile, ProcessState, StopReason};
+use v2ray_rs_tray::{TrayAction, TrayHandle, TraySnapshot};
 
 static TRAY_HANDLE: Mutex<Option<TrayHandle>> = Mutex::new(None);
-static TRAY_EVENT_TX: Mutex<Option<broadcast::Sender<ProcessEvent>>> = Mutex::new(None);
+static TRAY_SNAPSHOT_TX: Mutex<Option<tokio::sync::watch::Sender<TraySnapshot>>> = Mutex::new(None);
 
 const DEFAULT_WINDOW_WIDTH: i32 = 900;
 const DEFAULT_WINDOW_HEIGHT: i32 = 650;
-const EVENT_CHANNEL_CAPACITY: usize = 16;
 const MAX_AUTO_RECONNECTS: u32 = 3;
 const AUTO_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub struct AppInit {
     pub paths: AppPaths,
+    /// The warmed workspace store. Bootstrap creates it after the instance
+    /// lock and publishes every store snapshot before the app starts.
+    pub store: WorkspaceStore,
+    /// Startup load results, already published into `store`.
+    pub warm: WarmResult,
     pub tray_action_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TrayAction>>,
 }
 
@@ -57,7 +61,7 @@ use crate::subscriptions::{
     SubscriptionSourceInput, SubscriptionsMsg, SubscriptionsOutput, SubscriptionsPage,
 };
 use crate::wizard::OnboardingWizard;
-use crate::workspace::WorkspaceStore;
+use crate::workspace::{WarmResult, WorkspaceStore};
 
 mod bootstrap;
 mod config_regen;
@@ -107,7 +111,36 @@ pub struct App {
     deferred_connect: Option<DeferredConnect>,
     session_target: Option<SessionTarget>,
     settings_debounce: Option<glib::SourceId>,
-    pending_settings: Option<(u64, AppSettings)>,
+    pending_settings: Option<PendingSettings>,
+    /// Monotonic submission order for settings transactions. Completions can
+    /// arrive in any GLib poll order, so only a newer sequence may replace the
+    /// applied snapshot.
+    settings_seq: u64,
+    settings_applied_seq: u64,
+    /// The newest accepted settings edit whose write failed, keyed by
+    /// submission order. A quit or restart barrier must not report success
+    /// while such an edit is still unsaved; a newer successful transaction
+    /// that carries the same dialog state clears it.
+    settings_save_error: Option<(u64, String)>,
+    /// Submission order of accepted settings edits whose receipts the app has
+    /// not observed yet. A no-op barrier reports its own success even when an
+    /// earlier accepted edit failed, so a quit or restart waits for these
+    /// receipts before it treats the barrier as durable.
+    settings_writes_in_flight: BTreeSet<u64>,
+    /// A quit or restart whose barrier resolved while accepted settings edits
+    /// were still unresolved. The continuation resumes when the last covered
+    /// receipt lands.
+    settings_flush_wait: Option<SettingsFlushWait>,
+    /// Identity of the open preferences dialog. Revision counters restart at
+    /// zero per dialog, so rollback needs this identity as well.
+    preferences_dialog_id: u64,
+    /// The quit or restart continuation waiting behind the writer barrier.
+    persistence_flush: Option<PersistenceKind>,
+    /// A teardown that failed while the quit was flushing has already
+    /// presented its recovery control; the flush completion must not retry it.
+    quit_flush_abandoned: bool,
+    routing_save_in_flight: bool,
+    pending_routing: Option<RoutingRuleSet>,
     auto_reconnect_attempts: u32,
     status_prev: ProcessState,
     connection_origin: ConnectOrigin,
@@ -116,6 +149,9 @@ pub struct App {
     tun_release_in_flight: bool,
     tun_operator_in_flight: bool,
     cleanup_pending: bool,
+    /// Set with `cleanup_pending` when the failure is operator recovery:
+    /// the banner stays, but Retry is disabled by contract.
+    cleanup_recovery: bool,
     /// The parked cleanup failure the cleanup banner owns; its error toast
     /// stays suppressed while pending, and other errors keep toasting.
     cleanup_error: Option<String>,
@@ -152,13 +188,77 @@ impl DeferredConnect {
     }
 }
 
+/// One accepted preferences edit waiting for the debounce or a flush.
+#[derive(Debug, Clone)]
+struct PendingSettings {
+    dialog_id: u64,
+    revision: u64,
+    settings: AppSettings,
+}
+
+/// A quit or restart whose barrier resolved while accepted settings edits were
+/// still unresolved. The continuation resumes when the last covered receipt
+/// lands, so a failed edit is never hidden behind the barrier's own success.
+struct SettingsFlushWait {
+    kind: PersistenceKind,
+    /// Highest submission order the barrier covers.
+    through: u64,
+}
+
+/// The action that resumes once the writer barrier resolves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistenceKind {
+    Quit,
+    Restart,
+}
+
 #[derive(Debug)]
 pub enum AppMsg {
     ConfigRegenerated(Result<std::path::PathBuf, String>),
     OnboardingComplete(AppSettings, Option<(String, SubscriptionSource)>),
-    /// Accepted preferences edit tagged with the dialog's monotonic revision,
-    /// so a failed write reconciles only when it is the latest accepted edit.
-    SettingsChanged(u64, AppSettings),
+    /// Accepted preferences edit tagged with the dialog identity and its
+    /// monotonic revision, so a failed write reconciles only when it is that
+    /// dialog's latest accepted edit.
+    SettingsChanged(u64, u64, AppSettings),
+    /// A queued settings transaction finished. Only a newer submission order
+    /// may replace the applied snapshot.
+    SettingsCommitted {
+        seq: u64,
+        dialog: Option<(u64, u64)>,
+        result: Result<Arc<AppSettings>, String>,
+    },
+    /// The connection metadata write finished; its commit carries the latest
+    /// committed settings, including any edit queued before it.
+    LastSuccessCommitted {
+        seq: u64,
+        result: Result<Arc<AppSettings>, String>,
+    },
+    /// The onboarding save finished; the wizard closes only on success.
+    OnboardingCommitted {
+        seq: u64,
+        subscription: Option<(String, SubscriptionSource)>,
+        result: Result<Arc<AppSettings>, String>,
+    },
+    /// The corrupt-settings reset finished.
+    SettingsReset {
+        seq: u64,
+        result: Result<Arc<AppSettings>, String>,
+    },
+    /// A serialized routing-rules write finished.
+    RoutingPersisted(Result<Arc<RoutingRuleSet>, String>),
+    /// The writer barrier behind a quit or restart resolved. `committed` is
+    /// the settings snapshot the flush persisted, when it had a pending edit.
+    PersistenceFlushed {
+        kind: PersistenceKind,
+        committed: Option<Arc<AppSettings>>,
+        seq: Option<u64>,
+        dialog: Option<(u64, u64)>,
+        /// Highest accepted settings submission the barrier covers. The flush
+        /// waits for these receipts instead of trusting the barrier's own
+        /// success.
+        awaiting: Option<u64>,
+        error: Option<String>,
+    },
     ToggleConnection,
     Connect(ConnectOrigin),
     ConnectToNode(ConnectionNodeRef, ConnectOrigin),
@@ -177,6 +277,10 @@ pub enum AppMsg {
     PreferencesClosed,
     ResetBrokenSettings,
     QuitAfterSettingsError,
+    /// The preferences routing page reset the broken rules file itself; the
+    /// committed empty set arrives through this notification, which must not
+    /// enqueue a second write.
+    RoutingResetCommitted(RoutingRuleSet),
     RoutingChanged(RoutingRuleSet),
     ManualNodesChanged,
     SubscriptionsChanged,
@@ -184,7 +288,7 @@ pub enum AppMsg {
     ApplyAndRestart,
     SwitchView(usize),
     ShowToast(String),
-    FlushSettings(u64, AppSettings),
+    FlushSettings(u64, u64, AppSettings),
     AutoReconnect(u32),
     /// Route release finished; the flag reports whether routes and the
     /// recovery journal were cleared. A failed release keeps its journal.
@@ -193,6 +297,10 @@ pub enum AppMsg {
     /// A manager's cleanup failed: the session holds it parked for a retry,
     /// so rules may remain and no terminal state arrives until then.
     CleanupPending(u64, String),
+    /// The anti-DPI engine's exit could be neither observed nor confirmed:
+    /// rules may remain, no retry can fix it, and only operator recovery
+    /// can. The banner presents the detail without a Retry action.
+    CleanupRecoveryRequired(u64, String),
     /// The anti-DPI engine died after readiness: DPI interception is degraded
     /// but the proxy connection stays up. Non-fatal, one notice per
     /// generation.
@@ -284,16 +392,41 @@ impl App {
 
         self.sync_tun_probe_gate();
 
-        if let Ok(guard) = TRAY_EVENT_TX.lock()
+        self.sync_tray_snapshot();
+        self.notify_tray_transition(&from, state);
+        self.update_status_labels();
+    }
+
+    /// The one authoritative tray view, published on every applied state and
+    /// cleanup-flag change. The tray converges on this latest snapshot; it
+    /// never reads a `StateManager` it does not own.
+    fn sync_tray_snapshot(&self) {
+        if let Ok(guard) = TRAY_SNAPSHOT_TX.lock()
             && let Some(tx) = guard.as_ref()
         {
-            let _ = tx.send(ProcessEvent::StateChanged {
-                from,
-                to: state.clone(),
+            tx.send_replace(TraySnapshot {
+                state: self.process_state.clone(),
                 connection: self.connection_status.clone(),
+                cleanup_pending: self.cleanup_pending,
             });
         }
-        self.update_status_labels();
+    }
+
+    /// Desktop transition notifications are produced here, on the app's
+    /// accepted `apply_state` transitions: the tray's snapshot watch
+    /// coalesces intermediates by design, so a notification must never
+    /// depend on what the tray happens to observe. Only the desktop error
+    /// duplicating the pending-cleanup recovery banner is suppressed; the
+    /// notification setting stays with the notifier.
+    fn notify_tray_transition(&self, from: &ProcessState, to: &ProcessState) {
+        if !transition_notification_allowed(from, to, self.cleanup_pending) {
+            return;
+        }
+        if let Ok(guard) = TRAY_HANDLE.lock()
+            && let Some(handle) = guard.as_ref()
+        {
+            handle.notify_state_change(from, to);
+        }
     }
 
     fn update_status_labels(&self) {
@@ -457,15 +590,68 @@ impl App {
             .emit(SubscriptionsMsg::SetTunActive(tun_active));
     }
 
+    /// Parks the UI in non-retryable recovery: admission stays closed, the
+    /// banner carries the detail, and a pending quit is presented its
+    /// recovery control instead of closing. Only an explicit force exit
+    /// closes from here.
+    fn park_recovery(&mut self, detail: &str) {
+        self.cleanup_pending = true;
+        self.cleanup_recovery = true;
+        self.cleanup_error = Some(detail.to_string());
+        self.window.set_visible(true);
+        self.window.present();
+        self.sync_tray_snapshot();
+    }
+
     fn quit(&mut self, sender: &ComponentSender<Self>, signal: bool) {
-        if force_exit(self.pending_exit, signal) {
+        if force_exit(self.pending_exit, signal) || (signal && self.persistence_flush.is_some()) {
             log::warn!("quit signal received again while exit is pending, exiting now");
             std::process::exit(1);
         }
-        self.cancel_auto_reconnect();
-        self.flush_pending_settings(sender);
-        if self.tun_release_in_flight || self.tun_operator_in_flight {
+        if self.persistence_flush.is_some() || self.settings_flush_wait.is_some() {
+            // A quit wins over an in-flight restart flush, but neither
+            // continuation may enqueue a second barrier behind this one.
             self.pending_exit = true;
+            return;
+        }
+        self.cancel_auto_reconnect();
+        self.pending_exit = true;
+        self.quit_flush_abandoned = false;
+        self.begin_persistence_flush(sender, PersistenceKind::Quit);
+    }
+
+    /// Runs the quit state machine once every earlier workspace transaction
+    /// and the pending settings edit are durable.
+    fn finish_quit(&mut self, sender: &ComponentSender<Self>) {
+        if self.quit_flush_abandoned {
+            // A teardown failed while this quit was flushing; it already
+            // presented the recovery control. The next ordinary quit retries.
+            self.quit_flush_abandoned = false;
+            self.window.set_visible(true);
+            self.window.present();
+            return;
+        }
+        if self.cleanup_pending {
+            // A pending quit waits with the session's recovery control, not a
+            // second stop: the parked cleanup owns this state, and repeated
+            // ordinary quits only re-present it.
+            self.window.set_visible(true);
+            self.window.present();
+            return;
+        }
+        if let Some((_, error)) = self.settings_save_error.take() {
+            // An earlier asynchronous write failed after the barrier was
+            // queued: closing now would hide an unsaved edit. Report once;
+            // the next quit is not blocked by a failure already surfaced.
+            self.pending_exit = false;
+            self.show_toast(&format!(
+                "Failed to save settings: {error}. Your edits were not saved"
+            ));
+            self.window.set_visible(true);
+            self.window.present();
+            return;
+        }
+        if self.tun_release_in_flight || self.tun_operator_in_flight {
             return;
         }
         let plan = quit_plan(
@@ -476,49 +662,306 @@ impl App {
         log::info!("{}", quit_line(&plan));
         match plan {
             QuitPlan::Stop => {
-                self.pending_exit = true;
-                if let Some(handle) = self.process_handle.take()
+                // Borrowed like Disconnect: a parked-cleanup retry still
+                // needs this handle, and only a terminal state clears it.
+                if let Some(handle) = self.process_handle.as_ref()
                     && let Err(err) = handle.stop(StopReason::AppQuit)
                 {
                     log::warn!("stop request not delivered: {err:?}");
+                    // An undeliverable first stop is loss of the
+                    // controller, not a successful quit: no terminal
+                    // event will arrive. Park in non-retryable recovery
+                    // with the quit still pending — only an explicit
+                    // force exit closes now.
+                    self.park_recovery(&tr(
+                        "the session task has exited; the stop request could not be delivered",
+                    ));
+                    self.show_toast(&tr("Quit failed: the connection could not be stopped"));
                 }
             }
-            QuitPlan::AwaitStopped => self.pending_exit = true,
-            QuitPlan::Release => {
-                self.pending_exit = true;
-                self.release_tun_session(sender);
-            }
+            QuitPlan::AwaitStopped => {}
+            QuitPlan::Release => self.release_tun_session(sender),
             QuitPlan::Exit => self.window.destroy(),
         }
     }
 
-    fn persist_settings(&mut self, settings: AppSettings) -> Result<(), String> {
+    fn take_pending_settings(&mut self) -> Option<PendingSettings> {
+        if let Some(id) = self.settings_debounce.take() {
+            id.remove();
+        }
+        self.pending_settings.take()
+    }
+
+    fn next_settings_seq(&mut self) -> u64 {
+        self.settings_seq = self.settings_seq.wrapping_add(1);
+        self.settings_seq
+    }
+
+    /// Records the newest failed settings transaction. Only a newer one may
+    /// replace the detail an unsaved edit still owns.
+    fn note_settings_failed(&mut self, seq: u64, error: &str) {
+        if self
+            .settings_save_error
+            .as_ref()
+            .is_none_or(|(failed, _)| *failed <= seq)
+        {
+            self.settings_save_error = Some((seq, error.to_string()));
+        }
+    }
+
+    /// Clears the failure clock when a transaction that carries the same or
+    /// newer dialog state becomes durable.
+    fn note_settings_saved(&mut self, seq: u64) {
+        if self
+            .settings_save_error
+            .as_ref()
+            .is_some_and(|(failed, _)| *failed <= seq)
+        {
+            self.settings_save_error = None;
+        }
+    }
+
+    /// The rules the store last published. Used to settle the editor after a
+    /// rejected write, so a draft is never shown as persisted.
+    fn last_committed_routing(&self) -> RoutingRuleSet {
         self.store
-            .save_settings(&settings)
-            .map_err(|err| err.to_string())?;
-        self.settings = settings;
-        Ok(())
+            .routing_rules_snapshot()
+            .map(|rules| (*rules).clone())
+            .unwrap_or_default()
+    }
+
+    fn settle_routing_editor(&self, rules: &RoutingRuleSet) {
+        if let Some(prefs) = &self.preferences_dialog {
+            prefs.apply_committed_routing(rules);
+        }
+    }
+
+    /// Applies one durably committed routing set to everything that depends
+    /// on it. Called only from a write receipt or a reset that already
+    /// persisted, never on submission.
+    fn apply_routing_commit(&mut self, rules: &RoutingRuleSet, sender: &ComponentSender<Self>) {
+        self.settle_routing_editor(rules);
+        let subscriptions = self
+            .store
+            .subscriptions_snapshot()
+            .map(|subscriptions| (*subscriptions).clone())
+            .unwrap_or_default();
+        self.geodata_service
+            .update(GeodataRefreshConfig::from_settings(
+                &self.paths,
+                &self.settings,
+                rules,
+                &subscriptions,
+            ));
+        self.restart_required = self.check_restart_required();
+        if self.process_handle.is_none() && !self.pending_exit {
+            self.regenerate_config_disconnected(sender);
+        }
+    }
+
+    /// Enqueues the pending settings edit followed by a barrier, then resumes
+    /// `kind` after the writer resolves both. The GTK loop stays free while
+    /// the disk operation runs.
+    fn begin_persistence_flush(&mut self, sender: &ComponentSender<Self>, kind: PersistenceKind) {
+        let pending = self.take_pending_settings().map(|pending| {
+            let seq = self.next_settings_seq();
+            let PendingSettings {
+                dialog_id,
+                revision,
+                settings,
+            } = pending;
+            let receipt = self.store.enqueue_update_settings(move |committed| {
+                *committed = keep_last_success(settings, committed);
+            });
+            (seq, dialog_id, revision, receipt)
+        });
+        // A routing draft staged behind an in-flight write would otherwise be
+        // enqueued after this barrier and lost with the window. Queue it now,
+        // in submission order, so the barrier covers it.
+        if let Some(rules) = self.pending_routing.take() {
+            self.enqueue_routing_save(rules, sender);
+        }
+        // A barrier is a no-op transaction: it reports its own success even
+        // when an earlier accepted edit failed. Carry that failure into the
+        // quit so a save error never hides behind a later write.
+        let earlier_error = if pending.is_some() {
+            // The pending transaction carries the same dialog state and its
+            // own receipt reports the outcome.
+            None
+        } else {
+            self.settings_save_error.clone()
+        };
+        let barrier = self.store.enqueue_barrier();
+        // Accepted edits still in flight resolve after this barrier's job but
+        // may report their result in a later GLib poll. Remember the highest
+        // covered order so the flush waits for those receipts instead of
+        // treating the no-op barrier's own success as durability.
+        let awaiting = self.settings_writes_in_flight.iter().next_back().copied();
+        self.persistence_flush = Some(kind);
+        let s = sender.input_sender().clone();
+        glib::spawn_future_local(async move {
+            let mut committed = None;
+            let mut seq = None;
+            let mut dialog = None;
+            let mut error = None;
+            if let Some((order, dialog_id, revision, receipt)) = pending {
+                seq = Some(order);
+                dialog = Some((dialog_id, revision));
+                match receipt.await {
+                    Ok(Ok(((), settings))) => committed = Some(settings),
+                    Ok(Err(err)) => error = Some(err.to_string()),
+                    Err(_) => error = Some("workspace writer stopped".to_string()),
+                }
+            }
+            match barrier.await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => {
+                    if error.is_none() {
+                        error = Some(err.to_string());
+                    }
+                }
+                Err(_) => {
+                    if error.is_none() {
+                        error = Some("workspace writer stopped".to_string());
+                    }
+                }
+            }
+            if error.is_none()
+                && let Some((_, earlier)) = earlier_error
+            {
+                error = Some(earlier);
+            }
+            s.emit(AppMsg::PersistenceFlushed {
+                kind,
+                committed,
+                seq,
+                dialog,
+                awaiting,
+                error,
+            });
+        });
+    }
+
+    /// Reports an accepted settings edit that could not be persisted and keeps
+    /// the interactive window in front of the user.
+    fn report_unsaved_settings(&mut self, error: &str) {
+        log::error!("save settings: {error}");
+        self.pending_exit = false;
+        self.show_toast(&format!(
+            "Failed to save settings: {error}. Your edits were not saved"
+        ));
+        self.window.set_visible(true);
+        self.window.present();
+    }
+
+    /// Resumes quit or restart work once its barrier and every accepted
+    /// settings receipt it covers have resolved.
+    fn resume_persistence_flush(&mut self, sender: &ComponentSender<Self>, kind: PersistenceKind) {
+        if let Some((_, error)) = self.settings_save_error.take() {
+            self.report_unsaved_settings(&error);
+            return;
+        }
+        match kind {
+            PersistenceKind::Quit => self.quit_after_flush(sender),
+            PersistenceKind::Restart => {
+                if self.pending_exit {
+                    self.quit_after_flush(sender);
+                    return;
+                }
+                self.restart_required = false;
+                self.reconnect_pending = true;
+                sender.input(AppMsg::Disconnect);
+            }
+        }
+    }
+
+    fn quit_after_flush(&mut self, sender: &ComponentSender<Self>) {
+        // Edits accepted while the barrier was in flight still belong to
+        // this quit, and their receipts must resolve before it closes.
+        if self.pending_settings.is_some()
+            || self.settings_debounce.is_some()
+            || !self.settings_writes_in_flight.is_empty()
+        {
+            self.begin_persistence_flush(sender, PersistenceKind::Quit);
+        } else {
+            self.finish_quit(sender);
+        }
+    }
+
+    /// Continues a quit or restart whose barrier resolved early, once the
+    /// accepted settings receipts it covers are observed.
+    fn resume_deferred_flush(&mut self, sender: &ComponentSender<Self>) {
+        let Some(wait) = self.settings_flush_wait.as_ref() else {
+            return;
+        };
+        if self
+            .settings_writes_in_flight
+            .iter()
+            .any(|seq| *seq <= wait.through)
+        {
+            return;
+        }
+        let kind = wait.kind;
+        self.settings_flush_wait = None;
+        self.resume_persistence_flush(sender, kind);
     }
 
     fn commit_settings(
         &mut self,
+        dialog_id: u64,
         revision: u64,
         settings: AppSettings,
         sender: &ComponentSender<Self>,
     ) {
-        let settings = keep_last_success(settings, &self.settings);
-        if let Err(err) = self.persist_settings(settings) {
-            log::error!("save settings: {err}");
-            self.show_toast(&format!("Failed to save settings: {err}"));
-            // The write failed, so the dialog must show the last committed
-            // snapshot again — but only when the rejected write is still the
-            // dialog's latest accepted edit. A newer pending edit is never
-            // overwritten, and only the one error above is reported.
-            if let Some(prefs) = &self.preferences_dialog {
-                prefs.reconcile_settings_if_current(&self.settings, revision);
-            }
+        let seq = self.next_settings_seq();
+        self.settings_writes_in_flight.insert(seq);
+        let receipt = self.store.enqueue_update_settings(move |committed| {
+            *committed = keep_last_success(settings, committed);
+        });
+        let s = sender.input_sender().clone();
+        glib::spawn_future_local(async move {
+            let result = match receipt.await {
+                Ok(Ok(((), settings))) => Ok(settings),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err("workspace writer stopped".to_string()),
+            };
+            s.emit(AppMsg::SettingsCommitted {
+                seq,
+                dialog: Some((dialog_id, revision)),
+                result,
+            });
+        });
+    }
+
+    fn flush_pending_settings(&mut self, sender: &ComponentSender<Self>) {
+        if self.persistence_flush.is_some() {
+            // The quit or restart flush re-checks pending edits when it
+            // finishes; a second writer barrier would only delay it.
             return;
         }
+        if let Some(pending) = self.take_pending_settings() {
+            self.commit_settings(
+                pending.dialog_id,
+                pending.revision,
+                pending.settings,
+                sender,
+            );
+        }
+    }
+
+    /// Adopts a committed snapshot only when it is newer than the applied
+    /// one. Receipts can be polled in any order, but submissions reach the
+    /// writer in sequence, so an older completion must never roll back the UI.
+    fn adopt_committed_settings(&mut self, seq: u64, committed: &AppSettings) -> bool {
+        if seq <= self.settings_applied_seq {
+            return false;
+        }
+        self.settings_applied_seq = seq;
+        self.settings = committed.clone();
+        true
+    }
+
+    fn sync_settings_dependents(&mut self) {
         update_tray_notification_setting(self.settings.notifications_enabled);
         self.geodata_service
             .update(GeodataRefreshConfig::from_settings(
@@ -536,18 +979,23 @@ impl App {
                 real_delay_settings: self.settings.real_delay.clone(),
             });
         self.restart_required = self.check_restart_required();
-        if self.process_handle.is_none() {
-            self.regenerate_config_disconnected(sender);
-        }
     }
 
-    fn flush_pending_settings(&mut self, sender: &ComponentSender<Self>) {
-        if let Some(id) = self.settings_debounce.take() {
-            id.remove();
-        }
-        if let Some((revision, settings)) = self.pending_settings.take() {
-            self.commit_settings(revision, settings, sender);
-        }
+    /// Serializes routing edits: only one write is in flight, and the latest
+    /// candidate replaces any older pending one, so the final durable rules
+    /// match the final editor state.
+    fn enqueue_routing_save(&mut self, rules: RoutingRuleSet, sender: &ComponentSender<Self>) {
+        self.routing_save_in_flight = true;
+        let receipt = self.store.enqueue_save_routing_rules(rules);
+        let s = sender.input_sender().clone();
+        glib::spawn_future_local(async move {
+            let result = match receipt.await {
+                Ok(Ok(rules)) => Ok(rules),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err("workspace writer stopped".to_string()),
+            };
+            s.emit(AppMsg::RoutingPersisted(result));
+        });
     }
 
     fn load_latency_snapshot_or_default(&self) -> LatencySnapshot {
@@ -901,9 +1349,9 @@ impl App {
     }
 }
 
-/// Prunes the cached snapshot against `known`, persisting only when something
-/// was dropped. A load or persistence failure degrades to the local copy so a
-/// stale latency file never blocks connecting.
+/// Prunes the cached snapshot against `known`, enqueueing the write only when
+/// something was dropped. The caller keeps the local copy so a stale or failed
+/// write never blocks connecting; the receipt reports the failure.
 fn pruned_latency_snapshot(
     store: &WorkspaceStore,
     known: &std::collections::HashSet<ConnectionNodeRef>,
@@ -915,16 +1363,18 @@ fn pruned_latency_snapshot(
     if pruned.len() == before {
         return (cached, false);
     }
-    match store.update_latency_snapshot(|snapshot| {
-        snapshot.retain_known(known);
-        snapshot.clone()
-    }) {
-        Ok(updated) => (updated, true),
-        Err(err) => {
-            log::warn!("failed to persist pruned latency snapshot: {err}");
-            (pruned, true)
+    let guard = known.clone();
+    let receipt = store.enqueue_update_latency_snapshot(move |snapshot| {
+        snapshot.retain_known(&guard);
+    });
+    glib::spawn_future_local(async move {
+        match receipt.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => log::warn!("failed to persist pruned latency snapshot: {err}"),
+            Err(_) => log::warn!("failed to persist pruned latency snapshot: writer stopped"),
         }
-    }
+    });
+    (pruned, true)
 }
 
 #[relm4::component(pub)]
@@ -1045,7 +1495,11 @@ impl SimpleComponent for App {
 
                                 adw::Banner {
                                     set_hexpand: true,
-                                    set_title: &tr("Cleanup failed; session rules may remain installed"),
+                                    #[watch]
+                                    set_title: &cleanup_banner_title(
+                                        model.cleanup_recovery,
+                                        model.cleanup_error.as_deref(),
+                                    ),
                                     set_button_label: Some(&tr("Retry cleanup")),
                                     #[watch]
                                     set_revealed: model.cleanup_pending,
@@ -1179,6 +1633,8 @@ impl SimpleComponent for App {
     ) -> ComponentParts<Self> {
         let AppInit {
             paths,
+            store,
+            warm,
             tray_action_rx,
         } = init;
         if let Some(mut rx) = tray_action_rx {
@@ -1195,14 +1651,44 @@ impl SimpleComponent for App {
             });
         }
 
-        let store = WorkspaceStore::new(paths.clone());
-        let (settings, settings_load_error) = match store.load_settings() {
-            Ok(settings) => (settings, None),
+        let WarmResult {
+            settings,
+            subscriptions,
+            manual_nodes,
+            routing_rules,
+            latency,
+        } = warm;
+        let (settings, settings_load_error) = match settings {
+            Ok(settings) => ((*settings).clone(), None),
             Err(err) => {
                 log::error!("load settings: {err}");
                 (AppSettings::default(), Some(err.to_string()))
             }
         };
+        let subscriptions = match subscriptions {
+            Ok(subscriptions) => (*subscriptions).clone(),
+            Err(err) => {
+                log::warn!("load subscriptions for init: {err}");
+                Vec::new()
+            }
+        };
+        let manual_nodes = match manual_nodes {
+            Ok(nodes) => (*nodes).clone(),
+            Err(err) => {
+                log::warn!("load manual nodes for init: {err}");
+                Vec::new()
+            }
+        };
+        let routing_rules = match routing_rules {
+            Ok(rules) => (*rules).clone(),
+            Err(err) => {
+                log::warn!("load routing rules for init: {err}");
+                RoutingRuleSet::default()
+            }
+        };
+        if let Err(err) = latency {
+            log::warn!("load latency snapshot for init: {err}");
+        }
         // Off the GTK thread: orphan reaping can wait ~1.5s on a stubborn
         // process and TUN recovery up to HELPER_TIMEOUT. Recovery flushes the
         // tunnel routing table wholesale, so it takes the lifecycle lock: an
@@ -1288,24 +1774,11 @@ impl SimpleComponent for App {
         let status_label = gtk::Label::new(None);
         let status_details = gtk::Label::new(None);
 
-        let subscriptions = store.load_subscriptions().unwrap_or_else(|err| {
-            log::warn!("load subscriptions for init: {err}");
-            Vec::new()
-        });
-        let manual_nodes = store.load_manual_nodes().unwrap_or_else(|err| {
-            log::warn!("load manual nodes for init: {err}");
-            Vec::new()
-        });
         let has_active_nodes = active_nodes_available(&subscriptions, &manual_nodes);
         let (geodata_toasts, mut geodata_toast_rx) =
             tokio::sync::mpsc::unbounded_channel::<String>();
         let geodata_service = GeodataRefreshService::spawn(
-            GeodataRefreshConfig::from_settings(
-                &paths,
-                &settings,
-                &store.load_routing_rules().unwrap_or_default(),
-                &subscriptions,
-            ),
+            GeodataRefreshConfig::from_settings(&paths, &settings, &routing_rules, &subscriptions),
             geodata_toasts,
         );
         let geodata_toast_forwarder = sender.clone();
@@ -1328,6 +1801,7 @@ impl SimpleComponent for App {
             window: root.clone(),
             process_handle: None,
             cleanup_pending: false,
+            cleanup_recovery: false,
             cleanup_error: None,
             degraded_generation: None,
             tun_lifecycle,
@@ -1358,6 +1832,16 @@ impl SimpleComponent for App {
             session_target: None,
             settings_debounce: None,
             pending_settings: None,
+            settings_seq: 0,
+            settings_applied_seq: 0,
+            settings_save_error: None,
+            settings_writes_in_flight: BTreeSet::new(),
+            settings_flush_wait: None,
+            preferences_dialog_id: 0,
+            persistence_flush: None,
+            quit_flush_abandoned: false,
+            routing_save_in_flight: false,
+            pending_routing: None,
             auto_reconnect_attempts: 0,
             status_prev: ProcessState::Stopped,
             connection_origin: ConnectOrigin::User,
@@ -1404,54 +1888,201 @@ impl SimpleComponent for App {
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             AppMsg::OnboardingComplete(settings, subscription) => {
-                if let Err(err) = self.persist_settings(settings) {
-                    log::error!("save settings: {err}");
-                    self.show_toast(&onboarding_persist_error_message(&err));
-                    return;
-                }
-                self.show_wizard = false;
-                self.settings_load_error = None;
-                self.geodata_service
-                    .update(GeodataRefreshConfig::from_settings(
-                        &self.paths,
-                        &self.settings,
-                        &self.store.load_routing_rules().unwrap_or_default(),
-                        &self.store.load_subscriptions().unwrap_or_default(),
-                    ));
-                self.subscriptions_page
-                    .emit(SubscriptionsMsg::SyncSettings {
-                        auto_update_enabled: self.settings.auto_update_subscriptions,
-                        auto_update_interval_secs: self.settings.subscription_update_interval_secs,
-                        backend_type: self.settings.backend.backend_type,
-                        binary_path: self.settings.backend.binary_path.clone(),
-                        real_delay_settings: self.settings.real_delay.clone(),
-                    });
-                self.nodes_page.emit(NodesMsg::Reload);
-
-                if let Some((name, source)) = subscription {
-                    let source_input = match source {
-                        SubscriptionSource::Url { url } => SubscriptionSourceInput::Url(url),
-                        SubscriptionSource::File { path } => SubscriptionSourceInput::File(path),
+                let seq = self.next_settings_seq();
+                let receipt = self.store.enqueue_save_settings(settings);
+                let s = sender.input_sender().clone();
+                glib::spawn_future_local(async move {
+                    let result = match receipt.await {
+                        Ok(Ok(settings)) => Ok(settings),
+                        Ok(Err(err)) => Err(err.to_string()),
+                        Err(_) => Err("workspace writer stopped".to_string()),
                     };
-                    self.subscriptions_page
-                        .emit(SubscriptionsMsg::AddSubscription(name, source_input));
-                }
+                    s.emit(AppMsg::OnboardingCommitted {
+                        seq,
+                        subscription,
+                        result,
+                    });
+                });
             }
-            AppMsg::SettingsChanged(revision, settings) => {
+            AppMsg::OnboardingCommitted {
+                seq,
+                subscription,
+                result,
+            } => match result {
+                Ok(settings) => {
+                    self.note_settings_saved(seq);
+                    if self.adopt_committed_settings(seq, &settings) {
+                        self.sync_settings_dependents();
+                    }
+                    self.show_wizard = false;
+                    self.settings_load_error = None;
+                    self.nodes_page.emit(NodesMsg::Reload);
+                    if let Some((name, source)) = subscription {
+                        let source_input = match source {
+                            SubscriptionSource::Url { url } => SubscriptionSourceInput::Url(url),
+                            SubscriptionSource::File { path } => {
+                                SubscriptionSourceInput::File(path)
+                            }
+                        };
+                        self.subscriptions_page
+                            .emit(SubscriptionsMsg::AddSubscription(name, source_input));
+                    }
+                }
+                Err(err) => {
+                    log::error!("save settings: {err}");
+                    self.note_settings_failed(seq, &err);
+                    self.show_toast(&onboarding_persist_error_message(&err));
+                }
+            },
+            AppMsg::SettingsChanged(dialog_id, revision, settings) => {
                 if let Some(id) = self.settings_debounce.take() {
                     id.remove();
                 }
-                self.pending_settings = Some((revision, settings.clone()));
+                self.pending_settings = Some(PendingSettings {
+                    dialog_id,
+                    revision,
+                    settings: settings.clone(),
+                });
                 let s = sender.clone();
                 self.settings_debounce = Some(glib::timeout_add_local_once(
                     std::time::Duration::from_millis(300),
-                    move || s.input(AppMsg::FlushSettings(revision, settings)),
+                    move || s.input(AppMsg::FlushSettings(dialog_id, revision, settings)),
                 ));
             }
-            AppMsg::FlushSettings(revision, settings) => {
+            AppMsg::FlushSettings(dialog_id, revision, settings) => {
                 self.settings_debounce = None;
                 self.pending_settings = None;
-                self.commit_settings(revision, settings, &sender);
+                self.commit_settings(dialog_id, revision, settings, &sender);
+            }
+            AppMsg::SettingsCommitted {
+                seq,
+                dialog,
+                result,
+            } => {
+                self.settings_writes_in_flight.remove(&seq);
+                match result {
+                    Ok(settings) => {
+                        self.note_settings_saved(seq);
+                        if self.adopt_committed_settings(seq, &settings) {
+                            self.sync_settings_dependents();
+                            if self.process_handle.is_none() {
+                                self.regenerate_config_disconnected(&sender);
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("save settings: {err}");
+                        self.note_settings_failed(seq, &err);
+                        // A pending quit or a flush that is still covering
+                        // this receipt reports the unsaved edit once when it
+                        // resumes; a second toast here would double-post.
+                        let reported_by_flush = self.pending_exit
+                            || self.persistence_flush.is_some()
+                            || self
+                                .settings_flush_wait
+                                .as_ref()
+                                .is_some_and(|wait| seq <= wait.through);
+                        if !reported_by_flush {
+                            self.show_toast(&format!("Failed to save settings: {err}"));
+                        }
+                        // The dialog shows the last committed snapshot again
+                        // only when the rejected write is that same dialog's
+                        // latest accepted edit. A closed or reopened dialog has
+                        // a new identity, so a stale rollback never touches it.
+                        if let Some((dialog_id, revision)) = dialog
+                            && self.preferences_dialog_id == dialog_id
+                            && let Some(prefs) = &self.preferences_dialog
+                        {
+                            prefs.reconcile_settings_if_current(&self.settings, revision);
+                        }
+                    }
+                }
+                self.resume_deferred_flush(&sender);
+            }
+            AppMsg::LastSuccessCommitted { seq, result } => match result {
+                Ok(settings) => {
+                    self.adopt_committed_settings(seq, &settings);
+                }
+                Err(err) => log::error!("save settings: {err}"),
+            },
+            AppMsg::SettingsReset { seq, result } => match result {
+                Ok(settings) => {
+                    self.note_settings_saved(seq);
+                    self.adopt_committed_settings(seq, &settings);
+                    self.settings_load_error = None;
+                    self.show_wizard = true;
+                    self.wizard
+                        .emit(crate::wizard::WizardMsg::ResetSettings(Box::new(
+                            self.settings.clone(),
+                        )));
+                    self.sync_settings_dependents();
+                }
+                Err(err) => {
+                    self.show_toast(&format!("Failed to reset settings: {err}"));
+                }
+            },
+            AppMsg::RoutingPersisted(result) => {
+                self.routing_save_in_flight = false;
+                match result {
+                    Ok(rules) => {
+                        log::info!("Routing rules changed");
+                        self.apply_routing_commit(&rules, &sender);
+                    }
+                    Err(err) => {
+                        log::error!("save routing rules: {err}");
+                        self.show_toast(&format!("Failed to save routing rules: {err}"));
+                        // Settle the editor on the last durable set: a draft
+                        // must never be presented as persisted.
+                        let committed = self.last_committed_routing();
+                        self.settle_routing_editor(&committed);
+                    }
+                }
+                if let Some(next) = self.pending_routing.take() {
+                    self.enqueue_routing_save(next, &sender);
+                }
+            }
+            AppMsg::RoutingResetCommitted(rules) => {
+                // The preferences page already performed the durable reset;
+                // this only settles the dependent state.
+                self.apply_routing_commit(&rules, &sender);
+            }
+            AppMsg::PersistenceFlushed {
+                kind,
+                committed,
+                seq,
+                dialog,
+                awaiting,
+                error,
+            } => {
+                self.persistence_flush = None;
+                if let (Some(settings), Some(seq)) = (committed, seq) {
+                    self.note_settings_saved(seq);
+                    self.adopt_committed_settings(seq, &settings);
+                }
+                if let Some(error) = error {
+                    self.note_settings_failed(seq.unwrap_or(self.settings_seq), &error);
+                    if let Some((dialog_id, revision)) = dialog
+                        && self.preferences_dialog_id == dialog_id
+                        && let Some(prefs) = &self.preferences_dialog
+                    {
+                        prefs.reconcile_settings_if_current(&self.settings, revision);
+                    }
+                    self.report_unsaved_settings(&error);
+                    return;
+                }
+                // The barrier is a no-op transaction: it succeeded even when
+                // an accepted edit it covers failed. Wait for those receipts
+                // before treating the quit or restart as durable.
+                if let Some(through) = awaiting
+                    && self
+                        .settings_writes_in_flight
+                        .iter()
+                        .any(|in_flight| *in_flight <= through)
+                {
+                    self.settings_flush_wait = Some(SettingsFlushWait { kind, through });
+                    return;
+                }
+                self.resume_persistence_flush(&sender, kind);
             }
             AppMsg::ActiveNodesChanged(_has) => {
                 self.refresh_has_active_nodes();
@@ -1529,6 +2160,9 @@ impl SimpleComponent for App {
                 self.tun_operator_in_flight = false;
                 self.sync_tun_probe_gate();
                 if self.pending_exit {
+                    if self.persistence_flush.is_some() {
+                        return;
+                    }
                     self.pending_exit = false;
                     self.window.destroy();
                     return;
@@ -1788,9 +2422,28 @@ impl SimpleComponent for App {
                 }
                 let was_stopping = matches!(self.process_state, ProcessState::Stopping);
                 let stopped = matches!(state, ProcessState::Stopped | ProcessState::Error(_));
+                // A parked cleanup is ending with this terminal event; whether
+                // its removal was verified decides what a pending quit may do.
+                let cleanup_was_pending = stopped && self.cleanup_pending;
+                // A parked cleanup that reports its retained failure as
+                // terminal never verified the resources clean: re-arm the
+                // recovery surface before the state applies, so the banner
+                // carries the message and the duplicate toast stays
+                // suppressed. Admission stays closed and a pending quit keeps
+                // waiting for an explicit force exit.
+                let recovery_terminal = stopped
+                    && self.pending_exit
+                    && cleanup_was_pending
+                    && matches!(state, ProcessState::Error(_));
+                if recovery_terminal && let ProcessState::Error(detail) = &state {
+                    self.cleanup_pending = true;
+                    self.cleanup_recovery = true;
+                    self.cleanup_error = Some(detail.clone());
+                }
                 if stopped {
                     self.process_handle = None;
                     self.cleanup_pending = false;
+                    self.cleanup_recovery = false;
                     self.cleanup_error = None;
                     self.logs_page.emit(LogsMsg::SetRunning(false));
                     self.clear_restart_flow();
@@ -1807,13 +2460,27 @@ impl SimpleComponent for App {
                 }
                 if connection.is_some() {
                     self.connection_status = connection;
-                    if records_last_success(&state, self.connection_status.as_ref())
-                        && let Some(meta) = &self.connection_status
-                    {
-                        let settings = last_success_settings(&self.settings, meta);
-                        if let Err(err) = self.persist_settings(settings) {
-                            log::error!("save settings: {err}");
-                        }
+                    let last_success = self
+                        .connection_status
+                        .clone()
+                        .filter(|_| records_last_success(&state, self.connection_status.as_ref()));
+                    if let Some(meta) = last_success {
+                        // Computed from the latest committed value inside the
+                        // transaction, so a concurrent user edit queued before
+                        // this write is never clobbered.
+                        let seq = self.next_settings_seq();
+                        let receipt = self.store.enqueue_update_settings(move |settings| {
+                            *settings = last_success_settings(settings, &meta);
+                        });
+                        let s = sender.input_sender().clone();
+                        glib::spawn_future_local(async move {
+                            let result = match receipt.await {
+                                Ok(Ok(((), settings))) => Ok(settings),
+                                Ok(Err(err)) => Err(err.to_string()),
+                                Err(_) => Err("workspace writer stopped".to_string()),
+                            };
+                            s.emit(AppMsg::LastSuccessCommitted { seq, result });
+                        });
                     }
                 } else if matches!(state, ProcessState::Stopped | ProcessState::Error(_)) {
                     self.connection_status = None;
@@ -1836,10 +2503,23 @@ impl SimpleComponent for App {
                     self.toast_overlay.add_toast(toast);
                 }
                 if stopped && self.pending_exit {
+                    if self.persistence_flush.is_some() {
+                        // The flush continuation closes or presents once the
+                        // writer barrier resolves; do not race it.
+                        return;
+                    }
+                    if recovery_terminal {
+                        self.window.set_visible(true);
+                        self.window.present();
+                        return;
+                    }
                     if matches!(state, ProcessState::Error(_)) && self.tun_marker_present() {
                         self.release_tun_session(&sender);
                         return;
                     }
+                    // Stopped is emitted only after a verified removal, and an
+                    // Error without parked cleanup followed a verified
+                    // candidate teardown: either way the quit closes here.
                     self.pending_exit = false;
                     self.window.destroy();
                     return;
@@ -1912,8 +2592,30 @@ impl SimpleComponent for App {
                 self.tun_release_in_flight = false;
                 self.sync_tun_probe_gate();
                 if self.pending_exit {
-                    self.pending_exit = false;
-                    self.window.destroy();
+                    if released {
+                        if self.persistence_flush.is_some() {
+                            // The quit resumes after the barrier; the routes
+                            // are verified gone, so it may close then.
+                            return;
+                        }
+                        // The parked routes are confirmed gone: the quit's
+                        // cleanup is verified, so the window may close.
+                        self.pending_exit = false;
+                        self.window.destroy();
+                    } else {
+                        if self.persistence_flush.is_some() {
+                            // This failure already presented the recovery
+                            // control; the flush must not auto-retry it.
+                            self.quit_flush_abandoned = true;
+                        }
+                        // The release failed: closing now would abandon
+                        // unverified kernel state. The failure toast is
+                        // already shown; keep the window and the pending
+                        // quit — an ordinary quit re-attempts the release,
+                        // a second signal force-exits.
+                        self.window.set_visible(true);
+                        self.window.present();
+                    }
                     return;
                 }
                 if released {
@@ -1941,17 +2643,49 @@ impl SimpleComponent for App {
                 // The banner carries the warning and the retry action, so the
                 // matching error toast stays suppressed in `apply_state`.
                 self.cleanup_pending = true;
+                self.cleanup_recovery = false;
                 self.cleanup_error = Some(message.clone());
+                // A pending quit must surface the recovery control even when
+                // it was initiated from the tray with the window hidden.
+                if self.pending_exit {
+                    self.window.set_visible(true);
+                    self.window.present();
+                }
+                self.apply_state(&ProcessState::Error(message.clone()));
+            }
+            AppMsg::CleanupRecoveryRequired(generation, message) => {
+                // Same generation discipline as CleanupPending: a superseded
+                // session's report arms nothing.
+                if !is_current_generation(generation, self.connection_generation) {
+                    return;
+                }
+                self.cleanup_pending = true;
+                self.cleanup_recovery = true;
+                self.cleanup_error = Some(message.clone());
+                if self.pending_exit {
+                    self.window.set_visible(true);
+                    self.window.present();
+                }
                 self.apply_state(&ProcessState::Error(message.clone()));
             }
             AppMsg::RetryCleanup => {
-                if !cleanup_retry_available(self.cleanup_pending, self.process_handle.is_some()) {
+                if !cleanup_retry_available(
+                    self.cleanup_pending,
+                    self.process_handle.is_some(),
+                    self.cleanup_recovery,
+                ) {
                     return;
                 }
                 if let Some(handle) = self.process_handle.as_ref()
                     && let Err(err) = handle.stop(StopReason::UserStop)
                 {
                     log::warn!("cleanup retry stop not delivered: {err:?}");
+                    // A retry that cannot reach the session task would only
+                    // enqueue into the void: park as non-retryable recovery
+                    // with admission closed and the pending quit preserved.
+                    self.park_recovery(&tr(
+                        "the session task has exited; the cleanup retry could not be delivered",
+                    ));
                 }
             }
             AppMsg::EngineDegraded(generation, detail) => {
@@ -1964,9 +2698,7 @@ impl SimpleComponent for App {
                     return;
                 }
                 self.degraded_generation = Some(generation);
-                self.show_toast(&format!(
-                    "DPI interception degraded: {detail}. The proxy connection stays up."
-                ));
+                self.show_toast(&degraded_notice(&detail));
             }
             AppMsg::NodePins(generation, pins) => {
                 apply_node_pins(
@@ -2061,20 +2793,26 @@ impl SimpleComponent for App {
                     return;
                 }
 
+                self.preferences_dialog_id = self.preferences_dialog_id.wrapping_add(1);
+                let dialog_id = self.preferences_dialog_id;
                 let settings = self.settings.clone();
                 let window = self.window.clone();
                 let s = sender.input_sender().clone();
                 let s1 = s.clone();
+                let s2 = s.clone();
                 let toast_overlay = self.toast_overlay.clone();
                 let prefs = crate::preferences::show_preferences(
                     &window,
                     &self.store,
                     &settings,
                     move |revision, new_settings| {
-                        s.emit(AppMsg::SettingsChanged(revision, new_settings));
+                        s.emit(AppMsg::SettingsChanged(dialog_id, revision, new_settings));
                     },
                     move |rules| {
                         s1.emit(AppMsg::RoutingChanged(rules));
+                    },
+                    move |rules| {
+                        s2.emit(AppMsg::RoutingResetCommitted(rules));
                     },
                     move |msg| {
                         toast_overlay.add_toast(adw::Toast::new(msg));
@@ -2110,58 +2848,38 @@ impl SimpleComponent for App {
                 dialog.widget().present(Some(&window));
                 self.config_preview = Some(dialog);
             }
-            AppMsg::ResetBrokenSettings => match self.store.reset_settings() {
-                Ok(settings) => {
-                    self.settings = (*settings).clone();
-                    self.settings_load_error = None;
-                    self.show_wizard = true;
-                    self.wizard
-                        .emit(crate::wizard::WizardMsg::ResetSettings(Box::new(
-                            self.settings.clone(),
-                        )));
-                    self.geodata_service
-                        .update(GeodataRefreshConfig::from_settings(
-                            &self.paths,
-                            &self.settings,
-                            &self.store.load_routing_rules().unwrap_or_default(),
-                            &self.store.load_subscriptions().unwrap_or_default(),
-                        ));
-                    self.subscriptions_page
-                        .emit(SubscriptionsMsg::SyncSettings {
-                            auto_update_enabled: self.settings.auto_update_subscriptions,
-                            auto_update_interval_secs: self
-                                .settings
-                                .subscription_update_interval_secs,
-                            backend_type: self.settings.backend.backend_type,
-                            binary_path: self.settings.backend.binary_path.clone(),
-                            real_delay_settings: self.settings.real_delay.clone(),
-                        });
-                }
-                Err(err) => {
-                    self.show_toast(&format!("Failed to reset settings: {err}"));
-                }
-            },
+            AppMsg::ResetBrokenSettings => {
+                let seq = self.next_settings_seq();
+                let receipt = self.store.enqueue_reset_settings();
+                let s = sender.input_sender().clone();
+                glib::spawn_future_local(async move {
+                    let result = match receipt.await {
+                        Ok(Ok(settings)) => Ok(settings),
+                        Ok(Err(err)) => Err(err.to_string()),
+                        Err(_) => Err("workspace writer stopped".to_string()),
+                    };
+                    s.emit(AppMsg::SettingsReset { seq, result });
+                });
+            }
             AppMsg::QuitAfterSettingsError => {
                 self.window.destroy();
             }
             AppMsg::RoutingChanged(rules) => {
-                if let Err(err) = self.store.save_routing_rules(&rules) {
-                    log::error!("save routing rules: {err}");
-                    self.show_toast(&format!("Failed to save routing rules: {err}"));
+                if self.persistence_flush.is_some() || self.pending_exit {
+                    // A write accepted now would land after the quit barrier.
+                    // Block the edit and settle the editor on the last
+                    // durable set instead of staging it behind the exit.
+                    let committed = self.last_committed_routing();
+                    self.settle_routing_editor(&committed);
                     return;
                 }
-                log::info!("Routing rules changed");
-                self.geodata_service
-                    .update(GeodataRefreshConfig::from_settings(
-                        &self.paths,
-                        &self.settings,
-                        &rules,
-                        &self.store.load_subscriptions().unwrap_or_default(),
-                    ));
-                self.restart_required = self.check_restart_required();
-                if self.process_handle.is_none() {
-                    self.regenerate_config_disconnected(&sender);
+                if self.routing_save_in_flight {
+                    // Stage the newest editor state; the completion starts the
+                    // next write, so the final durable rules are the last ones.
+                    self.pending_routing = Some(rules);
+                    return;
                 }
+                self.enqueue_routing_save(rules, &sender);
             }
             AppMsg::ManualNodesChanged => {
                 self.refresh_has_active_nodes();
@@ -2195,9 +2913,13 @@ impl SimpleComponent for App {
                 }
             }
             AppMsg::ApplyAndRestart => {
-                self.restart_required = false;
-                self.reconnect_pending = true;
-                sender.input(AppMsg::Disconnect);
+                if self.persistence_flush.is_some() || self.settings_flush_wait.is_some() {
+                    return;
+                }
+                // Disconnect only after every earlier write and the pending
+                // settings edit are durable; a failed save keeps the window
+                // and the live session.
+                self.begin_persistence_flush(&sender, PersistenceKind::Restart);
             }
             AppMsg::SwitchView(view_index) => {
                 self.current_view = view_index;
@@ -2264,6 +2986,40 @@ fn status_texts(view: &StatusView) -> (String, String) {
     }
 }
 
+/// The cleanup banner's title. A retryable failure keeps the canonical
+/// warning with its Retry action; a non-retryable recovery names the manual
+/// action and appends the reason, because no retry will ever explain it.
+fn cleanup_banner_title(cleanup_recovery: bool, detail: Option<&str>) -> String {
+    if !cleanup_recovery {
+        return tr("Cleanup failed; session rules may remain installed");
+    }
+    match detail.map(str::trim) {
+        Some(detail) if !detail.is_empty() => {
+            format!("{}: {detail}", tr("Manual recovery required"))
+        }
+        _ => tr("Manual recovery required"),
+    }
+}
+
+/// The one degraded notice, with the engine's failure detail substituted into
+/// the translated template.
+fn degraded_notice(detail: &str) -> String {
+    tr("DPI interception degraded: {detail}. The proxy connection stays up.")
+        .replace("{detail}", detail)
+}
+
+/// Whether an accepted transition deserves the desktop notification: a real
+/// state change from the previously applied state, never a re-announce of
+/// an unchanged state, and never the error that duplicates the
+/// pending-cleanup recovery banner.
+fn transition_notification_allowed(
+    from: &ProcessState,
+    to: &ProcessState,
+    cleanup_pending: bool,
+) -> bool {
+    from != to && !(cleanup_pending && matches!(to, ProcessState::Error(_)))
+}
+
 /// The node the current session attempt is anchored to, and whether it ever
 /// reached `Running`. An established target survives backend errors and is
 /// retried within the auto-reconnect budget; an unestablished one surfaces
@@ -2297,6 +3053,10 @@ impl HealthFailover {
         self.reconnect_pending = false;
     }
 }
+
+#[cfg(test)]
+#[path = "tests/lifecycle_recovery.rs"]
+mod lifecycle_recovery;
 
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
@@ -2370,6 +3130,73 @@ mod tests {
             None,
             "rules remain installed"
         ));
+    }
+
+    #[test]
+    fn recovery_banner_names_the_manual_action_and_its_reason() {
+        assert_eq!(
+            cleanup_banner_title(false, Some("rules may remain installed")),
+            tr("Cleanup failed; session rules may remain installed")
+        );
+        assert_eq!(
+            cleanup_banner_title(true, Some("engine exit could not be verified")),
+            format!(
+                "{}: engine exit could not be verified",
+                tr("Manual recovery required")
+            )
+        );
+        assert_eq!(
+            cleanup_banner_title(true, Some("   ")),
+            tr("Manual recovery required")
+        );
+        assert_eq!(
+            cleanup_banner_title(true, None),
+            tr("Manual recovery required")
+        );
+    }
+
+    #[test]
+    fn degraded_notice_substitutes_the_detail_into_the_template() {
+        let notice = degraded_notice("helper exited with status 9");
+        assert!(notice.contains("helper exited with status 9"));
+        assert!(!notice.contains("{detail}"));
+    }
+
+    #[test]
+    fn transition_notifications_follow_accepted_states_not_snapshots() {
+        // A real accepted transition announces.
+        assert!(transition_notification_allowed(
+            &ProcessState::Starting,
+            &ProcessState::Running,
+            false
+        ));
+        // An unchanged state never re-announces, however often it is
+        // re-applied.
+        assert!(!transition_notification_allowed(
+            &ProcessState::Running,
+            &ProcessState::Running,
+            false
+        ));
+    }
+
+    #[test]
+    fn only_the_cleanup_duplicate_error_is_suppressed() {
+        assert!(
+            !transition_notification_allowed(
+                &ProcessState::Stopping,
+                &ProcessState::Error("cleanup failed".into()),
+                true
+            ),
+            "the desktop error duplicating the recovery banner is suppressed"
+        );
+        assert!(
+            transition_notification_allowed(
+                &ProcessState::Stopping,
+                &ProcessState::Error("boom".into()),
+                false
+            ),
+            "an ordinary error notification is preserved"
+        );
     }
 
     fn snapshot(backend: BackendType, tun_enabled: bool) -> RuntimeConfigSnapshot {
@@ -2740,6 +3567,14 @@ mod tests {
         );
         assert_eq!(
             quit_plan(false, &ProcessState::Stopping, true),
+            QuitPlan::AwaitStopped
+        );
+        assert_eq!(
+            quit_plan(true, &ProcessState::Stopping, false),
+            QuitPlan::AwaitStopped
+        );
+        assert_eq!(
+            quit_plan(true, &ProcessState::Stopping, true),
             QuitPlan::AwaitStopped
         );
     }

@@ -2,7 +2,7 @@
 
 ## Purpose
 
-TBD - created by archiving change fix-antidpi-engine-and-nft-correctness. Update Purpose after archive.
+Defines anti-DPI engine, firewall ownership, and packet processing correctness.
 
 ## Requirements
 
@@ -55,11 +55,23 @@ TBD - created by archiving change fix-antidpi-engine-and-nft-correctness. Update
 - **THEN** it SHALL return an error instead of panicking
 
 ### Requirement: NFQUEUE loop is poll-driven, fail-open, protocol-scoped, and strictly parsed
-The engine SHALL wait on `queue.as_raw_fd()` via `poll`, enable `NFQA_CFG_F_FAIL_OPEN`, separate TCP and QUIC strategy rotation, reject unknown strategy keys or unsafe parameters, bound flow memory with LRU/TTL eviction, and match hostlists in O(labels).
+The engine SHALL wait on `queue.as_raw_fd()` via `poll` and enable `NFQA_CFG_F_FAIL_OPEN`.
+It SHALL partition configured chains into separate TCP and UDP lists in their original order.
+Each list SHALL start at its first chain.
+The engine SHALL reject unknown strategy keys or unsafe parameters, bound flow memory with LRU/TTL eviction, and match hostlists in O(labels).
 
-#### Scenario: Default chains protect both TLS and QUIC from the first flow
+#### Scenario: Default chains select each protocol independently
 - **WHEN** the engine starts with `DEFAULT_CHAINS`
-- **THEN** TCP/443 ClientHellos use the TCP chain list and UDP/443 QUIC Initials use the QUIC chain list without cross-protocol stalling
+- **THEN** TCP/443 ClientHellos SHALL use the TCP list and UDP/443 QUIC Initials SHALL use the UDP list
+
+#### Scenario: TCP failures reach the rotation threshold
+- **WHEN** the first reply RST on each fired TCP flow reaches the configured failure threshold within the rotation window
+- **THEN** the engine SHALL advance the TCP list
+- **AND** the engine SHALL NOT advance the UDP list
+
+#### Scenario: UDP traffic has no automatic rotation signal
+- **WHEN** the engine processes UDP traffic
+- **THEN** the UDP list SHALL remain on its first chain because no UDP failure signal invokes rotation
 
 #### Scenario: Unknown strategy key is rejected before kernel mutation
 - **WHEN** a user supplies `fake:blob=tls:sni=example.com` or `fake:blob=0xaé` or `repeats=99999`

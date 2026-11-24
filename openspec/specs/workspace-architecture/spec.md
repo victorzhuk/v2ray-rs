@@ -1,12 +1,25 @@
 # workspace-architecture Specification
 
 ## Purpose
-Defines crate dependency boundaries, headless session supervision ownership, shared DNS and node config contracts, and centralized state persistence across the 8-crate workspace.
+Defines crate dependency boundaries, headless session supervision ownership, shared DNS and node config contracts, and centralized state persistence across the nine-crate workspace.
 
 ## Requirements
 
 ### Requirement: Nine-crate workspace DAG and pure core state types
-The workspace SHALL maintain a 9-crate layout (`core`, `tun-session`, `netctl`, `run`, `antidpi`, `subscription`, `process`, `tray`, `ui`) where `v2ray-rs-tray` depends on `v2ray-rs-core` without `v2ray-rs-process`, `v2ray-rs-antidpi` stays a standalone external binary with zero reverse crate dependents, and `v2ray-rs-subscription`'s dependency on `v2ray-rs-process` is explicitly documented for real-delay probing.
+The workspace SHALL maintain nine crates: `core`, `tun-session`, `netctl`, `run`, `antidpi`, `subscription`, `process`, `tray`, and `ui`. Direct normal Cargo dependencies SHALL match the workspace graph below. Executing a helper SHALL NOT imply a Cargo dependency on its crate.
+`netctl` SHALL depend on `core` only for tests. The `subscription` dependency on `process` supports real-delay probing.
+
+#### Scenario: Direct workspace dependencies match the graph
+- **WHEN** the workspace Cargo dependencies are inspected
+- **THEN** the direct normal dependencies SHALL match this graph:
+
+| Crate | Direct normal workspace dependencies |
+|---|---|
+| `ui` | `core`, `process`, `subscription`, `tray` |
+| `subscription` | `core`, `process` |
+| `process`, `tray` | `core` |
+| `core`, `netctl`, `antidpi` | `tun-session` |
+| `run`, `tun-session` | none |
 
 #### Scenario: Tray crate compiles without process crate dependency
 - **WHEN** the workspace dependency graph is inspected via `cargo metadata --no-deps`
@@ -19,6 +32,16 @@ The workspace SHALL maintain a 9-crate layout (`core`, `tun-session`, `netctl`, 
 #### Scenario: Existing process imports remain compatible
 - **WHEN** a downstream crate imports previously public process state or log types from `v2ray-rs-process`
 - **THEN** those paths SHALL resolve to the corresponding core types without caller changes
+
+### Requirement: Anti-DPI helper owns its journal
+The process crate SHALL invoke the anti-DPI helper as an external executable.
+The helper SHALL own `antidpi.v1.json` independently of the TUN journal payload.
+The two journals SHALL share identity types through `tun-session`.
+
+#### Scenario: Live controller removes its own anti-DPI rules
+- **WHEN** a live controller removes its anti-DPI rules
+- **THEN** it SHALL use its owner and session identity without `--sweep`
+- **AND** offline sweep SHALL refuse a live owner
 
 ### Requirement: Headless connection session supervisor lives in process crate
 Headless connection session supervision -- candidate failover, TUN hostname pin resolution and probing, sing-box connected-subnet snapshot orchestration, connection health monitoring, log batching, and failure classification -- SHALL reside in `v2ray-rs-process` without adding HTTP, TLS, or gRPC dependencies to `v2ray-rs-process`, leaving `v2ray-rs-ui` as a Relm4 event bridge.

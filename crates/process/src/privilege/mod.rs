@@ -126,7 +126,7 @@ mod tests;
 mod verify;
 
 pub(crate) use grant::validate_recovery_target;
-pub use grant::{antidpi_grant_eligible, grant, manual_command};
+pub use grant::{GrantedTargets, antidpi_grant_eligible, grant, manual_command};
 pub(crate) use probes::{
     file_caps_supported, mount_for_path, probe_net_admin, target_caps_supported,
 };

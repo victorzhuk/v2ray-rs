@@ -4,7 +4,7 @@ use toml::Value as TomlValue;
 use uuid::Uuid;
 
 use crate::fs::atomic_write;
-use crate::models::AppSettings;
+use crate::models::{AppSettings, Language};
 
 use super::{AppPaths, PersistenceError, RefMigration, read_file};
 
@@ -51,6 +51,30 @@ pub fn load_settings(paths: &AppPaths) -> Result<AppSettings, PersistenceError> 
         }
         Err(e) => Err(PersistenceError::CorruptConfig(e.to_string())),
     }
+}
+
+/// Reads only the persisted UI language without creating directories, moving
+/// legacy references or rewriting the file.
+///
+/// Startup needs gettext initialized before any worker thread exists, and a
+/// second launch that hands off to the running instance must not write.
+pub fn load_settings_language(paths: &AppPaths) -> Result<Language, PersistenceError> {
+    #[derive(serde::Deserialize)]
+    struct LanguageOnly {
+        #[serde(default)]
+        language: Language,
+    }
+
+    let path = paths.settings_path();
+    if !path.exists() {
+        return Ok(Language::default());
+    }
+    let contents = read_file(&path)?;
+    let raw: TomlValue =
+        toml::from_str(&contents).map_err(|e| PersistenceError::CorruptConfig(e.to_string()))?;
+    raw.try_into::<LanguageOnly>()
+        .map(|settings| settings.language)
+        .map_err(|e| PersistenceError::CorruptConfig(e.to_string()))
 }
 
 pub fn load_settings_or_default(paths: &AppPaths) -> AppSettings {
@@ -448,5 +472,27 @@ address = "1.1.1.1"
         load_settings(&paths).unwrap();
         let after_second_load = fs::read_to_string(paths.settings_path()).unwrap();
         assert_eq!(after_second_load, rewritten, "second load must not rewrite");
+    }
+
+    #[test]
+    fn test_load_settings_language_reads_legacy_file_without_rewriting_it() {
+        let (_tmp, paths) = super::super::test_paths();
+        let subscription = migration_subscription();
+        super::super::save_subscriptions(&paths, std::slice::from_ref(&subscription)).unwrap();
+
+        let legacy = legacy_settings_toml(&subscription, "");
+        paths.ensure_dirs().unwrap();
+        fs::write(paths.settings_path(), &legacy).unwrap();
+
+        assert_eq!(load_settings_language(&paths).unwrap(), Language::English);
+        assert_eq!(fs::read_to_string(paths.settings_path()).unwrap(), legacy);
+    }
+
+    #[test]
+    fn test_load_settings_language_defaults_without_a_file() {
+        let (_tmp, paths) = super::super::test_paths();
+
+        assert_eq!(load_settings_language(&paths).unwrap(), Language::English);
+        assert!(!paths.settings_path().exists());
     }
 }

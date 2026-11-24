@@ -16,6 +16,7 @@ use tokio::time::sleep;
 
 use crate::antidpi::{ANTIDPI_READY_TIMEOUT, AntiDpiRuntime, EngineExit};
 use crate::pid::PidFile;
+use crate::pid::{PinnedProcess, confirm_exit_by_pidfd};
 use crate::spawn::{MAX_LOG_LINE_BYTES, read_bounded_line};
 use crate::state::{ProcessEvent, ProcessState, StateManager, TransitionError};
 use crate::tun::{HelperRun, TunRuntime};
@@ -119,6 +120,8 @@ pub enum ProcessError {
     CleanupFailed { tun: String, antidpi: String },
     #[error("anti-DPI helper failed: {0}")]
     AntiDpiHelper(String),
+    #[error("engine exit could not be verified; manual recovery required: {0}")]
+    AntiDpiExitUnverified(String),
     #[error(
         "anti-DPI helper v2ray-rs-antidpi not found; install the v2ray-rs distribution package"
     )]
@@ -216,6 +219,7 @@ impl ProcessError {
                 | ProcessError::TunJournal(_)
                 | ProcessError::CleanupFailed { .. }
                 | ProcessError::AntiDpiHelper(_)
+                | ProcessError::AntiDpiExitUnverified(_)
                 | ProcessError::AntiDpiHelperMissing
                 | ProcessError::AntiDpiHelperRelogin
                 | ProcessError::AntiDpiHelperCapabilityMissing(_)
@@ -297,6 +301,10 @@ pub struct ProcessManager {
     antidpi: Option<AntiDpiRuntime>,
     antidpi_engine: Option<AntidpiEngine>,
     antidpi_rules_installed: bool,
+    /// Set when the engine's exit could be neither observed by its monitor
+    /// nor confirmed through the pidfd: rule removal and any replacement
+    /// engine stay blocked until operator recovery.
+    antidpi_exit_unverified: bool,
     antidpi_session_id: Option<String>,
     antidpi_log_handles: Vec<tokio::task::JoinHandle<()>>,
     backend: Option<BackendType>,
@@ -312,9 +320,12 @@ pub struct ProcessManager {
 /// Live anti-DPI engine child, owned by its monitor task. The manager holds
 /// the command channel and the exit record receiver; it never keeps the
 /// child's numeric pid, so only the monitor signals and reaps the child.
+/// The pidfd is opened at spawn, while the `Child` is still owned: it is the
+/// independent exit observer when the monitor or its wait fails.
 struct AntidpiEngine {
     stop_tx: mpsc::UnboundedSender<()>,
     exit_rx: mpsc::UnboundedReceiver<EngineExit>,
+    pin: Option<PinnedProcess>,
 }
 
 /// An exit is confirmed only when the monitor delivered a record with a real
@@ -477,6 +488,7 @@ impl ProcessManager {
             antidpi: None,
             antidpi_engine: None,
             antidpi_rules_installed: false,
+            antidpi_exit_unverified: false,
             antidpi_session_id: None,
             antidpi_log_handles: Vec::new(),
             backend: None,
@@ -568,6 +580,12 @@ impl ProcessManager {
 
     pub fn state(&self) -> ProcessState {
         self.state.state()
+    }
+
+    /// True once the engine's exit became unverifiable: cleanup cannot be
+    /// retried into a clean report, and no replacement engine may start.
+    pub fn requires_operator_recovery(&self) -> bool {
+        self.antidpi_exit_unverified
     }
 
     /// Reports whether a TUN runtime is attached, not whether routes are up.

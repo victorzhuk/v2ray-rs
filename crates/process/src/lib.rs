@@ -16,8 +16,8 @@ pub use manager::HostProbe;
 pub use manager::{ProcessError, ProcessManager, StopReason};
 pub use pid::PidFile;
 pub use privilege::{
-    ANTIDPI_CAPS, BACKEND_CAPS, HELPER_CAPS, PrivilegeError, ProbeFailure, antidpi_grant_eligible,
-    grant, has_antidpi_caps, has_net_admin, manual_command,
+    ANTIDPI_CAPS, BACKEND_CAPS, GrantedTargets, HELPER_CAPS, PrivilegeError, ProbeFailure,
+    antidpi_grant_eligible, grant, has_antidpi_caps, has_net_admin, manual_command,
 };
 pub use probe::{ProbeError, ProbeRunner};
 pub use state::{ProcessEvent, ProcessState, TransitionError};

@@ -67,10 +67,14 @@ pub(super) fn cleanup_blocks_new_session(cleanup_pending: bool) -> bool {
     cleanup_pending
 }
 
-/// Retry needs both the pending flag and the retained session handle;
-/// without either there is nothing to retry.
-pub(super) fn cleanup_retry_available(cleanup_pending: bool, has_handle: bool) -> bool {
-    cleanup_pending && has_handle
+/// Retry needs the pending flag, the retained session handle, and a failure
+/// a retry can actually reach; an unverified engine exit has none.
+pub(super) fn cleanup_retry_available(
+    cleanup_pending: bool,
+    has_handle: bool,
+    recovery_required: bool,
+) -> bool {
+    cleanup_pending && has_handle && !recovery_required
 }
 
 /// While a failed cleanup owns the UI, its error text is the banner's

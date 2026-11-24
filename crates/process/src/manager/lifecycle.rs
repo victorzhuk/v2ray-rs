@@ -567,7 +567,14 @@ impl ProcessManager {
         // launch (crash respawn) means the rules are already in place — but an
         // engine whose exit is observed or unknown must never be reused
         // without fresh readiness.
-        self.retain_live_engine();
+        self.retain_live_engine().await;
+        // An unverified engine exit from an earlier launch blocks both rule
+        // churn and a replacement engine until operator recovery.
+        if self.antidpi_exit_unverified {
+            return Err(ProcessError::AntiDpiExitUnverified(
+                "previous anti-DPI engine exit was never verified; no replacement may start".into(),
+            ));
+        }
         if self.antidpi.is_some() && self.antidpi_engine.is_none() {
             let rt = self.antidpi.clone().expect("antidpi runtime checked above");
             let session = self
@@ -576,10 +583,18 @@ impl ProcessManager {
                 .expect("session id allocated with the runtime");
             // Once an install is attempted, the stop path must try to remove:
             // a partially installed chain must not outlive the session.
+            let already_owed = self.antidpi_rules_installed;
             self.antidpi_rules_installed = true;
             let run = crate::antidpi::antidpi_install_rules(&rt, session).await;
             self.log_helper("antidpi-install-rules", &run);
             if let Err(e) = run.result {
+                // Exit status 20 is a verified pre-mutation refusal: this
+                // request acquired nothing. Disarm only when nothing earlier
+                // still owed cleanup; every other failure keeps the
+                // obligation armed.
+                if run.exit_code == Some(crate::antidpi::INSTALL_REFUSED_EXIT) && !already_owed {
+                    self.antidpi_rules_installed = false;
+                }
                 return Err(ProcessError::AntiDpiHelper(e));
             }
         }

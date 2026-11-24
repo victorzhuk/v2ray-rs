@@ -362,6 +362,7 @@ async fn helper_lines_stripped_of_escapes() {
             output: vec!["\u{1b}[1mlink up\u{1b}[0m".into()],
             result: Err("\u{1b}[31mno\u{1b}[0m".into()),
             timed_out: false,
+            exit_code: Some(1),
         },
     );
 
@@ -1198,16 +1199,22 @@ async fn retain_live_engine_keeps_only_a_running_engine() {
     // the engine may still run, so the handle is kept.
     let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
     let (_exit_tx, exit_rx) = mpsc::unbounded_channel();
-    mgr.antidpi_engine = Some(AntidpiEngine { stop_tx, exit_rx });
-    mgr.retain_live_engine();
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
+    mgr.retain_live_engine().await;
     assert!(mgr.antidpi_engine.is_some());
+    assert!(!mgr.requires_operator_recovery());
 
-    // Disconnected receiver without a record: the monitor is gone and the
-    // exit state is unknown — the handle is dropped so the next launch
-    // re-installs and re-spawns with fresh readiness.
+    // Disconnected receiver without a record and without a pidfd: the exit
+    // state is unknowable — the handle is dropped and the manager parks in
+    // operator recovery instead of re-spawning over an unknown exit.
     mgr.antidpi_engine.as_mut().unwrap().exit_rx.close();
-    mgr.retain_live_engine();
+    mgr.retain_live_engine().await;
     assert!(mgr.antidpi_engine.is_none());
+    assert!(mgr.requires_operator_recovery());
 
     // A delivered record means the exit was observed — also dropped.
     let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
@@ -1219,8 +1226,12 @@ async fn retain_live_engine_keeps_only_a_running_engine() {
         })
         .unwrap();
     drop(exit_tx);
-    mgr.antidpi_engine = Some(AntidpiEngine { stop_tx, exit_rx });
-    mgr.retain_live_engine();
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
+    mgr.retain_live_engine().await;
     assert!(mgr.antidpi_engine.is_none());
 }
 
@@ -1241,7 +1252,7 @@ async fn closed_stop_sender_requests_engine_exit() {
 }
 
 #[tokio::test]
-async fn unconfirmed_engine_exit_keeps_the_handle_and_fails_the_stop() {
+async fn unverified_engine_exit_parks_manager_in_operator_recovery() {
     let dir = tempfile::TempDir::new().unwrap();
     let mut mgr = manager_for(&dir, "exec sleep 30\n")
         .with_antidpi(Some(antidpi_rt(PathBuf::from("/nonexistent"))));
@@ -1249,17 +1260,215 @@ async fn unconfirmed_engine_exit_keeps_the_handle_and_fails_the_stop() {
     let (exit_tx, exit_rx) = mpsc::unbounded_channel();
     drop(stop_rx);
     drop(exit_tx);
-    mgr.antidpi_engine = Some(AntidpiEngine { stop_tx, exit_rx });
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
 
     let result = mgr.teardown_antidpi().await;
+    // A closed monitor without a pidfd cannot verify the exit: no retry can
+    // fix that, so the obligation and the journal stay and removal is
+    // refused instead of pretended clean.
     assert!(
-        matches!(result, Err(ProcessError::AntiDpiHelper(_))),
+        matches!(result, Err(ProcessError::AntiDpiExitUnverified(_))),
         "{result:?}"
     );
     assert!(
-        mgr.antidpi_engine.is_some(),
-        "the observation handle must survive an unconfirmed exit"
+        mgr.antidpi_engine.is_none(),
+        "neither a monitor nor a pidfd survives to retry"
     );
+    assert!(mgr.requires_operator_recovery());
+    // A retry through stop() must keep refusing removal.
+    let retry = mgr.teardown_antidpi().await;
+    assert!(
+        matches!(retry, Err(ProcessError::AntiDpiExitUnverified(_))),
+        "{retry:?}"
+    );
+}
+
+#[tokio::test]
+async fn pidfd_confirmed_exit_permits_rule_cleanup_after_monitor_loss() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let calls = dir.path().join("calls");
+    let antidpi = stub_antidpi(
+        &calls,
+        "case \"$1\" in remove-rules) exit 0 ;; esac\nexit 0\n",
+    );
+    let mut mgr = manager_for(&dir, "exec sleep 30\n").with_antidpi(Some(antidpi_rt(antidpi)));
+    // The obligation is armed: a manager that installed rules must remove
+    // them even when its monitor vanished, so the fixture proves the
+    // removal really runs instead of skipping an empty obligation.
+    mgr.antidpi_session_id = Some("pidfd-recovery".into());
+    mgr.antidpi_rules_installed = true;
+    let child = sleep_engine_child(&dir).await;
+    let pin = crate::pid::PinnedProcess::pin(child.id().expect("child pid"))
+        .expect("this kernel supports pidfd");
+    let (stop_tx, stop_rx) = mpsc::unbounded_channel::<()>();
+    let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+    drop(stop_rx);
+    drop(exit_tx);
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: Some(pin),
+    });
+
+    // The pidfd confirmed the exit even though the monitor delivered
+    // nothing, so cleanup proceeded past the dead engine and completed the
+    // armed removal. Only positive evidence of that removal proves the
+    // pidfd branch granted cleanup.
+    mgr.teardown_antidpi()
+        .await
+        .expect("a pidfd-confirmed exit must permit the armed rule cleanup");
+    assert!(
+        !mgr.antidpi_rules_installed,
+        "a completed removal clears the obligation"
+    );
+    assert!(
+        !mgr.requires_operator_recovery(),
+        "a pidfd-confirmed exit must never park the manager in recovery"
+    );
+    assert!(
+        mgr.antidpi_engine.is_none(),
+        "the confirmed engine handle must not survive the teardown"
+    );
+    let removals: Vec<String> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the confirmed exit removes the rules exactly once: {removals:?}"
+    );
+    assert_eq!(
+        removals[0]
+            .split("--session-id ")
+            .nth(1)
+            .expect("the removal is logged with its session id"),
+        "pidfd-recovery",
+        "the removal targets this manager's session: {}",
+        removals[0]
+    );
+}
+
+#[tokio::test]
+async fn engine_exit_timeout_keeps_the_handle_until_the_retry() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let calls = dir.path().join("calls");
+    let antidpi = stub_antidpi(&calls, "exit 0\n");
+    let mut mgr = manager_for(&dir, "exec sleep 30\n").with_antidpi(Some(antidpi_rt(antidpi)));
+    mgr.antidpi_session_id = Some("timeout-retry".into());
+    mgr.antidpi_rules_installed = true;
+
+    // A live monitor that stays silent past the stop deadline: the stop
+    // sender is held by the test, so the request is delivered, and no exit
+    // record ever arrives within the deadline.
+    let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
+    let (exit_tx, exit_rx) = mpsc::unbounded_channel();
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
+
+    let first = mgr
+        .teardown_antidpi()
+        .await
+        .expect_err("the silent monitor must hit the stop deadline");
+    let ProcessError::AntiDpiHelper(detail) = &first else {
+        panic!("expected the stop deadline failure, got {first:?}");
+    };
+    assert!(detail.contains("stop deadline"), "{detail}");
+    // Only the deadline passed: the engine handle and the removal
+    // obligation survive for the retry, and nothing parks in operator
+    // recovery.
+    assert!(
+        mgr.antidpi_engine.is_some(),
+        "a live monitor keeps its engine handle for the retry"
+    );
+    assert!(mgr.antidpi_rules_installed);
+    assert!(!mgr.requires_operator_recovery());
+
+    // The monitor delivers a confirmed exit right after the deadline: the
+    // retry consumes the kept handle and removes the rules exactly once.
+    let exited = std::process::Command::new("true").status().unwrap();
+    exit_tx
+        .send(EngineExit {
+            status: Some(exited),
+            wait_failed: false,
+        })
+        .unwrap();
+    drop(exit_tx);
+    mgr.teardown_antidpi()
+        .await
+        .expect("the retried stop must complete the cleanup");
+    assert!(mgr.antidpi_engine.is_none());
+    assert!(!mgr.antidpi_rules_installed);
+    let removals: Vec<String> = std::fs::read_to_string(&calls)
+        .unwrap()
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the retry removes exactly once: {removals:?}"
+    );
+    assert!(
+        removals[0].contains("timeout-retry"),
+        "the removal targets this session: {}",
+        removals[0]
+    );
+}
+
+#[tokio::test]
+async fn unverified_engine_exit_blocks_the_replacement_launch() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let mut mgr = manager_for(&dir, "exec sleep 30\n")
+        .with_antidpi(Some(antidpi_rt(PathBuf::from("/nonexistent"))));
+    mgr.antidpi_session_id = Some("gate-test".into());
+    // An unknown exit parks the manager, exactly like a crash respawn that
+    // finds a closed monitor and no pidfd.
+    let (stop_tx, _stop_rx) = mpsc::unbounded_channel::<()>();
+    let (_exit_tx, exit_rx) = mpsc::unbounded_channel();
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
+    mgr.antidpi_engine.as_mut().unwrap().exit_rx.close();
+    mgr.retain_live_engine().await;
+    assert!(mgr.requires_operator_recovery());
+
+    let result = mgr.launch().await;
+    assert!(
+        matches!(result, Err(ProcessError::AntiDpiExitUnverified(_))),
+        "{result:?}"
+    );
+    assert!(
+        mgr.child.is_none(),
+        "no replacement backend may spawn over an unknown exit"
+    );
+    assert!(
+        mgr.antidpi_engine.is_none(),
+        "no engine handle was fabricated"
+    );
+    assert!(
+        !mgr.antidpi_rules_installed,
+        "the gate precedes any new rule install"
+    );
+    // The refusal is stable: a retried launch cannot slip past it.
+    let again = mgr.launch().await;
+    assert!(
+        matches!(again, Err(ProcessError::AntiDpiExitUnverified(_))),
+        "{again:?}"
+    );
+    assert!(mgr.child.is_none());
 }
 
 #[tokio::test]
@@ -1269,7 +1478,11 @@ async fn manager_drop_leaves_engine_reaping_to_the_monitor() {
     let child = sleep_engine_child(&dir).await;
     let pid = child.id().expect("child pid");
     let (stop_tx, exit_rx) = mgr.monitor_engine(child);
-    mgr.antidpi_engine = Some(AntidpiEngine { stop_tx, exit_rx });
+    mgr.antidpi_engine = Some(AntidpiEngine {
+        stop_tx,
+        exit_rx,
+        pin: None,
+    });
 
     drop(mgr);
     // The manager keeps no pid and cannot signal one; the monitor sees the

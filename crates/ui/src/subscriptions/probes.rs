@@ -65,7 +65,7 @@ pub(super) fn apply_real_delay_by_ids(
     }
 }
 
-/// Runs a load-modify-save of the latency snapshot on a blocking thread.
+/// Enqueues a load-modify-save of the latency snapshot on the shared writer.
 pub(super) fn persist_latency_snapshot<F>(
     sender: &ComponentSender<SubscriptionsPage>,
     store: &WorkspaceStore,
@@ -73,11 +73,14 @@ pub(super) fn persist_latency_snapshot<F>(
 ) where
     F: FnOnce(&mut v2ray_rs_core::resolve::LatencySnapshot) + Send + 'static,
 {
-    let store = store.clone();
+    let receipt = store.enqueue_update_latency_snapshot(move |snapshot| {
+        apply(snapshot);
+    });
     sender.oneshot_command(async move {
-        let result = tokio::task::spawn_blocking(move || store.update_latency_snapshot(apply))
-            .await
-            .unwrap_or_else(|join_err| Err(PersistenceError::Io(std::io::Error::other(join_err))));
+        let result = match receipt.await {
+            Ok(result) => result.map(|_| ()),
+            Err(_) => Err(PersistenceError::CorruptConfig(writer_stopped_message())),
+        };
         SubscriptionsCmdOutput::SnapshotSaved(result)
     });
 }

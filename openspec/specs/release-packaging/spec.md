@@ -1,7 +1,7 @@
 # release-packaging Specification
 
 ## Purpose
-Defines reproducible version resolution for CI and manual release builds, Linux package build and runtime metadata, workspace-complete Makefile targets, and documentation parity across the 8-crate repository.
+Defines reproducible version resolution for CI and manual release builds, Linux package build and runtime metadata, workspace-complete Makefile targets, and documentation parity across the nine-crate repository.
 
 ## Requirements
 
@@ -16,8 +16,11 @@ The GitHub release workflow SHALL derive the package version from a `v*` tag ref
 - **WHEN** `release.yml` is triggered by pushing tag `v0.10.2`
 - **THEN** both `tarball` and `appimage` jobs SHALL build artifacts stamped with `0.10.2` after verifying `Cargo.toml` matches
 
-### Requirement: Distribution package metadata covers build tools, icons, and TUN helpers
-Source and binary Linux package definitions SHALL declare required protobuf compiler build dependencies and valid asset paths: `pkg/archlinux/PKGBUILD` SHALL include `protobuf` in `makedepends`, SHALL build `v2ray-rs-ui`, `v2ray-rs-netctl`, `v2ray-rs-run`, and `v2ray-rs-antidpi`, and SHALL install each binary under `/usr/bin` with mode `755` (the install hook tightens the privileged helpers), and `[package.metadata.deb]` in `crates/ui/Cargo.toml` SHALL reference existing icon files, include `v2ray-rs-netctl`, `v2ray-rs-run`, and `v2ray-rs-antidpi` with mode `755`, and declare runtime shared-library dependencies.
+### Requirement: Arch source package builds and installs required binaries
+`pkg/archlinux/PKGBUILD` SHALL include `protobuf` in `makedepends`.
+It SHALL build `v2ray-rs-ui`, `v2ray-rs-netctl`, `v2ray-rs-run`, and `v2ray-rs-antidpi`.
+It SHALL install each binary under `/usr/bin` with mode `755`.
+The install hook tightens the privileged helpers.
 
 #### Scenario: Arch source PKGBUILD declares protobuf makedepend
 - **WHEN** `pkg/archlinux/PKGBUILD` is inspected or built in a clean Arch chroot
@@ -26,6 +29,11 @@ Source and binary Linux package definitions SHALL declare required protobuf comp
 #### Scenario: Arch source PKGBUILD builds and installs the anti-DPI helper
 - **WHEN** `pkg/archlinux/PKGBUILD` is inspected
 - **THEN** its `build()` SHALL include `-p v2ray-rs-antidpi` and `package()` SHALL install `v2ray-rs-antidpi` to `/usr/bin` with mode `755`
+
+### Requirement: Debian package metadata covers assets and helpers
+`[package.metadata.deb]` in `crates/ui/Cargo.toml` SHALL reference existing icon files.
+It SHALL include `v2ray-rs-netctl`, `v2ray-rs-run`, and `v2ray-rs-antidpi` with mode `755`.
+It SHALL declare runtime shared-library dependencies.
 
 #### Scenario: Debian package metadata references existing assets and helpers
 - **WHEN** `[package.metadata.deb]` in `crates/ui/Cargo.toml` is validated against repository paths and release binaries
@@ -43,7 +51,7 @@ The root `Makefile` SHALL define per-crate `build-*` and `test-*` targets for al
 - **THEN** the staged release tree SHALL contain `bin/v2ray-rs-antidpi` beside the other binaries, and the tarball installer and uninstaller SHALL treat it as one of the installed binaries
 
 ### Requirement: Repository documentation reflects workspace boundaries and release assets
-`docs/ARCHITECTURE.md`, `docs/RELEASE.md`, and `CONTRIBUTING.md` SHALL accurately describe the 8-crate dependency graph (`tray` depending only on `core`), `process::session` supervision and connect-time DNS pinning, `WorkspaceStore` and `subscription_blobs/` storage, `v2ray-rs.install` release assets, the Rust 1.93 toolchain floor, `protobuf-compiler` setup, bounded test execution, and `.agents/skills/` paths.
+`docs/ARCHITECTURE.md`, `docs/RELEASE.md`, and `CONTRIBUTING.md` SHALL accurately describe the nine-crate workspace and direct Cargo dependencies. They SHALL distinguish Cargo dependencies from executable invocations. They SHALL describe `process::session` supervision and connect-time DNS pinning, `WorkspaceStore` and `subscription_blobs/` storage, `v2ray-rs.install` release assets, the Rust 1.93 toolchain floor, `protobuf-compiler` setup, bounded test execution, and `.agents/skills/` paths.
 
 #### Scenario: Architecture and contributor docs match Cargo manifests and file tree
 - **WHEN** `docs/ARCHITECTURE.md`, `docs/RELEASE.md`, and `CONTRIBUTING.md` are cross-checked against `Cargo.toml`, `crates/*/Cargo.toml`, and `.github/workflows/release.yml`
@@ -81,6 +89,25 @@ Package removal SHALL preserve the bypass account and access group.
 #### Scenario: Existing account and group
 - **WHEN** the package is installed and removed on a system with existing service identities
 - **THEN** their UID, GID, and existing memberships SHALL remain intact
+
+#### Scenario: System backend grants remain under administrator control
+- **WHEN** an uninstall removes package-owned helpers
+- **THEN** it SHALL explain that prior system-backend capability grants are not automatically revoked
+- **AND** it SHALL advise reviewing the actual backend with its administrator
+
+### Requirement: Grant confirmation uses verified destinations
+The grant SHALL return a receipt only after identity, mode, capability, and enrollment verification succeeds.
+The receipt SHALL identify the backend, route helper, and optional targeted anti-DPI helper.
+The UI SHALL verify the receipt destinations with a fresh probe before reporting success.
+
+#### Scenario: Targeted anti-DPI helper is not ready at the receipt path
+- **WHEN** a grant receipt names an anti-DPI helper and the fresh probe reports another path or a non-ready verdict
+- **THEN** the UI SHALL NOT report grant success
+
+#### Scenario: Optional anti-DPI helper was not targeted
+- **WHEN** the receipt omits the anti-DPI helper
+- **THEN** an unrelated fixable or package-repair verdict SHALL NOT fail the grant
+- **AND** a terminal anti-DPI verdict SHALL fail confirmation
 
 ### Requirement: AppImage installer TUN guidance names the tarball installer and tolerates unset USER
 When the AppImage installer prints post-install TUN setup instructions, the system-wide install command SHALL reference the release tarball installer URL (`install.sh`) rather than the AppImage installer URL, and group-enrollment guidance SHALL succeed under strict unset-variable shell execution when `USER` is unset in the environment.

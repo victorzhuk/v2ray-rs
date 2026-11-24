@@ -6,6 +6,19 @@ pub fn spawn(request: SessionRequest, sender: EventSender) -> SessionHandle {
     spawn_with(request, sender, |mgr| mgr, crate::connected_subnets)
 }
 
+/// `spawn` with a caller-supplied hook over every candidate's manager and a
+/// connected-subnet collector. Exposed only to tests so a joined UI test can
+/// pin host probes and helper paths without changing the production chain.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn spawn_configured(
+    request: SessionRequest,
+    sender: EventSender,
+    configure: impl Fn(ProcessManager) -> ProcessManager + Send + 'static,
+    collect: impl FnOnce(&str) -> std::io::Result<Vec<ipnet::IpNet>> + Send + 'static,
+) -> SessionHandle {
+    spawn_with(request, sender, configure, collect)
+}
+
 /// `spawn` with a hook over every candidate's manager, applied after the
 /// production builder chain, and a connected-subnet collector so tests can
 /// inject a deterministic snapshot.
@@ -648,8 +661,15 @@ pub(super) fn spawn_with(
                         if let Some(stale) = parked.take() {
                             stop_or_park(stale, StopReason::StartFailed, &mut pending).await;
                         }
-                        pending.append(&mut orphaned);
-                        retry_cleanup(pending, generation, &mut cmd_rx, &sender).await;
+                        finish_or_retry_cleanup(
+                            pending,
+                            &mut orphaned,
+                            generation,
+                            &mut cmd_rx,
+                            &sender,
+                            ProcessState::Error(terminal_failure(&failures)),
+                        )
+                        .await;
                         return;
                     }
                     supersede_parked(&mut parked, &mgr, &mut orphaned).await;
@@ -845,8 +865,15 @@ pub(super) fn spawn_with(
                 if let Some(stale) = parked.take() {
                     stop_or_park(stale, StopReason::StartFailed, &mut pending).await;
                 }
-                pending.append(&mut orphaned);
-                retry_cleanup(pending, generation, &mut cmd_rx, &sender).await;
+                finish_or_retry_cleanup(
+                    pending,
+                    &mut orphaned,
+                    generation,
+                    &mut cmd_rx,
+                    &sender,
+                    ProcessState::Error(terminal_failure(&failures)),
+                )
+                .await;
                 return;
             }
             supersede_parked(&mut parked, &mgr, &mut orphaned).await;

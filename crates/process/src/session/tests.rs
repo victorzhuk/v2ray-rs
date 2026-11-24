@@ -1386,6 +1386,708 @@ exec sleep 30"#,
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn verified_install_refusal_is_terminal_without_removal_or_banner() {
+    // install-rules exits 20: a live foreign owner was established under
+    // the transaction lock before any mutation. The session must end in a
+    // terminal error carrying the refusal, never launch the backend daemon,
+    // never remove another controller's rules, and never arm the retry banner.
+    let host = tempfile::tempdir().unwrap();
+    let calls = host.path().join("calls");
+    let antidpi_stub = host.path().join("v2ray-rs-antidpi");
+    std::fs::write(
+        &antidpi_stub,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1\" in \
+install-rules) echo 'rules owned by a live process' >&2; exit 20 ;; \
+remove-rules) exit 0 ;; esac\nexit 0\n",
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&antidpi_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend_calls = host.path().join("backend-calls");
+    let backend = stub(&format!(
+        "echo \"$@\" >> {bc}\n[ \"$1\" = version ] && {{ echo 'sing-box version 1.13.0'; exit 0; }}\n[ \"$1\" = check ] && exit 0\nexec sleep 30",
+        bc = backend_calls.display()
+    ));
+    let (listener, mut settings) = ready_singbox_settings();
+    settings.antidpi.enabled = true;
+    settings.antidpi.queue = 200;
+
+    let stub_path = antidpi_stub.clone();
+    let (handle, mut rx) = connect_with(
+        &backend,
+        settings,
+        vec![candidate("203.0.113.1")],
+        move |mgr| {
+            mgr.with_host_probe(crate::HostProbe {
+                getcap: stub_path.clone(),
+                helper: stub_path.clone(),
+                helper_access: Some(crate::HelperAccess::Ready),
+            })
+            .with_antidpi(Some(crate::AntiDpiRuntime {
+                helper_path: stub_path.clone(),
+                queue: 200,
+                strategies: vec![],
+                hostlist: None,
+            }))
+        },
+    );
+
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without a terminal state");
+        match msg {
+            SessionEvent::State(generation, state, _) => {
+                assert_eq!(generation, GENERATION);
+                let ProcessState::Error(detail) = &state else {
+                    panic!("a verified refusal must never reach {state:?}");
+                };
+                assert!(
+                    detail.contains("owned by a live process"),
+                    "the refusal detail must reach the terminal state: {detail}"
+                );
+                break;
+            }
+            SessionEvent::CleanupPending(generation, _) => {
+                panic!("a verified refusal must not arm the retry banner: gen {generation}");
+            }
+            SessionEvent::CleanupRecoveryRequired(generation, _) => {
+                panic!("a verified refusal must not park recovery: gen {generation}");
+            }
+            _ => {}
+        }
+    }
+    let _ = handle.stop(StopReason::UserStop);
+    // The refusal disarms this request's obligation: no removal may touch
+    // the foreign owner, and the backend daemon never launched behind the
+    // refused install. The pre-spawn config check legitimately runs the
+    // backend binary before install-rules (`check -c ...`, and the optional
+    // `version` probe), so presence of the call log alone proves nothing:
+    // only the `run` subcommand is the daemon launch.
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert!(
+        !calls.contains("remove-rules"),
+        "a verified refusal must never remove rules: {calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("install-rules"))
+            .count(),
+        1,
+        "exactly one install attempt: {calls}"
+    );
+    let backend_calls = std::fs::read_to_string(&backend_calls)
+        .expect("the pre-spawn config check must probe the backend, which records its argv");
+    assert!(
+        backend_calls
+            .lines()
+            .any(|line| line == "check" || line.starts_with("check ")),
+        "the fixture must observe the preflight probe that explains the call log: {backend_calls}"
+    );
+    assert!(
+        !backend_calls
+            .lines()
+            .any(|line| line == "run" || line.starts_with("run ")),
+        "the backend daemon must not launch behind a refused rule install: {backend_calls}"
+    );
+    assert_nothing_after_terminal(&mut rx).await;
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ambiguous_install_failure_removes_and_stays_an_error() {
+    // install-rules exits 1: an interrupted or unknown failure proves
+    // nothing. The obligation stays armed, so the failed candidate's
+    // cleanup removes what may have been installed under the same session
+    // id, and the startup error is preserved: the terminal state is an
+    // Error, never a clean Stopped, and no retry banner arms because the
+    // cleanup itself succeeded.
+    let host = tempfile::tempdir().unwrap();
+    let calls = host.path().join("calls");
+    let antidpi_stub = host.path().join("v2ray-rs-antidpi");
+    std::fs::write(
+        &antidpi_stub,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1\" in \
+install-rules) echo 'install interrupted' >&2; exit 1 ;; \
+remove-rules) exit 0 ;; esac\nexit 0\n",
+            calls = calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&antidpi_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend = stub(
+        "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n[ \"$1\" = check ] && exit 0\nexec sleep 30",
+    );
+    let (listener, mut settings) = ready_singbox_settings();
+    settings.antidpi.enabled = true;
+    settings.antidpi.queue = 200;
+
+    let stub_path = antidpi_stub.clone();
+    let (handle, mut rx) = connect_with(
+        &backend,
+        settings,
+        vec![candidate("203.0.113.1")],
+        move |mgr| {
+            mgr.with_host_probe(crate::HostProbe {
+                getcap: stub_path.clone(),
+                helper: stub_path.clone(),
+                helper_access: Some(crate::HelperAccess::Ready),
+            })
+            .with_antidpi(Some(crate::AntiDpiRuntime {
+                helper_path: stub_path.clone(),
+                queue: 200,
+                strategies: vec![],
+                hostlist: None,
+            }))
+        },
+    );
+
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without a terminal state");
+        match msg {
+            SessionEvent::State(generation, state, _) => {
+                assert_eq!(generation, GENERATION);
+                let ProcessState::Error(detail) = &state else {
+                    panic!("an ambiguous install failure must never reach {state:?}");
+                };
+                assert!(
+                    detail.contains("install interrupted"),
+                    "the startup failure must be preserved: {detail}"
+                );
+                break;
+            }
+            SessionEvent::CleanupPending(generation, _) => {
+                panic!("a completed cleanup must not arm the banner: gen {generation}");
+            }
+            _ => {}
+        }
+    }
+    let _ = handle.stop(StopReason::UserStop);
+    // The unknown outcome kept the obligation armed: the cleanup removed
+    // once, under the session id the install used.
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let install_id = calls
+        .lines()
+        .find(|line| line.starts_with("install-rules"))
+        .and_then(|line| line.split("--session-id ").nth(1))
+        .expect("the install attempt is logged with its session id");
+    let removals: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .collect();
+    assert_eq!(
+        removals.len(),
+        1,
+        "the armed obligation removes exactly once: {calls}"
+    );
+    assert_eq!(
+        install_id,
+        removals[0]
+            .split("--session-id ")
+            .nth(1)
+            .expect("the removal is logged with its session id"),
+        "one session id owns the install and its removal"
+    );
+    assert_nothing_after_terminal(&mut rx).await;
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn startup_error_survives_a_failed_removal_and_its_retry() {
+    // install-rules succeeds and the engine dies before its ready sentinel:
+    // a startup failure with the removal obligation armed. The first
+    // removal fails once, the retry completes it, and the terminal state
+    // stays the original startup Error for the same generation — never a
+    // clean Stopped, never a recovery park.
+    let host = tempfile::tempdir().unwrap();
+    let gate = host.path().join("remove-gate");
+    let calls = host.path().join("calls");
+    let antidpi_stub = host.path().join("v2ray-rs-antidpi");
+    std::fs::write(
+        &antidpi_stub,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1\" in \
+install-rules) exit 0 ;; \
+run) echo 'v2rs-engine-refused' >&2; exit 7 ;; \
+remove-rules) [ -f {gate} ] && exit 0; : > {gate}; echo 'boom' >&2; exit 1 ;; esac\nexit 0\n",
+            calls = calls.display(),
+            gate = gate.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&antidpi_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend = stub(
+        "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n[ \"$1\" = check ] && exit 0\nexec sleep 30",
+    );
+    let (listener, mut settings) = ready_singbox_settings();
+    settings.antidpi.enabled = true;
+    settings.antidpi.queue = 200;
+
+    let stub_path = antidpi_stub.clone();
+    let (handle, mut rx) = connect_with(
+        &backend,
+        settings,
+        vec![candidate("203.0.113.1")],
+        move |mgr| {
+            mgr.with_host_probe(crate::HostProbe {
+                getcap: stub_path.clone(),
+                helper: stub_path.clone(),
+                helper_access: Some(crate::HelperAccess::Ready),
+            })
+            .with_antidpi(Some(crate::AntiDpiRuntime {
+                helper_path: stub_path.clone(),
+                queue: 200,
+                strategies: vec![],
+                hostlist: None,
+            }))
+        },
+    );
+
+    // The parked report comes first and still names the startup failure;
+    // the retry through the same handle then completes the cleanup.
+    let mut pending = false;
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without a terminal state");
+        match msg {
+            SessionEvent::State(generation, state, _) => {
+                assert_eq!(generation, GENERATION);
+                let ProcessState::Error(detail) = &state else {
+                    panic!("a retried cleanup must never report {state:?}");
+                };
+                assert!(
+                    detail.contains("v2rs-engine-refused"),
+                    "the original startup failure must survive the cleanup retry: {detail}"
+                );
+                break;
+            }
+            SessionEvent::CleanupPending(generation, message) => {
+                assert_eq!(generation, GENERATION);
+                assert!(!pending, "one parked report per failed cleanup");
+                pending = true;
+                assert!(
+                    message.contains("v2rs-engine-refused"),
+                    "the parked report keeps the startup failure: {message}"
+                );
+                let _ = handle.stop(StopReason::AppQuit);
+            }
+            SessionEvent::CleanupRecoveryRequired(generation, _) => {
+                panic!("a retryable cleanup must not park recovery: gen {generation}");
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        pending,
+        "the failed first removal must park before the retry"
+    );
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let install_id = calls
+        .lines()
+        .find(|line| line.starts_with("install-rules"))
+        .and_then(|line| line.split("--session-id ").nth(1))
+        .expect("the install attempt is logged with its session id");
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("install-rules"))
+            .count(),
+        1,
+        "the cleanup retry must not mint a new install: {calls}"
+    );
+    let removals: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .collect();
+    assert_eq!(
+        removals.len(),
+        2,
+        "the failed attempt and its retry are the only removals: {calls}"
+    );
+    for removal in removals {
+        assert_eq!(
+            install_id,
+            removal
+                .split("--session-id ")
+                .nth(1)
+                .expect("each removal is logged with its session id"),
+            "the retried cleanup owns the same session"
+        );
+    }
+    assert_nothing_after_terminal(&mut rx).await;
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn require_recovery_represents_the_retained_failure_without_retrying() {
+    // An unverified engine exit parks the manager with an obligation no
+    // retry can discharge: require_recovery reports it on
+    // CleanupRecoveryRequired, re-presents the same report on a further
+    // Stop without attempting another teardown, and reports the retained
+    // failure exactly once as the terminal state when the channel closes.
+    let host = tempfile::tempdir().unwrap();
+    let calls = host.path().join("helper-calls");
+    let helper = host.path().join("v2ray-rs-netctl");
+    std::fs::write(
+        &helper,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {}\n[ \"$1\" = xray-down ] && exit 1\nexit 0\n",
+            calls.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut failed = ProcessManager::new(
+        PathBuf::from("/bin/true"),
+        PathBuf::from("/nonexistent/config.json"),
+        host.path().join("backend.pid"),
+        None,
+    )
+    .with_tun(Some(crate::TunRuntime {
+        backend: BackendType::Xray,
+        iface: "lo".into(),
+        addr_v4: "172.19.0.1/30".into(),
+        addr_v6: None,
+        helper_path: helper.clone(),
+        bypass_uid: None,
+        capture_dns: false,
+        strict: false,
+        exclude_routes: Vec::new(),
+        device_ifindex: None,
+        journal: Some(crate::TunJournal {
+            path: host.path().join("tun_session.v1.json"),
+            session_id: "recovery-session".into(),
+        }),
+    }));
+    // The parked manager is the real outcome of a failed teardown: its
+    // Error text is what the recovery report must carry.
+    failed
+        .stop()
+        .await
+        .expect_err("the failing helper must leave the TUN teardown unfinished");
+
+    let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<SessionCmd>();
+    let (tx, mut ev_rx) = EventSender::channel();
+    let receiver = tokio::spawn(async move {
+        let first = tokio::time::timeout(RECV_TIMEOUT, ev_rx.recv())
+            .await
+            .expect("no recovery report in time")
+            .expect("event sender gone");
+        match first {
+            SessionEvent::CleanupRecoveryRequired(generation, message) => {
+                assert_eq!(generation, GENERATION);
+                assert!(message.contains("TUN teardown failed"), "{message}");
+            }
+            other => panic!("recovery must be announced first, got {other:?}"),
+        }
+        // A further Stop re-presents the same retained failure and never
+        // re-enqueues a teardown attempt.
+        cmd_tx
+            .send(SessionCmd::Stop(StopReason::UserStop))
+            .expect("command channel alive");
+        let second = tokio::time::timeout(RECV_TIMEOUT, ev_rx.recv())
+            .await
+            .expect("no re-presented report in time")
+            .expect("event sender gone");
+        match second {
+            SessionEvent::CleanupRecoveryRequired(generation, message) => {
+                assert_eq!(generation, GENERATION);
+                assert!(message.contains("TUN teardown failed"), "{message}");
+            }
+            other => panic!("a Stop during recovery re-presents the report, got {other:?}"),
+        }
+        // Closing the channel is the only way out: the retained failure
+        // becomes the terminal state exactly once.
+        drop(cmd_tx);
+        let (state, _) = next_state(&mut ev_rx).await;
+        let ProcessState::Error(message) = &state else {
+            panic!("the retained failure must end as Error, got {state:?}");
+        };
+        assert!(message.contains("TUN teardown failed"), "{message}");
+        assert_nothing_after_terminal(&mut ev_rx).await;
+        ev_rx
+    });
+    tokio::time::timeout(
+        RECV_TIMEOUT,
+        require_recovery(vec![failed], GENERATION, &mut cmd_rx, &tx),
+    )
+    .await
+    .expect("require_recovery never finished");
+    drop(tx);
+    let _ev_rx = receiver.await.unwrap();
+    // The re-presenting Stop must not have run a second teardown.
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("xray-down"))
+            .count(),
+        1,
+        "recovery must never re-enqueue a removal attempt: {calls}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quit_from_running_parks_and_the_retry_stops_it() {
+    // The quit contract through real actions: an AppQuit from Running must
+    // report CleanupPending with no terminal state before it, and the
+    // retry through the same handle must end in Stopped for the same
+    // generation. Exactly two removals run, both for the session id the
+    // install used, and no new session identity is minted.
+    let host = tempfile::tempdir().unwrap();
+    let gate = host.path().join("remove-gate");
+    let calls = host.path().join("calls");
+    let antidpi_stub = host.path().join("v2ray-rs-antidpi");
+    std::fs::write(
+        &antidpi_stub,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1\" in \
+run) echo \"v2ray-rs-antidpi: ready queue=200\"; while :; do sleep 1; done ;; \
+remove-rules) [ -f {gate} ] && exit 0; : > {gate}; echo 'boom' >&2; exit 1 ;; esac\nexit 0\n",
+            calls = calls.display(),
+            gate = gate.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&antidpi_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend = stub(
+        "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n[ \"$1\" = check ] && exit 0\nexec sleep 30",
+    );
+    let (listener, mut settings) = ready_singbox_settings();
+    settings.antidpi.enabled = true;
+    settings.antidpi.queue = 200;
+
+    let stub_path = antidpi_stub.clone();
+    let (handle, mut rx) = connect_with(
+        &backend,
+        settings,
+        vec![candidate("203.0.113.1")],
+        move |mgr| {
+            mgr.with_host_probe(crate::HostProbe {
+                getcap: stub_path.clone(),
+                helper: stub_path.clone(),
+                helper_access: Some(crate::HelperAccess::Ready),
+            })
+            .with_antidpi(Some(crate::AntiDpiRuntime {
+                helper_path: stub_path.clone(),
+                queue: 200,
+                strategies: vec![],
+                hostlist: None,
+            }))
+        },
+    );
+
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no state in time")
+            .expect("connection task ended without Running");
+        if let SessionEvent::State(_, ProcessState::Running, _) = msg {
+            break;
+        }
+    }
+
+    let _ = handle.stop(StopReason::AppQuit);
+    // The quit parks: the cleanup report arrives before any terminal state.
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without a cleanup report");
+        match msg {
+            SessionEvent::State(_, ProcessState::Stopped | ProcessState::Error(_), _) => {
+                panic!("terminal state before the cleanup retry: {msg:?}");
+            }
+            SessionEvent::CleanupPending(generation, message) => {
+                assert_eq!(generation, GENERATION);
+                assert!(message.contains("cleanup failed"), "{message}");
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The retry through the same handle reaches the same generation's
+    // Stopped.
+    let _ = handle.stop(StopReason::AppQuit);
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without the retried stop");
+        if let SessionEvent::State(generation, ProcessState::Stopped, None) = msg {
+            assert_eq!(generation, GENERATION);
+            break;
+        }
+    }
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let install_id = calls
+        .lines()
+        .find(|line| line.starts_with("install-rules"))
+        .and_then(|line| line.split("--session-id ").nth(1))
+        .expect("the install is logged with its session id");
+    let removals: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .collect();
+    assert_eq!(
+        removals.len(),
+        2,
+        "the failed attempt and the retry are the only removals: {calls}"
+    );
+    for removal in removals {
+        assert_eq!(
+            install_id,
+            removal
+                .split("--session-id ")
+                .nth(1)
+                .expect("each removal is logged with its session id"),
+            "the parked session owns every removal"
+        );
+    }
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn quit_during_a_parked_disconnect_retries_the_same_session() {
+    // The user quits while a Disconnect's cleanup is parked: the AppQuit
+    // through the same handle retries the parked removal and reaches the
+    // disconnect's Stopped — no new generation, no second install.
+    let host = tempfile::tempdir().unwrap();
+    let gate = host.path().join("remove-gate");
+    let calls = host.path().join("calls");
+    let antidpi_stub = host.path().join("v2ray-rs-antidpi");
+    std::fs::write(
+        &antidpi_stub,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> {calls}\ncase \"$1\" in \
+run) echo \"v2ray-rs-antidpi: ready queue=200\"; while :; do sleep 1; done ;; \
+remove-rules) [ -f {gate} ] && exit 0; : > {gate}; echo 'boom' >&2; exit 1 ;; esac\nexit 0\n",
+            calls = calls.display(),
+            gate = gate.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&antidpi_stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let backend = stub(
+        "[ \"$1\" = version ] && { echo 'sing-box version 1.13.0'; exit 0; }\n[ \"$1\" = check ] && exit 0\nexec sleep 30",
+    );
+    let (listener, mut settings) = ready_singbox_settings();
+    settings.antidpi.enabled = true;
+    settings.antidpi.queue = 200;
+
+    let stub_path = antidpi_stub.clone();
+    let (handle, mut rx) = connect_with(
+        &backend,
+        settings,
+        vec![candidate("203.0.113.1")],
+        move |mgr| {
+            mgr.with_host_probe(crate::HostProbe {
+                getcap: stub_path.clone(),
+                helper: stub_path.clone(),
+                helper_access: Some(crate::HelperAccess::Ready),
+            })
+            .with_antidpi(Some(crate::AntiDpiRuntime {
+                helper_path: stub_path.clone(),
+                queue: 200,
+                strategies: vec![],
+                hostlist: None,
+            }))
+        },
+    );
+
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no state in time")
+            .expect("connection task ended without Running");
+        if let SessionEvent::State(_, ProcessState::Running, _) = msg {
+            break;
+        }
+    }
+
+    // The Disconnect parks.
+    let _ = handle.stop(StopReason::UserStop);
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without a cleanup report");
+        match msg {
+            SessionEvent::State(_, ProcessState::Stopped | ProcessState::Error(_), _) => {
+                panic!("terminal state before the cleanup retry: {msg:?}");
+            }
+            SessionEvent::CleanupPending(generation, _) => {
+                assert_eq!(generation, GENERATION);
+                break;
+            }
+            _ => {}
+        }
+    }
+
+    // The quit during the parked disconnect retries it.
+    let _ = handle.stop(StopReason::AppQuit);
+    loop {
+        let msg = tokio::time::timeout(RECV_TIMEOUT, rx.recv())
+            .await
+            .expect("no event in time")
+            .expect("connection task ended without the retried stop");
+        if let SessionEvent::State(generation, ProcessState::Stopped, None) = msg {
+            assert_eq!(generation, GENERATION);
+            break;
+        }
+    }
+
+    let calls = std::fs::read_to_string(&calls).unwrap();
+    let install_id = calls
+        .lines()
+        .find(|line| line.starts_with("install-rules"))
+        .and_then(|line| line.split("--session-id ").nth(1))
+        .expect("the install is logged with its session id");
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("install-rules"))
+            .count(),
+        1,
+        "the retry must not mint a new session: {calls}"
+    );
+    let removals: Vec<&str> = calls
+        .lines()
+        .filter(|line| line.starts_with("remove-rules"))
+        .collect();
+    assert_eq!(removals.len(), 2, "failed attempt and retry: {calls}");
+    for removal in removals {
+        assert_eq!(
+            install_id,
+            removal
+                .split("--session-id ")
+                .nth(1)
+                .expect("each removal is logged with its session id"),
+            "the parked session owns every removal"
+        );
+    }
+    drop(listener);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn failed_disconnect_cleanup_parks_until_retry() {
     // remove-rules fails exactly once (the gate file is created by the
     // failing call): the first disconnect must park the manager with a

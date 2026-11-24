@@ -7,12 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-24
+
 ### Added
 - Anti-DPI engine integration: an `[antidpi]` settings section (enabled, NFQUEUE number, strategy chains, hostlist), an Anti-DPI preferences page, engine lifecycle wired into the connection (rules installed before the backend starts, engine stopped and rules removed on disconnect, restart required on setting changes), and the `v2ray-rs-antidpi` helper shipped in every package and provisioned with `cap_net_admin,cap_net_raw` by the same install hook and privilege grant as the route helper.
 
+### Changed
+- Uninstalling explains that capabilities granted earlier to the system backend stay in place, so the backend is reviewed with its administrator.
+
 ### Fixed
 - Verify TUN privilege grants against relocated helper paths on AppImage and `nosuid` mounts.
-- Keep Retry cleanup available and disable Connect while session cleanup is pending.
+- Keep the recovery window available after Quit or Disconnect when cleanup fails, and disable Connect until cleanup succeeds.
+  Retry remains available for retryable failures. Unverified engine exit requires manual recovery.
+  A verified refusal from another live anti-DPI owner does not trigger cleanup of that owner's rules.
+  Tray status follows cleanup state without duplicate error notifications.
+- Keep the window responsive while workspace, routing, and subscription edits are written, and report a failed write instead of showing it as saved.
+- Roll back helper privilege changes on Arch when capability verification fails.
+- Reject unverified downloads before either release installer changes the install prefix.
 - Reset cached settings when repairing a broken settings file, even if the file is already gone.
 - Keep saved anti-DPI strategies when an edit contains multiple blank lines, and translate the remaining capability messages.
 - Save NFQUEUE number changes made with the spinner controls.
@@ -996,7 +1007,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Makefile for build automation
 - GitHub Actions CI configuration
 - CLAUDE.md development guidelines
-[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/victorzhuk/v2ray-rs/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.13...v0.21.0
 [0.20.13]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.12...v0.20.13
 [0.20.12]: https://github.com/victorzhuk/v2ray-rs/compare/v0.20.11...v0.20.12

@@ -247,6 +247,21 @@ esac
 EOF
 chmod 0755 "$fakebin/curl"
 
+# A sha256sum that prints the correct digest and then fails: both installers
+# must treat a failed verifier as fatal instead of trusting what it printed
+# before dying.
+real_sha256sum=$(command -v sha256sum)
+failbin="$work/failbin"
+mkdir -p "$failbin"
+cat >"$failbin/sha256sum" <<'EOF'
+#!/bin/sh
+[ "$1" = -b ] && [ $# -eq 2 ] || exit 2
+@REAL_SHA256SUM@ -b "$2" | awk '{print $1}'
+exit 1
+EOF
+sed -i "s|@REAL_SHA256SUM@|$real_sha256sum|g" "$failbin/sha256sum"
+chmod 0755 "$failbin/sha256sum"
+
 # --- tarball installer -----------------------------------------------------
 
 note "tarball installer"
@@ -273,6 +288,22 @@ else
         fail "tar-missing-verifier: missing verifier was not reported"
     assert_untouched "$work/p-tar-nosha" "tar-missing-verifier"
     pass "tar-missing-verifier"
+fi
+
+# The verifier itself fails while printing the expected digest: the installer
+# must refuse the download instead of trusting the printed digest.
+seed_prefix "$work/p-tar-vfail"
+: >"$marker"
+if env HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-tar-vfail" \
+    V2RAY_RS_DOWNLOAD_URL="file://$fixtures/v2ray-rs-x86_64-linux.tar.gz" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$failbin:$PATH" \
+    sh "$tar_installer" >"$work/tar-vfail.log" 2>&1; then
+    fail "tar-verifier-fails: installer exited successfully"
+else
+    grep -q "could not hash" "$work/tar-vfail.log" ||
+        fail "tar-verifier-fails: the failing verifier was not reported"
+    assert_untouched "$work/p-tar-vfail" "tar-verifier-fails"
+    pass "tar-verifier-fails"
 fi
 
 expect_success "tar-sidecar-install" "$tar_installer" "$work/p-tar-sidecar" \
@@ -329,6 +360,12 @@ if env HOME="$work/home" V2RAY_RS_INSTALL_DIR="$p_uninstall" \
         fail "tar-uninstall: antidpi helper path missing from the output"
     grep -q 'setcap -r' "$work/tar-uninstall.log" &&
         fail "tar-uninstall: output still hints at setcap -r"
+    grep -q 'not revoked automatically' "$work/tar-uninstall.log" ||
+        fail "tar-uninstall: the backend-grant note is missing from the output"
+    grep -q 'with its administrator' "$work/tar-uninstall.log" ||
+        fail "tar-uninstall: the administrator advice is missing from the output"
+    [ ! -e "$p_uninstall/bin/v2ray-rs" ] ||
+        fail "tar-uninstall: the seeded binary was left behind"
     pass "tar-uninstall"
 else
     fail "tar-uninstall: uninstaller failed: $(tail -n 3 "$work/tar-uninstall.log" | tr '\n' ' ')"
@@ -501,6 +538,22 @@ else
     pass "appimage-missing-verifier"
 fi
 
+# The verifier itself fails while printing the expected digest: the installer
+# must refuse the download before executing, extracting, or writing anything.
+seed_prefix "$work/p-app-vfail"
+: >"$marker"
+if env HOME="$work/home" V2RAY_RS_INSTALL_DIR="$work/p-app-vfail" \
+    V2RAY_RS_DOWNLOAD_URL="file://$fixtures/v2ray-rs-x86_64.AppImage" \
+    V2RAY_RS_NO_MODIFY_PATH=1 PATH="$failbin:$PATH" \
+    sh "$appimage_installer" >"$work/app-vfail.log" 2>&1; then
+    fail "appimage-verifier-fails: installer exited successfully"
+else
+    grep -q "could not hash" "$work/app-vfail.log" ||
+        fail "appimage-verifier-fails: the failing verifier was not reported"
+    assert_untouched "$work/p-app-vfail" "appimage-verifier-fails"
+    pass "appimage-verifier-fails"
+fi
+
 expect_success "appimage-sidecar-install" "$appimage_installer" "$work/p-app-sidecar" \
     "file://$fixtures/v2ray-rs-x86_64.AppImage"
 [ -x "$work/p-app-sidecar/bin/v2ray-rs.AppImage" ] ||
@@ -508,6 +561,29 @@ expect_success "appimage-sidecar-install" "$appimage_installer" "$work/p-app-sid
 grep -q "Exec=$work/p-app-sidecar/bin/v2ray-rs.AppImage" \
     "$work/p-app-sidecar/share/applications/com.github.v2ray-rs.desktop" ||
     fail "appimage-sidecar-install: desktop Exec was not rewritten"
+
+note "AppImage uninstaller"
+p_app_uninstall="$work/p-app-uninstall"
+seed_prefix "$p_app_uninstall"
+if env HOME="$work/home" V2RAY_RS_INSTALL_DIR="$p_app_uninstall" \
+    V2RAY_RS_NO_MODIFY_PATH=1 \
+    sh "$appimage_installer" --uninstall >"$work/app-uninstall.log" 2>&1; then
+    grep -q '/usr/local/lib/v2ray-rs/v2ray-rs-netctl' "$work/app-uninstall.log" ||
+        fail "app-uninstall: netctl helper path missing from the output"
+    grep -q '/usr/local/lib/v2ray-rs/v2ray-rs-antidpi' "$work/app-uninstall.log" ||
+        fail "app-uninstall: antidpi helper path missing from the output"
+    grep -q 'setcap -r' "$work/app-uninstall.log" &&
+        fail "app-uninstall: output still hints at setcap -r"
+    grep -q 'not revoked automatically' "$work/app-uninstall.log" ||
+        fail "app-uninstall: the backend-grant note is missing from the output"
+    grep -q 'with its administrator' "$work/app-uninstall.log" ||
+        fail "app-uninstall: the administrator advice is missing from the output"
+    [ ! -e "$p_app_uninstall/bin/v2ray-rs.AppImage" ] ||
+        fail "app-uninstall: the seeded AppImage was left behind"
+    pass "app-uninstall"
+else
+    fail "app-uninstall: uninstaller failed: $(tail -n 3 "$work/app-uninstall.log" | tr '\n' ' ')"
+fi
 
 pinned_app="$work/install-appimage-pinned.sh"
 bash "$repo/scripts/gen-installer-appimage.sh" 1.2.3 "$appimage" "$pinned_app" >/dev/null ||

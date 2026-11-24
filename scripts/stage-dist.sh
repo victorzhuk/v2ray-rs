@@ -91,6 +91,12 @@ for lang in en_US ru_RU; do
         { echo "staged $lang catalog lost the 'Anti-DPI engine' key" >&2; exit 2; }
     grep -q 'msgid "Anti-DPI engine"' "$txt" ||
         { echo "staged $lang catalog lost the 'Anti-DPI engine' key" >&2; exit 2; }
+    grep -q 'msgid "Retry cleanup"' "$txt" ||
+        { echo "staged $lang catalog lost the 'Retry cleanup' recovery key" >&2; exit 2; }
+    if [[ $lang == ru_RU ]]; then
+        grep -q 'Повторить очистку' "$txt" ||
+            { echo "staged ru_RU catalog lost the recovery translation" >&2; exit 2; }
+    fi
     rm -f "$txt"
 done
 

@@ -23,7 +23,9 @@ pub use manual_nodes::{
 };
 pub use presets::{delete_preset, load_custom_presets, save_preset};
 pub use routing::{load_routing_rules, save_routing_rules};
-pub use settings::{load_settings, load_settings_or_default, save_settings};
+pub use settings::{
+    load_settings, load_settings_language, load_settings_or_default, save_settings,
+};
 pub use subscriptions::{
     add_subscription, get_subscription, load_subscriptions, remove_subscription,
     save_subscriptions, update_subscription,

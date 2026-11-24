@@ -6,16 +6,43 @@ impl ProcessManager {
     // the teardown.
     /// Keeps the engine handle only when the monitor is alive and no exit
     /// record has arrived. An empty exit receiver means the monitor still
-    /// owns a possibly-running child: reuse it, its rules stay installed. A
-    /// delivered record or a disconnected receiver (monitor gone without a
-    /// record) drops the handle, so this launch re-installs and re-spawns:
-    /// an engine whose exit state is observed or unknown must never be
-    /// reused without fresh readiness.
-    pub(super) fn retain_live_engine(&mut self) {
-        if let Some(mut engine) = self.antidpi_engine.take()
-            && let Err(mpsc::error::TryRecvError::Empty) = engine.exit_rx.try_recv()
-        {
-            self.antidpi_engine = Some(engine);
+    /// owns a possibly-running child: reuse it, its rules stay installed.
+    /// Otherwise the exit must be confirmed — by the record or by the pidfd —
+    /// before this launch re-installs and re-spawns with fresh readiness; an
+    /// unconfirmable exit parks the manager in operator recovery instead.
+    pub(super) async fn retain_live_engine(&mut self) {
+        let Some(mut engine) = self.antidpi_engine.take() else {
+            return;
+        };
+        // One recv decides: an empty receiver means the monitor is alive and
+        // no record arrived, so the engine may still run and the handle is
+        // kept. Reading again after a delivered record would see Empty and
+        // lose the confirmation.
+        let observed = match engine.exit_rx.try_recv() {
+            Err(mpsc::error::TryRecvError::Empty) => {
+                self.antidpi_engine = Some(engine);
+                return;
+            }
+            Ok(record) => exit_confirmed(Some(&record)),
+            Err(mpsc::error::TryRecvError::Disconnected) => false,
+        };
+        // A delivered record or a disconnected receiver: the exit state is
+        // usable only when the record confirmed it, or the pidfd can confirm
+        // it now. An unknown exit must not allow a replacement engine.
+        let confirmed = observed
+            || match engine.pin.take() {
+                Some(pin) => tokio::task::spawn_blocking(move || confirm_exit_by_pidfd(pin))
+                    .await
+                    .unwrap_or(false),
+                None => false,
+            };
+        if confirmed {
+            log::info!("previous anti-DPI engine exit verified; installing fresh rules");
+        } else {
+            log::warn!(
+                "previous anti-DPI engine exit could not be verified; blocking rule install and replacement"
+            );
+            self.antidpi_exit_unverified = true;
         }
     }
 
@@ -32,6 +59,9 @@ impl ProcessManager {
         let mut child = Self::try_spawn_engine(rt, session)
             .await
             .map_err(|e| ProcessError::AntiDpiHelper(format!("engine spawn failed: {e}")))?;
+        // Pin the identity while this task still owns the child, before any
+        // try_wait can reap it: never re-opened later from a saved PID.
+        let pin = child.id().and_then(PinnedProcess::pin);
         let (ready_tx, ready_rx) = mpsc::unbounded_channel();
         let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel();
         if let Some(stdout) = child.stdout.take() {
@@ -43,18 +73,42 @@ impl ProcessManager {
         match Self::wait_engine_ready(rt.queue, &mut child, ready_rx, &mut stderr_rx).await {
             Ok(()) => {
                 let (stop_tx, exit_rx) = self.monitor_engine(child);
-                self.antidpi_engine = Some(AntidpiEngine { stop_tx, exit_rx });
+                self.antidpi_engine = Some(AntidpiEngine {
+                    stop_tx,
+                    exit_rx,
+                    pin,
+                });
                 Ok(())
             }
             Err(error) => {
                 let exit = crate::antidpi::terminate_engine(child).await;
-                let detail = format!(
-                    "{}; termination reaped it ({})",
-                    error,
-                    exit_status_field(exit.status.as_ref())
-                );
+                // A startup termination with an unknown status must not leave
+                // rules removable or a replacement engine spawnable: confirm
+                // through the pidfd, or park the manager in operator
+                // recovery. The pidfd wait blocks on signals and poll, so it
+                // runs off the async worker.
+                let mut confirmed = exit_confirmed(Some(&exit));
+                if !confirmed && let Some(pin) = pin {
+                    confirmed = tokio::task::spawn_blocking(move || confirm_exit_by_pidfd(pin))
+                        .await
+                        .unwrap_or(false);
+                }
+                // Only a confirmed exit was reaped; an unconfirmed one must
+                // not be described as reaped.
+                let detail = if confirmed {
+                    format!(
+                        "{}; termination reaped it ({})",
+                        error,
+                        exit_status_field(exit.status.as_ref())
+                    )
+                } else {
+                    format!("{error}; engine exit could not be verified after termination")
+                };
                 log::error!("{detail}");
                 self.push_notice(detail);
+                if !confirmed {
+                    self.antidpi_exit_unverified = true;
+                }
                 Err(error)
             }
         }
@@ -294,26 +348,59 @@ impl ProcessManager {
         let Some(rt) = self.antidpi.clone() else {
             return Ok(());
         };
+        if self.antidpi_exit_unverified {
+            // Neither the monitor nor a pidfd could verify the engine exit.
+            // The journal and the admission gate stay: removal here could
+            // strip a live engine's rules, and no retry can change that.
+            return Err(ProcessError::AntiDpiExitUnverified(
+                "anti-DPI engine exit was never verified; remove its rules manually".into(),
+            ));
+        }
         if let Some(mut engine) = self.antidpi_engine.take() {
             let _ = engine.stop_tx.send(());
-            let record = tokio::time::timeout(ANTIDPI_EXIT_WAIT, engine.exit_rx.recv())
-                .await
-                .unwrap_or_default();
-            if !exit_confirmed(record.as_ref()) {
-                log::warn!("anti-DPI engine did not confirm its exit on stop; keeping its handle");
-                self.antidpi_engine = Some(engine);
-                return Err(ProcessError::AntiDpiHelper(
-                    "anti-DPI engine did not confirm its exit within the stop deadline".into(),
+            let record = match tokio::time::timeout(ANTIDPI_EXIT_WAIT, engine.exit_rx.recv()).await
+            {
+                Ok(record) => record,
+                Err(_) => {
+                    // The monitor still exists: keep the handle and let the
+                    // next stop retry; the pidfd is not a second signer here.
+                    log::warn!(
+                        "anti-DPI engine did not confirm its exit on stop; keeping its handle"
+                    );
+                    self.antidpi_engine = Some(engine);
+                    return Err(ProcessError::AntiDpiHelper(
+                        "anti-DPI engine did not confirm its exit within the stop deadline".into(),
+                    ));
+                }
+            };
+            let mut confirmed = exit_confirmed(record.as_ref());
+            if !confirmed {
+                // A closed monitor or an unconfirmed final result: observe
+                // the pinned identity on a blocking worker. A confirmed exit
+                // permits cleanup even without an exit code; none is
+                // fabricated.
+                confirmed = match engine.pin.take() {
+                    Some(pin) => tokio::task::spawn_blocking(move || confirm_exit_by_pidfd(pin))
+                        .await
+                        .unwrap_or(false),
+                    None => false,
+                };
+            }
+            if !confirmed {
+                log::warn!("anti-DPI engine exit could not be verified; manual recovery required");
+                self.antidpi_exit_unverified = true;
+                return Err(ProcessError::AntiDpiExitUnverified(
+                    "engine exit could not be verified. Manual recovery required.".into(),
                 ));
             }
             // The engine's exit status belongs in the session record: it is
             // what a user compares against the helper's remove-rules output.
-            if let Some(exit) = &record {
-                self.push_notice(format!(
-                    "antidpi engine stopped ({})",
-                    exit_status_field(exit.status.as_ref())
-                ));
-            }
+            let status_field = record
+                .as_ref()
+                .and_then(|exit| exit.status.as_ref())
+                .map(|status| exit_status_field(Some(status)))
+                .unwrap_or_else(|| "exit confirmed, status unavailable".to_string());
+            self.push_notice(format!("antidpi engine stopped ({status_field})"));
             for handle in self.antidpi_log_handles.drain(..) {
                 let abort = handle.abort_handle();
                 if tokio::time::timeout(LOG_DRAIN_TIMEOUT, handle)

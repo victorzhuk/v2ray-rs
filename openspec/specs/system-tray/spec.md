@@ -44,6 +44,11 @@ The system SHALL display a context menu when the tray icon is activated.
 - **WHEN** the state is Stopping
 - **THEN** the Connect/Disconnect menu item SHALL be disabled (not clickable)
 
+#### Scenario: Cleanup is pending
+- **WHEN** cleanup is pending
+- **THEN** Connect SHALL be disabled
+- **AND** Open Main Window and Quit SHALL remain available
+
 ### Requirement: Tray tooltip status
 The system SHALL include active connection details in the tray tooltip.
 
@@ -87,17 +92,25 @@ The system SHALL support minimizing the main window to the system tray instead o
 
 ### Requirement: Tray notifications
 The system SHALL support optional desktop notifications for tray-visible connection state changes.
+The app SHALL produce notifications from accepted state transitions, independent of the coalescing tray snapshot.
+It SHALL suppress the error notification that duplicates pending cleanup, while retaining ordinary error notifications.
 
 #### Scenario: Notifications enabled
 - **WHEN** notifications are enabled and the connection state changes to Running or Error
-- **THEN** the tray integration SHALL emit a desktop notification describing the state change
+- **THEN** the tray integration SHALL emit a desktop notification describing the state change, except for a duplicate pending-cleanup error
 
-### Requirement: Tray listener resyncs on lag, escapes notifications, and cleans icon resources
-`TrayService` SHALL resync tray state from `StateManager` when its broadcast receiver reports `Lagged`, abort its listener task on `shutdown()`, honor the `notifications` enabled flag while escaping dynamic markup in `Notifier`, and avoid creating temporary icon theme directories or spawning `gtk-update-icon-cache` during normal pixmap-only startup.
+### Requirement: Tray snapshot converges and cleans icon resources
+`TrayService` SHALL consume the UI's `watch` snapshot for state, connection metadata, and cleanup status.
+The listener SHALL converge on the latest snapshot without requiring every intermediate value.
+The tray SHALL NOT read a `StateManager` it does not own.
+It SHALL abort its listener task on `shutdown()` and honor the notifications flag.
+`Notifier` SHALL escape dynamic markup.
+Pixmap-only startup SHALL NOT create temporary icon theme directories or invoke `gtk-update-icon-cache`.
 
-#### Scenario: Broadcast lag resyncs tray icon to current state
-- **WHEN** rapid log events cause `RecvError::Lagged` on the tray broadcast receiver across a state transition to `Running`
-- **THEN** the tray listener SHALL read the current state snapshot and update the tray icon and menu to `Connected`
+#### Scenario: Snapshot updates coalesce across a transition
+- **WHEN** the tray listener misses intermediate snapshots and the latest snapshot is Running
+- **THEN** the tray listener SHALL update the icon and menu to Connected
+- **AND** transition notifications SHALL follow accepted app state transitions, not snapshot delivery
 
 #### Scenario: Pixmap-only startup creates no temp icon theme
 - **WHEN** `TrayService::spawn` starts with `icon_name()` returning an empty string

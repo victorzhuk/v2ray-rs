@@ -306,66 +306,22 @@ fn capability_status(
     }
 }
 
-/// The exact targets a grant offered to repair, captured before elevation.
-/// Confirmed success requires these same post-grant destination paths
-/// healthy after the re-probe: a helper that disappeared or resolved to a
-/// different, unmanaged copy does not count as success.
-#[derive(Clone)]
-struct GrantTargets {
-    backend_path: PathBuf,
-    helper_path: PathBuf,
-    antidpi_path: PathBuf,
-}
-
-impl GrantTargets {
-    /// The expected post-grant destinations for a grant planned for the
-    /// resolved `helper` and `antidpi` paths, mirroring `plan_grant`: a
-    /// relocating plan (AppImage, `nosuid` mount) installs the bundled
-    /// copies under `RELOCATE_DIR`, an in-place plan keeps the resolved
-    /// paths, and a relocating plan without a bundled anti-DPI source has
-    /// no anti-DPI target, so the pre-grant resolution stays the
-    /// comparison point.
-    fn for_plan(
-        backend_path: PathBuf,
-        helper: &Path,
-        antidpi: &Path,
-        relocating: bool,
-        antidpi_relocates: bool,
-    ) -> GrantTargets {
-        GrantTargets {
-            backend_path,
-            helper_path: if relocating {
-                v2ray_rs_process::relocated_helper_path()
-            } else {
-                helper.to_path_buf()
-            },
-            antidpi_path: if relocating && antidpi_relocates {
-                v2ray_rs_process::relocated_antidpi_path()
-            } else {
-                antidpi.to_path_buf()
-            },
-        }
-    }
-}
-
-/// Whether a fresh post-grant probe verifies every target the grant offered
-/// to repair, captured before elevation: the same backend holds
-/// CAP_NET_ADMIN, no needed route-helper reason remains on the same resolved
-/// helper path, and an anti-DPI helper the grant targeted ends up ready at
-/// the expected destination, relocated or in place. Package guidance or a
+/// Whether a fresh post-grant probe verifies the destinations the elevation
+/// reported: the same backend holds CAP_NET_ADMIN, the resolved route helper
+/// is the path the grant verified, and an anti-DPI helper the grant targeted
+/// ends up ready at the receipt's destination. Package guidance or a
 /// still-fixable copy the grant never targeted is not a failed repair: the
 /// grant never promised to touch it; only a terminal verdict is.
 fn grant_confirmed(
     backend_caps: Option<&Result<bool, String>>,
     helper_needed: bool,
-    antidpi_targeted: bool,
-    targets: &GrantTargets,
+    targets: &v2ray_rs_process::GrantedTargets,
     probe: &HelperProbe,
 ) -> bool {
     if !matches!(backend_caps, Some(Ok(true))) {
         return false;
     }
-    if probe.helper != targets.helper_path {
+    if probe.helper != targets.helper {
         return false;
     }
     if helper_needed
@@ -376,11 +332,38 @@ fn grant_confirmed(
         return false;
     }
     let antidpi = antidpi_install_reason(&probe.antidpi);
-    if antidpi_targeted {
-        return probe.antidpi.path == targets.antidpi_path
-            && matches!(antidpi, AntidpiVerdict::Ready);
+    match &targets.antidpi {
+        Some(target) => probe.antidpi.path == *target && matches!(antidpi, AntidpiVerdict::Ready),
+        None => !matches!(antidpi, AntidpiVerdict::Terminal(_)),
     }
-    !matches!(antidpi, AntidpiVerdict::Terminal(_))
+}
+
+/// Turns the elevation result into the single toast the grant click shows.
+/// Only a verified receipt reaches the post-grant probe; a refusal carries no
+/// destinations and can never be reported as a granted repair.
+async fn grant_toast(
+    result: Result<v2ray_rs_process::GrantedTargets, String>,
+    helper_needed: bool,
+) -> String {
+    let targets = match result {
+        Ok(targets) => targets,
+        Err(err) => return format!("Grant failed: {err}"),
+    };
+    let verified = tokio::task::spawn_blocking(move || {
+        let backend_caps =
+            v2ray_rs_process::has_net_admin(&targets.backend).map_err(|err| err.to_string());
+        let probe = probe_helper();
+        let confirmed = grant_confirmed(Some(&backend_caps), helper_needed, &targets, &probe);
+        let (message, _) = capability_status(Some(&backend_caps), helper_needed, &probe);
+        (confirmed, message)
+    })
+    .await
+    .unwrap_or_else(|_| (false, "capability verification task aborted".to_string()));
+    if verified.0 {
+        "TUN privileges granted.".to_string()
+    } else {
+        format!("Grant did not fully verify: {}", verified.1)
+    }
 }
 
 pub(super) fn build_tun_page(
@@ -992,46 +975,30 @@ pub(super) fn build_tun_page(
             let Some(backend_path) = backend_path else {
                 return;
             };
+            // The backend chosen at click time owns the whole attempt: a
+            // later editor change must not retarget the elevation or the
+            // verdict that follows it.
+            let helper_needed = state.borrow().backend.backend_type == BackendType::Xray;
             // grant() blocks on the polkit dialog; run it off the GTK thread so
             // the whole app doesn't freeze until the prompt is answered.
             btn.set_sensitive(false);
             let btn = btn.clone();
             let refresh = refresh.clone();
             let toast_cb = toast_cb.clone();
-            // The closure may fire again, so the async block moves clones:
-            // `state` stays owned by the `Fn` closure, and `backend_path`
-            // flows through the preparation task into the grant task.
-            let state = state.clone();
             glib::MainContext::default().spawn_local(async move {
-                // Helper resolution, the target capture, and the pre-grant
-                // probe all hit the filesystem, so they run beside the grant
-                // itself. The capture mirrors `plan_grant`: confirmed success
-                // requires these same post-grant destinations healthy on the
-                // fresh probe.
+                // Resolving the helpers hits the filesystem, so it runs beside
+                // the elevation itself. The elevation's receipt, not a local
+                // prediction, names the destinations checked afterwards.
                 let prepared = tokio::task::spawn_blocking(move || {
                     let helper = v2ray_rs_process::helper_path();
                     // The anti-DPI helper rides along in the same elevation
                     // when it is installed; grant() skips absent targets
                     // itself.
                     let antidpi = v2ray_rs_process::antidpi_path();
-                    let targets = GrantTargets::for_plan(
-                        backend_path.clone(),
-                        &helper,
-                        &antidpi,
-                        v2ray_rs_process::relocation_required(),
-                        v2ray_rs_process::bundled_antidpi_path().is_some(),
-                    );
-                    // An anti-DPI helper that was grant-repairable before
-                    // elevation becomes a required target: the re-probe must
-                    // see it ready and still managed.
-                    let antidpi_targeted = matches!(
-                        antidpi_install_reason(&probe_antidpi()),
-                        AntidpiVerdict::Fixable(_)
-                    );
-                    (backend_path, helper, antidpi, targets, antidpi_targeted)
+                    (backend_path, helper, antidpi)
                 })
                 .await;
-                let (backend_path, helper, antidpi, targets, antidpi_targeted) = match prepared {
+                let (backend_path, helper, antidpi) = match prepared {
                     Ok(prepared) => prepared,
                     // Fail closed if the capture probe cannot run.
                     Err(_) => {
@@ -1047,43 +1014,11 @@ pub(super) fn build_tun_page(
                 })
                 .await;
                 btn.set_sensitive(true);
-                match result {
-                    Ok(Ok(())) => {
-                        // Claim success only after a fresh probe confirms
-                        // the grant repaired exactly the captured targets;
-                        // the row refreshes from the same post-grant state
-                        // either way, with one toast.
-                        let helper_needed =
-                            state.borrow().backend.backend_type == BackendType::Xray;
-                        let (confirmed, message) = tokio::task::spawn_blocking(move || {
-                            let backend_caps =
-                                v2ray_rs_process::has_net_admin(&targets.backend_path)
-                                    .map_err(|err| err.to_string());
-                            let probe = probe_helper();
-                            let confirmed = grant_confirmed(
-                                Some(&backend_caps),
-                                helper_needed,
-                                antidpi_targeted,
-                                &targets,
-                                &probe,
-                            );
-                            let (message, _) =
-                                capability_status(Some(&backend_caps), helper_needed, &probe);
-                            (confirmed, message)
-                        })
-                        .await
-                        .unwrap_or_else(|_| {
-                            (false, "capability verification task aborted".to_string())
-                        });
-                        if confirmed {
-                            toast_cb("TUN privileges granted.");
-                        } else {
-                            toast_cb(&format!("Grant did not fully verify: {message}"));
-                        }
-                    }
-                    Ok(Err(err)) => toast_cb(&format!("Grant failed: {err}")),
-                    Err(_) => toast_cb("Grant failed: elevation task aborted"),
-                }
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => Err("elevation task aborted".to_string()),
+                };
+                toast_cb(&grant_toast(result, helper_needed).await);
                 refresh();
             });
         });
@@ -1999,8 +1934,8 @@ mod tests {
         assert!(!grant);
     }
 
-    /// Post-grant verification: confirmed only when exactly the captured
-    /// targets verify clean on the fresh probe.
+    /// Post-grant verification: confirmed only when the receipt's exact
+    /// destinations verify clean on the fresh probe.
     #[test]
     fn grant_confirmation_requires_verified_targets() {
         let backend_ready = Some(&Ok::<bool, String>(true));
@@ -2010,14 +1945,14 @@ mod tests {
             false,
             false,
         );
-        let targets = GrantTargets {
-            backend_path: full.helper.clone(),
-            helper_path: full.helper.clone(),
-            antidpi_path: full.antidpi.path.clone(),
+        let targets = v2ray_rs_process::GrantedTargets {
+            backend: PathBuf::from("/usr/bin/xray"),
+            helper: full.helper.clone(),
+            antidpi: None,
         };
-        assert!(grant_confirmed(backend_ready, true, false, &targets, &full));
+        assert!(grant_confirmed(backend_ready, true, &targets, &full));
 
-        // A grant-repairable anti-DPI helper must end up ready.
+        // A targeted anti-DPI helper must end up ready at the receipt path.
         let mut capsless = full.clone();
         capsless.antidpi = antidpi_probe(
             v2ray_rs_process::HelperAccess::Ready,
@@ -2025,23 +1960,15 @@ mod tests {
             false,
             true,
         );
-        assert!(!grant_confirmed(
-            backend_ready,
-            true,
-            true,
-            &targets,
-            &capsless
-        ));
-        assert!(grant_confirmed(
-            backend_ready,
-            true,
-            false,
-            &targets,
-            &capsless
-        ));
+        let targeted = v2ray_rs_process::GrantedTargets {
+            antidpi: Some(full.antidpi.path.clone()),
+            ..targets.clone()
+        };
+        assert!(!grant_confirmed(backend_ready, true, &targeted, &capsless));
+        assert!(grant_confirmed(backend_ready, true, &targets, &capsless));
 
-        // Package guidance for an untargeted unmanaged copy is not a failed
-        // repair.
+        // Package guidance for a copy the elevation never targeted is not a
+        // failed repair.
         let mut unmanaged = full.clone();
         unmanaged.antidpi = antidpi_probe(
             v2ray_rs_process::HelperAccess::Ready,
@@ -2049,68 +1976,97 @@ mod tests {
             false,
             false,
         );
-        assert!(grant_confirmed(
-            backend_ready,
-            true,
-            false,
-            &targets,
-            &unmanaged
-        ));
+        assert!(grant_confirmed(backend_ready, true, &targets, &unmanaged));
 
         // A helper that disappeared or resolved to a different copy does
         // not confirm the repair.
         let mut relocated = full.clone();
         relocated.antidpi.path = PathBuf::from("/home/user/.local/bin/v2ray-rs-antidpi");
-        assert!(!grant_confirmed(
-            backend_ready,
-            true,
-            true,
-            &targets,
-            &relocated
-        ));
+        assert!(!grant_confirmed(backend_ready, true, &targeted, &relocated));
         let mut moved_helper = full.clone();
         moved_helper.helper = PathBuf::from("/run/user/1000/bin/v2ray-rs-netctl");
         assert!(!grant_confirmed(
             backend_ready,
             true,
-            false,
             &targets,
             &moved_helper
         ));
 
         let unreadable = Err::<bool, String>("getcap missing".to_string());
-        assert!(!grant_confirmed(
-            Some(&unreadable),
-            true,
+        assert!(!grant_confirmed(Some(&unreadable), true, &targets, &full));
+    }
+
+    /// A relogin requirement is terminal for the targeted helper: the grant
+    /// cannot confirm it, so the UI keeps the blocked verdict.
+    #[test]
+    fn receipt_does_not_confirm_a_relogin_blocked_helper() {
+        let backend_ready = Some(&Ok::<bool, String>(true));
+        let full = probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Ok(true)),
             false,
+            false,
+        );
+        let targets = v2ray_rs_process::GrantedTargets {
+            backend: PathBuf::from("/usr/bin/xray"),
+            helper: full.helper.clone(),
+            antidpi: Some(full.antidpi.path.clone()),
+        };
+
+        let mut route_blocked = probe(
+            v2ray_rs_process::HelperAccess::ReloginRequired,
+            None,
+            false,
+            false,
+        );
+        route_blocked.antidpi = full.antidpi.clone();
+        assert!(!grant_confirmed(
+            backend_ready,
+            true,
             &targets,
-            &full
+            &route_blocked
+        ));
+
+        let mut antidpi_blocked = full.clone();
+        antidpi_blocked.antidpi = antidpi_probe(
+            v2ray_rs_process::HelperAccess::ReloginRequired,
+            None,
+            false,
+            true,
+        );
+        assert!(!grant_confirmed(
+            backend_ready,
+            true,
+            &targets,
+            &antidpi_blocked
         ));
     }
 
-    /// A relocating grant (AppImage, `nosuid` mount) installs under
-    /// `RELOCATE_DIR`, so the captured targets must predict the relocated
-    /// destinations: a first-time grant confirms cleanly once the fresh
-    /// probe resolves the relocated copies.
+    /// A refused elevation returns no receipt, so the click can only report
+    /// failure -- never a partially applied repair.
+    #[tokio::test]
+    async fn refusal_without_receipt_is_reported_as_failure() {
+        let message = grant_toast(Err("polkit authorization denied".into()), true).await;
+        assert_eq!(message, "Grant failed: polkit authorization denied");
+    }
+
+    /// The receipt, not a pre-grant prediction, names a relocating grant's
+    /// destinations: the fixed paths the elevation published.
     #[test]
-    fn relocating_grant_confirmation_targets_relocated_paths() {
+    fn relocating_grant_confirmation_uses_receipt_destinations() {
         let backend_ready = Some(&Ok::<bool, String>(true));
         let bundled_helper = PathBuf::from("/tmp/appimg/bin/v2ray-rs-netctl");
         let bundled_antidpi = PathBuf::from("/tmp/appimg/bin/v2ray-rs-antidpi");
         let relocated_helper = PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-netctl");
         let relocated_antidpi = PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-antidpi");
 
-        let targets = GrantTargets::for_plan(
-            bundled_helper.clone(),
-            &bundled_helper,
-            &bundled_antidpi,
-            true,
-            true,
-        );
-        assert_eq!(targets.helper_path, relocated_helper);
-        assert_eq!(targets.antidpi_path, relocated_antidpi);
+        let targets = v2ray_rs_process::GrantedTargets {
+            backend: PathBuf::from("/usr/bin/xray"),
+            helper: relocated_helper.clone(),
+            antidpi: Some(relocated_antidpi.clone()),
+        };
 
-        // Post-grant probe: both relocated copies ready and managed.
+        // Post-grant probe: both published copies ready and managed.
         let mut relocated = probe(
             v2ray_rs_process::HelperAccess::Ready,
             Some(Ok(true)),
@@ -2119,74 +2075,64 @@ mod tests {
         );
         relocated.helper = relocated_helper.clone();
         relocated.antidpi.path = relocated_antidpi.clone();
-        assert!(grant_confirmed(
-            backend_ready,
-            true,
-            true,
-            &targets,
-            &relocated
-        ));
-        assert!(grant_confirmed(
-            backend_ready,
-            false,
-            false,
-            &targets,
-            &relocated
-        ));
+        assert!(grant_confirmed(backend_ready, true, &targets, &relocated));
+        assert!(grant_confirmed(backend_ready, false, &targets, &relocated));
 
-        // A probe that still resolves the in-place paths does not confirm
-        // the relocating grant.
-        let mut still_in_place = relocated.clone();
-        still_in_place.helper = bundled_helper.clone();
+        // A probe that still resolves the bundled copies does not confirm
+        // the receipt's published paths.
+        let mut still_bundled = relocated.clone();
+        still_bundled.helper = bundled_helper.clone();
         assert!(!grant_confirmed(
             backend_ready,
             false,
-            false,
             &targets,
-            &still_in_place
+            &still_bundled
         ));
         let mut stale_antidpi = relocated.clone();
         stale_antidpi.antidpi.path = bundled_antidpi.clone();
         assert!(!grant_confirmed(
             backend_ready,
             false,
-            true,
             &targets,
             &stale_antidpi
         ));
 
-        // An in-place plan keeps the resolved paths as the targets.
-        let inplace = GrantTargets::for_plan(
-            bundled_helper.clone(),
-            &bundled_helper,
-            &bundled_antidpi,
+        // An in-place receipt keeps the resolved paths.
+        let inplace = v2ray_rs_process::GrantedTargets {
+            backend: PathBuf::from("/usr/bin/xray"),
+            helper: bundled_helper.clone(),
+            antidpi: Some(bundled_antidpi.clone()),
+        };
+        let mut inplace_probe = probe(
+            v2ray_rs_process::HelperAccess::Ready,
+            Some(Ok(true)),
             false,
-            true,
+            false,
         );
-        assert_eq!(inplace.helper_path, bundled_helper);
-        assert_eq!(inplace.antidpi_path, bundled_antidpi);
+        inplace_probe.helper = bundled_helper.clone();
+        inplace_probe.antidpi.path = bundled_antidpi.clone();
+        assert!(grant_confirmed(
+            backend_ready,
+            true,
+            &inplace,
+            &inplace_probe
+        ));
 
-        // Relocating without a bundled anti-DPI source: no anti-DPI target,
-        // so a fixable copy the grant never carried cannot fail it.
-        let helper_only = GrantTargets::for_plan(
-            bundled_helper.clone(),
-            &bundled_helper,
-            &bundled_antidpi,
-            true,
-            false,
-        );
-        assert_eq!(helper_only.antidpi_path, bundled_antidpi);
-        let mut fixable = relocated.clone();
+        // The planner omits an unavailable optional helper, so a fixable copy
+        // the elevation never carried cannot fail the grant.
+        let helper_only = v2ray_rs_process::GrantedTargets {
+            antidpi: None,
+            ..inplace
+        };
+        let mut fixable = inplace_probe.clone();
         fixable.antidpi = antidpi_probe(
             v2ray_rs_process::HelperAccess::Ready,
             Some(Ok(false)),
             false,
             true,
         );
-        fixable.antidpi.path = bundled_antidpi.clone();
         assert!(grant_confirmed(
             backend_ready,
-            false,
             false,
             &helper_only,
             &fixable
@@ -2195,35 +2141,31 @@ mod tests {
         // A terminal verdict on the untargeted helper still fails.
         let mut terminal = fixable.clone();
         terminal.antidpi = antidpi_probe(v2ray_rs_process::HelperAccess::NoExec, None, false, true);
-        terminal.antidpi.path = bundled_antidpi.clone();
         assert!(!grant_confirmed(
             backend_ready,
-            false,
             false,
             &helper_only,
             &terminal
         ));
     }
 
-    /// A relocating grant promises the fixed `RELOCATE_DIR` destinations:
-    /// a healthy copy anywhere else — a PATH install, an unrelated
-    /// directory, a bare fallback name — is a wrong destination and must
-    /// not confirm the grant.
+    /// The receipt's destination is the only destination that confirms a
+    /// repair: a helper that was healthy before elevation, or stays healthy
+    /// elsewhere afterwards -- a PATH install, an unrelated directory, a bare
+    /// fallback name -- is not the grant's work.
     #[test]
-    fn relocating_grant_rejects_wrong_destinations() {
+    fn healthy_helper_elsewhere_does_not_confirm_the_receipt() {
         let backend_ready = Some(&Ok::<bool, String>(true));
-        let bundled_helper = PathBuf::from("/tmp/appimg/bin/v2ray-rs-netctl");
-        let bundled_antidpi = PathBuf::from("/tmp/appimg/bin/v2ray-rs-antidpi");
-        let targets = GrantTargets::for_plan(
-            bundled_helper.clone(),
-            &bundled_helper,
-            &bundled_antidpi,
-            true,
-            true,
-        );
+        let targets = v2ray_rs_process::GrantedTargets {
+            backend: PathBuf::from("/usr/bin/xray"),
+            helper: PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-netctl"),
+            antidpi: Some(PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-antidpi")),
+        };
 
-        // A healthy helper installed anywhere but the promised destination
-        // is not the grant's repair, whether or not TUN needs the helper.
+        // The selection was healthy before elevation, but the elevation
+        // published the receipts' paths; a fresh probe resolving the old
+        // healthy copy is a wrong destination even though every verdict
+        // reads ready.
         let mut wrong_helper = probe(
             v2ray_rs_process::HelperAccess::Ready,
             Some(Ok(true)),
@@ -2234,13 +2176,11 @@ mod tests {
         assert!(!grant_confirmed(
             backend_ready,
             true,
-            true,
             &targets,
             &wrong_helper
         ));
         assert!(!grant_confirmed(
             backend_ready,
-            false,
             false,
             &targets,
             &wrong_helper
@@ -2249,11 +2189,10 @@ mod tests {
         // A healthy targeted anti-DPI helper at the wrong place fails too;
         // rejection is by destination, not by verdict.
         let mut wrong_antidpi = wrong_helper.clone();
-        wrong_antidpi.helper = targets.helper_path.clone();
+        wrong_antidpi.helper = targets.helper.clone();
         wrong_antidpi.antidpi.path = PathBuf::from("/usr/local/bin/v2ray-rs-antidpi");
         assert!(!grant_confirmed(
             backend_ready,
-            true,
             true,
             &targets,
             &wrong_antidpi
@@ -2263,18 +2202,20 @@ mod tests {
         // equally wrong.
         let mut unresolved = wrong_antidpi.clone();
         unresolved.antidpi.path = PathBuf::from("v2ray-rs-antidpi");
-        assert!(!grant_confirmed(
-            backend_ready,
-            true,
-            true,
-            &targets,
-            &unresolved
-        ));
+        assert!(!grant_confirmed(backend_ready, true, &targets, &unresolved));
 
-        // An untargeted copy elsewhere was never the grant's promise; it
-        // does not fail the grant either — only a terminal verdict would.
-        let untargeted = grant_confirmed(backend_ready, false, false, &targets, &wrong_antidpi);
-        assert!(untargeted);
+        // An untargeted copy elsewhere was never the receipt's promise; it
+        // does not fail the grant either -- only a terminal verdict would.
+        let untargeted = v2ray_rs_process::GrantedTargets {
+            antidpi: None,
+            ..targets
+        };
+        assert!(grant_confirmed(
+            backend_ready,
+            false,
+            &untargeted,
+            &wrong_antidpi
+        ));
     }
 
     /// A healthy backend with a fixable route helper keeps the grant visible

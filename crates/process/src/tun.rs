@@ -678,6 +678,10 @@ pub struct HelperRun {
     pub output: Vec<String>,
     pub result: Result<(), String>,
     pub timed_out: bool,
+    /// The exit code the child actually reported, from `ExitStatus::code()`.
+    /// `None` for a signal death, a wait failure, a spawn failure, or a
+    /// timeout kill: absence is not a zero and must never read as one.
+    pub exit_code: Option<i32>,
 }
 
 /// Runs `netctl xray-up` to assign the address and policy routes.
@@ -810,6 +814,7 @@ async fn run_validated(
                 output: Vec::new(),
                 result: Err(err.to_string()),
                 timed_out: false,
+                exit_code: None,
             };
         }
     };
@@ -874,6 +879,7 @@ async fn run_command(build: impl FnMut() -> Command, verb: &str, timeout: Durati
                 output: Vec::new(),
                 result: Err(format!("{verb}: {e}")),
                 timed_out: false,
+                exit_code: None,
             };
         }
     };
@@ -895,13 +901,22 @@ async fn run_command(build: impl FnMut() -> Command, verb: &str, timeout: Durati
     .flatten()
     .collect();
 
-    let (mut result, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) if status.success() => (Ok(()), false),
-        Ok(Ok(status)) => (Err(format!("{verb} exited with {status}")), false),
-        Ok(Err(e)) => (Err(format!("{verb}: {e}")), false),
+    let (mut result, timed_out, exit_code) = match tokio::time::timeout(timeout, child.wait()).await
+    {
+        Ok(Ok(status)) if status.success() => (Ok(()), false, status.code()),
+        Ok(Ok(status)) => (
+            Err(format!("{verb} exited with {status}")),
+            false,
+            status.code(),
+        ),
+        Ok(Err(e)) => (Err(format!("{verb}: {e}")), false, None),
         Err(_) => {
             let _ = child.kill().await;
-            (Err(format!("{verb} timed out after {timeout:?}")), true)
+            (
+                Err(format!("{verb} timed out after {timeout:?}")),
+                true,
+                None,
+            )
         }
     };
 
@@ -925,6 +940,7 @@ async fn run_command(build: impl FnMut() -> Command, verb: &str, timeout: Durati
         output,
         result,
         timed_out,
+        exit_code,
     }
 }
 
@@ -962,6 +978,7 @@ mod tests {
                 output: Vec::new(),
                 result: Ok(()),
                 timed_out: false,
+                exit_code: Some(0),
             }
         };
         let outcome = operator_recover_with(&planted, "tun9", BackendType::Xray, run).await;
@@ -996,6 +1013,7 @@ mod tests {
                 output: Vec::new(),
                 result: Ok(()),
                 timed_out: false,
+                exit_code: Some(0),
             }
         };
         // Stub validator standing in for the real target checks (which need

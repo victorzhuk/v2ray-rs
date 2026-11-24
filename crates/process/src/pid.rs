@@ -74,7 +74,7 @@ fn record_disposition(term_exit_confirmed: bool, kill_exit: Option<bool>) -> Rec
 /// A pidfd pinning one process identity. Signals sent through it can never
 /// reach a different process that reused the PID, and the kernel reports the
 /// pinned process's termination through this descriptor.
-struct PinnedProcess {
+pub(crate) struct PinnedProcess {
     fd: OwnedFd,
 }
 
@@ -97,6 +97,14 @@ impl PinnedProcess {
             });
         }
         Err(open_disposition(io::Error::last_os_error().raw_os_error()))
+    }
+
+    /// Pins a live-or-exited process identity for the engine monitor, or
+    /// `None` when this kernel or context cannot pin one (ENOSYS, EPERM, a
+    /// pid already reaped). Must be called while the `Child` is still owned,
+    /// before any wait can reap the process.
+    pub(crate) fn pin(pid: u32) -> Option<Self> {
+        Self::open(pid).ok()
     }
 
     /// `pidfd_send_signal(2)`. `Ok(false)` maps `ESRCH`: the pinned process
@@ -167,6 +175,44 @@ enum ExeLookup {
     Path(PathBuf),
     PermissionDenied,
     Missing,
+}
+
+/// One nonblocking poll of the pidfd: `true` only when the kernel has
+/// reported the pinned process terminated.
+fn pid_exited(pinned: &PinnedProcess) -> bool {
+    let mut fds = nix::libc::pollfd {
+        fd: pinned.fd.as_raw_fd(),
+        events: nix::libc::POLLIN,
+        revents: 0,
+    };
+    // Safety: `fds` points at one valid `pollfd` for the duration of the call.
+    let rc = unsafe { nix::libc::poll(&mut fds, 1, 0) };
+    rc > 0 && fds.revents & nix::libc::POLLIN != 0
+}
+
+/// Bounded exit observation through a pinned process: an already-exited
+/// process confirms at once; a live one gets TERM then, if still alive after
+/// the TERM budget, KILL through the pidfd — never through a re-looked-up
+/// numeric PID. `true` only for a confirmed exit; no exit code is produced.
+/// Run on a blocking worker: `wait_exit` parks in `poll(2)`.
+pub(crate) fn confirm_exit_by_pidfd(pinned: PinnedProcess) -> bool {
+    if pid_exited(&pinned) {
+        return true;
+    }
+    match pinned.send_signal(nix::libc::SIGTERM) {
+        // ESRCH: exited and reaped between the poll and the signal.
+        Ok(false) => return true,
+        Ok(true) => {
+            if pinned.wait_exit(TERM_EXIT_TIMEOUT).unwrap_or(false) {
+                return true;
+            }
+        }
+        Err(_) => {}
+    }
+    if matches!(pinned.send_signal(nix::libc::SIGKILL), Ok(false)) {
+        return true;
+    }
+    pinned.wait_exit(KILL_EXIT_TIMEOUT).unwrap_or(false)
 }
 
 fn process_binary_path(pid: u32) -> ExeLookup {

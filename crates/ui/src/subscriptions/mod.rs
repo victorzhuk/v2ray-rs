@@ -4,7 +4,7 @@ use gtk::gdk;
 use relm4::adw;
 use relm4::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::Arc;
 use uuid::Uuid;
 
 use v2ray_rs_core::geo_probe::{AvailabilityVerdict, ServiceCheck, builtin_service_checks};
@@ -36,7 +36,12 @@ pub struct SubscriptionsPage {
     auto_update_streaks: HashMap<Uuid, FailureStreak>,
     testing_latency: HashSet<Uuid>,
     refreshing: HashSet<Uuid>,
-    persister: SubscriptionPersister,
+    writes: WriteTracker,
+    imports: ImportGeneration,
+    load_generation: u64,
+    loading: bool,
+    reset_pending: bool,
+    active_nodes_reported: bool,
     testing_real_delay: HashMap<Uuid, u64>,
     real_delay_run_token: u64,
     testing_availability: HashMap<Uuid, u64>,
@@ -151,70 +156,342 @@ pub enum SubscriptionsMsg {
 
 #[derive(Debug)]
 pub enum SubscriptionsCmdOutput {
-    AddDone(SubscriptionImportOutcome),
+    AddDone {
+        generation: u64,
+        outcome: SubscriptionImportOutcome,
+    },
     RefreshDone(Subscription, UpdateResult),
     LatencyResult(Uuid, Vec<ProbeTarget>, Vec<Option<u64>>),
     RealDelayResult(Uuid, u64, Vec<ProbeTarget>, RealDelayReport),
     AvailabilityResult(Uuid, u64, Vec<ProbeTarget>, RealDelayReport),
     RefreshFailed(Uuid, SubscriptionError),
-    AddFailed(SubscriptionError),
+    AddFailed {
+        generation: u64,
+        error: SubscriptionError,
+    },
     AutoUpdateDone(AutoUpdateRefreshBatch),
     AutoUpdateTick(u64),
     BackgroundLatencyTick,
-    SubscriptionsSaved(Result<(), PersistenceError>),
+    InitialLoaded(InitialSubscriptions),
+    SubscriptionsSaved(SubscriptionSaveOutcome),
+    ResetSaved {
+        revision: u64,
+        result: Result<(), PersistenceError>,
+    },
     SnapshotSaved(Result<(), PersistenceError>),
 }
 
-/// Serializes full-snapshot saves off the GTK thread. Latest snapshot wins:
-/// a job that loses the race against a newer dispatch writes the newer
-/// snapshot and skips its own stale one.
-#[derive(Clone, Default)]
-struct SubscriptionPersister {
-    pending: Arc<Mutex<Option<Vec<Subscription>>>>,
+#[derive(Debug)]
+pub(crate) struct InitialSubscriptions {
+    generation: u64,
+    result: Result<
+        (
+            Vec<Subscription>,
+            Option<Arc<v2ray_rs_core::resolve::LatencySnapshot>>,
+        ),
+        PersistenceError,
+    >,
 }
 
-impl SubscriptionPersister {
-    fn submit(
-        &self,
-        store: &WorkspaceStore,
-        sender: &ComponentSender<SubscriptionsPage>,
-        snapshot: Vec<Subscription>,
-    ) {
-        *self.lock_pending() = Some(snapshot);
-        let this = self.clone();
-        let store = store.clone();
-        sender.oneshot_command(async move {
-            let result = tokio::task::spawn_blocking(move || this.drain(&store))
-                .await
-                .unwrap_or_else(|join_err| {
-                    Err(PersistenceError::Io(std::io::Error::other(join_err)))
-                });
-            SubscriptionsCmdOutput::SubscriptionsSaved(result)
-        });
+#[derive(Debug)]
+pub(crate) struct SubscriptionSaveOutcome {
+    revision: u64,
+    runtime: bool,
+    result: Result<Arc<Vec<Subscription>>, PersistenceError>,
+}
+
+fn writer_stopped_message() -> String {
+    "workspace writer stopped".to_string()
+}
+
+/// Orders subscription writes on the shared workspace writer and classifies
+/// their receipts. Runtime outputs follow a durable receipt, never enqueueing.
+#[derive(Default)]
+struct WriteTracker {
+    submitted: u64,
+    committed: u64,
+    pending: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReceiptStatus {
+    durable: bool,
+    latest: bool,
+}
+
+impl WriteTracker {
+    fn submit(&mut self) -> u64 {
+        self.submitted = self.submitted.wrapping_add(1);
+        self.pending = self.pending.saturating_add(1);
+        self.submitted
     }
 
-    fn lock_pending(&self) -> MutexGuard<'_, Option<Vec<Subscription>>> {
-        self.pending
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn drain(&self, store: &WorkspaceStore) -> Result<(), PersistenceError> {
-        while let Some(snapshot) = self.lock_pending().take() {
-            store.save_subscriptions(&snapshot)?;
+    fn complete(&mut self, revision: u64, durable: bool) -> ReceiptStatus {
+        self.pending = self.pending.saturating_sub(1);
+        if durable && revision > self.committed {
+            self.committed = revision;
         }
-        Ok(())
+        ReceiptStatus {
+            durable,
+            latest: revision == self.submitted,
+        }
     }
 }
 
-fn commit_subscriptions_mutation<R>(
-    subscriptions: &mut Vec<Subscription>,
-    mutate: impl FnOnce(&mut Vec<Subscription>) -> Option<R>,
-) -> Option<R> {
-    let mut next = subscriptions.clone();
-    let result = mutate(&mut next)?;
-    *subscriptions = next;
-    Some(result)
+/// Bumped by a reset so an import that finishes later is discarded instead of
+/// resurrecting a deleted subscription.
+#[derive(Default)]
+struct ImportGeneration(u64);
+
+impl ImportGeneration {
+    fn current(&self) -> u64 {
+        self.0
+    }
+
+    fn invalidate(&mut self) {
+        self.0 = self.0.wrapping_add(1);
+    }
+
+    fn accepts(&self, generation: u64) -> bool {
+        generation == self.0
+    }
+}
+
+/// One ordered subscription collection edit. The same descriptor applies to
+/// the local list and, inside the writer transaction, to the latest committed
+/// list, so both stay in FIFO order without a second writer.
+#[derive(Clone)]
+enum SubscriptionEdit {
+    ToggleEnabled(Uuid),
+    ToggleUseImportedProfile(Uuid),
+    ToggleNodeEnabled {
+        subscription: Uuid,
+        index: usize,
+    },
+    Rename {
+        subscription: Uuid,
+        name: String,
+    },
+    MoveSubscription {
+        subscription: Uuid,
+        direction: Direction,
+    },
+    MoveNode {
+        subscription: Uuid,
+        index: usize,
+        direction: Direction,
+    },
+    Delete(Uuid),
+    SortByLatency(Uuid),
+    SortByRealDelay(Uuid),
+    SetNodesEnabled {
+        subscription: Uuid,
+        enabled: bool,
+    },
+    DragSubscription {
+        from: usize,
+        to: usize,
+    },
+    DragNode {
+        subscription: Uuid,
+        from: usize,
+        to: usize,
+    },
+    Push(Subscription),
+    Replace(Subscription),
+}
+
+impl SubscriptionEdit {
+    fn apply(&self, subscriptions: &mut Vec<Subscription>) -> bool {
+        match self {
+            Self::ToggleEnabled(id) => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *id) else {
+                    return false;
+                };
+                subscription.enabled = !subscription.enabled;
+                true
+            }
+            Self::ToggleUseImportedProfile(id) => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *id) else {
+                    return false;
+                };
+                subscription.use_imported_profile = !subscription.use_imported_profile;
+                true
+            }
+            Self::ToggleNodeEnabled {
+                subscription,
+                index,
+            } => {
+                let Some(node) = subscriptions
+                    .iter_mut()
+                    .find(|s| s.id == *subscription)
+                    .and_then(|s| s.nodes.get_mut(*index))
+                else {
+                    return false;
+                };
+                node.enabled = !node.enabled;
+                true
+            }
+            Self::Rename { subscription, name } => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *subscription)
+                else {
+                    return false;
+                };
+                subscription.name = name.clone();
+                true
+            }
+            Self::MoveSubscription {
+                subscription,
+                direction,
+            } => {
+                let Some(position) = subscriptions.iter().position(|s| s.id == *subscription)
+                else {
+                    return false;
+                };
+                let target = match direction {
+                    Direction::Up if position > 0 => position - 1,
+                    Direction::Down if position + 1 < subscriptions.len() => position + 1,
+                    _ => position,
+                };
+                if target == position {
+                    return false;
+                }
+                subscriptions.swap(position, target);
+                true
+            }
+            Self::MoveNode {
+                subscription,
+                index,
+                direction,
+            } => {
+                let (index, direction) = (*index, *direction);
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *subscription)
+                else {
+                    return false;
+                };
+                let target = match direction {
+                    Direction::Up if index > 0 => index - 1,
+                    Direction::Down if index + 1 < subscription.nodes.len() => index + 1,
+                    _ => index,
+                };
+                if target == index {
+                    return false;
+                }
+                subscription.nodes.swap(index, target);
+                true
+            }
+            Self::Delete(id) => {
+                let before = subscriptions.len();
+                subscriptions.retain(|s| s.id != *id);
+                subscriptions.len() != before
+            }
+            Self::SortByLatency(id) => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *id) else {
+                    return false;
+                };
+                subscription.nodes.sort_by(|a, b| {
+                    a.last_latency_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.last_latency_ms.unwrap_or(u64::MAX))
+                });
+                true
+            }
+            Self::SortByRealDelay(id) => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *id) else {
+                    return false;
+                };
+                subscription.nodes.sort_by(|a, b| {
+                    a.last_real_delay_ms
+                        .unwrap_or(u64::MAX)
+                        .cmp(&b.last_real_delay_ms.unwrap_or(u64::MAX))
+                });
+                true
+            }
+            Self::SetNodesEnabled {
+                subscription,
+                enabled,
+            } => {
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *subscription)
+                else {
+                    return false;
+                };
+                for node in &mut subscription.nodes {
+                    node.enabled = *enabled;
+                }
+                true
+            }
+            Self::DragSubscription { from, to } => {
+                let (from, to) = (*from, *to);
+                if from == to || from >= subscriptions.len() || to >= subscriptions.len() {
+                    return false;
+                }
+                let subscription = subscriptions.remove(from);
+                subscriptions.insert(to, subscription);
+                true
+            }
+            Self::DragNode {
+                subscription,
+                from,
+                to,
+            } => {
+                let (from, to) = (*from, *to);
+                let Some(subscription) = subscriptions.iter_mut().find(|s| s.id == *subscription)
+                else {
+                    return false;
+                };
+                if from == to || from >= subscription.nodes.len() || to >= subscription.nodes.len()
+                {
+                    return false;
+                }
+                let node = subscription.nodes.remove(from);
+                subscription.nodes.insert(to, node);
+                true
+            }
+            Self::Push(subscription) => {
+                subscriptions.push(subscription.clone());
+                true
+            }
+            Self::Replace(subscription) => {
+                let Some(existing) = subscriptions.iter_mut().find(|s| s.id == subscription.id)
+                else {
+                    return false;
+                };
+                *existing = subscription.clone();
+                true
+            }
+        }
+    }
+}
+
+type EgressSampleMap = HashMap<(Uuid, Uuid), EgressSample>;
+type VerdictMap = HashMap<(Uuid, Uuid), HashMap<String, VerdictRecord>>;
+
+/// Rebinds persisted latency samples onto freshly loaded subscriptions.
+fn hydrate_latency_state(
+    subscriptions: &mut [Subscription],
+    snapshot: &v2ray_rs_core::resolve::LatencySnapshot,
+) -> (EgressSampleMap, VerdictMap) {
+    let mut egress_samples = HashMap::new();
+    let mut verdicts = HashMap::new();
+    for subscription in subscriptions.iter_mut() {
+        for node in &mut subscription.nodes {
+            let node_ref = ConnectionNodeRef::Subscription {
+                subscription_id: subscription.id,
+                node_id: node.id,
+            };
+            if let Some(sample) = snapshot.get(node_ref) {
+                node.last_latency_ms = sample.latency_ms;
+                node.last_real_delay_ms = sample.real_delay_ms;
+                if let Some(egress) = sample.egress.clone() {
+                    egress_samples.insert((subscription.id, node.id), egress);
+                }
+                if !sample.verdicts.is_empty() {
+                    verdicts.insert((subscription.id, node.id), sample.verdicts.clone());
+                }
+            }
+        }
+    }
+    (egress_samples, verdicts)
 }
 
 fn subscription_persist_notice(err: &PersistenceError) -> String {
@@ -287,7 +564,7 @@ impl Component for SubscriptionsPage {
                     set_tooltip_text: Some(&tr("Add Subscription")),
                     add_css_class: "flat",
                     #[watch]
-                    set_sensitive: model.load_error.is_none(),
+                    set_sensitive: model.load_error.is_none() && !model.loading,
                     connect_clicked[sender] => move |_| {
                         show_add_dialog(sender.clone());
                     },
@@ -311,35 +588,10 @@ impl Component for SubscriptionsPage {
     ) -> ComponentParts<Self> {
         let (store, settings) = init;
         let service = SubscriptionService::new();
-        let (mut subscriptions, load_error) = match store.load_subscriptions() {
-            Ok(subscriptions) => (subscriptions, None),
-            Err(err) => (
-                Vec::new(),
-                Some(format!("Subscriptions are read-only: {err}")),
-            ),
-        };
-        let mut egress_samples = HashMap::new();
-        let mut verdicts = HashMap::new();
-        if let Ok(snapshot) = store.load_latency_snapshot() {
-            for sub in &mut subscriptions {
-                for node in &mut sub.nodes {
-                    let node_ref = v2ray_rs_core::models::ConnectionNodeRef::Subscription {
-                        subscription_id: sub.id,
-                        node_id: node.id,
-                    };
-                    if let Some(sample) = snapshot.get(node_ref) {
-                        node.last_latency_ms = sample.latency_ms;
-                        node.last_real_delay_ms = sample.real_delay_ms;
-                        if let Some(egress) = sample.egress.clone() {
-                            egress_samples.insert((sub.id, node.id), egress);
-                        }
-                        if !sample.verdicts.is_empty() {
-                            verdicts.insert((sub.id, node.id), sample.verdicts.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let subscriptions = Vec::new();
+        let load_error = None;
+        let egress_samples = HashMap::new();
+        let verdicts = HashMap::new();
 
         let list_container = gtk::ListBox::builder()
             .margin_top(12)
@@ -362,7 +614,12 @@ impl Component for SubscriptionsPage {
             auto_update_streaks: HashMap::new(),
             testing_latency: HashSet::new(),
             refreshing: HashSet::new(),
-            persister: SubscriptionPersister::default(),
+            writes: WriteTracker::default(),
+            imports: ImportGeneration::default(),
+            load_generation: 0,
+            loading: true,
+            reset_pending: false,
+            active_nodes_reported: false,
             testing_real_delay: HashMap::new(),
             real_delay_run_token: 0,
             testing_availability: HashMap::new(),
@@ -406,6 +663,21 @@ impl Component for SubscriptionsPage {
             },
         );
 
+        let generation = model.load_generation;
+        let load_store = store.clone();
+        sender.oneshot_command(async move {
+            let receipt = load_store.enqueue_warm();
+            let result = match receipt.await {
+                Ok(Ok(warm)) => match (warm.subscriptions, warm.latency) {
+                    (Ok(subscriptions), latency) => Ok(((*subscriptions).clone(), latency.ok())),
+                    (Err(err), _) => Err(err),
+                },
+                Ok(Err(err)) => Err(err),
+                Err(_) => Err(PersistenceError::CorruptConfig(writer_stopped_message())),
+            };
+            SubscriptionsCmdOutput::InitialLoaded(InitialSubscriptions { generation, result })
+        });
+
         if settings.auto_update_subscriptions {
             sender.input(SubscriptionsMsg::CheckAutoUpdate);
             schedule_auto_update_tick(
@@ -425,136 +697,96 @@ impl Component for SubscriptionsPage {
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
-        let emit_active_nodes = |subs: &[Subscription], sender: &ComponentSender<Self>| {
-            let has_active = subs.iter().any(|s| s.has_enabled_nodes());
-            let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
-        };
+        if self.loading
+            || (self.load_error.is_some()
+                && !matches!(
+                    msg,
+                    SubscriptionsMsg::ResetStorage
+                        | SubscriptionsMsg::SetActiveNode(_)
+                        | SubscriptionsMsg::SetTunActive(_)
+                        | SubscriptionsMsg::SyncSettings { .. }
+                ))
+        {
+            return;
+        }
 
-        if self.load_error.is_some()
+        if self.reset_pending
             && !matches!(
                 msg,
                 SubscriptionsMsg::ResetStorage
                     | SubscriptionsMsg::SetActiveNode(_)
                     | SubscriptionsMsg::SetTunActive(_)
                     | SubscriptionsMsg::SyncSettings { .. }
+                    | SubscriptionsMsg::ExpanderToggled(..)
+                    | SubscriptionsMsg::ConnectNode(..)
             )
         {
             return;
         }
 
-        let mut subscriptions_changed = false;
         let mut render_hint = RenderHint::Full;
 
         match msg {
             SubscriptionsMsg::ToggleSubscription(id) => {
-                if let Some(hint) =
-                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        sub.enabled = !sub.enabled;
-                        Some(RenderHint::SubscriptionToggle(id))
-                    })
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                    render_hint = hint;
+                if self.apply_edits(&sender, true, vec![SubscriptionEdit::ToggleEnabled(id)]) {
+                    render_hint = RenderHint::SubscriptionToggle(id);
                 }
             }
             SubscriptionsMsg::ToggleUseImportedProfile(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                    sub.use_imported_profile = !sub.use_imported_profile;
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::ToggleUseImportedProfile(id)],
+                );
             }
             SubscriptionsMsg::ToggleNode(sub_id, idx) => {
-                if let Some(hint) =
-                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
-                        let node = sub.nodes.get_mut(idx)?;
-                        node.enabled = !node.enabled;
-                        Some(RenderHint::NodeToggle(sub_id, idx))
-                    })
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                    render_hint = hint;
+                if self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::ToggleNodeEnabled {
+                        subscription: sub_id,
+                        index: idx,
+                    }],
+                ) {
+                    render_hint = RenderHint::NodeToggle(sub_id, idx);
                 }
             }
             SubscriptionsMsg::RenameSubscription(id, new_name) => {
-                if let Some(hint) =
-                    commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                        let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                        sub.name = new_name;
-                        Some(RenderHint::SubscriptionRename(id))
-                    })
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    render_hint = hint;
+                if self.apply_edits(
+                    &sender,
+                    false,
+                    vec![SubscriptionEdit::Rename {
+                        subscription: id,
+                        name: new_name,
+                    }],
+                ) {
+                    render_hint = RenderHint::SubscriptionRename(id);
                 }
             }
             SubscriptionsMsg::MoveSubscription(id, direction) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let pos = subscriptions.iter().position(|s| s.id == id)?;
-                    let new_pos = match direction {
-                        Direction::Up if pos > 0 => pos - 1,
-                        Direction::Down if pos + 1 < subscriptions.len() => pos + 1,
-                        _ => pos,
-                    };
-                    if new_pos == pos {
-                        return None;
-                    }
-                    subscriptions.swap(pos, new_pos);
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::MoveSubscription {
+                        subscription: id,
+                        direction,
+                    }],
+                );
             }
             SubscriptionsMsg::MoveNode(sub_id, idx, direction) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
-                    let new_idx = match direction {
-                        Direction::Up if idx > 0 => idx - 1,
-                        Direction::Down if idx + 1 < sub.nodes.len() => idx + 1,
-                        _ => idx,
-                    };
-                    if new_idx == idx {
-                        return None;
-                    }
-                    sub.nodes.swap(idx, new_idx);
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::MoveNode {
+                        subscription: sub_id,
+                        index: idx,
+                        direction,
+                    }],
+                );
             }
             SubscriptionsMsg::DeleteSubscription(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let initial_len = subscriptions.len();
-                    subscriptions.retain(|s| s.id != id);
-                    (subscriptions.len() != initial_len).then_some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
+                if self.apply_edits(&sender, true, vec![SubscriptionEdit::Delete(id)]) {
                     self.expanded_subs.remove(&id);
-                    subscriptions_changed = true;
                 }
             }
             SubscriptionsMsg::AddSubscription(name, source_input) => {
@@ -574,10 +806,14 @@ impl Component for SubscriptionsPage {
                     }
                 };
                 let svc = self.service.clone();
+                let generation = self.imports.current();
                 sender.oneshot_command(async move {
                     match svc.add_and_fetch(name, source).await {
-                        Ok(outcome) => SubscriptionsCmdOutput::AddDone(outcome),
-                        Err(e) => SubscriptionsCmdOutput::AddFailed(e),
+                        Ok(outcome) => SubscriptionsCmdOutput::AddDone {
+                            generation,
+                            outcome,
+                        },
+                        Err(error) => SubscriptionsCmdOutput::AddFailed { generation, error },
                     }
                 });
                 return;
@@ -616,21 +852,7 @@ impl Component for SubscriptionsPage {
                 });
             }
             SubscriptionsMsg::SortByLatency(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                    sub.nodes.sort_by(|a, b| {
-                        let la = a.last_latency_ms.unwrap_or(u64::MAX);
-                        let lb = b.last_latency_ms.unwrap_or(u64::MAX);
-                        la.cmp(&lb)
-                    });
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(&sender, true, vec![SubscriptionEdit::SortByLatency(id)]);
             }
             SubscriptionsMsg::TestRealDelay(id) => {
                 if self.tun_active {
@@ -782,84 +1004,45 @@ impl Component for SubscriptionsPage {
                 return;
             }
             SubscriptionsMsg::SortByRealDelay(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                    sub.nodes.sort_by(|a, b| {
-                        let la = a.last_real_delay_ms.unwrap_or(u64::MAX);
-                        let lb = b.last_real_delay_ms.unwrap_or(u64::MAX);
-                        la.cmp(&lb)
-                    });
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(&sender, true, vec![SubscriptionEdit::SortByRealDelay(id)]);
             }
             SubscriptionsMsg::EnableAllNodes(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                    for node in &mut sub.nodes {
-                        node.enabled = true;
-                    }
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::SetNodesEnabled {
+                        subscription: id,
+                        enabled: true,
+                    }],
+                );
             }
             SubscriptionsMsg::DisableAllNodes(id) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == id)?;
-                    for node in &mut sub.nodes {
-                        node.enabled = false;
-                    }
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::SetNodesEnabled {
+                        subscription: id,
+                        enabled: false,
+                    }],
+                );
             }
             SubscriptionsMsg::DragDropSubscription(from, to) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    if from == to || from >= subscriptions.len() || to >= subscriptions.len() {
-                        return None;
-                    }
-                    let sub = subscriptions.remove(from);
-                    subscriptions.insert(to, sub);
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::DragSubscription { from, to }],
+                );
             }
             SubscriptionsMsg::DragDropNode(sub_id, from, to) => {
-                if commit_subscriptions_mutation(&mut self.subscriptions, |subscriptions| {
-                    let sub = subscriptions.iter_mut().find(|s| s.id == sub_id)?;
-                    if from == to || from >= sub.nodes.len() || to >= sub.nodes.len() {
-                        return None;
-                    }
-                    let node = sub.nodes.remove(from);
-                    sub.nodes.insert(to, node);
-                    Some(())
-                })
-                .is_some()
-                {
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
-                    subscriptions_changed = true;
-                }
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::DragNode {
+                        subscription: sub_id,
+                        from,
+                        to,
+                    }],
+                );
             }
             SubscriptionsMsg::SetActiveNode(active) => {
                 if self.active_node == active {
@@ -876,16 +1059,24 @@ impl Component for SubscriptionsPage {
             SubscriptionsMsg::ConnectNode(sub_id, node_id) => {
                 let _ = sender.output(SubscriptionsOutput::ConnectNode(sub_id, node_id));
             }
-            SubscriptionsMsg::ResetStorage => match self.store.reset_subscriptions() {
-                Ok(()) => {
-                    self.subscriptions.clear();
-                    self.load_error = None;
-                    subscriptions_changed = true;
+            SubscriptionsMsg::ResetStorage => {
+                if self.reset_pending {
+                    return;
                 }
-                Err(err) => {
-                    log::error!("reset subscriptions: {err}");
-                }
-            },
+                self.reset_pending = true;
+                self.imports.invalidate();
+                self.load_generation = self.load_generation.wrapping_add(1);
+                let revision = self.writes.submit();
+                let receipt = self.store.enqueue_reset_subscriptions();
+                sender.oneshot_command(async move {
+                    let result = match receipt.await {
+                        Ok(result) => result.map(|_| ()),
+                        Err(_) => Err(PersistenceError::CorruptConfig(writer_stopped_message())),
+                    };
+                    SubscriptionsCmdOutput::ResetSaved { revision, result }
+                });
+                return;
+            }
             SubscriptionsMsg::CheckAutoUpdate => {
                 let svc = self.service.clone();
                 let interval = self.auto_update_interval_secs;
@@ -947,11 +1138,6 @@ impl Component for SubscriptionsPage {
                 return;
             }
         }
-        if subscriptions_changed {
-            let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-        }
-        emit_active_nodes(&self.subscriptions, &sender);
-
         match render_hint {
             RenderHint::NodeState => {
                 refresh_node_widgets(
@@ -1010,16 +1196,24 @@ impl Component for SubscriptionsPage {
     ) {
         let mut render_hint = RenderHint::Full;
         match msg {
-            SubscriptionsCmdOutput::AddDone(outcome) => {
+            SubscriptionsCmdOutput::AddDone {
+                generation,
+                outcome,
+            } => {
+                if !self.imports.accepts(generation) {
+                    log::info!("discarding a subscription import that a reset invalidated");
+                    return;
+                }
                 let summary =
                     format_update_summary(&outcome.subscription.name, "Imported", &outcome.result);
                 let profile_available = outcome.subscription.imported_profile.is_some()
                     && matches!(outcome.subscription.source, SubscriptionSource::Url { .. });
                 let name = outcome.subscription.name.clone();
-                self.subscriptions.push(outcome.subscription);
-                self.persister
-                    .submit(&self.store, &sender, self.subscriptions.clone());
-                let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                self.apply_edits(
+                    &sender,
+                    true,
+                    vec![SubscriptionEdit::Push(outcome.subscription)],
+                );
                 let _ = sender.output(SubscriptionsOutput::Notice(summary));
                 if profile_available {
                     let _ = sender.output(SubscriptionsOutput::Notice(format!(
@@ -1038,9 +1232,11 @@ impl Component for SubscriptionsPage {
                     let merged = merge_refreshed_subscription(&previous, sub);
                     let changed_node_ids = changed_connection_node_ids(&previous, &merged);
                     let runtime_changed = !previous.runtime_state_eq(&merged);
-                    self.subscriptions[pos] = merged;
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    self.apply_edits(
+                        &sender,
+                        runtime_changed,
+                        vec![SubscriptionEdit::Replace(merged)],
+                    );
                     if !changed_node_ids.is_empty() {
                         invalidate_node_samples(
                             &sender,
@@ -1054,9 +1250,6 @@ impl Component for SubscriptionsPage {
                     let _ = sender.output(SubscriptionsOutput::Notice(format_update_summary(
                         &name, "Updated", &result,
                     )));
-                    if runtime_changed {
-                        let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-                    }
                     if lost_profile {
                         let _ = sender.output(SubscriptionsOutput::Notice(format!(
                             "{name}: source no longer carries a routing profile — keeping the existing one"
@@ -1266,7 +1459,11 @@ impl Component for SubscriptionsPage {
                     &error,
                 )));
             }
-            SubscriptionsCmdOutput::AddFailed(error) => {
+            SubscriptionsCmdOutput::AddFailed { generation, error } => {
+                if !self.imports.accepts(generation) {
+                    log::info!("discarding a subscription import failure that a reset invalidated");
+                    return;
+                }
                 log::error!("failed to add subscription: {error}");
                 let _ = sender.output(SubscriptionsOutput::Notice(format_subscription_error(
                     &error,
@@ -1278,23 +1475,29 @@ impl Component for SubscriptionsPage {
                 if !results.is_empty() {
                     let previous = self.subscriptions.clone();
                     let mut changed_samples: Vec<(Uuid, Vec<Uuid>)> = Vec::new();
+                    let mut edits = Vec::new();
                     for (_, result) in &results {
                         if let Ok((updated, _)) = result
                             && let Some(existing) =
-                                self.subscriptions.iter_mut().find(|s| s.id == updated.id)
+                                self.subscriptions.iter().find(|s| s.id == updated.id)
                         {
                             let merged = merge_refreshed_subscription(existing, updated.clone());
                             let changed_node_ids = changed_connection_node_ids(existing, &merged);
-                            *existing = merged;
                             if !changed_node_ids.is_empty() {
                                 changed_samples.push((existing.id, changed_node_ids));
                             }
+                            edits.push(SubscriptionEdit::Replace(merged));
                         }
                     }
-                    let runtime_changed =
-                        !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
-                    self.persister
-                        .submit(&self.store, &sender, self.subscriptions.clone());
+                    let mut changed = false;
+                    for edit in &edits {
+                        changed |= edit.apply(&mut self.subscriptions);
+                    }
+                    if changed {
+                        let runtime_changed =
+                            !subscriptions_runtime_state_eq(&previous, &self.subscriptions);
+                        self.submit_edits(&sender, runtime_changed, edits);
+                    }
                     invalidate_node_samples_batch(
                         &sender,
                         &self.store,
@@ -1302,9 +1505,6 @@ impl Component for SubscriptionsPage {
                         &mut self.verdicts,
                         &changed_samples,
                     );
-                    if runtime_changed {
-                        let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
-                    }
                     for (id, result) in &results {
                         let name = self
                             .subscriptions
@@ -1342,16 +1542,80 @@ impl Component for SubscriptionsPage {
                     }
                 }
             }
-            SubscriptionsCmdOutput::SubscriptionsSaved(result) => {
-                if let Err(err) = result {
-                    report_subscription_persist_error(&sender, &err);
-                } else {
-                    let _ = sender.output(SubscriptionsOutput::SubscriptionsPersisted);
+            SubscriptionsCmdOutput::SubscriptionsSaved(outcome) => {
+                let status = self
+                    .writes
+                    .complete(outcome.revision, outcome.result.is_ok());
+                match outcome.result {
+                    Ok(committed) => {
+                        if status.durable && outcome.runtime {
+                            let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                        }
+                        let _ = sender.output(SubscriptionsOutput::SubscriptionsPersisted);
+                        if status.latest {
+                            self.report_active_nodes(
+                                &sender,
+                                committed.iter().any(|s| s.has_enabled_nodes()),
+                            );
+                        }
+                    }
+                    Err(err) => report_subscription_persist_error(&sender, &err),
+                }
+            }
+            SubscriptionsCmdOutput::ResetSaved { revision, result } => {
+                let status = self.writes.complete(revision, result.is_ok());
+                self.reset_pending = false;
+                match result {
+                    Ok(()) => {
+                        self.subscriptions.clear();
+                        self.egress_samples.clear();
+                        self.verdicts.clear();
+                        self.load_error = None;
+                        let _ = sender.output(SubscriptionsOutput::SubscriptionsChanged);
+                        let _ = sender.output(SubscriptionsOutput::SubscriptionsPersisted);
+                        if status.latest {
+                            self.report_active_nodes(&sender, false);
+                        }
+                    }
+                    Err(err) => {
+                        log::error!("reset subscriptions: {err}");
+                        let _ = sender.output(SubscriptionsOutput::Notice(format!(
+                            "Failed to reset subscriptions: {err}"
+                        )));
+                    }
+                }
+            }
+            SubscriptionsCmdOutput::InitialLoaded(loaded) => {
+                let InitialSubscriptions { generation, result } = loaded;
+                if generation != self.load_generation {
+                    return;
+                }
+                self.loading = false;
+                match result {
+                    Ok((subscriptions, latency)) => {
+                        self.subscriptions = subscriptions;
+                        if let Some(snapshot) = latency {
+                            let (egress_samples, verdicts) =
+                                hydrate_latency_state(&mut self.subscriptions, &snapshot);
+                            self.egress_samples = egress_samples;
+                            self.verdicts = verdicts;
+                        }
+                        self.load_error = None;
+                        let has_active = self.subscriptions.iter().any(|s| s.has_enabled_nodes());
+                        self.report_active_nodes(&sender, has_active);
+                    }
+                    Err(err) => {
+                        log::error!("load subscriptions: {err}");
+                        self.load_error = Some(format!("Subscriptions are read-only: {err}"));
+                    }
                 }
             }
             SubscriptionsCmdOutput::SnapshotSaved(result) => {
                 if let Err(err) = result {
                     log::error!("save latency snapshot: {err}");
+                    let _ = sender.output(SubscriptionsOutput::Notice(format!(
+                        "Failed to save latency snapshot: {err}"
+                    )));
                 }
             }
             SubscriptionsCmdOutput::AutoUpdateTick(generation) => {
@@ -1382,8 +1646,6 @@ impl Component for SubscriptionsPage {
                 });
             }
         }
-        let has_active = self.subscriptions.iter().any(|s| s.has_enabled_nodes());
-        let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
         if matches!(render_hint, RenderHint::NodeState) {
             refresh_node_widgets(
                 &self.node_widgets,
@@ -1413,6 +1675,61 @@ impl Component for SubscriptionsPage {
                 testing_availability: &self.testing_availability,
             },
         );
+    }
+}
+
+impl SubscriptionsPage {
+    /// Applies edits to the local list in submission order, then enqueues the
+    /// same ordered transaction on the shared writer.
+    fn apply_edits(
+        &mut self,
+        sender: &ComponentSender<Self>,
+        runtime: bool,
+        edits: Vec<SubscriptionEdit>,
+    ) -> bool {
+        let mut changed = false;
+        for edit in &edits {
+            changed |= edit.apply(&mut self.subscriptions);
+        }
+        if changed {
+            self.submit_edits(sender, runtime, edits);
+        }
+        changed
+    }
+
+    fn submit_edits(
+        &mut self,
+        sender: &ComponentSender<Self>,
+        runtime: bool,
+        edits: Vec<SubscriptionEdit>,
+    ) {
+        let revision = self.writes.submit();
+        let receipt = self
+            .store
+            .enqueue_update_subscriptions(move |subscriptions| {
+                for edit in edits {
+                    edit.apply(subscriptions);
+                }
+            });
+        sender.oneshot_command(async move {
+            let result = match receipt.await {
+                Ok(result) => result.map(|(_, committed)| committed),
+                Err(_) => Err(PersistenceError::CorruptConfig(writer_stopped_message())),
+            };
+            SubscriptionsCmdOutput::SubscriptionsSaved(SubscriptionSaveOutcome {
+                revision,
+                runtime,
+                result,
+            })
+        });
+    }
+
+    fn report_active_nodes(&mut self, sender: &ComponentSender<Self>, has_active: bool) {
+        if has_active == self.active_nodes_reported {
+            return;
+        }
+        self.active_nodes_reported = has_active;
+        let _ = sender.output(SubscriptionsOutput::ActiveNodesChanged(has_active));
     }
 }
 
@@ -1628,6 +1945,175 @@ mod availability_view_tests {
         // Unknown must not share the colored styling of the other two.
         assert!(!unknown.contains(&"success") && !unknown.contains(&"error"));
         assert!(unknown.contains(&"dim-label"));
+    }
+}
+
+#[cfg(test)]
+mod persistence_order_tests {
+    use super::*;
+    use std::sync::Arc;
+    use v2ray_rs_core::persistence::AppPaths;
+    use v2ray_rs_core::profile::AppProfile;
+
+    fn workspace() -> (tempfile::TempDir, WorkspaceStore) {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = AppPaths::for_profile_in(AppProfile::Test, tmp.path());
+        paths.ensure_dirs().unwrap();
+        (tmp, WorkspaceStore::new(paths))
+    }
+
+    fn seed(store: &WorkspaceStore) {
+        store
+            .save_subscriptions(&[Subscription::new_from_url(
+                "Seed",
+                "https://example.com/seed",
+            )])
+            .unwrap();
+    }
+
+    #[test]
+    fn a_reset_invalidates_an_in_flight_import() {
+        let mut imports = ImportGeneration::default();
+        let captured = imports.current();
+        assert!(imports.accepts(captured));
+
+        imports.invalidate();
+
+        assert!(!imports.accepts(captured));
+        assert!(imports.accepts(imports.current()));
+    }
+
+    #[test]
+    fn receipts_before_the_latest_submission_are_not_latest() {
+        let mut writes = WriteTracker::default();
+        let first = writes.submit();
+        let second = writes.submit();
+
+        let first_status = writes.complete(first, true);
+        assert!(first_status.durable);
+        assert!(!first_status.latest);
+
+        let second_status = writes.complete(second, false);
+        assert!(!second_status.durable);
+        assert!(second_status.latest);
+        assert_eq!(writes.committed, first);
+    }
+
+    #[tokio::test]
+    async fn held_edit_keeps_the_committed_snapshot_and_the_later_edit_wins() {
+        let (_tmp, store) = workspace();
+        seed(&store);
+        let before = store.subscriptions_snapshot().unwrap();
+        let disk_before = std::fs::read_to_string(store.paths().subscriptions_path()).unwrap();
+        let latch = store.test_writer_latch().clone();
+
+        latch.arm();
+        let first = store.enqueue_update_subscriptions(|subscriptions| {
+            subscriptions[0].name = "First".to_string();
+        });
+        latch.wait_until_parked();
+        let second = store.enqueue_update_subscriptions(|subscriptions| {
+            subscriptions[0].name = "Second".to_string();
+        });
+
+        assert!(Arc::ptr_eq(
+            &before,
+            &store.subscriptions_snapshot().unwrap()
+        ));
+        assert_eq!(
+            std::fs::read_to_string(store.paths().subscriptions_path()).unwrap(),
+            disk_before,
+            "a held edit must not reach disk before its receipt"
+        );
+
+        latch.release();
+        first.await.unwrap().unwrap();
+        second.await.unwrap().unwrap();
+
+        assert_eq!(store.subscriptions_snapshot().unwrap()[0].name, "Second");
+        assert_eq!(
+            WorkspaceStore::new(store.paths().clone())
+                .load_subscriptions()
+                .unwrap()[0]
+                .name,
+            "Second",
+            "the later edit must survive a reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_edit_keeps_the_previous_committed_snapshot() {
+        let (_tmp, store) = workspace();
+        seed(&store);
+        let latch = store.test_writer_latch().clone();
+        let data_dir = store
+            .paths()
+            .subscriptions_path()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+
+        latch.arm();
+        let failing = store.enqueue_update_subscriptions(|subscriptions| {
+            subscriptions[0].name = "Failed".to_string();
+        });
+        latch.wait_until_parked();
+        std::fs::remove_dir_all(&data_dir).unwrap();
+        std::fs::write(&data_dir, b"not a directory").unwrap();
+        latch.release();
+        assert!(
+            failing.await.unwrap().is_err(),
+            "a storage failure must answer with an explicit error"
+        );
+        assert_eq!(store.subscriptions_snapshot().unwrap()[0].name, "Seed");
+
+        std::fs::remove_file(&data_dir).unwrap();
+        std::fs::create_dir_all(&data_dir).unwrap();
+        latch.arm();
+        let later = store.enqueue_update_subscriptions(|subscriptions| {
+            subscriptions[0].name = "Later".to_string();
+        });
+        latch.wait_until_parked();
+        latch.release();
+        later.await.unwrap().unwrap();
+
+        assert_eq!(store.subscriptions_snapshot().unwrap()[0].name, "Later");
+        assert_eq!(
+            WorkspaceStore::new(store.paths().clone())
+                .load_subscriptions()
+                .unwrap()[0]
+                .name,
+            "Later",
+            "the failed edit must not survive a reopen"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_save_before_reset_leaves_no_file_and_reopen_is_empty() {
+        let (_tmp, store) = workspace();
+        let latch = store.test_writer_latch().clone();
+
+        latch.arm();
+        let save = store.enqueue_save_subscriptions(vec![Subscription::new_from_url(
+            "One",
+            "https://example.com/one",
+        )]);
+        latch.wait_until_parked();
+        let reset = store.enqueue_reset_subscriptions();
+        latch.release();
+
+        save.await.unwrap().unwrap();
+        reset.await.unwrap().unwrap();
+
+        assert!(store.subscriptions_snapshot().unwrap().is_empty());
+        assert!(!store.paths().subscriptions_path().exists());
+        assert!(
+            WorkspaceStore::new(store.paths().clone())
+                .load_subscriptions()
+                .unwrap()
+                .is_empty(),
+            "reset must not be recreated by the earlier save on reopen"
+        );
     }
 }
 

@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 
 use adw::prelude::*;
 use relm4::adw;
@@ -11,14 +12,119 @@ use v2ray_rs_core::models::{
 };
 
 use crate::i18n::tr;
-use crate::workspace::WorkspaceStore;
+use crate::workspace::{PersistenceReceipt, WorkspaceStore};
 
 pub struct NodesPage {
     store: WorkspaceStore,
+    /// Ordered edits: the committed list plus the submitted tail.
+    draft: NodeDraft,
+    /// Displayed list: the committed snapshot plus every pending edit.
     nodes: Vec<ManualNode>,
+    /// Whether a failed write in the current batch was already reported.
+    failure_reported: bool,
     list_container: gtk::ListBox,
     load_error: Option<String>,
     active_node: Option<Uuid>,
+}
+
+/// One ordered write submitted to the workspace writer for the node list.
+#[derive(Clone, Debug)]
+enum NodeOp {
+    Toggle(Uuid),
+    Delete(Uuid),
+    Add(ManualNode),
+    Update(Uuid, ProxyNode),
+    Reset,
+}
+
+impl NodeOp {
+    /// Applies the write to the latest committed list. A missing target is a
+    /// no-op: another writer may already have removed the node.
+    fn apply(self, nodes: &mut Vec<ManualNode>) {
+        match self {
+            Self::Toggle(id) => {
+                if let Some(node) = nodes.iter_mut().find(|node| node.id == id) {
+                    node.enabled = !node.enabled;
+                }
+            }
+            Self::Delete(id) => nodes.retain(|node| node.id != id),
+            Self::Add(node) => nodes.push(node),
+            Self::Update(id, proxy) => {
+                if let Some(node) = nodes.iter_mut().find(|node| node.id == id) {
+                    node.node = proxy;
+                }
+            }
+            Self::Reset => nodes.clear(),
+        }
+    }
+}
+
+/// The receipt's outer error means the writer stopped without answering.
+const WRITER_STOPPED: &str = "workspace writer stopped";
+
+/// Ordered node edits for one collection.
+///
+/// The displayed list is the last acknowledged list plus every edit still in
+/// the writer queue. Each accepted edit is enqueued synchronously in
+/// submission order, so the writer FIFO - and any later barrier - covers it.
+/// Receipts settle in the same order; a failed receipt rolls back only its
+/// own edit, because later edits were already enqueued against the same
+/// committed base.
+#[derive(Default)]
+struct NodeDraft {
+    committed: Vec<ManualNode>,
+    submitted: VecDeque<NodeOp>,
+}
+
+impl NodeDraft {
+    fn seed(&mut self, committed: Vec<ManualNode>) {
+        self.committed = committed;
+    }
+
+    fn stage(&mut self, op: NodeOp) {
+        self.submitted.push_back(op);
+    }
+
+    /// Test-only: exposing the pending head lets the draft tests prove that
+    /// receipts settle strictly in submission order.
+    #[cfg(test)]
+    fn front(&self) -> Option<NodeOp> {
+        self.submitted.front().cloned()
+    }
+
+    /// Retires the acknowledged write and adopts the list the writer returned.
+    fn complete(&mut self, committed: Vec<ManualNode>) {
+        self.committed = committed;
+        self.submitted.pop_front();
+    }
+
+    /// Drops the rejected write. Later submissions stay queued: they were
+    /// enqueued before this receipt and the writer will still settle them.
+    fn fail(&mut self) {
+        self.submitted.pop_front();
+    }
+
+    fn is_empty(&self) -> bool {
+        self.submitted.is_empty()
+    }
+
+    fn committed_active(&self) -> bool {
+        self.committed.iter().any(|node| node.enabled)
+    }
+
+    fn display(&self) -> Vec<ManualNode> {
+        let mut nodes = self.committed.clone();
+        for op in &self.submitted {
+            op.clone().apply(&mut nodes);
+        }
+        nodes
+    }
+}
+
+/// The receipt for either kind of node write, normalized to its committed list.
+enum NodeWrite {
+    Edit(PersistenceReceipt<((), Arc<Vec<ManualNode>>)>),
+    Reset(PersistenceReceipt<Arc<Vec<ManualNode>>>),
 }
 
 #[derive(Debug)]
@@ -41,6 +147,9 @@ pub enum NodesMsg {
     ResetStorage,
     Reload,
     SetActiveNode(Option<Uuid>),
+    /// Internal: an ordered node write settled with its durable list or the
+    /// error that kept the previous snapshot.
+    SaveFinished(Result<Arc<Vec<ManualNode>>, String>),
 }
 
 #[derive(Clone, Copy)]
@@ -774,8 +883,11 @@ impl Component for NodesPage {
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
         let (store, _settings) = init;
-        let (nodes, load_error) = match store.load_manual_nodes() {
-            Ok(nodes) => (nodes, None),
+        // Warm bootstrap publishes the node list before the interactive app
+        // starts; this reads the shared snapshot instead of loading from disk
+        // on the GTK thread.
+        let (committed, load_error) = match store.manual_nodes_snapshot() {
+            Ok(nodes) => ((*nodes).clone(), None),
             Err(err) => (
                 Vec::new(),
                 Some(format!("Manual nodes are read-only: {err}")),
@@ -791,9 +903,13 @@ impl Component for NodesPage {
             .selection_mode(gtk::SelectionMode::None)
             .build();
 
+        let mut draft = NodeDraft::default();
+        draft.seed(committed.clone());
         let model = NodesPage {
             store,
-            nodes,
+            draft,
+            nodes: committed,
+            failure_reported: false,
             list_container: list_container.clone(),
             load_error,
             active_node: None,
@@ -806,21 +922,27 @@ impl Component for NodesPage {
     }
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>, _root: &Self::Root) {
-        let emit_active_nodes = |nodes: &[ManualNode], sender: &ComponentSender<Self>| {
-            let has_active = nodes.iter().any(|n| n.enabled);
-            let _ = sender.output(NodesOutput::ActiveNodesChanged(has_active));
-        };
+        let mut committed_changed = false;
+        let mut report = None;
 
-        let mut changed = false;
-
-        if self.load_error.is_some() && !matches!(msg, NodesMsg::ResetStorage | NodesMsg::Reload) {
+        if self.load_error.is_some()
+            && !matches!(
+                &msg,
+                NodesMsg::ResetStorage | NodesMsg::Reload | NodesMsg::SaveFinished(_)
+            )
+        {
             return;
         }
 
         match msg {
-            NodesMsg::Reload => match self.store.load_manual_nodes() {
+            NodesMsg::Reload => match self.store.manual_nodes_snapshot() {
                 Ok(nodes) => {
-                    self.nodes = nodes;
+                    // A pending queue owns the base: its receipts publish the
+                    // durable list, so a reload never reseeds beneath it.
+                    if self.draft.is_empty() {
+                        self.draft.seed((*nodes).clone());
+                        self.nodes = self.draft.display();
+                    }
                     self.load_error = None;
                 }
                 Err(err) => {
@@ -828,28 +950,18 @@ impl Component for NodesPage {
                 }
             },
             NodesMsg::ToggleNode(id) => {
-                if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
-                    self.nodes[pos].enabled = !self.nodes[pos].enabled;
-                    if persist_manual_nodes(&self.store, &self.nodes) {
-                        changed = true;
-                    } else {
-                        self.nodes[pos].enabled = !self.nodes[pos].enabled;
-                    }
+                if self.nodes.iter().any(|node| node.id == id) {
+                    self.stage(NodeOp::Toggle(id), &sender);
                 }
             }
             NodesMsg::DeleteNode(id) => {
-                if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
-                    let removed = self.nodes.remove(pos);
-                    if persist_manual_nodes(&self.store, &self.nodes) {
-                        changed = true;
-                    } else {
-                        self.nodes.insert(pos, removed);
-                    }
+                if self.nodes.iter().any(|node| node.id == id) {
+                    self.stage(NodeOp::Delete(id), &sender);
                 }
             }
             NodesMsg::EditNode(id) => {
-                let node = match self.nodes.iter().find(|n| n.id == id) {
-                    Some(n) => n.node.clone(),
+                let node = match self.nodes.iter().find(|node| node.id == id) {
+                    Some(node) => node.node.clone(),
                     None => return,
                 };
                 show_edit_dialog(id, node, sender.clone());
@@ -862,27 +974,15 @@ impl Component for NodesPage {
                     let _ = sender.output(NodesOutput::Notice(err.to_string()));
                     return;
                 }
-                let manual = ManualNode::new(node);
-                self.nodes.push(manual);
-                if persist_manual_nodes(&self.store, &self.nodes) {
-                    changed = true;
-                } else {
-                    let _ = self.nodes.pop();
-                }
+                self.stage(NodeOp::Add(ManualNode::new(node)), &sender);
             }
             NodesMsg::UpdateNode(id, node) => {
                 if let Err(err) = node.validate() {
                     let _ = sender.output(NodesOutput::Notice(err.to_string()));
                     return;
                 }
-                if let Some(pos) = self.nodes.iter().position(|n| n.id == id) {
-                    let previous = self.nodes[pos].node.clone();
-                    self.nodes[pos].node = node;
-                    if persist_manual_nodes(&self.store, &self.nodes) {
-                        changed = true;
-                    } else {
-                        self.nodes[pos].node = previous;
-                    }
+                if self.nodes.iter().any(|existing| existing.id == id) {
+                    self.stage(NodeOp::Update(id, node), &sender);
                 }
             }
             NodesMsg::ImportFromUrl(uri) => match v2ray_rs_subscription::parse_uri(&uri) {
@@ -891,28 +991,41 @@ impl Component for NodesPage {
                         let _ = sender.output(NodesOutput::Notice(format!("Invalid node: {err}")));
                         return;
                     }
-                    let manual = ManualNode::new(node);
-                    self.nodes.push(manual);
-                    if persist_manual_nodes(&self.store, &self.nodes) {
-                        changed = true;
-                    } else {
-                        let _ = self.nodes.pop();
-                    }
+                    self.stage(NodeOp::Add(ManualNode::new(node)), &sender);
                 }
                 Err(err) => {
                     let _ =
                         sender.output(NodesOutput::Notice(format!("Failed to parse URI: {err}")));
                 }
             },
-            NodesMsg::ResetStorage => match self.store.reset_manual_nodes() {
-                Ok(()) => {
-                    self.nodes.clear();
-                    self.load_error = None;
+            NodesMsg::ResetStorage => {
+                self.stage(NodeOp::Reset, &sender);
+            }
+            NodesMsg::SaveFinished(result) => {
+                match result {
+                    Ok(committed) => {
+                        self.draft.complete((*committed).clone());
+                        self.nodes = self.draft.display();
+                        self.load_error = None;
+                        committed_changed = true;
+                    }
+                    Err(err) => {
+                        log::error!("save manual nodes: {err}");
+                        // This edit returns to the last durable list. Later
+                        // edits are still queued and settle on their own
+                        // receipts, so one failed batch is reported once.
+                        self.draft.fail();
+                        self.nodes = self.draft.display();
+                        if !self.failure_reported {
+                            self.failure_reported = true;
+                            report = Some(format!("Failed to save manual nodes: {err}"));
+                        }
+                    }
                 }
-                Err(err) => {
-                    log::error!("reset manual nodes: {err}");
+                if self.draft.is_empty() {
+                    self.failure_reported = false;
                 }
-            },
+            }
             NodesMsg::SetActiveNode(active) => {
                 if self.active_node == active {
                     return;
@@ -921,21 +1034,53 @@ impl Component for NodesPage {
             }
         }
 
-        emit_active_nodes(&self.nodes, &sender);
-        if changed {
+        // Only the durable list decides whether a connectable node exists:
+        // an in-flight edit must not flip the app's connected-state gate.
+        let has_active = self.draft.committed_active();
+        let _ = sender.output(NodesOutput::ActiveNodesChanged(has_active));
+        if committed_changed {
             let _ = sender.output(NodesOutput::NodesChanged);
+        }
+        if let Some(message) = report {
+            let _ = sender.output(NodesOutput::Notice(message));
         }
         render_list(&self.nodes, &self.list_container, &sender, self.active_node);
     }
 }
 
-fn persist_manual_nodes(store: &WorkspaceStore, nodes: &[ManualNode]) -> bool {
-    match store.save_manual_nodes(nodes) {
-        Ok(()) => true,
-        Err(e) => {
-            log::error!("save manual nodes: {e}");
-            false
-        }
+impl NodesPage {
+    /// Applies an edit to the display and enqueues it immediately.
+    ///
+    /// Enqueue order is submission order, and the same order is kept for
+    /// receipts, so a Quit barrier enqueued after this edit covers it. The
+    /// edit cannot wait for an earlier receipt: staging it outside the writer
+    /// FIFO would let that barrier overtake it.
+    fn stage(&mut self, op: NodeOp, sender: &ComponentSender<Self>) {
+        op.clone().apply(&mut self.nodes);
+        self.draft.stage(op.clone());
+        let write = match op {
+            NodeOp::Reset => NodeWrite::Reset(self.store.enqueue_reset_manual_nodes()),
+            edit => NodeWrite::Edit(
+                self.store
+                    .enqueue_update_manual_nodes(move |nodes| edit.apply(nodes)),
+            ),
+        };
+        let sender = sender.clone();
+        relm4::gtk::glib::spawn_future_local(async move {
+            let result = match write {
+                NodeWrite::Edit(receipt) => match receipt.await {
+                    Ok(Ok(((), nodes))) => Ok(nodes),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(_) => Err(WRITER_STOPPED.to_string()),
+                },
+                NodeWrite::Reset(receipt) => match receipt.await {
+                    Ok(Ok(nodes)) => Ok(nodes),
+                    Ok(Err(err)) => Err(err.to_string()),
+                    Err(_) => Err(WRITER_STOPPED.to_string()),
+                },
+            };
+            sender.input(NodesMsg::SaveFinished(result));
+        });
     }
 }
 
@@ -1328,6 +1473,7 @@ fn comma_separated_values(row: &adw::EntryRow) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use v2ray_rs_core::persistence;
 
     #[test]
     fn grpc_multi_mode_row_notes_sing_box_and_keeps_value() {
@@ -1423,5 +1569,203 @@ mod tests {
                 other => panic!("expected Vless node, got {other:?}"),
             }
         });
+    }
+
+    fn manual_node(remark: &str) -> ManualNode {
+        ManualNode::new(ProxyNode::Shadowsocks(ShadowsocksConfig {
+            address: "203.0.113.7".into(),
+            port: 8388,
+            method: "aes-256-gcm".into(),
+            password: "secret".into(),
+            remark: Some(remark.into()),
+        }))
+    }
+
+    #[test]
+    fn submitted_node_edits_settle_until_their_receipts() {
+        let a = manual_node("a");
+        let b = manual_node("b");
+        let mut draft = NodeDraft::default();
+        draft.seed(vec![a.clone()]);
+
+        draft.stage(NodeOp::Toggle(a.id));
+        draft.stage(NodeOp::Add(b.clone()));
+
+        let display = draft.display();
+        assert_eq!(display.len(), 2);
+        assert!(!display[0].enabled);
+        assert_eq!(display[1].id, b.id);
+        assert!(
+            matches!(draft.front(), Some(NodeOp::Toggle(id)) if id == a.id),
+            "the toggle is the oldest pending write"
+        );
+
+        draft.complete(vec![ManualNode {
+            enabled: false,
+            ..a.clone()
+        }]);
+        assert_eq!(draft.display().len(), 2);
+        assert!(
+            matches!(draft.front(), Some(NodeOp::Add(_))),
+            "the add still waits for its own receipt"
+        );
+
+        draft.complete(vec![
+            ManualNode {
+                enabled: false,
+                ..a.clone()
+            },
+            b,
+        ]);
+        assert!(draft.is_empty());
+        assert_eq!(draft.display().len(), 2);
+    }
+
+    #[test]
+    fn failed_receipt_rolls_back_only_its_own_edit() {
+        let a = manual_node("a");
+        let b = manual_node("b");
+        let mut draft = NodeDraft::default();
+        draft.seed(vec![a.clone()]);
+        draft.stage(NodeOp::Delete(a.id));
+        draft.stage(NodeOp::Add(b.clone()));
+
+        draft.fail();
+
+        assert!(
+            !draft.is_empty(),
+            "the later edit was already enqueued and keeps its receipt"
+        );
+        assert_eq!(draft.display(), vec![a.clone(), b.clone()]);
+        assert!(
+            matches!(draft.front(), Some(NodeOp::Add(node)) if node.id == b.id),
+            "the failed delete is retired; the add is next in receipt order"
+        );
+
+        // The failed delete never reached the store, so the add transaction
+        // runs against the still-durable list and its receipt carries `a`.
+        // Adopting that receipt keeps the rolled-back node visible instead of
+        // hiding a durable entry.
+        draft.complete(vec![a.clone(), b.clone()]);
+        assert!(draft.is_empty());
+        assert_eq!(
+            draft.display(),
+            vec![a, b],
+            "the add receipt adopts the durable list, including the rolled-back delete"
+        );
+    }
+
+    #[test]
+    fn committed_activity_ignores_pending_edits() {
+        let a = manual_node("a");
+        let mut draft = NodeDraft::default();
+        draft.seed(vec![a.clone()]);
+        assert!(draft.committed_active());
+
+        draft.stage(NodeOp::Toggle(a.id));
+        assert!(
+            draft.committed_active(),
+            "an unacknowledged toggle does not change the durable active state"
+        );
+
+        draft.complete(vec![ManualNode {
+            enabled: false,
+            ..a
+        }]);
+        assert!(!draft.committed_active());
+    }
+
+    #[test]
+    fn staged_reset_clears_the_list_in_submission_order() {
+        let a = manual_node("a");
+        let b = manual_node("b");
+        let mut draft = NodeDraft::default();
+        draft.seed(vec![a.clone()]);
+        draft.stage(NodeOp::Add(b.clone()));
+        draft.stage(NodeOp::Reset);
+
+        assert!(draft.display().is_empty());
+
+        draft.complete(vec![a, b]);
+        assert!(matches!(draft.front(), Some(NodeOp::Reset)));
+        assert!(draft.display().is_empty());
+
+        draft.complete(Vec::new());
+        assert!(draft.is_empty());
+        assert!(draft.display().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_node_receipts_settle_in_submission_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = v2ray_rs_core::persistence::AppPaths::for_profile_in(
+            v2ray_rs_core::profile::AppProfile::Test,
+            tmp.path(),
+        );
+        paths.ensure_dirs().unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+        let a = manual_node("a");
+        let b = manual_node("b");
+
+        store
+            .enqueue_save_manual_nodes(vec![a.clone()])
+            .await
+            .unwrap()
+            .unwrap();
+        // Both edits are enqueued before either receipt is consumed: this is
+        // the page's submission order, and a barrier queued behind them must
+        // observe both.
+        let first = store.enqueue_update_manual_nodes({
+            let id = a.id;
+            move |nodes| NodeOp::Toggle(id).apply(nodes)
+        });
+        let second = store.enqueue_update_manual_nodes({
+            let node = b.clone();
+            move |nodes| NodeOp::Add(node).apply(nodes)
+        });
+        let barrier = store.enqueue_barrier();
+
+        let (_, committed) = first.await.unwrap().unwrap();
+        assert_eq!(committed.len(), 1);
+        assert!(!committed[0].enabled);
+
+        let (_, committed) = second.await.unwrap().unwrap();
+        assert_eq!(committed.len(), 2);
+        assert!(!committed[0].enabled);
+        assert_eq!(committed[1].id, b.id);
+
+        barrier.await.unwrap().unwrap();
+        assert_eq!(persistence::load_manual_nodes(&paths).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn node_write_receipts_deliver_the_durable_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = v2ray_rs_core::persistence::AppPaths::for_profile_in(
+            v2ray_rs_core::profile::AppProfile::Test,
+            tmp.path(),
+        );
+        paths.ensure_dirs().unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+        let node = manual_node("durable");
+
+        store
+            .enqueue_save_manual_nodes(vec![node.clone()])
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, committed) = store
+            .enqueue_update_manual_nodes({
+                let id = node.id;
+                move |nodes| NodeOp::Toggle(id).apply(nodes)
+            })
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!committed[0].enabled);
+
+        let committed = store.enqueue_reset_manual_nodes().await.unwrap().unwrap();
+        assert!(committed.is_empty());
+        assert!(!paths.custom_nodes_path().exists());
     }
 }

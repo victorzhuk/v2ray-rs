@@ -10,11 +10,13 @@ NETCTL=/usr/bin/v2ray-rs-netctl
 RUN=/usr/bin/v2ray-rs-run
 ANTIDPI=/usr/bin/v2ray-rs-antidpi
 
-# Exact normalized capability postconditions: "names|flags" with names and
-# flag letters each sorted. Anything beyond the exact set -- wrong flags or an
-# extra capability -- is a mismatch, never a match by capability name.
-NETCTL_CAPSET='cap_net_admin|ep'
-ANTIDPI_CAPSET='cap_net_admin,cap_net_raw|ep'
+# Exact normalized capability postconditions: the canonical pair-list key from
+# _capset_key -- one "name=flags" pair per capability, flag letters sorted
+# within each pair, pairs sorted and space-joined. Anything beyond the exact
+# pair list -- wrong flags, a duplicate capability, or an extra one -- is a
+# mismatch, never a match by capability name.
+NETCTL_CAPSET='cap_net_admin=ep'
+ANTIDPI_CAPSET='cap_net_admin=ep cap_net_raw=ep'
 
 _helper_matches() {
     local _owner=$1 _mode=$2 _bin=$3
@@ -23,38 +25,61 @@ _helper_matches() {
         [[ $(stat -c '%a' "$_bin" 2>/dev/null) == "$_mode" ]]
 }
 
-# Canonical form of a capability specification: names sorted and comma-joined,
-# then flag letters sorted after "|". getcap emits "name=flags" entries joined
-# with commas or spaces and setcap accepts '=' or '+', so both spellings are
-# accepted here. Anything the loop cannot classify is a malformed record.
+# Canonical form of a capability specification: one "name=flags" pair per
+# capability, flag letters sorted and unique within each pair, pairs sorted
+# and joined with single spaces. getcap renders clauses as "names=flags"
+# where the comma-joined names share the flags, and setcap accepts '=' or
+# '+', so both spellings are accepted. Malformed records are rejected, never
+# matched: empty names or flag sets (including empty comma-separated fields,
+# which word splitting would drop), repeated flag letters, names outside the
+# capability identifier shape (which also rejects glob metacharacters),
+# flag letters outside e/p/i, duplicate names, and clauses without flags.
 _capset_key() {
-    local _piece _sub _flags _names=() _all=() _sorted
-    for _piece in $1; do
-        _flags=""
-        _names=()
-        while IFS= read -r _sub; do
-            [[ -n $_sub ]] || continue
-            case $_sub in
-                *=*) _flags="$_flags${_sub#*=}" _names+=("${_sub%%=*}") ;;
-                *+*) _flags="$_flags${_sub#*+}" _names+=("${_sub%%+*}") ;;
-                *) _names+=("$_sub") ;;
-            esac
-        done < <(printf '%s\n' "${_piece//,/$'\n'}")
-        [[ ${#_names[@]} -gt 0 && -n $_flags ]] || return 1
-        _all+=("${_names[@]}")
+    local _pieces=() _piece _clause_names _names=() _name _flags _sorted _prev _i _pairs=()
+
+    # read -ra splits on whitespace but never performs pathname expansion, so
+    # a word like cap_*=ep stays literal and is rejected as a malformed name.
+    IFS=$' \t\n' read -ra _pieces <<<"$1" || return 1
+    for _piece in "${_pieces[@]}"; do
+        case $_piece in
+            *=*) _clause_names=${_piece%%=*} _flags=${_piece#*=} ;;
+            *+*) _clause_names=${_piece%%+*} _flags=${_piece#*+} ;;
+            *) return 1 ;;
+        esac
+        [[ -n $_clause_names && -n $_flags ]] || return 1
+        case $_flags in
+            *[!epi]*) return 1 ;;
+        esac
+        _sorted=$(printf '%s\n' "$_flags" | fold -w 1 | LC_ALL=C sort | tr -d '\n')
+        for (( _i = 1; _i < ${#_sorted}; _i++ )); do
+            [[ ${_sorted:_i-1:1} != "${_sorted:_i:1}" ]] || return 1
+        done
+        _flags=$_sorted
+        # read -ra keeps empty comma-separated fields; word splitting dropped
+        # them, which let cap_net_admin,,cap_net_raw=ep pass as two names.
+        IFS=',' read -ra _names <<<"$_clause_names" || return 1
+        for _name in "${_names[@]}"; do
+            [[ -n $_name ]] || return 1
+            [[ $_name =~ ^[A-Za-z0-9_]+$ ]] || return 1
+            for _prev in "${_pairs[@]}"; do
+                case $_prev in "$_name="*) return 1 ;; esac
+            done
+            _pairs+=("$_name=$_flags")
+        done
     done
-    [[ ${#_all[@]} -gt 0 ]] || return 1
-    _sorted=$(printf '%s\n' "${_all[@]}" | sort) || return 1
-    printf '%s|%s\n' "${_sorted//$'\n'/,}" \
-        "$(printf '%s' "$_flags" | fold -w 1 | sort -u | tr -d '\n')"
+    [[ ${#_pairs[@]} -gt 0 ]] || return 1
+    _sorted=$(printf '%s\n' "${_pairs[@]}" | LC_ALL=C sort) || return 1
+    printf '%s\n' "${_sorted//$'\n'/ }"
 }
 
 # Classifies a capability postcondition from evidence. The readback must be
-# successful and diagnostic-free: a nonzero getcap exit or any stderr is
-# "unverified", never absence. Returns "unverified", "absent" for an empty
-# capset, or the canonical key read back from the file.
+# successful, diagnostic-free, and about exactly this file: a nonzero getcap
+# exit, any stderr, output naming another file, a second record, or an
+# unparseable capset is "unverified", never absence. Returns "unverified",
+# "absent" for an empty capset, or the canonical pair-list key read back from
+# the file.
 _caps_state() {
-    local _bin=$1 _line _out _st=0 _tmp _err _key
+    local _bin=$1 _line _out _st=0 _tmp _err _key="" _lines=0
 
     _tmp=$(mktemp) || { echo unverified; return 0; }
     _out=$(getcap "$_bin" 2>"$_tmp") || _st=$?
@@ -62,19 +87,23 @@ _caps_state() {
     rm -f "$_tmp"
     if [[ $_st -ne 0 || -n $_err ]]; then
         echo unverified
-    elif [[ -z $_out ]]; then
+        return 0
+    fi
+    while IFS= read -r _line; do
+        [[ -n $_line ]] || continue
+        _lines=$((_lines + 1))
+        [[ $_lines -eq 1 ]] || continue
+        if [[ $_line != "$_bin "* ]]; then
+            _key=""
+            continue
+        fi
+        _key=$(_capset_key "${_line#"$_bin" }") || _key=""
+    done <<<"$_out"
+    if [[ $_lines -eq 0 ]]; then
         echo absent
+    elif [[ $_lines -eq 1 && -n $_key ]]; then
+        echo "$_key"
     else
-        while IFS= read -r _line; do
-            [[ -n $_line ]] || continue
-            if [[ $_line != "$_bin "* ]]; then
-                echo unverified
-                return 0
-            fi
-            _key=$(_capset_key "${_line#"$_bin" }") || { echo unverified; return 0; }
-            echo "$_key"
-            return 0
-        done <<<"$_out"
         echo unverified
     fi
 }
@@ -267,5 +296,7 @@ pre_remove() {
     # would change the identity, UID, GID, and group memberships that a
     # reinstall and the bypass wrapper depend on.
     echo "==> Retaining the v2ray-rs group and v2ray-rs-bypass user across removal."
+    echo "==> Capabilities granted earlier to your system backend are not revoked automatically;"
+    echo "==> review the actual backend binary with its administrator before relying on them."
     return $_status
 }

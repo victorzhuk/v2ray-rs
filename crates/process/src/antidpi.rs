@@ -18,6 +18,12 @@ use crate::tun::{HELPER_TIMEOUT, HelperRun, run_helper};
 /// distribution installs on `/usr/bin`.
 pub const ANTIDPI_BIN: &str = "v2ray-rs-antidpi";
 
+/// `install-rules` exit status meaning: the helper verified a live foreign
+/// journal owner under the transaction lock and refused before this request
+/// acquired anything. Only this status disarms a fresh install obligation;
+/// a generic conflict or any other failure keeps it armed.
+pub(crate) const INSTALL_REFUSED_EXIT: i32 = 20;
+
 /// How long the stop path waits after SIGTERM before SIGKILL on the engine
 /// child. Mirrors the backend's own stop budget (`manager::STOP_TIMEOUT`).
 pub(crate) const ANTIDPI_STOP_TIMEOUT: Duration = Duration::from_secs(5);

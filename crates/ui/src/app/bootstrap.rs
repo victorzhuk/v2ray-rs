@@ -508,6 +508,18 @@ pub(super) fn try_run() -> Result<(), String> {
         .ensure_dirs()
         .map_err(|err| format!("failed to create directories: {err}"))?;
 
+    // gettext's setlocale and env LANGUAGE are not thread-safe, so this runs
+    // before logging, WorkspaceStore, GTK, Tokio, or the tray service spawn
+    // threads. A language change needs a restart. This read is deliberately
+    // side-effect-free: a second launch that hands off to the running instance
+    // must not migrate or rewrite the settings file.
+    let language_result = v2ray_rs_core::persistence::load_settings_language(&paths);
+    let language = match &language_result {
+        Ok(language) => *language,
+        Err(_) => AppSettings::default().language,
+    };
+    crate::i18n::init_process_locale(language);
+
     crate::logging::init_logging(&paths);
     crate::logging::install_panic_hook();
     log::info!(
@@ -515,18 +527,9 @@ pub(super) fn try_run() -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
         profile.qualifier()
     );
-
-    let settings = match v2ray_rs_core::persistence::load_settings(&paths) {
-        Ok(settings) => settings,
-        Err(err) => {
-            log::warn!("load settings during startup: {err}");
-            AppSettings::default()
-        }
-    };
-    // gettext's setlocale and env LANGUAGE are not thread-safe, so this must
-    // run before WorkspaceStore, GTK, Tokio, or the tray service spawn threads.
-    // A language change needs a restart.
-    crate::i18n::init_process_locale(settings.language);
+    if let Err(err) = &language_result {
+        log::warn!("load settings language during startup: {err}");
+    }
 
     let app_id = profile.app_id();
     // Default profile paths can rely on GApplication's session-bus uniqueness:
@@ -600,6 +603,21 @@ pub(super) fn try_run() -> Result<(), String> {
         .update_started(&paths)
         .map_err(|e| format!("failed to update instance stamp: {e}"))?;
 
+    // The store's writer owns the only migration writeback and publishes the
+    // snapshot every later read uses. Only the lock holder reaches this point,
+    // so a second launch handed off above never loads or rewrites the store.
+    let store = WorkspaceStore::new(paths.clone());
+    let warm = store
+        .warm()
+        .map_err(|err| format!("failed to load the workspace store: {err}"))?;
+    let startup_settings = match &warm.settings {
+        Ok(settings) => (**settings).clone(),
+        Err(err) => {
+            log::warn!("load settings during startup: {err}");
+            AppSettings::default()
+        }
+    };
+
     if let Err(err) = rustls::crypto::ring::default_provider().install_default() {
         log::debug!("rustls crypto provider already installed or unavailable: {err:?}");
     }
@@ -608,16 +626,17 @@ pub(super) fn try_run() -> Result<(), String> {
         .map_err(|err| format!("failed to create tokio runtime: {err}"))?;
     let _rt_guard = rt.enter();
 
-    let (event_tx, event_rx) = broadcast::channel::<ProcessEvent>(EVENT_CHANNEL_CAPACITY);
-    if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
-        *guard = Some(event_tx);
+    let (snapshot_tx, snapshot_rx) =
+        tokio::sync::watch::channel(v2ray_rs_tray::TraySnapshot::initial());
+    if let Ok(mut guard) = TRAY_SNAPSHOT_TX.lock() {
+        *guard = Some(snapshot_tx);
     }
 
     let should_install_icons =
         profile == AppProfile::Production || overrides.install_icons.unwrap_or(false);
     let tray_action_rx = if should_install_icons {
         let (tray_tx, tray_rx) = tokio::sync::mpsc::unbounded_channel::<TrayAction>();
-        let notifier = v2ray_rs_tray::Notifier::new(settings.notifications_enabled);
+        let notifier = v2ray_rs_tray::Notifier::new(startup_settings.notifications_enabled);
         let tray_id = tray_id(
             &profile,
             overrides.has_directory_overrides(),
@@ -625,7 +644,7 @@ pub(super) fn try_run() -> Result<(), String> {
         );
         match rt.block_on(async {
             v2ray_rs_tray::TrayService::spawn(
-                event_rx,
+                snapshot_rx,
                 notifier,
                 move |action| {
                     let _ = tray_tx.send(action);
@@ -757,6 +776,8 @@ pub(super) fn try_run() -> Result<(), String> {
     let relm_app = RelmApp::from_app(app);
     relm_app.run::<App>(AppInit {
         paths,
+        store,
+        warm,
         tray_action_rx,
     });
 
@@ -765,7 +786,7 @@ pub(super) fn try_run() -> Result<(), String> {
     {
         rt.block_on(handle.shutdown());
     }
-    if let Ok(mut guard) = TRAY_EVENT_TX.lock() {
+    if let Ok(mut guard) = TRAY_SNAPSHOT_TX.lock() {
         guard.take();
     }
 

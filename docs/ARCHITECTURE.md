@@ -7,30 +7,24 @@ delegated to the system-installed CLI binary. The app's job is orchestration.
 
 ## Crate dependency graph
 
-```
-                    ┌─────────┐
-                    │   ui    │ (GTK4/Relm4 binary)
-                    └────┬────┘
-           ┌─────────────┼──────────────┐
-           ▼             ▼              ▼
-       ┌───────┐   ┌──────────────┐  ┌──────┐
-       │process│◄──│subscription  │  │ tray │
-       └───┬───┘   └──────┬───────┘  └──┬───┘
-           │              │              │
-           └──────────────┼──────────────┘
-                          ▼
-                      ┌──────┐
-                      │ core │ (models, config, persistence, geodata)
-                      └──────┘
-  (subscription → process for the Real Delay probe)
+Direct workspace Cargo dependencies:
 
-Privileged helpers (separate binaries, no crate deps on core):
-  v2ray-rs-netctl  — route helper (CAP_NET_ADMIN via setcap)
-  v2ray-rs-run     — setuid-root process wrapper (drops to bypass user)
-
-Shared journal crate (not a privileged helper): core and netctl
-  → tun-session (versioned ownership journal)
+```text
+ui           -> core, process, subscription, tray
+subscription -> core, process
+process      -> core
+tray         -> core
+core         -> tun-session
+netctl       -> tun-session
+antidpi      -> tun-session
+run          -> none
+tun-session  -> none
 ```
+
+`netctl -> core` is a test-only dependency. The `process` crate invokes the
+anti-DPI helper as a separate executable, not as a Cargo dependency. The route
+helper and bypass wrapper are also separate executables.
+`subscription -> process` provides the Real Delay probe.
 
 ## Runtime data flow
 
@@ -52,16 +46,16 @@ ProcessManager::start()
   → tokio::process::Command::new(backend_binary).arg("run").arg("-c").arg(config)
   → stdout/stderr → strip_ansi → backend.log + LogBuffer (ring, 10K lines) + broadcast channel
   → [xray TUN] wait_for_device() + netctl xray-up → routes programmed
-  → ProcessState transitions broadcast to UI + tray
+  → ProcessState transitions reach UI → tray snapshot and transition notifications
 ```
 
 ## Crates
 
 ### `core` (`v2ray-rs-core`)
 
-Domain models, persistence, and config generation. Every other crate depends
-on this; its single in-workspace dependency is `v2ray-rs-tun-session`, the
-shared TUN journal schema with its owner-only atomic writer.
+Domain models, persistence, and config generation. Its single in-workspace
+dependency is `v2ray-rs-tun-session`, which supplies shared journal types and
+owner-only atomic file I/O.
 
 Key types: `ProxyNode` (tagged enum: Vless/Vmess/Shadowsocks/Trojan),
 `Subscription`, `RoutingRuleSet`, `AppSettings`, `TunConfig`, `DnsConfig`,
@@ -183,8 +177,8 @@ the full teardown path.
 
 ### `netctl` (`v2ray-rs-netctl`)
 
-Standalone binary with `CAP_NET_ADMIN` set via `setcap`. It shares the small
-`tun-session` crate with core, without depending on core's config or geodata code.
+Standalone binary with `CAP_NET_ADMIN` set via `setcap`. Its normal Cargo
+dependency is `tun-session`; its dependency on `core` is test-only.
 
 Automatic operations require `--journal FILE --session-id UUID`. The helper checks
 an owner-only regular journal file, schema version, session identity, boot, and
@@ -283,21 +277,29 @@ schema version, session UUID, boot UUID, namespace device/inode, controller PID
 and start time, device and reservation indices, phase, exact owned resources,
 and any pending addition. It has no protocol, GUI, or netlink dependency.
 
+### `antidpi` (`v2ray-rs-antidpi`)
+
+The process crate starts this executable to manage anti-DPI rules and the
+engine. The helper owns a separate `antidpi.v1.json` journal. It shares identity
+types with `tun-session`, not the TUN journal payload. A live controller removes
+its own rules with its owner and session identity. `--sweep` is offline recovery
+for a provably dead owner, not live-controller cleanup.
+
 ### `tray` (`v2ray-rs-tray`)
 
 Depends only on `core` (no `process` dependency). Implements the
 StatusNotifierItem protocol via `ksni`. Uses FreeDesktop theme-aware symbolic
-SVG icons (three embedded: disconnected/connected/error). Falls back to ARGB32
-pixmap rendering when the DE has no theme lookup. `TrayService::spawn()` /
-`TrayService::spawn_with_data_dir()` listens on a
-`tokio::sync::broadcast::Receiver<ProcessEvent>` (fed by the UI bridge) and
-rebuilds the menu on state changes. `Notifier` sends desktop notifications via
-`notify-rust`.
+SVG icons (three embedded: disconnected/connected/error), with ARGB32 pixmap
+fallback. `TrayService::spawn()` receives a `watch::Receiver<TraySnapshot>`
+from the UI. The menu and icon converge on the latest state, connection metadata,
+and cleanup flag. The app sends notifications from accepted state transitions,
+separately from the coalescing snapshot.
 
 ### `ui` (`v2ray-rs-ui`)
 
-Depends on all other library crates. The GTK4/Relm4 application binary entry
-point is `run()`. `WorkspaceStore` (`crates/ui/src/workspace.rs`) is the public
+Depends directly on `core`, `process`, `subscription`, and `tray`. The
+GTK4/Relm4 application binary entry point is `run()`. `WorkspaceStore`
+(`crates/ui/src/workspace.rs`) is the public
 authoritative store holding `Arc` snapshots of settings, subscriptions, manual
 nodes, routing rules, and latency data with a single serialized background
 writer thread.
@@ -343,18 +345,17 @@ tunnel.
 
 ## Privileged / TUN model
 
-TUN mode requires two non-GUI binaries to hold elevated capabilities:
+TUN mode uses a backend and privileged helpers:
 
 | Binary | How privileged | Capabilities |
 |---|---|---|
 | xray / v2ray / sing-box | `setcap` | `cap_net_admin,cap_net_bind_service,cap_net_raw+ep` |
 | `v2ray-rs-netctl` | `setcap`, `0750 root:v2ray-rs` | `cap_net_admin+ep` |
 | `v2ray-rs-run` | `chown root:v2ray-rs` + `chmod 4750` | SUID (drops to bypass user) |
+| `v2ray-rs-antidpi` | `setcap`, `0750 root:v2ray-rs` | `cap_net_admin,cap_net_raw+ep` |
 
-All three are granted in one `pkexec` elevation: a shell script with every path,
-capability string, group name, account name, and recorded identity passed as
-quoted positional parameters (eleven for `InPlace`, ten for `Relocate`) so a
-user-controlled value with shell metacharacters cannot inject commands.
+The grant uses one `pkexec` elevation, passing paths and other values as quoted
+positional parameters. The anti-DPI helper is an optional grant target.
 
 `privilege::file_caps_supported()` reads `/proc/self/mounts` and refuses to
 grant on a `nosuid` mount, surfacing the manual `setcap` command instead.
@@ -454,12 +455,17 @@ After a successful elevation the result is verified by identity rather than by
 exit status: the installed helper must be a regular file whose identity,
 ownership, and `0750` mode match, with `cap_net_admin` present and the account
 enrolled; an optional wrapper must match `root:v2ray-rs` `4750`; the backend
-keeps its identity and capability. A relocating plan installs a fresh inode, so
-its script prints one `helper-identity=<device>:<inode>` record that stdout
-must contain and nothing else, and the installed helper is checked against that
-new identity rather than the replaced one. Both a ready helper and a genuine
-`ReloginRequired` mean provisioning succeeded — the running session is never
-required to have acquired the group.
+keeps its identity and capability. A relocating plan installs fresh helper
+inodes. Its script reports the route-helper identity and, when targeted, the
+anti-DPI identity. The installed files are checked against those records.
+Enrollment verification does not require the running session to have acquired
+the group. The UI can still report `ReloginRequired` after provisioning.
+
+On verified success, `grant()` returns the actual backend and route-helper
+paths and an optional anti-DPI path. The UI probes those destinations again.
+For a targeted anti-DPI helper, the resolved path must match the receipt and
+the helper must be ready. An untargeted helper can retain package-repair
+guidance, but a terminal verdict still fails confirmation.
 
 The xray start sequence in `ProcessManager`:
 1. `helper_access(stored helper_path)` — refuse a missing, unenrolled, mis-owned,
@@ -639,10 +645,8 @@ Constraints on the relocating elevation:
 - After the elevation, `grant()` confirms the newly installed helper by
   identity, ownership, mode, capability, and enrollment; a relocated copy is a
   fresh inode, so it is matched against the `helper-identity` record the
-  elevated script prints rather than the replaced inode. A `getcap` that cannot
-  be run is not treated as
-  failure: it may simply be absent from the user's `PATH` while the elevation's
-  `setcap` worked fine.
+  elevated script prints rather than the replaced inode. A missing or failed `getcap`
+  prevents verification and the grant returns an error.
 - `preflight_targets()` checks the *destination* directory's mount, not the
   bundled copy's — the latter is known `nosuid`, which is the whole reason for
   relocating.
@@ -772,16 +776,16 @@ directory and appended to across runs.
 - **Atomic file writes.** Every persistence write goes through `atomic_write()`
   in `crates/core/src/fs.rs`: `NamedTempFile` in the target directory →
   `sync_all` → `persist` (rename). JSON files serialised via `serde_json`,
-  settings via `toml`. Exception: TUN journals go through the
-  `v2ray-rs-tun-session` owner-only atomic writer.
+  settings via `toml`. TUN and anti-DPI journals use separate owner-only
+  journal writers.
 
 - **Workspace deps.** All external crate versions declared once in the root
   `[workspace.dependencies]` and used with `.workspace = true`. Edition 2024
   throughout.
 
-- **Broadcast for state fan-out.** `ProcessManager` publishes `ProcessEvent`
-  on `tokio::broadcast` channels (state and logs kept separate). The UI and the
-  tray subscribe independently; neither polls.
+- **State fan-out.** `ProcessManager` publishes state and logs on separate
+  `tokio::broadcast` channels. The UI publishes the tray's latest view through
+  `watch` and sends notifications from accepted state transitions.
 
 - **Blocking work off the GTK thread.** Subprocess and blocking calls that would
   otherwise freeze the event loop — the `pkexec` privilege grant, the orphaned-

@@ -309,3 +309,24 @@ msgstr ""
 
 msgid "Anti-DPI helper needs installing before the anti-DPI engine can start"
 msgstr ""
+
+msgid "Cleanup failed; session rules may remain installed"
+msgstr ""
+
+msgid "Retry cleanup"
+msgstr ""
+
+msgid "Manual recovery required"
+msgstr ""
+
+msgid "DPI interception degraded: {detail}. The proxy connection stays up."
+msgstr ""
+
+msgid "the session task has exited; the stop request could not be delivered"
+msgstr ""
+
+msgid "the session task has exited; the cleanup retry could not be delivered"
+msgstr ""
+
+msgid "Quit failed: the connection could not be stopped"
+msgstr ""

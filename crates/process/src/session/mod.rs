@@ -40,6 +40,8 @@ mod tests;
 pub use builders::v2ray_tun_warning;
 use cleanup::strip_leading_timestamp;
 pub use supervisor::spawn;
+#[cfg(any(test, feature = "test-utils"))]
+pub use supervisor::spawn_configured;
 
 /// Everything the UI needs to hear from a running session.
 #[derive(Debug, Clone)]
@@ -54,6 +56,11 @@ pub enum SessionEvent {
     /// a retry, reporting no terminal state until the rules are gone. The
     /// text names what may remain installed.
     CleanupPending(u64, String),
+    /// The anti-DPI engine's exit could be neither observed by its monitor
+    /// nor confirmed through the pidfd: rules may remain and no retry can
+    /// fix it. The text names the manual recovery required; Retry is futile
+    /// and must stay disabled.
+    CleanupRecoveryRequired(u64, String),
     /// The anti-DPI engine exited on its own after readiness: DPI
     /// interception is degraded while the proxy connection stays up. At most
     /// one notice per generation; a superseded session's notices carry a

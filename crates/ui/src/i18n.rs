@@ -66,7 +66,7 @@ fn resolve_locale_dir(
     dev_locale: &Path,
 ) -> PathBuf {
     if let Some(dir) = env_dir
-        && dir.exists()
+        && dir.is_dir()
     {
         return dir.to_path_buf();
     }
@@ -84,7 +84,7 @@ fn resolve_locale_dir(
         }
     }
 
-    if dev_locale.exists() {
+    if dev_locale.is_dir() {
         return dev_locale.to_path_buf();
     }
 
@@ -107,6 +107,32 @@ mod tests {
             .to_str()
             .unwrap()
             .to_string()
+    }
+
+    #[test]
+    fn resolve_locale_dir_ignores_a_file_named_env_or_dev_override() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_env = tmp.path().join("locale-file");
+        std::fs::write(&file_env, b"not a directory").unwrap();
+        let exe_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&exe_dir).unwrap();
+        let exe_share = tmp.path().join("share/locale");
+        std::fs::create_dir_all(&exe_share).unwrap();
+        let dev_dir = tmp.path().join("dev-locale");
+
+        // A file where a locale directory was requested is not a catalog:
+        // the valid bundled directory keeps serving messages.
+        assert_eq!(
+            resolve_locale_dir(Some(&file_env), Some(&exe_dir), &dev_dir),
+            exe_share
+        );
+
+        let file_dev = tmp.path().join("dev-locale-file");
+        std::fs::write(&file_dev, b"not a directory").unwrap();
+        assert_eq!(
+            resolve_locale_dir(Some(&file_env), None, &file_dev),
+            PathBuf::from("/usr/share/locale")
+        );
     }
 
     #[test]
@@ -244,5 +270,32 @@ mod tests {
         assert_eq!(format!("{:.2}", 1.5_f64), "1.50");
 
         assert_eq!(tr("Connect"), "Подключить");
+
+        // The recovery surface is translated in the tracked catalog too.
+        assert_eq!(
+            tr("Cleanup failed; session rules may remain installed"),
+            "Очистка не удалась; правила сессии могут остаться установленными"
+        );
+        assert_eq!(tr("Retry cleanup"), "Повторить очистку");
+        assert_eq!(
+            tr("Manual recovery required"),
+            "Требуется ручное восстановление"
+        );
+        assert_eq!(
+            tr("DPI interception degraded: {detail}. The proxy connection stays up."),
+            "Перехват DPI ухудшен: {detail}. Прокси-соединение остаётся активным."
+        );
+        assert_eq!(
+            tr("the session task has exited; the stop request could not be delivered"),
+            "задача сессии завершилась; запрос остановки не удалось доставить"
+        );
+        assert_eq!(
+            tr("the session task has exited; the cleanup retry could not be delivered"),
+            "задача сессии завершилась; повтор очистки не удалось доставить"
+        );
+        assert_eq!(
+            tr("Quit failed: the connection could not be stopped"),
+            "Не удалось выйти: соединение не было остановлено"
+        );
     }
 }

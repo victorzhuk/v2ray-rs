@@ -30,8 +30,13 @@ pub(super) async fn finish_or_retry_cleanup(
     pending.append(orphaned);
     if pending.is_empty() {
         sender.emit(SessionEvent::State(generation, on_clean, None));
+    } else if pending
+        .iter()
+        .any(ProcessManager::requires_operator_recovery)
+    {
+        require_recovery(pending, generation, cmd_rx, sender).await;
     } else {
-        retry_cleanup(pending, generation, cmd_rx, sender).await;
+        retry_cleanup(pending, generation, cmd_rx, sender, on_clean).await;
     }
 }
 
@@ -70,13 +75,16 @@ fn cleanup_message(pending: &[ProcessManager]) -> String {
 
 /// Holds managers whose cleanup failed: no terminal state is reported while
 /// their rules may remain. The next `Stop` retries every parked cleanup, and
-/// only when all succeed is the terminal `Stopped` emitted. A closed channel
-/// has no one left to retry, so the retained failure is reported as terminal.
+/// only when all succeed is the terminal `on_clean` state emitted — a
+/// candidate failure reports its own terminal error here, never a clean
+/// disconnect. A closed channel has no one left to retry, so the retained
+/// failure is reported as terminal.
 pub(super) async fn retry_cleanup(
     pending: Vec<ProcessManager>,
     generation: u64,
     cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
     sender: &EventSender,
+    on_clean: ProcessState,
 ) {
     let mut pending = pending;
     sender.emit(SessionEvent::CleanupPending(
@@ -93,7 +101,7 @@ pub(super) async fn retry_cleanup(
                     }
                 }
                 if remaining.is_empty() {
-                    sender.emit(SessionEvent::State(generation, ProcessState::Stopped, None));
+                    sender.emit(SessionEvent::State(generation, on_clean, None));
                     return;
                 }
                 pending = remaining;
@@ -105,6 +113,42 @@ pub(super) async fn retry_cleanup(
             None => {
                 // Closed channel: nobody can retry, so report every parked
                 // failure once as the terminal state.
+                sender.emit(SessionEvent::State(
+                    generation,
+                    ProcessState::Error(cleanup_message(&pending)),
+                    None,
+                ));
+                return;
+            }
+        }
+    }
+}
+
+/// Holds managers whose cleanup cannot proceed: the engine exit is
+/// unverified, so neither a retry nor a replacement may touch the host. The
+/// recovery state stays presented until the channel closes; a further Stop
+/// only re-presents it, never re-enqueues an attempt.
+pub(super) async fn require_recovery(
+    pending: Vec<ProcessManager>,
+    generation: u64,
+    cmd_rx: &mut mpsc::UnboundedReceiver<SessionCmd>,
+    sender: &EventSender,
+) {
+    sender.emit(SessionEvent::CleanupRecoveryRequired(
+        generation,
+        cleanup_message(&pending),
+    ));
+    loop {
+        match cmd_rx.recv().await {
+            Some(SessionCmd::Stop(_)) => {
+                sender.emit(SessionEvent::CleanupRecoveryRequired(
+                    generation,
+                    cleanup_message(&pending),
+                ));
+            }
+            None => {
+                // Closed channel: nobody can observe anymore, so report the
+                // retained failure once as the terminal state.
                 sender.emit(SessionEvent::State(
                     generation,
                     ProcessState::Error(cleanup_message(&pending)),

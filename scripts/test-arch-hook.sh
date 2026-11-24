@@ -95,6 +95,7 @@ sed -i "s|@REAL_STAT@|$real_stat|g" "$stub/stat"
 cat >"$stub/getcap" <<'EOF'
 #!/bin/sh
 [ "${GETCAP_FAIL:-0}" = 1 ] && exit 1
+[ "${GETCAP_WARN:-0}" = 1 ] && printf 'getcap: diagnostic noise\n' >&2
 [ -f "$1.caps" ] && cat "$1.caps"
 exit 0
 EOF
@@ -162,7 +163,7 @@ run_hook() {
         IDENTITY_LEDGER="$work/$name/identities" \
         CALL_LOG="$work/$name/calls" \
         UNEXPECTED_LOG="$work/$name/unexpected" \
-        CHOWN_FAIL=0 CHOWN_NOOP=0 SETCAP_FAIL=0 SETCAP_NOOP=0 GETCAP_FAIL=0 "$@" \
+        CHOWN_FAIL=0 CHOWN_NOOP=0 SETCAP_FAIL=0 SETCAP_NOOP=0 GETCAP_FAIL=0 GETCAP_WARN=0 "$@" \
         bash -c '. "$1"; "$2"' _ "$work/$name/hook.sh" "$function" \
         >"$work/$name/out" 2>&1
 }
@@ -280,6 +281,212 @@ else
     pass "extra capabilities are rejected and revoked"
 fi
 
+note "correct multi-name clause"
+setup_case multiname
+seed_caps multiname v2ray-rs-netctl 'cap_net_admin=ep'
+seed_caps multiname v2ray-rs-antidpi 'cap_net_admin,cap_net_raw=ep'
+seed_owner multiname v2ray-rs-netctl
+seed_owner multiname v2ray-rs-run
+seed_owner multiname v2ray-rs-antidpi
+if run_hook multiname post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    [ "$(caps_of "$work/multiname/usr/bin/v2ray-rs-antidpi")" = \
+        "$work/multiname/usr/bin/v2ray-rs-antidpi cap_net_admin,cap_net_raw=ep" ] ||
+        fail "multi-name: the seeded readback was mutated"
+    output_has "usermod -aG v2ray-rs" multiname ||
+        fail "multi-name: success guidance missing"
+    pass "a comma-joined readback clause normalizes to the exact pair set"
+else
+    fail "multi-name: post_install rejected 'cap_net_admin,cap_net_raw=ep'"
+fi
+
+note "mixed flags in both orders"
+setup_case mixedorders
+seed_caps mixedorders v2ray-rs-netctl 'cap_net_admin=pe'
+seed_caps mixedorders v2ray-rs-antidpi 'cap_net_raw=ep cap_net_admin=ep'
+seed_owner mixedorders v2ray-rs-netctl
+seed_owner mixedorders v2ray-rs-run
+seed_owner mixedorders v2ray-rs-antidpi
+if run_hook mixedorders post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    output_has "usermod -aG v2ray-rs" mixedorders ||
+        fail "mixed-orders: success guidance missing"
+    pass "unordered flag letters and reversed clauses normalize correctly"
+else
+    fail "mixed-orders: post_install rejected a semantically correct capset"
+fi
+
+note "mixed per-capability flags"
+setup_case mixedflags
+seed_caps mixedflags v2ray-rs-netctl 'cap_net_admin=ep'
+seed_caps mixedflags v2ray-rs-antidpi 'cap_net_admin=ep cap_net_raw=e'
+seed_owner mixedflags v2ray-rs-netctl
+seed_owner mixedflags v2ray-rs-run
+seed_owner mixedflags v2ray-rs-antidpi
+if run_hook mixedflags post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "mixed-flags: post_install accepted cap_net_raw=e beside cap_net_admin=ep"
+else
+    output_has "anti-DPI capability verification" mixedflags ||
+        fail "mixed-flags: the per-capability flag mismatch was not reported"
+    output_has "Privilege cleanup verified" mixedflags ||
+        fail "mixed-flags: cleanup did not verify"
+    assert_unprivileged mixedflags
+    pass "mixed per-capability flags are rejected and revoked"
+fi
+
+note "mixed per-capability flags, reversed clause order"
+setup_case mixedflagsrev
+seed_caps mixedflagsrev v2ray-rs-netctl 'cap_net_admin=ep'
+seed_caps mixedflagsrev v2ray-rs-antidpi 'cap_net_raw=e cap_net_admin=ep'
+seed_owner mixedflagsrev v2ray-rs-netctl
+seed_owner mixedflagsrev v2ray-rs-run
+seed_owner mixedflagsrev v2ray-rs-antidpi
+if run_hook mixedflagsrev post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "mixed-flags-rev: post_install accepted the reversed mixed-flag clause"
+else
+    output_has "anti-DPI capability verification" mixedflagsrev ||
+        fail "mixed-flags-rev: the per-capability flag mismatch was not reported"
+    output_has "Privilege cleanup verified" mixedflagsrev ||
+        fail "mixed-flags-rev: cleanup did not verify"
+    assert_unprivileged mixedflagsrev
+    pass "reversed mixed per-capability flags are rejected and revoked"
+fi
+
+note "empty clause name"
+setup_case emptynames
+seed_caps emptynames v2ray-rs-netctl 'cap_net_admin=ep'
+seed_caps emptynames v2ray-rs-antidpi 'cap_net_admin,,cap_net_raw=ep'
+seed_owner emptynames v2ray-rs-netctl
+seed_owner emptynames v2ray-rs-run
+seed_owner emptynames v2ray-rs-antidpi
+if run_hook emptynames post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "empty-names: post_install accepted 'cap_net_admin,,cap_net_raw=ep'"
+else
+    output_has "anti-DPI capability verification" emptynames ||
+        fail "empty-names: the empty clause name was not reported"
+    output_has "Privilege cleanup verified" emptynames ||
+        fail "empty-names: cleanup did not verify"
+    assert_unprivileged emptynames
+    pass "an empty comma-separated name is rejected and revoked"
+fi
+
+note "duplicate flag letters"
+setup_case dupflags
+seed_caps dupflags v2ray-rs-netctl 'cap_net_admin=epe'
+seed_caps dupflags v2ray-rs-antidpi 'cap_net_admin=ep cap_net_raw=ep'
+seed_owner dupflags v2ray-rs-netctl
+seed_owner dupflags v2ray-rs-run
+seed_owner dupflags v2ray-rs-antidpi
+if run_hook dupflags post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "dup-flags: post_install accepted cap_net_admin=epe"
+else
+    output_has "cap_net_admin verification" dupflags ||
+        fail "dup-flags: the repeated flag letter was not reported"
+    output_has "Privilege cleanup verified" dupflags ||
+        fail "dup-flags: cleanup did not verify"
+    assert_unprivileged dupflags
+    pass "repeated flag letters are rejected and revoked"
+fi
+
+note "glob metacharacters in a name"
+setup_case globname
+seed_caps globname v2ray-rs-netctl 'cap_net_admin=ep cap_*=ei'
+seed_owner globname v2ray-rs-netctl
+seed_owner globname v2ray-rs-run
+seed_owner globname v2ray-rs-antidpi
+if run_hook globname post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "glob-name: post_install accepted a wildcard capability name"
+else
+    output_has "cap_net_admin verification" globname ||
+        fail "glob-name: the wildcard name was not reported"
+    output_has "Privilege cleanup verified" globname ||
+        fail "glob-name: cleanup did not verify"
+    assert_unprivileged globname
+    pass "a glob metacharacter name is rejected without expansion and revoked"
+fi
+
+note "unparseable readback"
+setup_case garbled
+seed_caps garbled v2ray-rs-netctl 'cap_net_admin=ex cap_net_admin=ep'
+seed_owner garbled v2ray-rs-netctl
+seed_owner garbled v2ray-rs-run
+seed_owner garbled v2ray-rs-antidpi
+if run_hook garbled post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "garbled: post_install accepted an unknown flag and a duplicate name"
+else
+    output_has "cap_net_admin verification" garbled ||
+        fail "garbled: the unparseable readback was not reported"
+    output_has "Privilege cleanup verified" garbled ||
+        fail "garbled: cleanup did not verify"
+    assert_unprivileged garbled
+    pass "an unknown flag and a duplicate name are rejected and revoked"
+fi
+
+note "malformed clause"
+setup_case malformedclause
+seed_caps malformedclause v2ray-rs-netctl 'cap_net_admin'
+seed_owner malformedclause v2ray-rs-netctl
+seed_owner malformedclause v2ray-rs-run
+seed_owner malformedclause v2ray-rs-antidpi
+if run_hook malformedclause post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "malformed-clause: post_install accepted a clause without flags"
+else
+    output_has "cap_net_admin verification" malformedclause ||
+        fail "malformed-clause: the malformed clause was not reported"
+    output_has "Privilege cleanup verified" malformedclause ||
+        fail "malformed-clause: cleanup did not verify"
+    assert_unprivileged malformedclause
+    pass "a clause without flags is rejected and revoked"
+fi
+
+note "duplicate capability name"
+setup_case dupname
+seed_caps dupname v2ray-rs-netctl 'cap_net_admin=ep cap_net_admin=ep'
+seed_owner dupname v2ray-rs-netctl
+seed_owner dupname v2ray-rs-run
+seed_owner dupname v2ray-rs-antidpi
+if run_hook dupname post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "dup-name: post_install accepted a duplicated capability"
+else
+    output_has "cap_net_admin verification" dupname ||
+        fail "dup-name: the duplicated capability was not reported"
+    output_has "Privilege cleanup verified" dupname ||
+        fail "dup-name: cleanup did not verify"
+    assert_unprivileged dupname
+    pass "a duplicate capability name alone is rejected and revoked"
+fi
+
+note "unexpected extra output"
+setup_case extraout
+seed_caps extraout v2ray-rs-netctl 'cap_net_admin=ep'
+printf '/elsewhere cap_chown=ep\n' >>"$work/extraout/usr/bin/v2ray-rs-netctl.caps"
+seed_owner extraout v2ray-rs-netctl
+seed_owner extraout v2ray-rs-run
+seed_owner extraout v2ray-rs-antidpi
+if run_hook extraout post_install SETCAP_NOOP=1 CHOWN_NOOP=1; then
+    fail "extra-out: post_install accepted a second getcap record"
+else
+    output_has "cap_net_admin verification" extraout ||
+        fail "extra-out: the extra record was not reported"
+    output_has "Privilege cleanup verified" extraout ||
+        fail "extra-out: cleanup did not verify"
+    assert_unprivileged extraout
+    pass "a correct record plus extra output is rejected and revoked"
+fi
+
+note "diagnostic readback"
+setup_case diag
+if run_hook diag post_install GETCAP_WARN=1; then
+    fail "diag: post_install succeeded with a noisy getcap"
+else
+    output_has "cap_net_admin verification" diag ||
+        fail "diag: the diagnostic readback was not reported"
+    output_has "Revocation could not be verified for: route helper capability and anti-DPI helper capability" diag ||
+        fail "diag: unverified revocation was not reported"
+    output_has "Privilege cleanup verified" diag &&
+        fail "diag: a diagnostic readback was treated as verified absence"
+    assert_unprivileged diag
+    pass "a diagnostic readback is unverified, never absence"
+fi
+
 note "unreadable probe"
 setup_case probe
 if run_hook probe post_install GETCAP_FAIL=1; then
@@ -319,6 +526,10 @@ if run_hook install pre_remove; then
     [ "$(identity_count user install)" = 1 ] || fail "removal: user identity was lost"
     [ ! -s "$work/install/unexpected" ] || fail "removal: an identity deletion was attempted"
     output_has "Retaining" install || fail "removal: retention was not reported"
+    output_has "not revoked automatically" install ||
+        fail "removal: the backend-grant note was not reported"
+    output_has "with its administrator" install ||
+        fail "removal: the administrator advice was not reported"
     assert_unprivileged install
     pass "removal revokes privileges and keeps system identities"
 else
@@ -335,6 +546,20 @@ else
     [ "$(identity_count user install)" = 1 ] || fail "removal-unresolved: user identity was lost"
     [ ! -s "$work/install/unexpected" ] || fail "removal-unresolved: an identity deletion was attempted"
     pass "unresolved revocation fails pre_remove and keeps identities"
+fi
+
+note "removal with diagnostic readback"
+if run_hook diag pre_remove GETCAP_WARN=1; then
+    fail "removal-diag: pre_remove returned success with a noisy getcap"
+else
+    output_has "Unresolved: helper privilege cleanup did not verify" diag ||
+        fail "removal-diag: the unresolved cleanup was not reported"
+    output_has "not revoked automatically" diag ||
+        fail "removal-diag: the backend-grant note was not reported"
+    [ "$(identity_count group diag)" = 1 ] || fail "removal-diag: group identity was lost"
+    [ "$(identity_count user diag)" = 1 ] || fail "removal-diag: user identity was lost"
+    [ ! -s "$work/diag/unexpected" ] || fail "removal-diag: an identity deletion was attempted"
+    pass "a diagnostic readback keeps removal unresolved and identities intact"
 fi
 
 note "reinstall"

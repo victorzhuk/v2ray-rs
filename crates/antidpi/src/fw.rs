@@ -79,7 +79,11 @@ fn decide_install(
     if j.owner != *owner {
         return match state::owner_liveness(&j.owner) {
             Liveness::Dead => Ok(InstallAction::Clean(j.clone())),
-            Liveness::Alive => Err(Error::Firewall(format!(
+            // A dedicated error, not the generic firewall conflict: it is
+            // raised only here, under the transaction lock and before this
+            // request acquired anything, so `install-rules` can report a
+            // verified refusal on its own exit status.
+            Liveness::Alive => Err(Error::ForeignLiveOwner(format!(
                 "the anti-DPI rules are owned by a live process (pid {}); refusing to modify them",
                 j.owner.pid
             ))),
@@ -1275,9 +1279,18 @@ mod tests {
             count,
         )
         .unwrap_err();
+        assert!(
+            matches!(&err, Error::ForeignLiveOwner(_)),
+            "a live foreign owner needs the dedicated refusal, got {err:?}"
+        );
         assert!(err.to_string().contains("live process"), "{err}");
         assert_eq!((removals, installs), (0, 0));
-        assert_eq!(on_disk(&path), Some(j));
+        // The refusal is raised before acquisition mutates anything: the
+        // journal keeps its owner, session, phase, and both recorded
+        // families.
+        let unchanged = on_disk(&path).expect("the journal must survive the refusal");
+        assert_eq!(unchanged, j);
+        assert_eq!(unchanged.phase, Phase::Active);
     }
 
     #[test]

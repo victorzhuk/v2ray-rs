@@ -359,15 +359,20 @@ resolve_expected_sha256() {
 }
 
 verify_checksum() {
-    local _file="$1" _url="$2" _want _got
+    local _file="$1" _url="$2" _want _got _hashed
 
     check_cmd sha256sum || err "sha256sum not found; refusing to install an unverified download"
 
     _want=$(resolve_expected_sha256 "$_url" "$_file") ||
         err "no checksum available for this download; refusing to install it"
 
-    _got=$(sha256sum -b "$_file" | awk '{print $1}')
-    [ -n "$_got" ] || err "could not hash $_file"
+    # Check the verifier's exit status on the complete output first: parsing a
+    # digest out of a failed run would trust whatever it printed before dying.
+    _hashed=$(sha256sum -b "$_file") || err "could not hash $_file"
+    _got=$(printf '%s\n' "$_hashed" | awk 'NR==1 {print $1}')
+    case "$_got" in
+        "" | *[!0-9a-f]*) err "could not hash $_file; sha256sum printed no usable digest" ;;
+    esac
     [ "$_got" = "$_want" ] || err "checksum mismatch
     want: $_want
     got:  $_got"
@@ -469,6 +474,8 @@ uninstall() {
     say "they only exist if a grant ran:"
     say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-netctl    # route helper, if granted"
     say "    sudo rm /usr/local/lib/v2ray-rs/v2ray-rs-antidpi   # anti-DPI engine, if granted"
+    say "Capabilities granted earlier to your system backend are not revoked automatically;"
+    say "review the actual backend binary with its administrator before relying on them."
 }
 
 # Removes a generated cache when it is the only thing left under dir, then the

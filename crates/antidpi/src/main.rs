@@ -436,7 +436,15 @@ fn cmd_install_rules(
         log::warn!("kernel prerequisite {key}={want} is unmet; continuing without writing it");
     }
     let owner_pid = owner.pid;
-    fw::install(queue, fw::DEFAULT_FWMARK, owner, session)?;
+    if let Err(e) = fw::install(queue, fw::DEFAULT_FWMARK, owner, session) {
+        // Exit status 20: a verified refusal before this request acquired
+        // anything. Mapped here and only here; the detail stays on stderr.
+        if matches!(e, Error::ForeignLiveOwner(_)) {
+            eprintln!("v2ray-rs-antidpi: {e}");
+            std::process::exit(20);
+        }
+        return Err(e);
+    }
     log::info!("rules installed for owner pid {owner_pid} (session {session})");
     Ok(())
 }

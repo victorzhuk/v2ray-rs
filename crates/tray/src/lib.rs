@@ -3,4 +3,4 @@ mod notification;
 mod tray;
 
 pub use notification::Notifier;
-pub use tray::{TrayAction, TrayHandle, TrayService};
+pub use tray::{TrayAction, TrayHandle, TrayService, TraySnapshot};

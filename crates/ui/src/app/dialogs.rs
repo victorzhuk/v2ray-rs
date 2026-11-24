@@ -9,11 +9,13 @@ pub(super) enum QuitPlan {
 
 /// A Disconnect already took the handle while the app is `Stopping`; the
 /// window must outlive that stop so its teardown and marker clear finish.
+/// A handle present during `Stopping` means that stop is already in flight,
+/// so a quit waits for it instead of enqueueing a second stop.
 pub(super) fn quit_plan(has_handle: bool, state: &ProcessState, marker_present: bool) -> QuitPlan {
-    if has_handle {
-        QuitPlan::Stop
-    } else if matches!(state, ProcessState::Stopping) {
+    if matches!(state, ProcessState::Stopping) {
         QuitPlan::AwaitStopped
+    } else if has_handle {
+        QuitPlan::Stop
     } else if marker_present {
         QuitPlan::Release
     } else {

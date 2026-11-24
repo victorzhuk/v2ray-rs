@@ -507,6 +507,48 @@ fn recovery_validates_the_canonical_path_through_a_symlinked_parent() {
 }
 
 #[test]
+fn receipt_names_the_verified_destinations() {
+    let inplace = granted_targets(&in_place(None));
+    assert_eq!(inplace.backend, PathBuf::from("/usr/bin/xray"));
+    assert_eq!(inplace.helper, PathBuf::from("/usr/bin/v2ray-rs-netctl"));
+    assert_eq!(inplace.antidpi, None);
+
+    let with_antidpi = granted_targets(&in_place_with_antidpi());
+    assert_eq!(
+        with_antidpi.helper,
+        PathBuf::from("/usr/bin/v2ray-rs-netctl")
+    );
+    assert_eq!(
+        with_antidpi.antidpi,
+        Some(PathBuf::from("/usr/bin/v2ray-rs-antidpi"))
+    );
+
+    // A relocating grant reports the fixed destination it published, never
+    // the bundled source it streamed from.
+    let relocate = granted_targets(&relocate());
+    assert_eq!(
+        relocate.helper,
+        PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-netctl")
+    );
+    assert_eq!(relocate.antidpi, None);
+
+    let relocate_antidpi = granted_targets(&relocate_with_antidpi());
+    assert_eq!(
+        relocate_antidpi.antidpi,
+        Some(PathBuf::from("/usr/local/lib/v2ray-rs/v2ray-rs-antidpi"))
+    );
+}
+
+#[test]
+fn receipt_omits_an_unavailable_optional_antidpi_target() {
+    // The planner skips an absent optional helper instead of promising a
+    // destination the elevation will not touch.
+    assert_eq!(plan_antidpi_in_place(None).unwrap(), None);
+    let absent = PathBuf::from("/nonexistent/v2ray-rs-antidpi");
+    assert_eq!(plan_antidpi_in_place(Some(&absent)).unwrap(), None);
+}
+
+#[test]
 fn eligibility_matches_the_grant_planner() {
     // Absent and unmanaged candidates are never eligible: the planner
     // skips the optional helper, and the UI reads that as "no repair to

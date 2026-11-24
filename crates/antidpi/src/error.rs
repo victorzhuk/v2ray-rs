@@ -8,6 +8,12 @@ pub enum Error {
     Strategy(String),
     #[error("firewall: {0}")]
     Firewall(String),
+    /// A live foreign owner holds the journal and its rules, verified before
+    /// this request mutated anything. Only `install-rules` maps this to its
+    /// dedicated exit status; every other command reports it as a normal
+    /// failure.
+    #[error("foreign owner: {0}")]
+    ForeignLiveOwner(String),
     #[error("timed out: {0}")]
     TimedOut(String),
     #[error("conflict: {0}")]

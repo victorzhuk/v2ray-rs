@@ -231,15 +231,16 @@ Parsing is strict: an unknown or duplicate parameter, a mistyped boolean,
 `repeats` outside 1..=64, `seqovl` above 1500, or a malformed hex blob is an
 error (`sni=` belongs inside `tls_mod=`). Chains are partitioned by protocol
 when the engine starts. TCP chains carry any split or a non-QUIC fake.
-UDP/QUIC chains carry a QUIC or raw-blob fake. The two lists rotate
-independently, so the default chains protect TLS and QUIC from the first
-flow of each.
+UDP/QUIC chains carry a QUIC or raw-blob fake. Each list starts at its first
+chain. A reply RST on a fired TCP flow can advance the TCP list when the
+configured threshold is reached. No automatic failure signal advances the UDP
+list, so it remains on its first chain.
 
 ```text
 v2ray-rs-antidpi check --strategy S
-v2ray-rs-antidpi install-rules --queue N [--strategy S]... [--hosts PATH] [--owner PID:START]
-v2ray-rs-antidpi run --queue N --no-fw [--strategy S]... [--hosts PATH]
-v2ray-rs-antidpi remove-rules [--sweep] [--owner PID:START]
+v2ray-rs-antidpi install-rules --queue N [--strategy S]... [--hosts PATH] [--owner PID:START] [--session-id UUID]
+v2ray-rs-antidpi run --queue N --no-fw [--strategy S]... [--hosts PATH] [--session-id UUID]
+v2ray-rs-antidpi remove-rules [--sweep | --session-id UUID] [--owner PID:START]
 ```
 
 `--strategy` is repeatable. `--owner` identifies the controller by PID and

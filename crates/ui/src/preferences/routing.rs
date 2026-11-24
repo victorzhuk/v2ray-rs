@@ -3,7 +3,8 @@ use ipnet::IpNet;
 use relm4::adw;
 use relm4::gtk;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::collections::VecDeque;
+use std::rc::{Rc, Weak};
 use std::str::FromStr;
 use uuid::Uuid;
 
@@ -17,13 +18,96 @@ use v2ray_rs_core::persistence::{self, AppPaths};
 use crate::i18n::tr;
 use crate::workspace::WorkspaceStore;
 
-use super::{RoutingCallback, emit_routing};
+use super::{RoutingCallback, RoutingObservers, RoutingResetCallback};
+
+/// Shared routing editor state.
+///
+/// Row widgets render the draft; the app only receives drafts. A draft is
+/// published to `committed` (the effective-DNS preview and any other observer)
+/// after the app confirms its durable write, so the dialog never presents an
+/// unacknowledged edit as stored. The app serializes routing writes, so one
+/// receipt settles each submitted set in order.
+pub(super) struct RoutingEditor {
+    committed: Rc<RefCell<RoutingRuleSet>>,
+    draft: Rc<RefCell<RoutingRuleSet>>,
+    /// Drafts handed to the app whose receipts have not arrived yet.
+    outstanding: RefCell<VecDeque<RoutingRuleSet>>,
+    on_changed: RoutingCallback,
+    committed_observers: RoutingObservers,
+    row_renderers: RefCell<Vec<Rc<dyn Fn()>>>,
+}
+
+impl RoutingEditor {
+    pub(super) fn new(
+        committed: Rc<RefCell<RoutingRuleSet>>,
+        on_changed: RoutingCallback,
+        committed_observers: RoutingObservers,
+    ) -> Rc<Self> {
+        let draft = Rc::new(RefCell::new(committed.borrow().clone()));
+        Rc::new(Self {
+            committed,
+            draft,
+            outstanding: RefCell::new(VecDeque::new()),
+            on_changed,
+            committed_observers,
+            row_renderers: RefCell::new(Vec::new()),
+        })
+    }
+
+    fn draft(&self) -> Rc<RefCell<RoutingRuleSet>> {
+        self.draft.clone()
+    }
+
+    /// Registers the row renderer the editor refreshes after a rollback. The
+    /// editor owns it strongly, so the page must hold the editor weakly.
+    fn register_rows(&self, render: impl Fn() + 'static) {
+        self.row_renderers.borrow_mut().push(Rc::new(render));
+    }
+
+    /// Hands the current draft to the app and records it as outstanding.
+    fn submit(&self) {
+        let draft = self.draft.borrow().clone();
+        self.outstanding.borrow_mut().push_back(draft.clone());
+        (self.on_changed)(draft);
+    }
+
+    /// Settles one routing receipt with the rules the store now holds.
+    ///
+    /// A set that matches an outstanding submission was acknowledged; the
+    /// draft stays. A set that matches none is a rejected write: the draft
+    /// rolls back only when no newer submission is still in flight, so a late
+    /// failure never discards a later staged edit.
+    pub(super) fn apply_committed(&self, rules: &RoutingRuleSet) {
+        let matched = {
+            let mut outstanding = self.outstanding.borrow_mut();
+            match outstanding.iter().position(|submitted| submitted == rules) {
+                Some(position) => {
+                    outstanding.drain(..=position);
+                    true
+                }
+                None => false,
+            }
+        };
+        *self.committed.borrow_mut() = rules.clone();
+        let rollback = !matched && self.outstanding.borrow().is_empty();
+        if rollback {
+            *self.draft.borrow_mut() = rules.clone();
+            let renderers: Vec<_> = self.row_renderers.borrow().iter().cloned().collect();
+            for render in renderers {
+                render();
+            }
+        }
+        let observers: Vec<_> = self.committed_observers.borrow().iter().cloned().collect();
+        for observer in observers {
+            observer();
+        }
+    }
+}
 
 pub(super) fn build_routing_page(
     store: &WorkspaceStore,
     settings_state: &Rc<RefCell<AppSettings>>,
-    rule_set: &Rc<RefCell<RoutingRuleSet>>,
-    on_changed: &RoutingCallback,
+    editor: &Rc<RoutingEditor>,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
         .title(tr("Routing"))
@@ -63,14 +147,18 @@ pub(super) fn build_routing_page(
     let ctx = RenderCtx {
         page: page.clone(),
         settings_state: settings_state.clone(),
-        rule_set: rule_set.clone(),
-        on_changed: on_changed.clone(),
+        draft: editor.draft(),
+        editor: Rc::downgrade(editor),
         paths: paths.clone(),
         store: store.clone(),
         added_groups: Rc::new(RefCell::new(Vec::new())),
     };
 
     render_routing_rules(&ctx);
+    {
+        let ctx = ctx.clone();
+        editor.register_rows(move || render_routing_rules(&ctx));
+    }
 
     {
         let ctx = ctx.clone();
@@ -91,7 +179,7 @@ pub(super) fn build_routing_page(
 
 pub(super) fn build_routing_error_page(
     store: &WorkspaceStore,
-    on_reset: &RoutingCallback,
+    on_reset: &RoutingResetCallback,
     error: String,
 ) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::builder()
@@ -124,15 +212,24 @@ pub(super) fn build_routing_error_page(
 
     let store = store.clone();
     let on_reset = on_reset.clone();
-    reset_btn.connect_clicked(move |button| match store.reset_routing_rules() {
-        Ok(()) => {
-            on_reset(RoutingRuleSet::new());
-            status.set_label("Routing rules reset. Reopen Preferences to continue.");
-            button.set_sensitive(false);
-        }
-        Err(err) => {
-            status.set_label(&format!("Reset failed: {err}"));
-        }
+    reset_btn.connect_clicked(move |button| {
+        button.set_sensitive(false);
+        status.set_label("Resetting routing rules...");
+        let store = store.clone();
+        let on_reset = on_reset.clone();
+        let status = status.clone();
+        let button = button.clone();
+        gtk::glib::spawn_future_local(async move {
+            match reset_routing_rules(&store, &on_reset).await {
+                Ok(()) => {
+                    status.set_label("Routing rules reset. Reopen Preferences to continue.");
+                }
+                Err(err) => {
+                    status.set_label(&format!("Reset failed: {err}"));
+                    button.set_sensitive(true);
+                }
+            }
+        });
     });
 
     group.add(&row);
@@ -140,19 +237,41 @@ pub(super) fn build_routing_error_page(
     page
 }
 
+/// Resets the stored routing rules on the workspace writer and reports the
+/// committed empty set only after the durable receipt. A failed write leaves
+/// the broken file in place and returns the error for the status row.
+async fn reset_routing_rules(
+    store: &WorkspaceStore,
+    on_reset: &RoutingResetCallback,
+) -> Result<(), String> {
+    match store.enqueue_reset_routing_rules().await {
+        Ok(Ok(rules)) => {
+            on_reset((*rules).clone());
+            Ok(())
+        }
+        Ok(Err(err)) => Err(err.to_string()),
+        Err(_) => Err("workspace writer stopped".to_string()),
+    }
+}
+
 #[derive(Clone)]
 struct RenderCtx {
     page: adw::PreferencesPage,
     settings_state: Rc<RefCell<AppSettings>>,
-    rule_set: Rc<RefCell<RoutingRuleSet>>,
-    on_changed: RoutingCallback,
+    /// Draft the rows render and mutate.
+    draft: Rc<RefCell<RoutingRuleSet>>,
+    /// Weak so the editor's row renderer does not form an ownership cycle
+    /// through the page widgets.
+    editor: Weak<RoutingEditor>,
     paths: Rc<AppPaths>,
     store: WorkspaceStore,
     added_groups: Rc<RefCell<Vec<adw::PreferencesGroup>>>,
 }
 
 fn emit_routing_change(ctx: &RenderCtx) {
-    emit_routing(&ctx.rule_set, &ctx.on_changed);
+    if let Some(editor) = ctx.editor.upgrade() {
+        editor.submit();
+    }
 }
 
 fn render_routing_rules(ctx: &RenderCtx) {
@@ -161,7 +280,7 @@ fn render_routing_rules(ctx: &RenderCtx) {
     }
     ctx.added_groups.borrow_mut().clear();
 
-    let rs = ctx.rule_set.borrow();
+    let rs = ctx.draft.borrow();
     let rules = rs.rules();
 
     if rules.is_empty() {
@@ -197,7 +316,7 @@ fn render_routing_rules(ctx: &RenderCtx) {
             let ctx = ctx.clone();
             remove_btn.connect_clicked(move |_| {
                 let ids: Vec<Uuid> = ctx
-                    .rule_set
+                    .draft
                     .borrow()
                     .rules()
                     .iter()
@@ -205,7 +324,7 @@ fn render_routing_rules(ctx: &RenderCtx) {
                     .map(|r| r.id)
                     .collect();
                 {
-                    let mut rs = ctx.rule_set.borrow_mut();
+                    let mut rs = ctx.draft.borrow_mut();
                     for id in &ids {
                         rs.remove(id);
                     }
@@ -249,7 +368,7 @@ fn build_routing_rule_row(
         let id = rule.id;
         let ctx = ctx.clone();
         switch.connect_active_notify(move |_| {
-            let mut rs = ctx.rule_set.borrow_mut();
+            let mut rs = ctx.draft.borrow_mut();
             if let Some(r) = rs.rules_mut().iter_mut().find(|r| r.id == id) {
                 r.enabled = !r.enabled;
             }
@@ -281,7 +400,7 @@ fn build_routing_rule_row(
         let pop = popover.clone();
         btn.connect_clicked(move |_| {
             pop.popdown();
-            ctx.rule_set.borrow_mut().move_rule(idx, idx - 1);
+            ctx.draft.borrow_mut().move_rule(idx, idx - 1);
             emit_routing_change(&ctx);
             render_routing_rules(&ctx);
         });
@@ -297,7 +416,7 @@ fn build_routing_rule_row(
         let pop = popover.clone();
         btn.connect_clicked(move |_| {
             pop.popdown();
-            ctx.rule_set.borrow_mut().move_rule(idx, idx + 1);
+            ctx.draft.borrow_mut().move_rule(idx, idx + 1);
             emit_routing_change(&ctx);
             render_routing_rules(&ctx);
         });
@@ -315,7 +434,7 @@ fn build_routing_rule_row(
         edit_btn.connect_clicked(move |_| {
             pop.popdown();
             let rule = ctx
-                .rule_set
+                .draft
                 .borrow()
                 .rules()
                 .iter()
@@ -339,7 +458,7 @@ fn build_routing_rule_row(
         let pop = popover.clone();
         delete_btn.connect_clicked(move |_| {
             pop.popdown();
-            ctx.rule_set.borrow_mut().remove(&id);
+            ctx.draft.borrow_mut().remove(&id);
             emit_routing_change(&ctx);
             render_routing_rules(&ctx);
         });
@@ -379,7 +498,7 @@ fn build_routing_rule_row(
             }
 
             ctx_drop
-                .rule_set
+                .draft
                 .borrow_mut()
                 .move_rule(drop_idx, drop_idx_target);
 
@@ -854,7 +973,7 @@ fn show_routing_rule_dialog(existing: Option<RoutingRule>, ctx: &RenderCtx) {
             build_saved_routing_rule(existing_rule.as_ref(), match_condition, action, via_node);
 
         {
-            let mut rs = ctx.rule_set.borrow_mut();
+            let mut rs = ctx.draft.borrow_mut();
             let existing_idx = rs.rules().iter().position(|r| r.id == rule.id);
             if let Some(idx) = existing_idx {
                 rs.rules_mut()[idx] = rule;
@@ -896,7 +1015,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
         let ctx = ctx.clone();
         let p = preset.clone();
         apply_btn.connect_clicked(move |_| {
-            ctx.rule_set.borrow_mut().apply_preset(&p);
+            ctx.draft.borrow_mut().apply_preset(&p);
             emit_routing_change(&ctx);
             render_routing_rules(&ctx);
         });
@@ -921,7 +1040,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             let ctx = ctx.clone();
             let p = preset.clone();
             apply_btn.connect_clicked(move |_| {
-                ctx.rule_set.borrow_mut().apply_preset(&p);
+                ctx.draft.borrow_mut().apply_preset(&p);
                 emit_routing_change(&ctx);
                 render_routing_rules(&ctx);
             });
@@ -961,7 +1080,7 @@ fn show_routing_presets_dialog(paths: &Rc<AppPaths>, ctx: &RenderCtx) {
             .build(),
     );
     {
-        let rs = ctx.rule_set.clone();
+        let rs = ctx.draft.clone();
         let pp = paths.clone();
         save_row.connect_activated(move |_| {
             show_save_preset_dialog(&rs.borrow(), &pp);
@@ -1061,6 +1180,64 @@ fn format_match(m: &RuleMatch) -> String {
 #[cfg(test)]
 mod routing_row_tests {
     use super::*;
+
+    fn temp_paths(root: &std::path::Path) -> AppPaths {
+        let paths = AppPaths::for_profile_in(v2ray_rs_core::profile::AppProfile::Test, root);
+        paths.ensure_dirs().unwrap();
+        paths
+    }
+
+    #[tokio::test]
+    async fn routing_reset_reports_only_after_the_durable_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_paths(tmp.path());
+        std::fs::write(paths.routing_rules_path(), b"{corrupt").unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+
+        let reported = Rc::new(RefCell::new(None));
+        let sink = reported.clone();
+        let on_reset: RoutingResetCallback = Rc::new(move |rules| {
+            *sink.borrow_mut() = Some(rules);
+        });
+
+        reset_routing_rules(&store, &on_reset).await.unwrap();
+
+        assert!(
+            reported
+                .borrow()
+                .as_ref()
+                .is_some_and(|rules| rules.rules().is_empty()),
+            "the committed empty set reaches the app only through the receipt"
+        );
+        assert!(
+            persistence::load_routing_rules(&paths)
+                .unwrap()
+                .rules()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_routing_reset_keeps_the_previous_state_and_does_not_publish() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = temp_paths(tmp.path());
+        // A directory at the rules path makes the atomic write fail.
+        std::fs::create_dir(paths.routing_rules_path()).unwrap();
+        let store = WorkspaceStore::new(paths.clone());
+
+        let published = Rc::new(RefCell::new(false));
+        let sink = published.clone();
+        let on_reset: RoutingResetCallback = Rc::new(move |_| *sink.borrow_mut() = true);
+
+        let error = reset_routing_rules(&store, &on_reset).await.unwrap_err();
+
+        assert!(!error.is_empty());
+        assert!(
+            !*published.borrow(),
+            "a failed reset is not a committed one"
+        );
+        assert!(paths.routing_rules_path().is_dir());
+    }
 
     fn rule(m: RuleMatch) -> RoutingRule {
         RoutingRule {

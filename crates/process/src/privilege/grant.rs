@@ -109,12 +109,31 @@ pub(super) fn invoking_account(at: &Path) -> Result<(u32, String), PrivilegeErro
     Ok((u32::from(uid), user.name))
 }
 
+/// The destinations a successful elevation was verified to provision. The UI
+/// treats this as the promise the grant kept: a fresh post-grant probe must
+/// find exactly these paths healthy before it reports success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrantedTargets {
+    pub backend: PathBuf,
+    pub helper: PathBuf,
+    pub antidpi: Option<PathBuf>,
+}
+
 /// Grants the required capabilities via a single `pkexec` elevation. Blocks
 /// until the polkit dialog completes. `antidpi` is the anti-DPI helper to
 /// provision in the same elevation, or `None` to leave it untouched — a
 /// non-existent path is skipped, so environments that build without the
 /// antidpi crate still grant TUN.
-pub fn grant(backend: &Path, helper: &Path, antidpi: Option<&Path>) -> Result<(), PrivilegeError> {
+///
+/// The returned receipt is built only after every post-elevation identity,
+/// mode, capability and enrollment check passed, from the canonical paths the
+/// elevation mutated or the fixed destinations it published. A failed or
+/// unverified elevation therefore returns an error and no receipt.
+pub fn grant(
+    backend: &Path,
+    helper: &Path,
+    antidpi: Option<&Path>,
+) -> Result<GrantedTargets, PrivilegeError> {
     ensure_not_root(
         u32::from(nix::unistd::getuid()),
         u32::from(nix::unistd::geteuid()),
@@ -251,6 +270,7 @@ pub fn grant(backend: &Path, helper: &Path, antidpi: Option<&Path>) -> Result<()
             }
             verify_identity(backend)?;
             verify_backend_caps(&backend.path)?;
+            Ok(granted_targets(&plan))
         }
         Selection::Relocate {
             dest_dir,
@@ -352,9 +372,37 @@ pub fn grant(backend: &Path, helper: &Path, antidpi: Option<&Path>) -> Result<()
             }
             verify_identity(backend)?;
             verify_backend_caps(&backend.path)?;
+            Ok(granted_targets(&plan))
         }
     }
-    Ok(())
+}
+
+/// Projects a verified plan onto the destinations the caller may report.
+/// In-place targets are the canonical paths the elevation mutated; a
+/// relocation promises the fixed destination it published.
+pub(super) fn granted_targets(plan: &GrantPlan) -> GrantedTargets {
+    match plan {
+        GrantPlan::InPlace {
+            backend,
+            helper,
+            antidpi,
+            ..
+        } => GrantedTargets {
+            backend: backend.path.clone(),
+            helper: helper.path.clone(),
+            antidpi: antidpi.as_ref().map(|target| target.path.clone()),
+        },
+        GrantPlan::Relocate {
+            backend,
+            dst,
+            antidpi,
+            ..
+        } => GrantedTargets {
+            backend: backend.path.clone(),
+            helper: dst.clone(),
+            antidpi: antidpi.as_ref().map(|target| target.dst.clone()),
+        },
+    }
 }
 
 /// Runs the single `pkexec` elevation and captures its output so relocation

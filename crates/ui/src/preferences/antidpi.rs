@@ -294,7 +294,11 @@ pub(super) fn build_antidpi_page(
         let cb = cb.clone();
         let toast_cb = toast_cb.clone();
         let buffer = strategies_buffer.clone();
-        let scroll = strategies_scroll.clone();
+        // The controller outlives the page's external references, so the
+        // scroll window it decorates stays weak: a strong capture would
+        // cycle through the controller, the view that owns it, and the
+        // scroll window that owns the view, and leak the page on close.
+        let scroll = strategies_scroll.downgrade();
         // Commit only when editing finishes: a per-keystroke commit would
         // fight the user with validation rollbacks on half-typed chains.
         let focus = gtk::EventControllerFocus::new();
@@ -303,6 +307,11 @@ pub(super) fn build_antidpi_page(
             if render.get() {
                 return;
             }
+            // The dialog is gone: there is no row left to restore and no
+            // toast to aim at, so the closing editor commits nothing.
+            let Some(scroll) = scroll.upgrade() else {
+                return;
+            };
             let (start, end) = buffer.bounds();
             let text = buffer.text(&start, &end, true);
             // The whole edit is applied or none of it: every field failure
@@ -778,6 +787,68 @@ mod tests {
             // Reconciliation must not re-emit: one save error was already
             // reported for the failed write, and no second save is scheduled.
             assert_eq!(*emitted.borrow(), 2);
+        });
+    }
+
+    #[test]
+    fn closing_the_page_releases_the_rows_and_the_strategies_scroll() {
+        crate::gtk_test::run(|| {
+            let ctx = gtk::glib::MainContext::default();
+            let state = Rc::new(RefCell::new(AppSettings::default()));
+            let observers: SettingsObservers = Rc::new(RefCell::new(Vec::new()));
+            let toast_cb: ToastCallback = Rc::new(|_| {});
+            let cb: SettingsCallback = Rc::new(|_| {});
+
+            let (page, rows) = build_antidpi_page(&state, &cb, &observers, &toast_cb);
+            let scroll = rows.strategies_scroll.downgrade();
+            let page_weak = page.downgrade();
+
+            // A committed render proves the page answers its observers while
+            // the dialog is open.
+            let list: Vec<_> = observers.borrow().iter().cloned().collect();
+            for observer in list {
+                observer(&AppSettings::default());
+            }
+            assert!(scroll.upgrade().is_some());
+            assert!(page_weak.upgrade().is_some());
+
+            // Closing the dialog drops the handle's observer set, the page,
+            // and every handler-owned reference.
+            drop(rows);
+            drop(page);
+            drop(observers);
+            drop(cb);
+            drop(toast_cb);
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
+            assert!(
+                scroll.upgrade().is_none(),
+                "the focus handler must not pin the strategies scroll window"
+            );
+            assert!(
+                page_weak.upgrade().is_none(),
+                "the anti-DPI page outlived its dialog"
+            );
+
+            // Reopening builds a fresh page over the same shared state.
+            let observers: SettingsObservers = Rc::new(RefCell::new(Vec::new()));
+            let cb: SettingsCallback = Rc::new(|_| {});
+            let toast_cb: ToastCallback = Rc::new(|_| {});
+            let (page, rows) = build_antidpi_page(&state, &cb, &observers, &toast_cb);
+            let reopened_scroll = rows.strategies_scroll.downgrade();
+            assert!(reopened_scroll.upgrade().is_some());
+            assert_eq!(observers.borrow().len(), 1);
+            drop(rows);
+            drop(page);
+            drop(observers);
+            while ctx.pending() {
+                ctx.iteration(false);
+            }
+            assert!(
+                reopened_scroll.upgrade().is_none(),
+                "a reopened page must be released like the first"
+            );
         });
     }
 }
